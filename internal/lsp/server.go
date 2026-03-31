@@ -17,6 +17,7 @@ import (
 
 	"gitlab.com/remote-com/employ-starbase/dexter/internal/parser"
 	"gitlab.com/remote-com/employ-starbase/dexter/internal/store"
+	"gitlab.com/remote-com/employ-starbase/dexter/internal/version"
 )
 
 type Server struct {
@@ -176,7 +177,7 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 		},
 		ServerInfo: &protocol.ServerInfo{
 			Name:    "dexter",
-			Version: "0.1.4",
+			Version: version.Version,
 		},
 	}, nil
 }

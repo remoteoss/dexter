@@ -6,106 +6,112 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"sync"
 	"time"
 
+	"github.com/spf13/cobra"
 	dexter_lsp "gitlab.com/remote-com/employ-starbase/dexter/internal/lsp"
 	"gitlab.com/remote-com/employ-starbase/dexter/internal/parser"
 	"gitlab.com/remote-com/employ-starbase/dexter/internal/store"
+	"gitlab.com/remote-com/employ-starbase/dexter/internal/version"
 )
 
-func usage() {
-	fmt.Fprintf(os.Stderr, `dexter - Elixir module index
-
-Usage:
-  dexter init [--force] [path]    Full index of an Elixir project
-  dexter reindex [file|path]      Re-index a single file or check all files for changes
-  dexter lookup [flags] <module> [func]   Look up where a module/function is defined
-    --strict               Exit 1 if exact match not found (no fallback)
-    --no-follow-delegates  Don't follow defdelegate to the target module
-  dexter lsp [path]               Start the LSP server (stdio)
-
-Options:
-  path defaults to the current directory
-`)
-	os.Exit(1)
-}
-
 func main() {
-	if len(os.Args) < 2 {
-		usage()
+	rootCmd := &cobra.Command{
+		Use:          "dexter",
+		Short:        "Elixir module index",
+		SilenceUsage: true,
 	}
 
-	switch os.Args[1] {
-	case "init":
-		force := false
-		pathIdx := -1
-		for i := 2; i < len(os.Args); i++ {
-			if os.Args[i] == "--force" {
-				force = true
-			} else {
-				pathIdx = i
+	var force bool
+	initCmd := &cobra.Command{
+		Use:   "init [path]",
+		Short: "Full index of an Elixir project",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			projectRoot, err := resolvePath(args, 0)
+			if err != nil {
+				return err
 			}
-		}
-		var projectRoot string
-		if pathIdx >= 0 {
-			projectRoot = getPath(pathIdx)
-		} else {
-			projectRoot, _ = os.Getwd()
-		}
-		cmdInit(projectRoot, force)
-	case "reindex":
-		target := getPath(2)
-		cmdReindex(target)
-	case "lookup":
-		strict := false
-		followDelegates := true
-		lookupArgs := []string{}
-		for _, arg := range os.Args[2:] {
-			switch {
-			case arg == "--strict":
-				strict = true
-			case arg == "--no-follow-delegates":
-				followDelegates = false
-			case strings.HasPrefix(arg, "--"):
-				fmt.Fprintf(os.Stderr, "Unknown option: %s\n", arg)
-				os.Exit(1)
-			default:
-				lookupArgs = append(lookupArgs, arg)
+			cmdInit(projectRoot, force)
+			return nil
+		},
+	}
+	initCmd.Flags().BoolVar(&force, "force", false, "Delete and rebuild index from scratch")
+
+	reindexCmd := &cobra.Command{
+		Use:   "reindex [file|path]",
+		Short: "Re-index a single file or check all files for changes",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			target, err := resolvePath(args, 0)
+			if err != nil {
+				return err
 			}
-		}
-		if len(lookupArgs) < 1 {
-			usage()
-		}
-		module := lookupArgs[0]
-		function := ""
-		if len(lookupArgs) >= 2 {
-			function = lookupArgs[1]
-		}
-		projectRoot, _ := os.Getwd()
-		cmdLookup(projectRoot, module, function, strict, followDelegates)
-	case "lsp":
-		projectRoot, _ := os.Getwd()
-		cmdLSP(projectRoot)
-	default:
-		usage()
+			cmdReindex(target)
+			return nil
+		},
+	}
+
+	var strict bool
+	var noFollowDelegates bool
+	lookupCmd := &cobra.Command{
+		Use:   "lookup <module> [func]",
+		Short: "Look up where a module/function is defined",
+		Args:  cobra.RangeArgs(1, 2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			module := args[0]
+			function := ""
+			if len(args) == 2 {
+				function = args[1]
+			}
+			projectRoot, err := os.Getwd()
+			if err != nil {
+				return err
+			}
+			cmdLookup(projectRoot, module, function, strict, !noFollowDelegates)
+			return nil
+		},
+	}
+	lookupCmd.Flags().BoolVar(&strict, "strict", false, "Exit 1 if exact match not found (no fallback)")
+	lookupCmd.Flags().BoolVar(&noFollowDelegates, "no-follow-delegates", false, "Don't follow defdelegate to the target module")
+
+	lspCmd := &cobra.Command{
+		Use:   "lsp [path]",
+		Short: "Start the LSP server (stdio)",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			projectRoot, err := resolvePath(args, 0)
+			if err != nil {
+				return err
+			}
+			cmdLSP(projectRoot)
+			return nil
+		},
+	}
+
+	versionCmd := &cobra.Command{
+		Use:   "version",
+		Short: "Print the version",
+		Run: func(cmd *cobra.Command, args []string) {
+			fmt.Println(version.Version)
+		},
+	}
+
+	rootCmd.AddCommand(initCmd, reindexCmd, lookupCmd, lspCmd, versionCmd)
+
+	if err := rootCmd.Execute(); err != nil {
+		os.Exit(1)
 	}
 }
 
-func getPath(argIndex int) string {
-	if len(os.Args) > argIndex {
-		p, err := filepath.Abs(os.Args[argIndex])
-		if err != nil {
-			fatal(err)
-		}
-		return p
+// resolvePath returns the absolute path for args[index], or the current working
+// directory if args doesn't have an entry at that index.
+func resolvePath(args []string, index int) (string, error) {
+	if index < len(args) {
+		return filepath.Abs(args[index])
 	}
-	p, err := os.Getwd()
-	if err != nil {
-		fatal(err)
-	}
-	return p
+	return os.Getwd()
 }
 
 func findProjectRoot(path string) string {
