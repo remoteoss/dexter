@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.3] - 2026-03-30
+
+### Fixed
+
+- `dexter init` now defaults to current working directory when no path is given
+- `dexter init --force` no longer misinterprets `--force` as a path argument
+- `dexter init --force` now removes stale WAL files (`.dexter.db-shm`, `.dexter.db-wal`) that could corrupt the new database
+
 ## [0.1.2] - 2026-03-30
 
 ### Fixed

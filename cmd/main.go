@@ -40,7 +40,7 @@ func main() {
 	switch os.Args[1] {
 	case "init":
 		force := false
-		pathIdx := 2
+		pathIdx := -1
 		for i := 2; i < len(os.Args); i++ {
 			if os.Args[i] == "--force" {
 				force = true
@@ -48,7 +48,12 @@ func main() {
 				pathIdx = i
 			}
 		}
-		projectRoot := getPath(pathIdx)
+		var projectRoot string
+		if pathIdx >= 0 {
+			projectRoot = getPath(pathIdx)
+		} else {
+			projectRoot, _ = os.Getwd()
+		}
 		cmdInit(projectRoot, force)
 	case "reindex":
 		target := getPath(2)
@@ -136,8 +141,8 @@ func cmdInit(projectRoot string, force bool) {
 			fmt.Fprintf(os.Stderr, "Run `dexter reindex` to update, or `dexter init --force` to delete and rebuild from scratch.\n")
 			os.Exit(1)
 		}
-		if err := os.Remove(dbPath); err != nil {
-			fatal(err)
+		for _, f := range []string{dbPath, dbPath + "-shm", dbPath + "-wal"} {
+			os.Remove(f) // ignore errors — files may not exist
 		}
 	}
 

@@ -176,7 +176,7 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 		},
 		ServerInfo: &protocol.ServerInfo{
 			Name:    "dexter",
-			Version: "0.1.2",
+			Version: "0.1.3",
 		},
 	}, nil
 }
