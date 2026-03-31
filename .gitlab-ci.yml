@@ -1,0 +1,40 @@
+stages:
+  - test
+
+variables:
+  CGO_ENABLED: "1"
+  GOLANGCI_LINT_VERSION: v2.9.0
+
+test:
+  stage: test
+  image: golang:1.26
+  cache:
+    key:
+      files:
+        - go.sum
+    paths:
+      - /go/pkg/mod/
+  script:
+    - go test ./...
+  tags:
+    - size-m
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+lint:
+  stage: test
+  image: golangci/golangci-lint:$GOLANGCI_LINT_VERSION
+  cache:
+    key:
+      files:
+        - go.sum
+    paths:
+      - /go/pkg/mod/
+  script:
+    - golangci-lint run ./...
+  tags:
+    - size-m
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'

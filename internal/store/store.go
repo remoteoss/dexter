@@ -23,7 +23,7 @@ func Open(projectRoot string) (*Store, error) {
 	db.SetMaxOpenConns(2)
 
 	if err := migrate(db); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, err
 	}
 
@@ -88,7 +88,7 @@ func (s *Store) SetIndexVersion(v int) error {
 
 func (s *Store) IsEmpty() bool {
 	var count int
-	s.db.QueryRow("SELECT COUNT(*) FROM files").Scan(&count)
+	_ = s.db.QueryRow("SELECT COUNT(*) FROM files").Scan(&count)
 	return count == 0
 }
 
@@ -111,7 +111,7 @@ func (s *Store) IndexFile(path string, defs []parser.Definition) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	_, err = tx.Exec("DELETE FROM definitions WHERE file_path = ?", path)
 	if err != nil {
@@ -127,7 +127,7 @@ func (s *Store) IndexFile(path string, defs []parser.Definition) error {
 	if err != nil {
 		return err
 	}
-	defer stmt.Close()
+	defer func() { _ = stmt.Close() }()
 
 	for _, d := range defs {
 		_, err := stmt.Exec(d.Module, d.Function, d.Kind, d.Line, d.FilePath, d.DelegateTo, d.DelegateAs)
@@ -144,7 +144,7 @@ func (s *Store) RemoveFile(path string) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	_, err = tx.Exec("DELETE FROM definitions WHERE file_path = ?", path)
 	if err != nil {
@@ -184,7 +184,7 @@ func (s *Store) queryLookup(query string, args ...interface{}) ([]LookupResult, 
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var results []LookupResult
 	for rows.Next() {

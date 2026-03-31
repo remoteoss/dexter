@@ -20,7 +20,11 @@ func setupTestServer(t *testing.T) (*Server, func()) {
 
 	server := NewServer(s, dir)
 
-	return server, func() { s.Close() }
+	return server, func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("failed to close store: %v", err)
+		}
+	}
 }
 
 func indexFile(t *testing.T, s *store.Store, dir, relPath, content string) {

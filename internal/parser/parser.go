@@ -261,4 +261,3 @@ func WalkElixirFiles(root string, fn func(path string, info os.FileInfo) error) 
 		return fn(path, info)
 	})
 }
-

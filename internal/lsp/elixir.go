@@ -69,9 +69,9 @@ func ExtractModuleAndFunction(expr string) (moduleRef string, functionName strin
 }
 
 var (
-	aliasMultiRe   = regexp.MustCompile(`^\s*alias\s+([A-Za-z0-9_.]+)\.{([^}]+)}`)
-	importRe       = regexp.MustCompile(`^\s*import\s+([A-Za-z0-9_.]+)`)
-	defmoduleRe    = regexp.MustCompile(`^\s*defmodule\s+([A-Za-z0-9_.]+)\s+do`)
+	aliasMultiRe    = regexp.MustCompile(`^\s*alias\s+([A-Za-z0-9_.]+)\.{([^}]+)}`)
+	importRe        = regexp.MustCompile(`^\s*import\s+([A-Za-z0-9_.]+)`)
+	defmoduleRe     = regexp.MustCompile(`^\s*defmodule\s+([A-Za-z0-9_.]+)\s+do`)
 	moduleAttrDefRe = regexp.MustCompile(`^\s*@([a-z_][a-z0-9_]*)\s+[^@]`)
 )
 

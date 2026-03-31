@@ -23,6 +23,20 @@ go test ./...
 
 Tests include unit tests for the parser, store, and LSP elixir analysis functions, plus integration tests that scaffold a fake Elixir project, run `dexter init`, and verify lookups.
 
+## Linting
+
+Run `golangci-lint` after completing a set of changes and before marking work as done:
+
+```sh
+golangci-lint run ./...
+```
+
+Install via Go modules if you don't yet have it:
+
+```sh
+go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+```
+
 ## Key design decisions
 
 - **Regex over tree-sitter** — 7.5x faster per file. The regex parser handles heredocs, module nesting, and all def forms. Edge cases are fixed as they come up.

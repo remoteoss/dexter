@@ -32,7 +32,7 @@ func writeElixirFile(t *testing.T, dir, relPath, content string) string {
 
 func TestIndexAndLookupModule(t *testing.T) {
 	s, dir := setupTestStore(t)
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	path := writeElixirFile(t, dir, "lib/foo.ex", `defmodule MyApp.Foo do
   def bar do
@@ -63,7 +63,7 @@ end
 
 func TestIndexAndLookupFunction(t *testing.T) {
 	s, dir := setupTestStore(t)
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	path := writeElixirFile(t, dir, "lib/foo.ex", `defmodule MyApp.Foo do
   def bar(arg) do
@@ -106,7 +106,7 @@ end
 
 func TestReindexUpdatesDefinitions(t *testing.T) {
 	s, dir := setupTestStore(t)
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	path := writeElixirFile(t, dir, "lib/foo.ex", `defmodule MyApp.Foo do
   def bar do
@@ -160,7 +160,7 @@ end
 
 func TestRemoveFile(t *testing.T) {
 	s, dir := setupTestStore(t)
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	path := writeElixirFile(t, dir, "lib/foo.ex", `defmodule MyApp.Foo do
   def bar do
@@ -192,7 +192,7 @@ end
 
 func TestMtimeTracking(t *testing.T) {
 	s, dir := setupTestStore(t)
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	path := writeElixirFile(t, dir, "lib/foo.ex", `defmodule MyApp.Foo do
 end
@@ -222,7 +222,7 @@ end
 
 func TestMultipleFunctionHeadsLookup(t *testing.T) {
 	s, dir := setupTestStore(t)
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	path := writeElixirFile(t, dir, "lib/webhooks.ex", `defmodule MyApp.Webhooks do
   def process_event("completed", payload) do

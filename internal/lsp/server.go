@@ -73,14 +73,16 @@ func (s *Server) backgroundReindex() {
 		if isEmpty {
 			log.Printf("No index found, building from scratch...")
 			if s.client != nil {
-				s.client.ShowMessage(context.Background(), &protocol.ShowMessageParams{
+				if err := s.client.ShowMessage(context.Background(), &protocol.ShowMessageParams{
 					Type:    protocol.MessageTypeInfo,
 					Message: "Dexter: building index for the first time, go-to-definition will be available shortly...",
-				})
+				}); err != nil {
+					log.Printf("ShowMessage: %v", err)
+				}
 			}
 		}
 
-		parser.WalkElixirFiles(s.projectRoot, func(path string, info os.FileInfo) error {
+		if err := parser.WalkElixirFiles(s.projectRoot, func(path string, info os.FileInfo) error {
 			if !isEmpty {
 				storedMtime, found := s.store.GetFileMtime(path)
 				currentMtime := info.ModTime().UnixNano()
@@ -98,16 +100,20 @@ func (s *Server) backgroundReindex() {
 			}
 			reindexed++
 			return nil
-		})
+		}); err != nil {
+			log.Printf("WalkElixirFiles: %v", err)
+		}
 
 		elapsed := time.Since(start).Round(time.Millisecond)
 		log.Printf("Background reindex: %d files updated (%s)", reindexed, elapsed)
 
 		if isEmpty && s.client != nil {
-			s.client.ShowMessage(context.Background(), &protocol.ShowMessageParams{
+			if err := s.client.ShowMessage(context.Background(), &protocol.ShowMessageParams{
 				Type:    protocol.MessageTypeInfo,
 				Message: fmt.Sprintf("Dexter: index built (%d files in %s)", reindexed, elapsed),
-			})
+			}); err != nil {
+				log.Printf("ShowMessage: %v", err)
+			}
 		}
 	}()
 }
@@ -145,8 +151,8 @@ func (s *Server) watchGitHead() {
 // === LSP Lifecycle ===
 
 func (s *Server) Initialize(ctx context.Context, params *protocol.InitializeParams) (*protocol.InitializeResult, error) {
-	if params.RootURI != "" {
-		root := uriToPath(params.RootURI)
+	if len(params.WorkspaceFolders) > 0 {
+		root := uriToPath(protocol.DocumentURI(params.WorkspaceFolders[0].URI))
 		if root != "" {
 			s.projectRoot = findDexterRoot(root)
 		}

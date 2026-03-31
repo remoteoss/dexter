@@ -148,7 +148,7 @@ func cmdInit(projectRoot string, force bool) {
 			os.Exit(1)
 		}
 		for _, f := range []string{dbPath, dbPath + "-shm", dbPath + "-wal"} {
-			os.Remove(f) // ignore errors — files may not exist
+			_ = os.Remove(f) // files may not exist
 		}
 	}
 
@@ -156,7 +156,11 @@ func cmdInit(projectRoot string, force bool) {
 	if err != nil {
 		fatal(err)
 	}
-	defer s.Close()
+	defer func() {
+		if err := s.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to close store: %v\n", err)
+		}
+	}()
 
 	start := time.Now()
 
@@ -235,11 +239,20 @@ func cmdReindex(target string) {
 	if err != nil {
 		fatal(err)
 	}
-	defer s.Close()
+	storeClosed := false
+	closeStore := func() {
+		if !storeClosed {
+			storeClosed = true
+			if err := s.Close(); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to close store: %v\n", err)
+			}
+		}
+	}
+	defer closeStore()
 
 	if stored := s.GetIndexVersion(); stored != version.IndexVersion {
 		fmt.Fprintf(os.Stderr, "Index version mismatch (stored: %d, current: %d), performing full rebuild...\n", stored, version.IndexVersion)
-		s.Close()
+		closeStore()
 		cmdInit(projectRoot, true)
 		return
 	}
@@ -289,7 +302,11 @@ func cmdLookup(projectRoot string, module string, function string, strict bool, 
 	if err != nil {
 		fatal(err)
 	}
-	defer s.Close()
+	defer func() {
+		if err := s.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to close store: %v\n", err)
+		}
+	}()
 
 	if function != "" {
 		var results []store.LookupResult
@@ -336,14 +353,20 @@ func cmdLSP(projectRoot string) {
 	if stored := s.GetIndexVersion(); stored != version.IndexVersion {
 		log.SetOutput(os.Stderr)
 		log.Printf("Index version mismatch (stored: %d, current: %d), rebuilding index...", stored, version.IndexVersion)
-		s.Close()
+		if err := s.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to close store: %v\n", err)
+		}
 		cmdInit(projectRoot, true)
 		s, err = store.Open(projectRoot)
 		if err != nil {
 			fatal(err)
 		}
 	}
-	defer s.Close()
+	defer func() {
+		if err := s.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to close store: %v\n", err)
+		}
+	}()
 
 	log.SetOutput(os.Stderr)
 	log.Printf("Dexter LSP starting (root: %s)", projectRoot)

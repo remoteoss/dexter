@@ -916,4 +916,3 @@ end
 		t.Errorf("expected def for identity, got %q", funcs["identity"])
 	}
 }
-
