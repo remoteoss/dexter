@@ -188,10 +188,13 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 				},
 			},
 			DefinitionProvider: true,
+			CompletionProvider: &protocol.CompletionOptions{
+				TriggerCharacters: []string{"."},
+			},
 		},
 		ServerInfo: &protocol.ServerInfo{
 			Name:    "dexter",
-			Version: "0.1.4",
+			Version: "0.2.0",
 		},
 	}, nil
 }
@@ -412,7 +415,120 @@ func (s *Server) ColorPresentation(ctx context.Context, params *protocol.ColorPr
 	return nil, nil
 }
 func (s *Server) Completion(ctx context.Context, params *protocol.CompletionParams) (*protocol.CompletionList, error) {
-	return nil, nil
+	docURI := string(params.TextDocument.URI)
+
+	text, ok := s.docs.Get(docURI)
+	if !ok {
+		return nil, nil
+	}
+
+	lines := strings.Split(text, "\n")
+	lineNum := int(params.Position.Line)
+	col := int(params.Position.Character)
+
+	if lineNum >= len(lines) {
+		return nil, nil
+	}
+
+	prefix, afterDot := ExtractCompletionContext(lines[lineNum], col)
+	if prefix == "" && !afterDot {
+		return nil, nil
+	}
+
+	moduleRef, funcPrefix := ExtractModuleAndFunction(prefix)
+	aliases := ExtractAliases(text)
+
+	var items []protocol.CompletionItem
+
+	if moduleRef != "" && (afterDot || funcPrefix != "") {
+		resolved := resolveModule(moduleRef, aliases)
+		results, err := s.store.ListModuleFunctions(resolved, true)
+		if err != nil {
+			return nil, nil
+		}
+		for _, r := range results {
+			if funcPrefix != "" && !strings.HasPrefix(r.Function, funcPrefix) {
+				continue
+			}
+			items = append(items, protocol.CompletionItem{
+				Label:  r.Function,
+				Kind:   kindToCompletionItemKind(r.Kind),
+				Detail: r.Kind,
+			})
+		}
+	} else if moduleRef != "" {
+		results, err := s.store.SearchModules(moduleRef)
+		if err != nil {
+			return nil, nil
+		}
+		for _, r := range results {
+			items = append(items, protocol.CompletionItem{
+				Label:  r.Module,
+				Kind:   protocol.CompletionItemKindModule,
+				Detail: "module",
+			})
+		}
+	} else if funcPrefix != "" {
+		seen := make(map[string]bool)
+
+		for _, bf := range FindBufferFunctions(text) {
+			if strings.HasPrefix(bf.Name, funcPrefix) && !seen[bf.Name] {
+				seen[bf.Name] = true
+				items = append(items, protocol.CompletionItem{
+					Label:  bf.Name,
+					Kind:   kindToCompletionItemKind(bf.Kind),
+					Detail: bf.Kind,
+				})
+			}
+		}
+
+		for _, mod := range ExtractImports(text) {
+			results, err := s.store.ListModuleFunctions(mod, true)
+			if err != nil {
+				continue
+			}
+			for _, r := range results {
+				if strings.HasPrefix(r.Function, funcPrefix) && !seen[r.Function] {
+					seen[r.Function] = true
+					items = append(items, protocol.CompletionItem{
+						Label:  r.Function,
+						Kind:   kindToCompletionItemKind(r.Kind),
+						Detail: r.Module + " (" + r.Kind + ")",
+					})
+				}
+			}
+		}
+	}
+
+	if len(items) == 0 {
+		return nil, nil
+	}
+
+	return &protocol.CompletionList{
+		IsIncomplete: false,
+		Items:        items,
+	}, nil
+}
+
+func resolveModule(moduleRef string, aliases map[string]string) string {
+	if resolved, ok := aliases[moduleRef]; ok {
+		return resolved
+	}
+	if parts := strings.SplitN(moduleRef, ".", 2); len(parts) == 2 {
+		if resolved, ok := aliases[parts[0]]; ok {
+			return resolved + "." + parts[1]
+		}
+	}
+	return moduleRef
+}
+
+func kindToCompletionItemKind(kind string) protocol.CompletionItemKind {
+	switch kind {
+	case "module", "defprotocol":
+		return protocol.CompletionItemKindModule
+	default:
+		return protocol.CompletionItemKindFunction
+	}
 }
 func (s *Server) CompletionResolve(ctx context.Context, params *protocol.CompletionItem) (*protocol.CompletionItem, error) {
 	return nil, nil
