@@ -112,31 +112,20 @@ func findProjectRoot(path string) string {
 		path = filepath.Dir(path)
 	}
 
-	// First look for an existing .dexter.db (the index we created)
-	dir := path
-	for {
-		if _, err := os.Stat(filepath.Join(dir, ".dexter.db")); err == nil {
-			return dir
+	for _, marker := range []string{".dexter.db", ".git", "mix.exs"} {
+		dir := path
+		for {
+			if _, err := os.Stat(filepath.Join(dir, marker)); err == nil {
+				return dir
+			}
+			parent := filepath.Dir(dir)
+			if parent == dir {
+				break
+			}
+			dir = parent
 		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			break
-		}
-		dir = parent
 	}
-
-	// Fall back to mix.exs
-	dir = path
-	for {
-		if _, err := os.Stat(filepath.Join(dir, "mix.exs")); err == nil {
-			return dir
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return path
-		}
-		dir = parent
-	}
+	return path
 }
 
 func cmdInit(projectRoot string, force bool) {
@@ -316,12 +305,6 @@ func cmdLookup(projectRoot string, module string, function string, strict bool, 
 
 func cmdLSP(projectRoot string) {
 	projectRoot = findProjectRoot(projectRoot)
-
-	dbPath := filepath.Join(projectRoot, ".dexter.db")
-	if _, err := os.Stat(dbPath); err != nil {
-		fmt.Fprintf(os.Stderr, "No index found at %s. Run `dexter init` first.\n", dbPath)
-		os.Exit(1)
-	}
 
 	s, err := store.Open(projectRoot)
 	if err != nil {

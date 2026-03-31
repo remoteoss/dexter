@@ -500,6 +500,81 @@ end
 	t.Error("missing defdelegate format")
 }
 
+func TestParseFile_DefdelegateModuleAlias(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.HRIS do
+  alias __MODULE__.Services
+
+  defdelegate link_via_team_membership(user_id, company_id),
+    to: Services.AssociateWithTeam,
+    as: :call
+end
+`)
+
+	defs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, d := range defs {
+		if d.Function == "link_via_team_membership" {
+			if d.DelegateTo != "MyApp.HRIS.Services.AssociateWithTeam" {
+				t.Errorf("expected MyApp.HRIS.Services.AssociateWithTeam, got %q", d.DelegateTo)
+			}
+			return
+		}
+	}
+	t.Error("missing defdelegate link_via_team_membership")
+}
+
+func TestParseFile_DefdelegateTo__MODULE__Directly(t *testing.T) {
+	path := writeTempFile(t, `defmodule DataUtils.Banks do
+  defdelegate account_number, to: __MODULE__, as: :scramble_alphanumeric
+end
+`)
+
+	defs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, d := range defs {
+		if d.Function == "account_number" {
+			if d.DelegateTo != "DataUtils.Banks" {
+				t.Errorf("expected DataUtils.Banks, got %q", d.DelegateTo)
+			}
+			if d.DelegateAs != "scramble_alphanumeric" {
+				t.Errorf("expected scramble_alphanumeric, got %q", d.DelegateAs)
+			}
+			return
+		}
+	}
+	t.Error("missing defdelegate account_number")
+}
+
+func TestParseFile_AliasModuleAs(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.MyPayProvider do
+  alias __MODULE__, as: MyPayProvider
+
+  defdelegate process(payload), to: MyPayProvider.Processor, as: :call
+end
+`)
+
+	defs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, d := range defs {
+		if d.Function == "process" {
+			if d.DelegateTo != "MyApp.MyPayProvider.Processor" {
+				t.Errorf("expected MyApp.MyPayProvider.Processor, got %q", d.DelegateTo)
+			}
+			return
+		}
+	}
+	t.Error("missing defdelegate process")
+}
+
 func TestParseFile_Defguard(t *testing.T) {
 	path := writeTempFile(t, `defmodule MyApp.Guards do
   defguard is_admin(user) when user.role == :admin

@@ -58,6 +58,12 @@ func migrate(db *sql.DB) error {
 	return err
 }
 
+func (s *Store) IsEmpty() bool {
+	var count int
+	s.db.QueryRow("SELECT COUNT(*) FROM files").Scan(&count)
+	return count == 0
+}
+
 func (s *Store) GetFileMtime(path string) (int64, bool) {
 	var mtime int64
 	err := s.db.QueryRow("SELECT mtime FROM files WHERE path = ?", path).Scan(&mtime)

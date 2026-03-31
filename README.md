@@ -19,6 +19,7 @@ mise install dexter@latest
 mise use -g dexter@latest
 
 # 3. Index your project (one-time, ~8s for a large codebase)
+# Run from your monorepo root — dexter will place .dexter.db next to your .git directory
 cd ~/code/my-elixir-project
 dexter init .
 
@@ -26,6 +27,7 @@ dexter init .
 echo ".dexter.db" >> .gitignore
 
 # 5. Configure your editor (see below)
+# When using the LSP server, dexter auto-builds the index on first startup if it doesn't exist
 ```
 
 ### VS Code / Cursor extension
@@ -45,7 +47,7 @@ Add to your LSP configuration (e.g., `after/plugin/lsp.lua`):
 ```lua
 vim.lsp.config('dexter', {
   cmd = { 'dexter', 'lsp' },
-  root_markers = { '.dexter.db', 'mix.exs', '.git' },
+  root_markers = { '.dexter.db', '.git', 'mix.exs' },
   filetypes = { 'elixir', 'eelixir' },
 })
 

@@ -72,13 +72,24 @@ func ParseFile(path string) ([]Definition, error) {
 			currentModule = moduleStack[len(moduleStack)-1]
 		}
 
-		// Track aliases
+		// Track aliases, resolving __MODULE__ to the current module name
+		resolveModule := func(s string) string {
+			if currentModule != "" {
+				return strings.ReplaceAll(s, "__MODULE__", currentModule)
+			}
+			return s
+		}
 		if m := AliasAsRe.FindStringSubmatch(line); m != nil {
-			aliases[m[2]] = m[1]
+			resolved := resolveModule(m[1])
+			// Skip if we can't resolve __MODULE__ (no current module yet)
+			if !strings.Contains(resolved, "__MODULE__") {
+				aliases[m[2]] = resolved
+			}
 		} else if m := AliasRe.FindStringSubmatch(line); m != nil {
-			parts := strings.Split(m[1], ".")
+			resolved := resolveModule(m[1])
+			parts := strings.Split(resolved, ".")
 			shortName := parts[len(parts)-1]
-			aliases[shortName] = m[1]
+			aliases[shortName] = resolved
 		}
 
 		if m := defmoduleRe.FindStringSubmatch(line); m != nil {
@@ -129,7 +140,7 @@ func ParseFile(path string) ([]Definition, error) {
 					Kind:     kind,
 				}
 				if kind == "defdelegate" {
-					def.DelegateTo, def.DelegateAs = findDelegateToAndAs(lines, lineIdx, aliases)
+					def.DelegateTo, def.DelegateAs = findDelegateToAndAs(lines, lineIdx, aliases, currentModule)
 				}
 				defs = append(defs, def)
 				continue
@@ -161,7 +172,7 @@ func ParseFile(path string) ([]Definition, error) {
 
 // findDelegateTo searches the current line and up to 5 subsequent lines for a to: target,
 // then resolves it via aliases.
-func findDelegateToAndAs(lines []string, startIdx int, aliases map[string]string) (string, string) {
+func findDelegateToAndAs(lines []string, startIdx int, aliases map[string]string, currentModule string) (string, string) {
 	end := startIdx + 6
 	if end > len(lines) {
 		end = len(lines)
@@ -171,8 +182,20 @@ func findDelegateToAndAs(lines []string, startIdx int, aliases map[string]string
 	for i := startIdx; i < end; i++ {
 		if m := delegateToRe.FindStringSubmatch(lines[i]); m != nil && targetModule == "" {
 			target := m[1]
+			// Resolve __MODULE__ directly in to: field
+			if currentModule != "" {
+				target = strings.ReplaceAll(target, "__MODULE__", currentModule)
+			}
 			if resolved, ok := aliases[target]; ok {
+				// Exact alias match: "to: Services" where Services -> MyApp.HRIS.Services
 				targetModule = resolved
+			} else if parts := strings.SplitN(target, ".", 2); len(parts) == 2 {
+				// Partial alias: "to: Services.Foo" where Services -> MyApp.HRIS.Services
+				if resolved, ok := aliases[parts[0]]; ok {
+					targetModule = resolved + "." + parts[1]
+				} else {
+					targetModule = target
+				}
 			} else {
 				targetModule = target
 			}

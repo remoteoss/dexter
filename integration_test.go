@@ -388,6 +388,82 @@ end
 	}
 }
 
+func TestIntegration_LookupFindsDbViaGitRoot(t *testing.T) {
+	binary := buildDexter(t)
+	root := scaffoldProject(t)
+
+	// Create a monorepo-like structure: .git at root, subapp with mix.exs
+	if err := os.MkdirAll(filepath.Join(root, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	subapp := filepath.Join(root, "apps", "myapp")
+	if err := os.MkdirAll(subapp, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subapp, "mix.exs"), []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Init explicitly at the .git root (monorepo root)
+	runDexter(t, binary, root, "init", root)
+
+	// Lookup run from the subapp should find the db at the .git root
+	out := runDexter(t, binary, subapp, "lookup", "MyApp.Repo")
+	if !strings.Contains(out, "repo.ex:1") {
+		t.Errorf("expected lookup to find MyApp.Repo via .git root db, got: %s", out)
+	}
+}
+
+func TestIntegration_LookupPrefersGitOverMixExs(t *testing.T) {
+	binary := buildDexter(t)
+
+	// Monorepo root with .git
+	monorepoRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(monorepoRoot, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(monorepoRoot, "mix.exs"), []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Subapp with its own mix.exs
+	subapp := filepath.Join(monorepoRoot, "apps", "my_app")
+	if err := os.MkdirAll(subapp, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subapp, "mix.exs"), []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Index at the monorepo root
+	scaffoldFiles := map[string]string{
+		"mix.exs": `defmodule MyApp.MixProject do use Mix.Project end`,
+		"apps/my_app/lib/foo.ex": `defmodule Foo do
+  def bar do :ok end
+end`,
+	}
+	for relPath, content := range scaffoldFiles {
+		fullPath := filepath.Join(monorepoRoot, relPath)
+		if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(fullPath, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runDexter(t, binary, monorepoRoot, "init", monorepoRoot)
+
+	// Lookup from subapp should find the db at .git root, not create a new one at mix.exs
+	out := runDexter(t, binary, subapp, "lookup", "Foo")
+	if !strings.Contains(out, "foo.ex:1") {
+		t.Errorf("expected lookup to find Foo via .git root db, got: %s", out)
+	}
+
+	if _, err := os.Stat(filepath.Join(subapp, ".dexter.db")); err == nil {
+		t.Error("should not have created a second .dexter.db in the subapp")
+	}
+}
+
 func TestIntegration_InitForce(t *testing.T) {
 	binary := buildDexter(t)
 	root := scaffoldProject(t)

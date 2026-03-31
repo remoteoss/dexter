@@ -2,6 +2,7 @@ package lsp
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -19,17 +20,20 @@ import (
 )
 
 type Server struct {
-	store       *store.Store
-	docs        *DocumentStore
-	projectRoot string
-	initialized bool
+	store           *store.Store
+	docs            *DocumentStore
+	projectRoot     string
+	initialized     bool
+	client          protocol.Client
+	followDelegates bool
 }
 
 func NewServer(s *store.Store, projectRoot string) *Server {
 	return &Server{
-		store:       s,
-		docs:        NewDocumentStore(),
-		projectRoot: projectRoot,
+		store:           s,
+		docs:            NewDocumentStore(),
+		projectRoot:     projectRoot,
+		followDelegates: true, // default
 	}
 }
 
@@ -47,7 +51,7 @@ func Serve(in io.Reader, out io.Writer, s *store.Store, projectRoot string) erro
 	logger, _ := zap.NewProduction()
 	stream := jsonrpc2.NewStream(stdinoutCloser{in, out})
 	conn := jsonrpc2.NewConn(stream)
-	_ = protocol.ClientDispatcher(conn, logger)
+	server.client = protocol.ClientDispatcher(conn, logger)
 
 	handler := protocol.ServerHandler(server, nil)
 	ctx := context.Background()
@@ -57,17 +61,31 @@ func Serve(in io.Reader, out io.Writer, s *store.Store, projectRoot string) erro
 	return conn.Err()
 }
 
-// backgroundReindex runs an incremental mtime-based reindex in the background.
+// backgroundReindex runs in the background. If the index is empty it does a
+// full init, otherwise it does an incremental mtime-based update.
 func (s *Server) backgroundReindex() {
 	go func() {
 		start := time.Now()
 		reindexed := 0
+		isEmpty := s.store.IsEmpty()
+
+		if isEmpty {
+			log.Printf("No index found, building from scratch...")
+			if s.client != nil {
+				s.client.ShowMessage(context.Background(), &protocol.ShowMessageParams{
+					Type:    protocol.MessageTypeInfo,
+					Message: "Dexter: building index for the first time, go-to-definition will be available shortly...",
+				})
+			}
+		}
 
 		parser.WalkElixirFiles(s.projectRoot, func(path string, info os.FileInfo) error {
-			storedMtime, found := s.store.GetFileMtime(path)
-			currentMtime := info.ModTime().UnixNano()
-			if found && storedMtime == currentMtime {
-				return nil
+			if !isEmpty {
+				storedMtime, found := s.store.GetFileMtime(path)
+				currentMtime := info.ModTime().UnixNano()
+				if found && storedMtime == currentMtime {
+					return nil
+				}
 			}
 
 			defs, err := parser.ParseFile(path)
@@ -81,7 +99,15 @@ func (s *Server) backgroundReindex() {
 			return nil
 		})
 
-		log.Printf("Background reindex: %d files updated (%s)", reindexed, time.Since(start).Round(time.Millisecond))
+		elapsed := time.Since(start).Round(time.Millisecond)
+		log.Printf("Background reindex: %d files updated (%s)", reindexed, elapsed)
+
+		if isEmpty && s.client != nil {
+			s.client.ShowMessage(context.Background(), &protocol.ShowMessageParams{
+				Type:    protocol.MessageTypeInfo,
+				Message: fmt.Sprintf("Dexter: index built (%d files in %s)", reindexed, elapsed),
+			})
+		}
 	}()
 }
 
@@ -125,7 +151,11 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 		}
 	}
 
-	log.Printf("Initialize: projectRoot=%s", s.projectRoot)
+	if opts, ok := params.InitializationOptions.(map[string]interface{}); ok {
+		if v, ok := opts["followDelegates"].(bool); ok {
+			s.followDelegates = v
+		}
+	}
 
 	if !s.initialized {
 		s.initialized = true
@@ -208,11 +238,9 @@ func (s *Server) DidSave(ctx context.Context, params *protocol.DidSaveTextDocume
 
 func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionParams) ([]protocol.Location, error) {
 	docURI := string(params.TextDocument.URI)
-	log.Printf("Definition request: uri=%s line=%d col=%d", docURI, params.Position.Line, params.Position.Character)
 
 	text, ok := s.docs.Get(docURI)
 	if !ok {
-		log.Printf("Definition: document not found in store")
 		return nil, nil
 	}
 
@@ -221,18 +249,15 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 	col := int(params.Position.Character)
 
 	if lineNum >= len(lines) {
-		log.Printf("Definition: line %d out of range (total %d)", lineNum, len(lines))
 		return nil, nil
 	}
 
 	expr := ExtractExpression(lines[lineNum], col)
 	if expr == "" {
-		log.Printf("Definition: no expression at cursor")
 		return nil, nil
 	}
 
 	moduleRef, functionName := ExtractModuleAndFunction(expr)
-	log.Printf("Definition: expr=%q module=%q function=%q", expr, moduleRef, functionName)
 
 	// Bare function call — check local buffer, then imports
 	if moduleRef == "" {
@@ -268,17 +293,19 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 	fullModule := moduleRef
 	if resolved, ok := aliases[moduleRef]; ok {
 		fullModule = resolved
-		log.Printf("Definition: resolved alias %q -> %q", moduleRef, fullModule)
 	}
 
 	if functionName != "" {
-		log.Printf("Definition: looking up %s.%s", fullModule, functionName)
-		results, err := s.store.LookupFollowDelegate(fullModule, functionName)
+		var results []store.LookupResult
+		var err error
+		if s.followDelegates {
+			results, err = s.store.LookupFollowDelegate(fullModule, functionName)
+		} else {
+			results, err = s.store.LookupFunction(fullModule, functionName)
+		}
 		if err == nil && len(results) > 0 {
-			log.Printf("Definition: found %d results", len(results))
 			return storeResultsToLocations(results), nil
 		}
-		log.Printf("Definition: no function results, falling back to module")
 	}
 
 	// Fall back to module
@@ -307,20 +334,23 @@ func lineRange(line int) protocol.Range {
 	}
 }
 
-// findDexterRoot walks up from the given path looking for .dexter.db.
-// Falls back to the original path if not found.
+// findDexterRoot walks up from the given path looking for .dexter.db first,
+// then .git (monorepo root), falling back to the original path.
 func findDexterRoot(path string) string {
-	dir := path
-	for {
-		if _, err := os.Stat(filepath.Join(dir, ".dexter.db")); err == nil {
-			return dir
+	for _, marker := range []string{".dexter.db", ".git"} {
+		dir := path
+		for {
+			if _, err := os.Stat(filepath.Join(dir, marker)); err == nil {
+				return dir
+			}
+			parent := filepath.Dir(dir)
+			if parent == dir {
+				break
+			}
+			dir = parent
 		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return path
-		}
-		dir = parent
 	}
+	return path
 }
 
 func uriToPath(u protocol.DocumentURI) string {
