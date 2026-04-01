@@ -332,6 +332,12 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 		// For example: Keyword.put_new(opts, :oban_module, Oban.Pro.Worker)
 		// These modules are typically used transitively deeper in the chain
 		// via `use unquote(var)` and can't be resolved statically otherwise.
+		//
+		// This is a bit hacky — it matches any Keyword call with a module
+		// value, not just ones whose variable feeds into a `use unquote(var)`.
+		// A proper fix would link the variable name to the unquote call, but
+		// that requires a two-pass scan. The false positives are harmless
+		// (just extra nil lookups) and the pattern doesn't appear in practice.
 		if m := keywordModuleRe.FindStringSubmatch(line); m != nil {
 			transUses = append(transUses, resolveAlias(m[1]))
 		}
