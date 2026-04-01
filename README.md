@@ -1,10 +1,8 @@
 # Dexter
 
-A fast Elixir go-to-definition engine that runs as an LSP server. Built for large codebases where traditional Elixir LSP servers are too slow.
+A fast, lightweight Elixir LSP built for large codebases where traditional Elixir LSP servers are too slow. Dexter provides go-to-definition, hover documentation, and autocompletion — all backed by a local SQLite index that stays up to date automatically.
 
-Dexter indexes every module and function definition in your project into a local SQLite database, then serves instant go-to-definition responses over the Language Server Protocol. It understands aliases, imports, `defdelegate`, nested modules, and heredocs.
-
-Dexter is designed to run **alongside** your existing Elixir LSP, not replace it. Use dexter for fast navigation and your full LSP for diagnostics, completions, and refactoring.
+Dexter can run standalone or alongside your existing Elixir LSP. It covers navigation, documentation, and completions out of the box — the only thing missing compared to a full Elixir LSP is diagnostics, and that's on the roadmap.
 
 ## Quick start
 
@@ -262,7 +260,7 @@ Measured on a 57k-file Elixir monorepo (2.5M lines, 340k+ definitions):
 
 ## Why?
 
-Elixir LSP servers (ElixirLS, Lexical, etc.) can struggle with very large monorepos. Ctags works but doesn't understand Elixir module namespacing, so `Foo` often resolves to the wrong module. Dexter sits in between — it's Elixir-aware but doesn't try to be a full LSP. Just fast, correct go-to-definition.
+Elixir LSP servers (ElixirLS, Lexical, etc.) can struggle with very large monorepos. Ctags works but doesn't understand Elixir module namespacing, so `Foo` often resolves to the wrong module. Dexter sits in between — it's Elixir-aware but doesn't try to be a full LSP. Just fast, correct navigation, docs, and completions.
 
 ## Development
 
@@ -279,10 +277,16 @@ make test
 ## Releasing
 
 ```sh
+# 1. Create a release branch with the version bump
 make release VERSION=0.2.0
+
+# 2. Push the branch and merge it into main
+
+# 3. Tag and push the tag
+make tag VERSION=0.2.0
 ```
 
-This updates the version in `internal/version/version.go`, commits, tags, and pushes. Users can then upgrade via mise:
+This updates the version in `internal/version/version.go` on a release branch. After merging to main, `make tag` creates and pushes the git tag. Users can then upgrade via mise:
 
 ```sh
 mise plugin update dexter && mise install dexter@latest
