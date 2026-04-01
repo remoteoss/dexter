@@ -82,7 +82,10 @@ func (s *Server) backgroundReindex() {
 			}
 		}
 
+		seen := make(map[string]struct{})
 		if err := parser.WalkElixirFiles(s.projectRoot, func(path string, info os.FileInfo) error {
+			seen[path] = struct{}{}
+
 			if !isEmpty {
 				storedMtime, found := s.store.GetFileMtime(path)
 				currentMtime := info.ModTime().UnixNano()
@@ -102,6 +105,15 @@ func (s *Server) backgroundReindex() {
 			return nil
 		}); err != nil {
 			log.Printf("WalkElixirFiles: %v", err)
+		}
+
+		// Prune store entries for files no longer on disk
+		if storedPaths, err := s.store.ListFilePaths(); err == nil {
+			for _, storedPath := range storedPaths {
+				if _, ok := seen[storedPath]; !ok {
+					_ = s.store.RemoveFile(storedPath)
+				}
+			}
 		}
 
 		elapsed := time.Since(start).Round(time.Millisecond)
@@ -148,11 +160,29 @@ func (s *Server) watchGitHead() {
 	}()
 }
 
+// periodicReindex runs backgroundReindex on a fixed interval to catch files
+// created or deleted outside the editor.
+func (s *Server) periodicReindex() {
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			s.backgroundReindex()
+		}
+	}()
+}
+
 // === LSP Lifecycle ===
 
 func (s *Server) Initialize(ctx context.Context, params *protocol.InitializeParams) (*protocol.InitializeResult, error) {
 	if len(params.WorkspaceFolders) > 0 {
 		root := uriToPath(protocol.DocumentURI(params.WorkspaceFolders[0].URI))
+		if root != "" {
+			s.projectRoot = findDexterRoot(root)
+		}
+	} else if params.RootURI != "" { //nolint:staticcheck // RootURI is deprecated but Neovim still sends it
+		root := uriToPath(params.RootURI) //nolint:staticcheck
 		if root != "" {
 			s.projectRoot = findDexterRoot(root)
 		}
@@ -168,6 +198,7 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 		s.initialized = true
 		s.backgroundReindex()
 		s.watchGitHead()
+		s.periodicReindex()
 	}
 
 	return &protocol.InitializeResult{
@@ -189,6 +220,26 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 }
 
 func (s *Server) Initialized(ctx context.Context, params *protocol.InitializedParams) error {
+	if s.client != nil {
+		go func() {
+			if err := s.client.RegisterCapability(context.Background(), &protocol.RegistrationParams{
+				Registrations: []protocol.Registration{
+					{
+						ID:     "dexter-file-watcher",
+						Method: "workspace/didChangeWatchedFiles",
+						RegisterOptions: protocol.DidChangeWatchedFilesRegistrationOptions{
+							Watchers: []protocol.FileSystemWatcher{
+								{GlobPattern: "**/*.ex", Kind: protocol.WatchKindCreate + protocol.WatchKindChange + protocol.WatchKindDelete},
+								{GlobPattern: "**/*.exs", Kind: protocol.WatchKindCreate + protocol.WatchKindChange + protocol.WatchKindDelete},
+							},
+						},
+					},
+				},
+			}); err != nil {
+				log.Printf("RegisterCapability: %v", err)
+			}
+		}()
+	}
 	return nil
 }
 
@@ -416,6 +467,31 @@ func (s *Server) DidChangeConfiguration(ctx context.Context, params *protocol.Di
 	return nil
 }
 func (s *Server) DidChangeWatchedFiles(ctx context.Context, params *protocol.DidChangeWatchedFilesParams) error {
+	for _, change := range params.Changes {
+		path := uriToPath(change.URI)
+		if path == "" {
+			continue
+		}
+		switch change.Type {
+		case protocol.FileChangeTypeCreated, protocol.FileChangeTypeChanged:
+			go func(filePath string) {
+				defs, err := parser.ParseFile(filePath)
+				if err != nil {
+					log.Printf("Error parsing %s: %v", filePath, err)
+					return
+				}
+				if err := s.store.IndexFile(filePath, defs); err != nil {
+					log.Printf("Error indexing %s: %v", filePath, err)
+				}
+			}(path)
+		case protocol.FileChangeTypeDeleted:
+			go func(filePath string) {
+				if err := s.store.RemoveFile(filePath); err != nil {
+					log.Printf("Error removing %s from index: %v", filePath, err)
+				}
+			}(path)
+		}
+	}
 	return nil
 }
 func (s *Server) DidChangeWorkspaceFolders(ctx context.Context, params *protocol.DidChangeWorkspaceFoldersParams) error {

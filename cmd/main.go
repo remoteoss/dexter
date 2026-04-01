@@ -369,7 +369,7 @@ func cmdLSP(projectRoot string) {
 	}()
 
 	log.SetOutput(os.Stderr)
-	log.Printf("Dexter LSP starting (root: %s)", projectRoot)
+	log.Printf("Dexter LSP v%s starting (root: %s)", version.Version, projectRoot)
 
 	if err := dexter_lsp.Serve(os.Stdin, os.Stdout, s, projectRoot); err != nil {
 		fatal(err)

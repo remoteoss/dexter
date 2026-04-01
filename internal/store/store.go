@@ -139,6 +139,24 @@ func (s *Store) IndexFile(path string, defs []parser.Definition) error {
 	return tx.Commit()
 }
 
+func (s *Store) ListFilePaths() ([]string, error) {
+	rows, err := s.db.Query("SELECT path FROM files")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var paths []string
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			return nil, err
+		}
+		paths = append(paths, path)
+	}
+	return paths, rows.Err()
+}
+
 func (s *Store) RemoveFile(path string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
