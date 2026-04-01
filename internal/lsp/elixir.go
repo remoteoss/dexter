@@ -2,15 +2,28 @@ package lsp
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
 	"unicode"
 
 	"gitlab.com/remote-com/employ-starbase/dexter/internal/parser"
 )
 
-// ExtractExpression returns the full dotted expression around the cursor position.
-// Line is the text content, col is 0-based character offset.
-// For example, on "  Foo.Bar.baz(123)" with col=9, returns "Foo.Bar.baz".
+func isExprChar(b byte) bool {
+	c := rune(b)
+	return unicode.IsLetter(c) || unicode.IsDigit(c) || c == '_' || c == '.' || c == '?' || c == '!'
+}
+
+// ExtractExpression returns the dotted expression up to and including the
+// segment the cursor is on. Line is the text content, col is a 0-based
+// character offset.
+//
+// Examples (cursor position marked with |):
+//
+//	"MyApp.Re|po.all"  →  "MyApp.Repo"
+//	"MyApp.Repo.a|ll"  →  "MyApp.Repo.all"
+//	"Ti|ger.Repo.all"  →  "MyApp"
+//	"MyApp|.Repo.all"  →  "MyApp.Repo"   (cursor on dot → include next segment)
 func ExtractExpression(line string, col int) string {
 	if len(line) == 0 {
 		return ""
@@ -22,12 +35,6 @@ func ExtractExpression(line string, col int) string {
 		col = 0
 	}
 
-	isExprChar := func(b byte) bool {
-		c := rune(b)
-		return unicode.IsLetter(c) || unicode.IsDigit(c) || c == '_' || c == '.' || c == '?' || c == '!'
-	}
-
-	// If cursor is not on an expression character, return empty
 	if !isExprChar(line[col]) {
 		return ""
 	}
@@ -42,7 +49,21 @@ func ExtractExpression(line string, col int) string {
 		end++
 	}
 
-	return line[start : end+1]
+	fullExpr := line[start : end+1]
+	cursorOffset := col - start
+
+	// Scan right from the cursor to find the next dot, which marks the end of
+	// the current segment. If the cursor lands on a dot, skip it so that the
+	// next segment is included (hovering on "MyApp|.Repo" resolves MyApp.Repo).
+	searchFrom := cursorOffset
+	if fullExpr[searchFrom] == '.' {
+		searchFrom++
+	}
+	nextDot := strings.IndexByte(fullExpr[searchFrom:], '.')
+	if nextDot == -1 {
+		return fullExpr
+	}
+	return fullExpr[:searchFrom+nextDot]
 }
 
 // ExtractModuleAndFunction splits a dotted expression into module reference and optional function name.
@@ -68,28 +89,76 @@ func ExtractModuleAndFunction(expr string) (moduleRef string, functionName strin
 	return
 }
 
+// ExtractCompletionContext extracts the typing context for autocompletion.
+// Unlike ExtractExpression (which requires the cursor on an expression char),
+// this scans backward from col to handle incomplete expressions like "Foo.|".
+// Returns the prefix text and whether the cursor is immediately after a dot.
+func ExtractCompletionContext(line string, col int) (prefix string, afterDot bool) {
+	if col <= 0 || len(line) == 0 {
+		return "", false
+	}
+	if col > len(line) {
+		col = len(line)
+	}
+
+	end := col - 1
+	if end < 0 || !isExprChar(line[end]) {
+		return "", false
+	}
+
+	start := end
+	for start > 0 && isExprChar(line[start-1]) {
+		start--
+	}
+
+	raw := line[start : end+1]
+
+	// Trim trailing dots — "Foo." means afterDot=true, prefix="Foo"
+	if strings.HasSuffix(raw, ".") {
+		return strings.TrimSuffix(raw, "."), true
+	}
+
+	return raw, false
+}
+
+type BufferFunction struct {
+	Name  string
+	Arity int
+	Kind  string
+}
+
+// FindBufferFunctions scans document text for all function definitions.
+// Returns a deduplicated list (multi-clause functions with the same arity appear once).
+func FindBufferFunctions(text string) []BufferFunction {
+	seen := make(map[string]bool)
+	var results []BufferFunction
+	for _, line := range strings.Split(text, "\n") {
+		if m := parser.FuncDefRe.FindStringSubmatch(line); m != nil {
+			name := m[2]
+			arity := parser.ExtractArity(line, name)
+			key := name + "/" + strconv.Itoa(arity)
+			if !seen[key] {
+				seen[key] = true
+				results = append(results, BufferFunction{Name: name, Arity: arity, Kind: m[1]})
+			}
+		}
+	}
+	return results
+}
+
 var (
 	aliasMultiRe    = regexp.MustCompile(`^\s*alias\s+([A-Za-z0-9_.]+)\.{([^}]+)}`)
 	importRe        = regexp.MustCompile(`^\s*import\s+([A-Za-z0-9_.]+)`)
-	defmoduleRe     = regexp.MustCompile(`^\s*defmodule\s+([A-Za-z0-9_.]+)\s+do`)
 	moduleAttrDefRe = regexp.MustCompile(`^\s*@([a-z_][a-z0-9_]*)\s+[^@]`)
 )
-
-// extractCurrentModule returns the first defmodule name found in the text.
-func extractCurrentModule(text string) string {
-	for _, line := range strings.Split(text, "\n") {
-		if m := defmoduleRe.FindStringSubmatch(line); m != nil {
-			return m[1]
-		}
-	}
-	return ""
-}
 
 // ExtractAliases parses all alias declarations from document text.
 // Returns a map of short name -> full module name.
 // Handles: "alias A.B.C", "alias A.B.C, as: D", "alias A.B.{C, D}", and __MODULE__ references.
 func ExtractAliases(text string) map[string]string {
-	currentModule := extractCurrentModule(text)
+	var currentModule string
+	aliases := make(map[string]string)
+
 	resolve := func(s string) string {
 		if currentModule != "" {
 			return strings.ReplaceAll(s, "__MODULE__", currentModule)
@@ -97,8 +166,13 @@ func ExtractAliases(text string) map[string]string {
 		return s
 	}
 
-	aliases := make(map[string]string)
 	for _, line := range strings.Split(text, "\n") {
+		if currentModule == "" {
+			if m := parser.DefmoduleRe.FindStringSubmatch(line); m != nil {
+				currentModule = m[1]
+			}
+		}
+
 		// alias A.B.C, as: D
 		if m := parser.AliasAsRe.FindStringSubmatch(line); m != nil {
 			resolved := resolve(m[1])

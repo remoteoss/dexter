@@ -2,11 +2,13 @@ package lsp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,6 +18,7 @@ import (
 	"go.uber.org/zap"
 
 	"gitlab.com/remote-com/employ-starbase/dexter/internal/parser"
+	"gitlab.com/remote-com/employ-starbase/dexter/internal/stdlib"
 	"gitlab.com/remote-com/employ-starbase/dexter/internal/store"
 	"gitlab.com/remote-com/employ-starbase/dexter/internal/version"
 )
@@ -24,6 +27,7 @@ type Server struct {
 	store           *store.Store
 	docs            *DocumentStore
 	projectRoot     string
+	stdlibRoot      string
 	initialized     bool
 	client          protocol.Client
 	followDelegates bool
@@ -83,28 +87,34 @@ func (s *Server) backgroundReindex() {
 		}
 
 		seen := make(map[string]struct{})
-		if err := parser.WalkElixirFiles(s.projectRoot, func(path string, info os.FileInfo) error {
-			seen[path] = struct{}{}
+		walkAndIndex := func(root string) {
+			_ = parser.WalkElixirFiles(root, func(path string, info os.FileInfo) error {
+				seen[path] = struct{}{}
 
-			if !isEmpty {
-				storedMtime, found := s.store.GetFileMtime(path)
-				currentMtime := info.ModTime().UnixNano()
-				if found && storedMtime == currentMtime {
+				if !isEmpty {
+					storedMtime, found := s.store.GetFileMtime(path)
+					currentMtime := info.ModTime().UnixNano()
+					if found && storedMtime == currentMtime {
+						return nil
+					}
+				}
+
+				defs, err := parser.ParseFile(path)
+				if err != nil {
 					return nil
 				}
-			}
-
-			defs, err := parser.ParseFile(path)
-			if err != nil {
+				if err := s.store.IndexFile(path, defs); err != nil {
+					log.Printf("Warning: reindex %s: %v", path, err)
+				}
+				reindexed++
 				return nil
-			}
-			if err := s.store.IndexFile(path, defs); err != nil {
-				log.Printf("Warning: reindex %s: %v", path, err)
-			}
-			reindexed++
-			return nil
-		}); err != nil {
-			log.Printf("WalkElixirFiles: %v", err)
+			})
+		}
+
+		walkAndIndex(s.projectRoot)
+
+		if s.stdlibRoot != "" {
+			walkAndIndex(s.stdlibRoot)
 		}
 
 		// Prune store entries for files no longer on disk
@@ -188,9 +198,26 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 		}
 	}
 
+	var explicitStdlibPath string
 	if opts, ok := params.InitializationOptions.(map[string]interface{}); ok {
 		if v, ok := opts["followDelegates"].(bool); ok {
 			s.followDelegates = v
+		}
+		if v, ok := opts["stdlibPath"].(string); ok {
+			explicitStdlibPath = v
+		}
+	}
+
+	if root, ok := stdlib.Resolve(s.store, explicitStdlibPath); ok {
+		s.stdlibRoot = root
+		log.Printf("Elixir stdlib at: %s", root)
+	} else {
+		log.Printf("Could not detect Elixir stdlib (set stdlibPath in initializationOptions or DEXTER_ELIXIR_LIB_ROOT)")
+		if s.client != nil {
+			_ = s.client.ShowMessage(context.Background(), &protocol.ShowMessageParams{
+				Type:    protocol.MessageTypeWarning,
+				Message: "Dexter: could not detect Elixir stdlib — stdlib modules (Enum, String, etc.) won't resolve. Set stdlibPath in initializationOptions or DEXTER_ELIXIR_LIB_ROOT.",
+			})
 		}
 	}
 
@@ -211,6 +238,11 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 				},
 			},
 			DefinitionProvider: true,
+			HoverProvider:      true,
+			CompletionProvider: &protocol.CompletionOptions{
+				TriggerCharacters: []string{"."},
+				ResolveProvider:   true,
+			},
 		},
 		ServerInfo: &protocol.ServerInfo{
 			Name:    "dexter",
@@ -455,10 +487,257 @@ func (s *Server) ColorPresentation(ctx context.Context, params *protocol.ColorPr
 	return nil, nil
 }
 func (s *Server) Completion(ctx context.Context, params *protocol.CompletionParams) (*protocol.CompletionList, error) {
-	return nil, nil
+	docURI := string(params.TextDocument.URI)
+
+	text, ok := s.docs.Get(docURI)
+	if !ok {
+		return nil, nil
+	}
+
+	lines := strings.Split(text, "\n")
+	lineNum := int(params.Position.Line)
+	col := int(params.Position.Character)
+
+	if lineNum >= len(lines) {
+		return nil, nil
+	}
+
+	prefix, afterDot := ExtractCompletionContext(lines[lineNum], col)
+	if prefix == "" && !afterDot {
+		return nil, nil
+	}
+
+	moduleRef, funcPrefix := ExtractModuleAndFunction(prefix)
+
+	var items []protocol.CompletionItem
+
+	if moduleRef != "" && (afterDot || funcPrefix != "") {
+		aliases := ExtractAliases(text)
+		resolved := resolveModule(moduleRef, aliases)
+		results, err := s.store.ListModuleFunctions(resolved, true)
+		if err != nil {
+			return nil, nil
+		}
+		for _, r := range results {
+			if funcPrefix != "" && !strings.HasPrefix(r.Function, funcPrefix) {
+				continue
+			}
+			item := protocol.CompletionItem{
+				Label:  r.Function,
+				Kind:   kindToCompletionItemKind(r.Kind),
+				Detail: r.Kind,
+				Data: map[string]interface{}{
+					"filePath": r.FilePath,
+					"line":     r.Line,
+				},
+			}
+			applySnippet(&item, r.Function, r.Arity)
+			items = append(items, item)
+		}
+
+		if afterDot && funcPrefix == "" {
+			subResults, err := s.store.SearchModules(resolved + ".")
+			if err == nil {
+				resolvedPrefix := resolved + "."
+				seenSub := make(map[string]bool)
+				for _, r := range subResults {
+					segment := strings.TrimPrefix(r.Module, resolvedPrefix)
+					// Reduce to the immediate next segment (e.g. "Query.API" → "Query")
+					if dot := strings.IndexByte(segment, '.'); dot >= 0 {
+						segment = segment[:dot]
+					}
+					if seenSub[segment] {
+						continue
+					}
+					seenSub[segment] = true
+					items = append(items, protocol.CompletionItem{
+						Label:  segment,
+						Kind:   protocol.CompletionItemKindModule,
+						Detail: resolvedPrefix + segment,
+					})
+				}
+			}
+		}
+	} else if moduleRef != "" {
+		aliases := ExtractAliases(text)
+
+		for shortName, fullModule := range aliases {
+			if strings.HasPrefix(shortName, moduleRef) {
+				items = append(items, protocol.CompletionItem{
+					Label:  shortName,
+					Kind:   protocol.CompletionItemKindModule,
+					Detail: fullModule,
+				})
+			}
+		}
+
+		if parts := strings.SplitN(moduleRef, ".", 2); len(parts) == 2 {
+			if resolved, ok := aliases[parts[0]]; ok {
+				resolvedPrefix := resolved + "." + parts[1]
+				aliasResults, err := s.store.SearchModules(resolvedPrefix)
+				if err == nil {
+					for _, r := range aliasResults {
+						label := parts[0] + strings.TrimPrefix(r.Module, resolved)
+						items = append(items, protocol.CompletionItem{
+							Label:  label,
+							Kind:   protocol.CompletionItemKindModule,
+							Detail: r.Module,
+						})
+					}
+				}
+			}
+		}
+
+		results, err := s.store.SearchModules(moduleRef)
+		if err != nil {
+			return nil, nil
+		}
+		for _, r := range results {
+			items = append(items, protocol.CompletionItem{
+				Label:  r.Module,
+				Kind:   protocol.CompletionItemKindModule,
+				Detail: "module",
+			})
+		}
+	} else if funcPrefix != "" {
+		seen := make(map[string]bool)
+
+		for _, bf := range FindBufferFunctions(text) {
+			key := funcKey(bf.Name, bf.Arity)
+			if strings.HasPrefix(bf.Name, funcPrefix) && !seen[key] {
+				seen[key] = true
+				item := protocol.CompletionItem{
+					Label:  bf.Name,
+					Kind:   kindToCompletionItemKind(bf.Kind),
+					Detail: bf.Kind,
+				}
+				applySnippet(&item, bf.Name, bf.Arity)
+				items = append(items, item)
+			}
+		}
+
+		for _, mod := range ExtractImports(text) {
+			results, err := s.store.ListModuleFunctions(mod, true)
+			if err != nil {
+				continue
+			}
+			for _, r := range results {
+				key := funcKey(r.Function, r.Arity)
+				if strings.HasPrefix(r.Function, funcPrefix) && !seen[key] {
+					seen[key] = true
+					item := protocol.CompletionItem{
+						Label:  r.Function,
+						Kind:   kindToCompletionItemKind(r.Kind),
+						Detail: r.Module + " (" + r.Kind + ")",
+						Data: map[string]interface{}{
+							"filePath": r.FilePath,
+							"line":     r.Line,
+						},
+					}
+					applySnippet(&item, r.Function, r.Arity)
+					items = append(items, item)
+				}
+			}
+		}
+	}
+
+	if len(items) == 0 {
+		return nil, nil
+	}
+
+	return &protocol.CompletionList{
+		IsIncomplete: false,
+		Items:        items,
+	}, nil
+}
+
+func resolveModule(moduleRef string, aliases map[string]string) string {
+	if resolved, ok := aliases[moduleRef]; ok {
+		return resolved
+	}
+	if parts := strings.SplitN(moduleRef, ".", 2); len(parts) == 2 {
+		if resolved, ok := aliases[parts[0]]; ok {
+			return resolved + "." + parts[1]
+		}
+	}
+	return moduleRef
+}
+
+func funcKey(name string, arity int) string {
+	return name + "/" + strconv.Itoa(arity)
+}
+
+func applySnippet(item *protocol.CompletionItem, name string, arity int) {
+	if arity > 0 {
+		item.InsertText = functionSnippet(name, arity)
+		item.InsertTextFormat = protocol.InsertTextFormatSnippet
+	}
+}
+
+func functionSnippet(name string, arity int) string {
+	var args []string
+	for i := 1; i <= arity; i++ {
+		args = append(args, fmt.Sprintf("${%d:arg%d}", i, i))
+	}
+	return name + "(" + strings.Join(args, ", ") + ")"
+}
+
+func kindToCompletionItemKind(kind string) protocol.CompletionItemKind {
+	switch kind {
+	case "module", "defprotocol":
+		return protocol.CompletionItemKindModule
+	default:
+		return protocol.CompletionItemKindFunction
+	}
 }
 func (s *Server) CompletionResolve(ctx context.Context, params *protocol.CompletionItem) (*protocol.CompletionItem, error) {
-	return nil, nil
+	if params.Data == nil {
+		return params, nil
+	}
+
+	raw, err := json.Marshal(params.Data)
+	if err != nil {
+		return params, nil
+	}
+
+	var data struct {
+		FilePath string `json:"filePath"`
+		Line     int    `json:"line"`
+	}
+	if err := json.Unmarshal(raw, &data); err != nil || data.FilePath == "" {
+		return params, nil
+	}
+
+	cleaned := filepath.Clean(data.FilePath)
+	inProject := strings.HasPrefix(cleaned, s.projectRoot+string(os.PathSeparator))
+	inStdlib := s.stdlibRoot != "" && strings.HasPrefix(cleaned, s.stdlibRoot+string(os.PathSeparator))
+	if !inProject && !inStdlib {
+		return params, nil
+	}
+
+	fileData, err := os.ReadFile(cleaned)
+	if err != nil {
+		return params, nil
+	}
+
+	lines := strings.Split(string(fileData), "\n")
+	defIdx := data.Line - 1
+	if defIdx < 0 || defIdx >= len(lines) {
+		return params, nil
+	}
+
+	doc, spec := extractDocAbove(lines, defIdx)
+	signature := extractSignature(lines, defIdx)
+	content := formatHoverContent(doc, spec, signature)
+
+	if content != "" {
+		params.Documentation = protocol.MarkupContent{
+			Kind:  protocol.Markdown,
+			Value: content,
+		}
+	}
+
+	return params, nil
 }
 func (s *Server) Declaration(ctx context.Context, params *protocol.DeclarationParams) ([]protocol.Location, error) {
 	return nil, nil
@@ -522,7 +801,69 @@ func (s *Server) Formatting(ctx context.Context, params *protocol.DocumentFormat
 	return nil, nil
 }
 func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*protocol.Hover, error) {
-	return nil, nil
+	docURI := string(params.TextDocument.URI)
+
+	text, ok := s.docs.Get(docURI)
+	if !ok {
+		return nil, nil
+	}
+
+	lines := strings.Split(text, "\n")
+	lineNum := int(params.Position.Line)
+	col := int(params.Position.Character)
+
+	if lineNum >= len(lines) {
+		return nil, nil
+	}
+
+	expr := ExtractExpression(lines[lineNum], col)
+	if expr == "" {
+		return nil, nil
+	}
+
+	moduleRef, functionName := ExtractModuleAndFunction(expr)
+	aliases := ExtractAliases(text)
+
+	if moduleRef == "" {
+		if functionName == "" {
+			return nil, nil
+		}
+
+		if line, found := FindFunctionDefinition(text, functionName); found {
+			return s.hoverFromBuffer(text, line-1)
+		}
+
+		for _, mod := range ExtractImports(text) {
+			results, err := s.store.LookupFunction(mod, functionName)
+			if err != nil || len(results) == 0 {
+				continue
+			}
+			return s.hoverFromFile(functionName, results[0])
+		}
+
+		return nil, nil
+	}
+
+	fullModule := resolveModule(moduleRef, aliases)
+
+	if functionName != "" {
+		var results []store.LookupResult
+		var err error
+		if s.followDelegates {
+			results, err = s.store.LookupFollowDelegate(fullModule, functionName)
+		} else {
+			results, err = s.store.LookupFunction(fullModule, functionName)
+		}
+		if err == nil && len(results) > 0 {
+			return s.hoverFromFile(functionName, results[0])
+		}
+	}
+
+	results, err := s.store.LookupModule(fullModule)
+	if err != nil || len(results) == 0 {
+		return nil, nil
+	}
+	return s.hoverFromFile("", results[0])
 }
 func (s *Server) Implementation(ctx context.Context, params *protocol.ImplementationParams) ([]protocol.Location, error) {
 	return nil, nil

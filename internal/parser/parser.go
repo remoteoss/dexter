@@ -12,23 +12,23 @@ var (
 	AliasRe   = regexp.MustCompile(`^\s*alias\s+([A-Za-z0-9_.]+)`)
 	AliasAsRe = regexp.MustCompile(`^\s*alias\s+([A-Za-z0-9_.]+)\s*,\s*as:\s*([A-Za-z0-9_]+)`)
 	FuncDefRe = regexp.MustCompile(`^\s*(defp?|defmacrop?|defguardp?|defdelegate)\s+([a-z_][a-z0-9_?!]*)[\s(,]`)
+	TypeDefRe = regexp.MustCompile(`^\s*@(typep?|opaque)\s+([a-z_][a-z0-9_?!]*)`)
 )
 
 var (
-	defmoduleRe    = regexp.MustCompile(`^\s*defmodule\s+([A-Za-z0-9_.]+)\s+do`)
+	DefmoduleRe    = regexp.MustCompile(`^\s*defmodule\s+([A-Za-z0-9_.]+)\s+do`)
 	defprotocolRe  = regexp.MustCompile(`^\s*defprotocol\s+([A-Za-z0-9_.]+)\s+do`)
 	defimplRe      = regexp.MustCompile(`^\s*defimpl\s+([A-Za-z0-9_.]+)`)
 	defstructRe    = regexp.MustCompile(`^\s*defstruct\s`)
 	defexceptionRe = regexp.MustCompile(`^\s*defexception\s`)
 	delegateToRe   = regexp.MustCompile(`to:\s*([A-Za-z0-9_.]+)`)
 	delegateAsRe   = regexp.MustCompile(`as:\s*:?([a-z_][a-z0-9_?!]*)`)
-	// Matches lines that open a new do...end block (end with keyword `do`, not `do:`)
-	opensBlockRe = regexp.MustCompile(`\bdo\s*$`)
 )
 
 type Definition struct {
 	Module     string
 	Function   string
+	Arity      int
 	Line       int
 	FilePath   string
 	Kind       string
@@ -43,8 +43,8 @@ func ParseFile(path string) ([]Definition, error) {
 	}
 
 	type moduleFrame struct {
-		name  string
-		depth int // doDepth when this module's `do` was opened
+		name   string
+		indent int // leading whitespace count when defmodule was found
 	}
 
 	lines := strings.Split(string(data), "\n")
@@ -52,7 +52,6 @@ func ParseFile(path string) ([]Definition, error) {
 	var moduleStack []moduleFrame
 	aliases := map[string]string{} // short name -> full module
 	inHeredoc := false
-	doDepth := 0
 
 	for lineIdx, line := range lines {
 		lineNum := lineIdx + 1
@@ -71,16 +70,11 @@ func ParseFile(path string) ([]Definition, error) {
 			continue
 		}
 
-		// Decrement depth on bare `end`, and pop module if it was opened at this depth
-		if trimmed == "end" {
-			if len(moduleStack) > 1 && moduleStack[len(moduleStack)-1].depth == doDepth {
+		if trimmed == "end" && len(moduleStack) > 0 {
+			indent := len(line) - len(strings.TrimLeft(line, " \t"))
+			if moduleStack[len(moduleStack)-1].indent == indent {
 				moduleStack = moduleStack[:len(moduleStack)-1]
 			}
-			if doDepth > 0 {
-				doDepth--
-			}
-		} else if opensBlockRe.MatchString(trimmed) {
-			doDepth++
 		}
 
 		currentModule := ""
@@ -108,7 +102,7 @@ func ParseFile(path string) ([]Definition, error) {
 			aliases[shortName] = resolved
 		}
 
-		if m := defmoduleRe.FindStringSubmatch(line); m != nil {
+		if m := DefmoduleRe.FindStringSubmatch(line); m != nil {
 			name := m[1]
 			// A single-segment name (no dots) nested inside another module is
 			// relative: defmodule Foo inside defmodule Bar becomes Bar.Foo
@@ -116,7 +110,8 @@ func ParseFile(path string) ([]Definition, error) {
 				name = currentModule + "." + name
 			}
 			currentModule = name
-			moduleStack = append(moduleStack, moduleFrame{name: currentModule, depth: doDepth})
+			indent := len(line) - len(strings.TrimLeft(line, " \t"))
+			moduleStack = append(moduleStack, moduleFrame{name: currentModule, indent: indent})
 			defs = append(defs, Definition{
 				Module:   currentModule,
 				Line:     lineNum,
@@ -128,7 +123,8 @@ func ParseFile(path string) ([]Definition, error) {
 
 		if m := defprotocolRe.FindStringSubmatch(line); m != nil {
 			currentModule = m[1]
-			moduleStack = append(moduleStack, moduleFrame{name: currentModule, depth: doDepth})
+			indent := len(line) - len(strings.TrimLeft(line, " \t"))
+			moduleStack = append(moduleStack, moduleFrame{name: currentModule, indent: indent})
 			defs = append(defs, Definition{
 				Module:   currentModule,
 				Line:     lineNum,
@@ -140,7 +136,8 @@ func ParseFile(path string) ([]Definition, error) {
 
 		if m := defimplRe.FindStringSubmatch(line); m != nil {
 			currentModule = m[1]
-			moduleStack = append(moduleStack, moduleFrame{name: currentModule, depth: doDepth})
+			indent := len(line) - len(strings.TrimLeft(line, " \t"))
+			moduleStack = append(moduleStack, moduleFrame{name: currentModule, indent: indent})
 			defs = append(defs, Definition{
 				Module:   currentModule,
 				Line:     lineNum,
@@ -151,12 +148,25 @@ func ParseFile(path string) ([]Definition, error) {
 		}
 
 		if currentModule != "" {
+			if m := TypeDefRe.FindStringSubmatch(line); m != nil {
+				defs = append(defs, Definition{
+					Module:   currentModule,
+					Function: m[2],
+					Arity:    ExtractArity(line, m[2]),
+					Line:     lineNum,
+					FilePath: path,
+					Kind:     m[1],
+				})
+				continue
+			}
+
 			if m := FuncDefRe.FindStringSubmatch(line); m != nil {
 				kind := m[1]
 				funcName := m[2]
 				def := Definition{
 					Module:   currentModule,
 					Function: funcName,
+					Arity:    ExtractArity(line, funcName),
 					Line:     lineNum,
 					FilePath: path,
 					Kind:     kind,
@@ -234,6 +244,52 @@ func findDelegateToAndAs(lines []string, startIdx int, aliases map[string]string
 		}
 	}
 	return targetModule, targetFunc
+}
+
+// ExtractArity counts the number of arguments in a function definition line.
+// It finds the first parenthesized argument list after the function name and
+// counts top-level commas, respecting nested parens/brackets/braces.
+func ExtractArity(line string, funcName string) int {
+	idx := strings.Index(line, funcName)
+	if idx < 0 {
+		return 0
+	}
+	rest := line[idx+len(funcName):]
+
+	parenIdx := strings.IndexByte(rest, '(')
+	if parenIdx < 0 {
+		return 0
+	}
+
+	depth := 1
+	commas := 0
+	hasContent := false
+	for _, ch := range rest[parenIdx+1:] {
+		switch ch {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			depth--
+			if depth == 0 {
+				if hasContent {
+					return commas + 1
+				}
+				return 0
+			}
+		case ',':
+			if depth == 1 {
+				commas++
+			}
+		}
+		if depth == 1 && ch != ' ' && ch != '\t' && ch != '\n' {
+			hasContent = true
+		}
+	}
+
+	if hasContent {
+		return commas + 1
+	}
+	return 0
 }
 
 func IsElixirFile(path string) bool {

@@ -44,6 +44,7 @@ func migrate(db *sql.DB) error {
 		CREATE TABLE IF NOT EXISTS definitions (
 			module TEXT NOT NULL,
 			function TEXT NOT NULL DEFAULT '',
+			arity INTEGER NOT NULL DEFAULT 0,
 			kind TEXT NOT NULL,
 			line INTEGER NOT NULL,
 			file_path TEXT NOT NULL,
@@ -86,6 +87,22 @@ func (s *Store) SetIndexVersion(v int) error {
 	return err
 }
 
+// GetStdlibRoot returns the cached Elixir stdlib lib root, if any.
+func (s *Store) GetStdlibRoot() (string, bool) {
+	var value string
+	err := s.db.QueryRow("SELECT value FROM metadata WHERE key = 'stdlib_root'").Scan(&value)
+	if err != nil || value == "" {
+		return "", false
+	}
+	return value, true
+}
+
+// SetStdlibRoot persists the detected Elixir stdlib lib root.
+func (s *Store) SetStdlibRoot(root string) error {
+	_, err := s.db.Exec("INSERT OR REPLACE INTO metadata (key, value) VALUES ('stdlib_root', ?)", root)
+	return err
+}
+
 func (s *Store) IsEmpty() bool {
 	var count int
 	_ = s.db.QueryRow("SELECT COUNT(*) FROM files").Scan(&count)
@@ -123,14 +140,14 @@ func (s *Store) IndexFile(path string, defs []parser.Definition) error {
 		return err
 	}
 
-	stmt, err := tx.Prepare("INSERT INTO definitions (module, function, kind, line, file_path, delegate_to, delegate_as) VALUES (?, ?, ?, ?, ?, ?, ?)")
+	stmt, err := tx.Prepare("INSERT INTO definitions (module, function, arity, kind, line, file_path, delegate_to, delegate_as) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
 	if err != nil {
 		return err
 	}
 	defer func() { _ = stmt.Close() }()
 
 	for _, d := range defs {
-		_, err := stmt.Exec(d.Module, d.Function, d.Kind, d.Line, d.FilePath, d.DelegateTo, d.DelegateAs)
+		_, err := stmt.Exec(d.Module, d.Function, d.Arity, d.Kind, d.Line, d.FilePath, d.DelegateTo, d.DelegateAs)
 		if err != nil {
 			return err
 		}
@@ -173,6 +190,61 @@ func (s *Store) RemoveFile(path string) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+type CompletionResult struct {
+	Module   string
+	Function string
+	Arity    int
+	Kind     string
+	FilePath string
+	Line     int
+}
+
+func (s *Store) SearchModules(prefix string) ([]CompletionResult, error) {
+	rows, err := s.db.Query(
+		"SELECT DISTINCT module FROM definitions WHERE module LIKE ? AND function = '' AND kind IN ('module', 'defprotocol') ORDER BY module LIMIT 100",
+		prefix+"%",
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var results []CompletionResult
+	for rows.Next() {
+		var r CompletionResult
+		if err := rows.Scan(&r.Module); err != nil {
+			return nil, err
+		}
+		r.Kind = "module"
+		results = append(results, r)
+	}
+	return results, rows.Err()
+}
+
+func (s *Store) ListModuleFunctions(module string, publicOnly bool) ([]CompletionResult, error) {
+	query := "SELECT module, function, arity, kind, file_path, line FROM definitions WHERE module = ? AND function != ''"
+	if publicOnly {
+		query += " AND kind IN ('def', 'defmacro', 'defguard', 'defdelegate')"
+	}
+	query += " GROUP BY function, arity ORDER BY function, arity LIMIT 100"
+
+	rows, err := s.db.Query(query, module)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var results []CompletionResult
+	for rows.Next() {
+		var r CompletionResult
+		if err := rows.Scan(&r.Module, &r.Function, &r.Arity, &r.Kind, &r.FilePath, &r.Line); err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	return results, rows.Err()
 }
 
 type LookupResult struct {

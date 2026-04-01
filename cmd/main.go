@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 	dexter_lsp "gitlab.com/remote-com/employ-starbase/dexter/internal/lsp"
 	"gitlab.com/remote-com/employ-starbase/dexter/internal/parser"
+	"gitlab.com/remote-com/employ-starbase/dexter/internal/stdlib"
 	"gitlab.com/remote-com/employ-starbase/dexter/internal/store"
 	"gitlab.com/remote-com/employ-starbase/dexter/internal/version"
 )
@@ -173,6 +174,12 @@ func cmdInit(projectRoot string, force bool) {
 	if err != nil {
 		fatal(err)
 	}
+	if stdlibRoot, ok := stdlib.Resolve(s, ""); ok {
+		_ = parser.WalkElixirFiles(stdlibRoot, func(path string, info os.FileInfo) error {
+			paths = append(paths, path)
+			return nil
+		})
+	}
 
 	// Phase 2: parse in parallel
 	type parseResult struct {
@@ -266,7 +273,7 @@ func cmdReindex(target string) {
 	reindexed := 0
 	skipped := 0
 
-	err = parser.WalkElixirFiles(target, func(path string, fi os.FileInfo) error {
+	walkFn := func(path string, fi os.FileInfo) error {
 		storedMtime, found := s.GetFileMtime(path)
 		currentMtime := fi.ModTime().UnixNano()
 		if found && storedMtime == currentMtime {
@@ -277,9 +284,14 @@ func cmdReindex(target string) {
 		reindexFile(s, path)
 		reindexed++
 		return nil
-	})
+	}
+
+	err = parser.WalkElixirFiles(target, walkFn)
 	if err != nil {
 		fatal(err)
+	}
+	if stdlibRoot, ok := stdlib.Resolve(s, ""); ok {
+		_ = parser.WalkElixirFiles(stdlibRoot, walkFn)
 	}
 
 	fmt.Fprintf(os.Stderr, "Reindexed %d files, %d unchanged (%s)\n", reindexed, skipped, time.Since(start).Round(time.Millisecond))

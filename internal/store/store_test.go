@@ -220,6 +220,191 @@ end
 	}
 }
 
+func TestSearchModules(t *testing.T) {
+	s, dir := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	path := writeElixirFile(t, dir, "lib/handlers.ex", `defmodule MyApp.Handlers do
+end
+
+defmodule MyApp.Handlers.Webhooks do
+end
+
+defmodule MyApp.Handlers.Billing do
+end
+
+defmodule MyApp.Repo do
+end
+`)
+
+	defs, err := parser.ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IndexFile(path, defs); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("prefix matches multiple modules", func(t *testing.T) {
+		results, err := s.SearchModules("MyApp.Handler")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(results) != 3 {
+			t.Fatalf("expected 3 results, got %d", len(results))
+		}
+	})
+
+	t.Run("exact prefix", func(t *testing.T) {
+		results, err := s.SearchModules("MyApp.Repo")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(results) != 1 {
+			t.Fatalf("expected 1 result, got %d", len(results))
+		}
+		if results[0].Module != "MyApp.Repo" {
+			t.Errorf("expected MyApp.Repo, got %q", results[0].Module)
+		}
+	})
+
+	t.Run("no matches", func(t *testing.T) {
+		results, err := s.SearchModules("NonExistent")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(results) != 0 {
+			t.Errorf("expected 0 results, got %d", len(results))
+		}
+	})
+
+	t.Run("excludes defimpl", func(t *testing.T) {
+		implPath := writeElixirFile(t, dir, "lib/impl.ex", `defimpl Jason.Encoder, for: MyApp.Handlers do
+end
+`)
+		implDefs, err := parser.ParseFile(implPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.IndexFile(implPath, implDefs); err != nil {
+			t.Fatal(err)
+		}
+
+		results, err := s.SearchModules("Jason.Encoder")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(results) != 0 {
+			t.Errorf("expected 0 results (defimpl excluded), got %d", len(results))
+		}
+	})
+}
+
+func TestListModuleFunctions(t *testing.T) {
+	s, dir := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	path := writeElixirFile(t, dir, "lib/accounts.ex", `defmodule MyApp.Accounts do
+  def create(attrs) do
+    :ok
+  end
+
+  def list(opts) do
+    :ok
+  end
+
+  defp validate(attrs) do
+    :ok
+  end
+
+  defmacro my_macro(expr) do
+    quote do: unquote(expr)
+  end
+
+  defdelegate fetch(id), to: MyApp.Repo
+end
+`)
+
+	defs, err := parser.ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IndexFile(path, defs); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("public only", func(t *testing.T) {
+		results, err := s.ListModuleFunctions("MyApp.Accounts", true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(results) != 4 {
+			t.Fatalf("expected 4 public functions, got %d", len(results))
+		}
+		for _, r := range results {
+			if r.Kind == "defp" {
+				t.Error("should not include defp when publicOnly=true")
+			}
+		}
+	})
+
+	t.Run("all functions", func(t *testing.T) {
+		results, err := s.ListModuleFunctions("MyApp.Accounts", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(results) != 5 {
+			t.Fatalf("expected 5 total functions, got %d", len(results))
+		}
+	})
+
+	t.Run("deduplicates multi-clause functions", func(t *testing.T) {
+		multiPath := writeElixirFile(t, dir, "lib/webhooks.ex", `defmodule MyApp.Webhooks do
+  def process("a", p) do
+    :ok
+  end
+
+  def process("b", p) do
+    :ok
+  end
+
+  def process("c", p) do
+    :ok
+  end
+end
+`)
+
+		multiDefs, err := parser.ParseFile(multiPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.IndexFile(multiPath, multiDefs); err != nil {
+			t.Fatal(err)
+		}
+
+		results, err := s.ListModuleFunctions("MyApp.Webhooks", true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(results) != 1 {
+			t.Fatalf("expected 1 deduplicated function, got %d", len(results))
+		}
+		if results[0].Function != "process" {
+			t.Errorf("expected 'process', got %q", results[0].Function)
+		}
+	})
+
+	t.Run("nonexistent module", func(t *testing.T) {
+		results, err := s.ListModuleFunctions("NonExistent", true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(results) != 0 {
+			t.Errorf("expected 0 results, got %d", len(results))
+		}
+	})
+}
+
 func TestMultipleFunctionHeadsLookup(t *testing.T) {
 	s, dir := setupTestStore(t)
 	defer func() { _ = s.Close() }()
@@ -252,5 +437,36 @@ end
 	}
 	if results[0].Line != 2 || results[1].Line != 6 {
 		t.Errorf("unexpected lines: %d, %d", results[0].Line, results[1].Line)
+	}
+}
+
+func TestStdlibRoot(t *testing.T) {
+	s, _ := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	// Empty store returns nothing.
+	if _, ok := s.GetStdlibRoot(); ok {
+		t.Error("expected no stdlib root on fresh store")
+	}
+
+	if err := s.SetStdlibRoot("/path/to/elixir/lib"); err != nil {
+		t.Fatal(err)
+	}
+
+	root, ok := s.GetStdlibRoot()
+	if !ok {
+		t.Fatal("expected stdlib root after set")
+	}
+	if root != "/path/to/elixir/lib" {
+		t.Errorf("got %q, want %q", root, "/path/to/elixir/lib")
+	}
+
+	// Overwrite with a new value.
+	if err := s.SetStdlibRoot("/new/path"); err != nil {
+		t.Fatal(err)
+	}
+	root, _ = s.GetStdlibRoot()
+	if root != "/new/path" {
+		t.Errorf("got %q after overwrite, want %q", root, "/new/path")
 	}
 }

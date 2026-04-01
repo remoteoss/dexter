@@ -886,6 +886,256 @@ end
 	}
 }
 
+func TestParseFile_ProtocolFollowedByModule(t *testing.T) {
+	path := writeTempFile(t, `defprotocol Enumerable do
+  @doc """
+  Reduces the enumerable.
+  """
+  def reduce(enumerable, acc, fun)
+
+  @doc """
+  Counts the enumerable.
+  """
+  def count(enumerable)
+end
+
+defmodule Enum do
+  def map(enumerable, fun) do
+    :ok
+  end
+
+  def filter(enumerable, fun) do
+    :ok
+  end
+end
+`)
+
+	defs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	modules := map[string]string{}
+	funcs := map[string]string{}
+	for _, d := range defs {
+		if d.Kind == "defprotocol" || d.Kind == "module" {
+			modules[d.Module] = d.Kind
+		}
+		if d.Function != "" {
+			funcs[d.Function] = d.Module
+		}
+	}
+
+	if modules["Enumerable"] != "defprotocol" {
+		t.Error("missing defprotocol Enumerable")
+	}
+	if modules["Enum"] != "module" {
+		t.Errorf("expected Enum as module, got kind %q (modules: %v)", modules["Enum"], modules)
+	}
+	if funcs["reduce"] != "Enumerable" {
+		t.Errorf("reduce should belong to Enumerable, got %q", funcs["reduce"])
+	}
+	if funcs["map"] != "Enum" {
+		t.Errorf("map should belong to Enum, got %q", funcs["map"])
+	}
+	if funcs["filter"] != "Enum" {
+		t.Errorf("filter should belong to Enum, got %q", funcs["filter"])
+	}
+}
+
+func TestParseFile_StdlibStyleWithManyDocBlocks(t *testing.T) {
+	content := "defmodule Enum do\n" +
+		"  @moduledoc \"\"\"\n" +
+		"  Functions for working with collections (known as enumerables).\n" +
+		"\n" +
+		"  All the functions in this module are eager.\n" +
+		"  \"\"\"\n" +
+		"\n" +
+		"  @doc \"\"\"\n" +
+		"  Returns `true` if all elements in `enumerable` are truthy.\n" +
+		"\n" +
+		"  ## Examples\n" +
+		"\n" +
+		"      iex> Enum.all?([1, 2, 3])\n" +
+		"      true\n" +
+		"\n" +
+		"  \"\"\"\n" +
+		"  @spec all?(t()) :: boolean()\n" +
+		"  def all?(enumerable) when is_list(enumerable) do\n" +
+		"    all_list(enumerable)\n" +
+		"  end\n" +
+		"\n" +
+		"  def all?(enumerable) do\n" +
+		"    Enumerable.reduce(enumerable, {:cont, true}, fn _, _ -> {:halt, false} end)\n" +
+		"  end\n" +
+		"\n" +
+		"  @doc \"\"\"\n" +
+		"  Returns the count of elements.\n" +
+		"\n" +
+		"  ## Examples\n" +
+		"\n" +
+		"      iex> Enum.count([1, 2, 3])\n" +
+		"      3\n" +
+		"\n" +
+		"  \"\"\"\n" +
+		"  @spec count(t()) :: non_neg_integer()\n" +
+		"  def count(enumerable) when is_list(enumerable) do\n" +
+		"    length(enumerable)\n" +
+		"  end\n" +
+		"\n" +
+		"  def count(enumerable) do\n" +
+		"    case Enumerable.count(enumerable) do\n" +
+		"      {:ok, value} -> value\n" +
+		"      {:error, _} -> 0\n" +
+		"    end\n" +
+		"  end\n" +
+		"\n" +
+		"  @doc \"\"\"\n" +
+		"  Filters the enumerable.\n" +
+		"\n" +
+		"  ## Examples\n" +
+		"\n" +
+		"      iex> Enum.filter([1, 2, 3], fn x -> rem(x, 2) == 0 end)\n" +
+		"      [2]\n" +
+		"\n" +
+		"  \"\"\"\n" +
+		"  @spec filter(t(), (element() -> as_boolean(term()))) :: list()\n" +
+		"  def filter(enumerable, fun) when is_list(enumerable) and is_function(fun, 1) do\n" +
+		"    filter_list(enumerable, fun)\n" +
+		"  end\n" +
+		"\n" +
+		"  def filter(enumerable, fun) when is_function(fun, 1) do\n" +
+		"    :ok\n" +
+		"  end\n" +
+		"\n" +
+		"  @doc \"\"\"\n" +
+		"  Maps the given function over enumerable.\n" +
+		"\n" +
+		"  ## Examples\n" +
+		"\n" +
+		"      iex> Enum.map([1, 2, 3], fn x -> x * 2 end)\n" +
+		"      [2, 4, 6]\n" +
+		"\n" +
+		"  \"\"\"\n" +
+		"  @spec map(t(), (element() -> any())) :: list()\n" +
+		"  def map(enumerable, fun) when is_list(enumerable) and is_function(fun, 1) do\n" +
+		"    :lists.map(fun, enumerable)\n" +
+		"  end\n" +
+		"\n" +
+		"  def map(enumerable, fun) when is_function(fun, 1) do\n" +
+		"    :ok\n" +
+		"  end\n" +
+		"\n" +
+		"  @doc \"\"\"\n" +
+		"  Sorts the enumerable according to Erlang's term ordering.\n" +
+		"\n" +
+		"  ## Examples\n" +
+		"\n" +
+		"      iex> Enum.sort([3, 2, 1])\n" +
+		"      [1, 2, 3]\n" +
+		"\n" +
+		"  \"\"\"\n" +
+		"  @spec sort(t()) :: list()\n" +
+		"  def sort(enumerable) when is_list(enumerable) do\n" +
+		"    :lists.sort(enumerable)\n" +
+		"  end\n" +
+		"\n" +
+		"  def sort(enumerable) do\n" +
+		"    sort(enumerable, &(&1 <= &2))\n" +
+		"  end\n" +
+		"\n" +
+		"  @doc \"\"\"\n" +
+		"  Sorts the enumerable by the given function.\n" +
+		"  \"\"\"\n" +
+		"  @spec sort(t(), (element(), element() -> boolean())) :: list()\n" +
+		"  def sort(enumerable, sorter)\n" +
+		"\n" +
+		"  def sort(enumerable, sorter) when is_list(enumerable) and is_function(sorter, 2) do\n" +
+		"    :lists.sort(sorter, enumerable)\n" +
+		"  end\n" +
+		"\n" +
+		"  def sort(enumerable, :asc) when is_list(enumerable), do: :lists.sort(enumerable)\n" +
+		"  def sort(enumerable, :desc) when is_list(enumerable), do: :lists.reverse(:lists.sort(enumerable))\n" +
+		"\n" +
+		"  @doc \"\"\"\n" +
+		"  Returns a subset list of the given enumerable by index_range.\n" +
+		"\n" +
+		"  ## Examples\n" +
+		"\n" +
+		"      iex> Enum.slice(1..100, 5..10)\n" +
+		"      [6, 7, 8, 9, 10, 11]\n" +
+		"\n" +
+		"  \"\"\"\n" +
+		"  @spec slice(t(), Range.t()) :: list()\n" +
+		"  def slice(enumerable, first..last//step = index_range) when is_integer(first) do\n" +
+		"    slice_range(enumerable, index_range)\n" +
+		"  end\n" +
+		"\n" +
+		"  @doc \"\"\"\n" +
+		"  Reduces the enumerable.\n" +
+		"  \"\"\"\n" +
+		"  @spec reduce(t(), any(), (element(), any() -> any())) :: any()\n" +
+		"  def reduce(enumerable, acc, fun) when is_list(enumerable) and is_function(fun, 2) do\n" +
+		"    :lists.foldl(fun, acc, enumerable)\n" +
+		"  end\n" +
+		"\n" +
+		"  def reduce(enumerable, acc, fun) when is_function(fun, 2) do\n" +
+		"    :ok\n" +
+		"  end\n" +
+		"\n" +
+		"  defp all_list([h | t]) do\n" +
+		"    if h, do: all_list(t), else: false\n" +
+		"  end\n" +
+		"\n" +
+		"  defp all_list([]), do: true\n" +
+		"\n" +
+		"  defp filter_list([h | t], fun) do\n" +
+		"    if fun.(h), do: [h | filter_list(t, fun)], else: filter_list(t, fun)\n" +
+		"  end\n" +
+		"\n" +
+		"  defp filter_list([], _fun), do: []\n" +
+		"\n" +
+		"  defp slice_range(enumerable, range) do\n" +
+		"    Enum.to_list(enumerable) |> Enum.slice(range)\n" +
+		"  end\n" +
+		"end\n"
+	path := writeTempFile(t, content)
+
+	defs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	funcs := map[string]bool{}
+	privateFuncs := map[string]bool{}
+	for _, d := range defs {
+		if d.Module == "Enum" && d.Function != "" {
+			switch d.Kind {
+			case "def":
+				funcs[d.Function] = true
+			case "defp":
+				privateFuncs[d.Function] = true
+			}
+		}
+	}
+
+	for _, name := range []string{"all?", "count", "filter", "map", "sort", "slice", "reduce"} {
+		if !funcs[name] {
+			t.Errorf("missing public function %q in Enum (found: %v)", name, funcs)
+		}
+	}
+
+	for _, name := range []string{"all_list", "filter_list", "slice_range"} {
+		if !privateFuncs[name] {
+			t.Errorf("missing private function %q in Enum", name)
+		}
+	}
+
+	if funcs["all_list"] || funcs["filter_list"] || funcs["slice_range"] {
+		t.Error("private functions should not be in public funcs map")
+	}
+}
+
 func TestParseFile_InlineDoSyntax(t *testing.T) {
 	path := writeTempFile(t, `defmodule MyApp.Math do
   def add(a, b), do: a + b
@@ -914,5 +1164,252 @@ end
 	}
 	if funcs["identity"] != "def" {
 		t.Errorf("expected def for identity, got %q", funcs["identity"])
+	}
+}
+
+func TestParseFile_FnEndBlockDoesNotPopModule(t *testing.T) {
+	path := writeTempFile(t, `defmodule Enum do
+  def min_max(enumerable, empty_fallback) do
+    reduce_fun = fn entry, [min | max] = acc ->
+      cond do
+        entry < min -> [entry | max]
+        entry > max -> [min | entry]
+        true -> acc
+      end
+    end
+
+    first_fun = fn entry ->
+      [entry | entry]
+    end
+
+    result = reduce(enumerable, :first, reduce_fun, first_fun)
+    result
+  end
+
+  def sort(enumerable) when is_list(enumerable) do
+    :lists.sort(enumerable)
+  end
+
+  def sort(enumerable) do
+    sort(enumerable, &(&1 <= &2))
+  end
+
+  def zip(enumerables) do
+    :ok
+  end
+end
+`)
+
+	defs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	funcs := map[string]string{}
+	for _, d := range defs {
+		if d.Function != "" {
+			funcs[d.Function] = d.Module
+		}
+	}
+
+	for _, name := range []string{"min_max", "sort", "zip"} {
+		if funcs[name] != "Enum" {
+			t.Errorf("%s should belong to Enum, got %q (all funcs: %v)", name, funcs[name], funcs)
+		}
+	}
+}
+
+func TestParseFile_FnEndWithTrailingParen(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyModule do
+  def process(enumerable) do
+    Enumerable.reduce(enumerable, {:cont, []}, fn entry, acc ->
+      {:cont, [entry | acc]}
+    end)
+  end
+
+  def next_func(x) do
+    x + 1
+  end
+end
+`)
+
+	defs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	funcs := map[string]string{}
+	for _, d := range defs {
+		if d.Function != "" {
+			funcs[d.Function] = d.Module
+		}
+	}
+
+	if funcs["process"] != "MyModule" {
+		t.Errorf("process should belong to MyModule, got %q", funcs["process"])
+	}
+	if funcs["next_func"] != "MyModule" {
+		t.Errorf("next_func should belong to MyModule, got %q", funcs["next_func"])
+	}
+}
+
+func TestExtractArity(t *testing.T) {
+	tests := []struct {
+		name     string
+		line     string
+		funcName string
+		expected int
+	}{
+		{"no parens", "  def foo, do: :ok", "foo", 0},
+		{"empty parens", "  def foo(), do: :ok", "foo", 0},
+		{"one arg", "  def foo(a), do: :ok", "foo", 1},
+		{"two args", "  def foo(a, b) do", "foo", 2},
+		{"three args", "  def create(name, email, role) do", "create", 3},
+		{"nested map", "  def foo(%{name: name}, opts) do", "foo", 2},
+		{"nested list", "  def foo([head | tail], acc) do", "foo", 2},
+		{"default arg", "  defmacro from(expr, kw \\\\ []) do", "from", 2},
+		{"defguard", "  defguard is_admin(user) when user.role == :admin", "is_admin", 1},
+		{"defdelegate", "  defdelegate create(attrs), to: Create", "create", 1},
+		{"tuple arg", "  def foo({a, b}, c) do", "foo", 2},
+		{"keyword list", "  def foo(a, opts \\\\ [key: :val]) do", "foo", 2},
+		{"pattern match", "  def handle_call(:get, _from, state) do", "handle_call", 3},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ExtractArity(tt.line, tt.funcName)
+			if got != tt.expected {
+				t.Errorf("ExtractArity(%q, %q) = %d, want %d", tt.line, tt.funcName, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestParseFile_Arity(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.Accounts do
+  def create(attrs) do
+    :ok
+  end
+
+  def list(opts, page) do
+    :ok
+  end
+
+  def all do
+    :ok
+  end
+
+  defp validate(changeset, rules) do
+    :ok
+  end
+
+  defdelegate fetch(id), to: MyApp.Repo
+end
+`)
+
+	defs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	arities := map[string]int{}
+	for _, d := range defs {
+		if d.Function != "" {
+			arities[d.Function] = d.Arity
+		}
+	}
+
+	if arities["create"] != 1 {
+		t.Errorf("create: expected arity 1, got %d", arities["create"])
+	}
+	if arities["list"] != 2 {
+		t.Errorf("list: expected arity 2, got %d", arities["list"])
+	}
+	if arities["all"] != 0 {
+		t.Errorf("all: expected arity 0, got %d", arities["all"])
+	}
+	if arities["validate"] != 2 {
+		t.Errorf("validate: expected arity 2, got %d", arities["validate"])
+	}
+	if arities["fetch"] != 1 {
+		t.Errorf("fetch: expected arity 1, got %d", arities["fetch"])
+	}
+}
+
+func TestParseFile_TypeDefinitions(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.User do
+  @type t() :: %__MODULE__{}
+  @type id :: pos_integer()
+  @typep internal(a, b) :: {a, b}
+  @opaque token :: String.t()
+
+  def create(attrs) do
+    :ok
+  end
+end
+`)
+
+	defs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	byFunc := map[string]Definition{}
+	for _, d := range defs {
+		if d.Function != "" {
+			byFunc[d.Function] = d
+		}
+	}
+
+	cases := []struct {
+		name string
+		kind string
+		line int
+	}{
+		{"t", "type", 2},
+		{"id", "type", 3},
+		{"internal", "typep", 4},
+		{"token", "opaque", 5},
+	}
+
+	for _, tc := range cases {
+		d, ok := byFunc[tc.name]
+		if !ok {
+			t.Errorf("expected %q to be indexed", tc.name)
+			continue
+		}
+		if d.Kind != tc.kind {
+			t.Errorf("%q: got kind %q, want %q", tc.name, d.Kind, tc.kind)
+		}
+		if d.Line != tc.line {
+			t.Errorf("%q: got line %d, want %d", tc.name, d.Line, tc.line)
+		}
+		if d.Module != "MyApp.User" {
+			t.Errorf("%q: got module %q, want MyApp.User", tc.name, d.Module)
+		}
+	}
+
+	// Parameterized type arity
+	if byFunc["internal"].Arity != 2 {
+		t.Errorf("internal: expected arity 2, got %d", byFunc["internal"].Arity)
+	}
+	// Non-parameterized type arity
+	if byFunc["t"].Arity != 0 {
+		t.Errorf("t: expected arity 0, got %d", byFunc["t"].Arity)
+	}
+}
+
+func TestParseFile_TypesNotIndexedOutsideModule(t *testing.T) {
+	// @type at the top level (outside a defmodule) should not be indexed.
+	path := writeTempFile(t, `@type orphan :: integer()
+`)
+	defs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range defs {
+		if d.Function == "orphan" {
+			t.Error("should not index @type outside of a defmodule")
+		}
 	}
 }

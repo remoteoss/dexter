@@ -118,11 +118,15 @@ make install   # for Cursor, or make install-vscode for VSCode
 
 ## Features
 
+- **Elixir stdlib indexing** — jump to `Enum`, `String`, `Mix`, and other bundled modules by indexing your local Elixir installation sources
+- **Hover documentation** — `@doc`, `@moduledoc`, `@typedoc`, and `@spec` annotations rendered as Markdown when you hover over a symbol
+- **Cursor-position-aware resolution** — hovering on `MyApp.Repo` in `MyApp.Repo.all` shows docs for the module, hovering on `all` shows docs for the function
 - **Alias resolution** — `alias MyApp.Handlers.Foo`, `alias MyApp.Handlers.Foo, as: Cool`, `alias MyApp.Handlers.{Foo, Bar}`
 - **Import resolution** — bare function calls resolved through `import` declarations
 - **Delegate following** — `defdelegate fetch(id), to: MyApp.Repo` jumps to `MyApp.Repo.fetch`, respecting `as:` renames
 - **Local buffer search** — private function calls resolve without leaving the current file
 - **All def forms** — `def`, `defp`, `defmacro`, `defmacrop`, `defguard`, `defguardp`, `defdelegate`, `defprotocol`, `defimpl`, `defstruct`, `defexception`
+- **Type definitions** — `@type`, `@typep`, and `@opaque` are indexed for go-to-definition and hover
 - **Heredoc awareness** — code examples in `@moduledoc`/`@doc` are skipped
 - **Module nesting** — correctly tracks `end` keywords to attribute functions to the right module
 - **Git branch detection** — automatically reindexes when you switch branches
@@ -135,11 +139,17 @@ The CLI commands are available for scripting and manual use.
 ### Index a project
 
 ```sh
-# First time — indexes all .ex/.exs files (including deps/)
+# First time — indexes all .ex/.exs files (including deps/ and the Elixir standard library)
 dexter init ~/code/my-elixir-project
 
 # Re-init from scratch (deletes existing index)
 dexter init --force ~/code/my-elixir-project
+```
+
+Dexter auto-detects your Elixir installation. If it can't find it (e.g. a non-standard install), set:
+
+```sh
+export DEXTER_ELIXIR_LIB_ROOT="/path/to/elixir/lib"
 ```
 
 ### Look up definitions
@@ -176,6 +186,36 @@ When running as an LSP server, dexter automatically:
 - Reindexes files on save (`textDocument/didSave`)
 - Runs an incremental reindex on startup
 - Watches `.git/HEAD` for branch switches and reindexes when detected
+
+## Hover documentation
+
+Dexter serves hover docs (`textDocument/hover`) for functions, modules, and types. When you hover over a symbol, it looks up the definition in the index and reads the `@doc`, `@moduledoc`, `@typedoc`, or `@spec` annotations from the source file.
+
+The hover response shows the function signature (with `@spec` if present), followed by the doc string:
+
+```
+defp do_something(arg1, arg2)
+@spec do_something(binary(), map()) :: {:ok, map()} | {:error, term()}
+
+Does something with arg1 and arg2.
+```
+
+### Cursor-position-aware resolution
+
+Dexter resolves hover (and go-to-definition) based on which segment of a dotted expression your cursor is on:
+
+| Cursor position | Expression | Resolves to |
+|-----------------|------------|-------------|
+| On `Repo` in `MyApp.Repo.all` | `MyApp.Repo` | The `MyApp.Repo` module |
+| On `all` in `MyApp.Repo.all` | `MyApp.Repo.all` | The `all` function |
+| On `MyApp` in `MyApp.Repo.all` | `MyApp` | The `MyApp` module |
+
+## LSP options
+
+Dexter reads `initializationOptions` from your editor configuration:
+
+- **`followDelegates`** (boolean, default: `true`): follow `defdelegate` targets on lookup.
+- **`stdlibPath`** (string): override the Elixir stdlib directory to index. Defaults to auto-detection; use this if your install is non-standard.
 
 ## Index location (.dexter.db)
 

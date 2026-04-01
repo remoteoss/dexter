@@ -11,17 +11,19 @@ func TestExtractExpression(t *testing.T) {
 		col      int
 		expected string
 	}{
+		// Cursor on middle segment → truncate at that segment's end
 		{
-			name:     "module.function at cursor",
+			name:     "cursor on middle module segment",
 			line:     "    Foo.Bar.baz(123)",
 			col:      9,
-			expected: "Foo.Bar.baz",
+			expected: "Foo.Bar",
 		},
+		// Cursor on dot → include next segment
 		{
-			name:     "module name",
+			name:     "cursor on dot between segments",
 			line:     "    Foo.Bar.Baz",
 			col:      7,
-			expected: "Foo.Bar.Baz",
+			expected: "Foo.Bar",
 		},
 		{
 			name:     "bare function",
@@ -29,12 +31,14 @@ func TestExtractExpression(t *testing.T) {
 			col:      7,
 			expected: "do_something",
 		},
+		// Cursor on first segment → return only that segment
 		{
 			name:     "cursor at start of expr",
 			line:     "    Foo.bar()",
 			col:      4,
-			expected: "Foo.bar",
+			expected: "Foo",
 		},
+		// Cursor on last segment → return full expression
 		{
 			name:     "cursor at end of expr",
 			line:     "    Foo.bar()",
@@ -53,10 +57,18 @@ func TestExtractExpression(t *testing.T) {
 			col:      6,
 			expected: "process!",
 		},
+		// Cursor on first segment of underscore module
 		{
-			name:     "module with underscore",
+			name:     "cursor on first segment of underscore module",
 			line:     "    MyApp_Web.Router",
 			col:      8,
+			expected: "MyApp_Web",
+		},
+		// Cursor on last segment → full expr
+		{
+			name:     "cursor on last segment",
+			line:     "    MyApp_Web.Router",
+			col:      16,
 			expected: "MyApp_Web.Router",
 		},
 		{
@@ -70,6 +82,25 @@ func TestExtractExpression(t *testing.T) {
 			line:     "    Foo.bar()",
 			col:      11,
 			expected: "",
+		},
+		// Three-part expression: cursor on each segment
+		{
+			name:     "three-part: cursor on first",
+			line:     "MyApp.Repo.all",
+			col:      2,
+			expected: "MyApp",
+		},
+		{
+			name:     "three-part: cursor on middle",
+			line:     "MyApp.Repo.all",
+			col:      7,
+			expected: "MyApp.Repo",
+		},
+		{
+			name:     "three-part: cursor on last",
+			line:     "MyApp.Repo.all",
+			col:      11,
+			expected: "MyApp.Repo.all",
 		},
 	}
 
@@ -357,9 +388,13 @@ end`
 
 func TestExtractExpression_PipeOperator(t *testing.T) {
 	line := "    |> Foo.Bar.transform()"
-	got := ExtractExpression(line, 12)
-	if got != "Foo.Bar.transform" {
-		t.Errorf("got %q, want Foo.Bar.transform", got)
+	// col=12 is on 'a' of Bar → returns up to and including Bar
+	if got := ExtractExpression(line, 12); got != "Foo.Bar" {
+		t.Errorf("cursor on Bar: got %q, want %q", got, "Foo.Bar")
+	}
+	// col=15 is on 't' of transform → returns full expression
+	if got := ExtractExpression(line, 15); got != "Foo.Bar.transform" {
+		t.Errorf("cursor on transform: got %q, want %q", got, "Foo.Bar.transform")
 	}
 }
 
@@ -453,6 +488,173 @@ end`
 		_, found := FindModuleAttributeDefinition(text, "nonexistent")
 		if found {
 			t.Error("expected not found for nonexistent attribute")
+		}
+	})
+}
+
+func TestExtractCompletionContext(t *testing.T) {
+	tests := []struct {
+		name         string
+		line         string
+		col          int
+		wantPrefix   string
+		wantAfterDot bool
+	}{
+		{
+			name:         "module prefix",
+			line:         "  MyApp.Han",
+			col:          11,
+			wantPrefix:   "MyApp.Han",
+			wantAfterDot: false,
+		},
+		{
+			name:         "after dot — function listing",
+			line:         "  Foo.",
+			col:          6,
+			wantPrefix:   "Foo",
+			wantAfterDot: true,
+		},
+		{
+			name:         "function prefix after dot",
+			line:         "  Foo.ba",
+			col:          8,
+			wantPrefix:   "Foo.ba",
+			wantAfterDot: false,
+		},
+		{
+			name:         "bare function prefix",
+			line:         "  some_func",
+			col:          11,
+			wantPrefix:   "some_func",
+			wantAfterDot: false,
+		},
+		{
+			name:         "cursor at start — no completion",
+			line:         "  Foo.bar",
+			col:          0,
+			wantPrefix:   "",
+			wantAfterDot: false,
+		},
+		{
+			name:         "empty line",
+			line:         "",
+			col:          0,
+			wantPrefix:   "",
+			wantAfterDot: false,
+		},
+		{
+			name:         "cursor on whitespace",
+			line:         "  Foo.bar  ",
+			col:          10,
+			wantPrefix:   "",
+			wantAfterDot: false,
+		},
+		{
+			name:         "deeply nested module dot",
+			line:         "  MyApp.Handlers.Webhooks.V2.",
+			col:          29,
+			wantPrefix:   "MyApp.Handlers.Webhooks.V2",
+			wantAfterDot: true,
+		},
+		{
+			name:         "question mark function",
+			line:         "  Foo.valid?",
+			col:          12,
+			wantPrefix:   "Foo.valid?",
+			wantAfterDot: false,
+		},
+		{
+			name:         "bang function",
+			line:         "  Foo.process!",
+			col:          14,
+			wantPrefix:   "Foo.process!",
+			wantAfterDot: false,
+		},
+		{
+			name:         "mid-word cursor",
+			line:         "  Enum.map_reduce",
+			col:          10,
+			wantPrefix:   "Enum.map",
+			wantAfterDot: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prefix, afterDot := ExtractCompletionContext(tt.line, tt.col)
+			if prefix != tt.wantPrefix {
+				t.Errorf("prefix: got %q, want %q", prefix, tt.wantPrefix)
+			}
+			if afterDot != tt.wantAfterDot {
+				t.Errorf("afterDot: got %v, want %v", afterDot, tt.wantAfterDot)
+			}
+		})
+	}
+}
+
+func TestFindBufferFunctions(t *testing.T) {
+	text := `defmodule Foo do
+  def public_one(a) do
+    :ok
+  end
+
+  def public_two(b) do
+    :ok
+  end
+
+  defp private_func(x) do
+    x
+  end
+
+  defmacro my_macro(expr) do
+    quote do: unquote(expr)
+  end
+
+  defguard is_admin(user) when user.role == :admin
+
+  defdelegate fetch(id), to: MyApp.Repo
+
+  def public_one(a, b) do
+    :ok
+  end
+end`
+
+	results := FindBufferFunctions(text)
+
+	t.Run("deduplicates same name and arity", func(t *testing.T) {
+		// public_one/1 and public_one/2 are different, so both should appear
+		count := 0
+		for _, r := range results {
+			if r.Name == "public_one" {
+				count++
+			}
+		}
+		if count != 2 {
+			t.Errorf("expected public_one twice (arity 1 and 2), got %d times", count)
+		}
+	})
+
+	t.Run("finds all unique functions", func(t *testing.T) {
+		if len(results) != 7 {
+			t.Fatalf("expected 7 unique function/arity combos, got %d", len(results))
+		}
+	})
+
+	t.Run("preserves kind", func(t *testing.T) {
+		for _, r := range results {
+			if r.Name == "my_macro" && r.Kind != "defmacro" {
+				t.Errorf("expected defmacro kind for my_macro, got %q", r.Kind)
+			}
+			if r.Name == "private_func" && r.Kind != "defp" {
+				t.Errorf("expected defp kind for private_func, got %q", r.Kind)
+			}
+		}
+	})
+
+	t.Run("empty buffer", func(t *testing.T) {
+		results := FindBufferFunctions("")
+		if len(results) != 0 {
+			t.Errorf("expected 0 results for empty buffer, got %d", len(results))
 		}
 	})
 }
