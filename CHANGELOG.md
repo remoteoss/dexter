@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.4.1] - 2026-04-01
+
+### Fixed
+
+- **Function lookup ordering** — when a name is shared by both a function and a type, the function definition is now returned first
+
+### Changed
+
+- **CLI description** — updated tagline
+
 ## [0.4.0] - 2026-04-01
 
 ### Added

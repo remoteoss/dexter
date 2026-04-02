@@ -104,6 +104,42 @@ end
 	}
 }
 
+func TestLookupFunctionOrdersFunctionsBeforeTypes(t *testing.T) {
+	s, dir := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	path := writeElixirFile(t, dir, "lib/foo.ex", `defmodule MyApp.Foo do
+  @type bar :: atom()
+
+  def bar(arg) do
+    :ok
+  end
+end
+`)
+
+	defs, err := parser.ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IndexFile(path, defs); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := s.LookupFunction("MyApp.Foo", "bar")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results (function + type), got %d", len(results))
+	}
+	if results[0].Kind != "def" {
+		t.Errorf("expected first result to be 'def', got %q", results[0].Kind)
+	}
+	if results[1].Kind != "type" {
+		t.Errorf("expected second result to be 'type', got %q", results[1].Kind)
+	}
+}
+
 func TestReindexUpdatesDefinitions(t *testing.T) {
 	s, dir := setupTestStore(t)
 	defer func() { _ = s.Close() }()

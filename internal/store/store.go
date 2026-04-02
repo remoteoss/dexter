@@ -264,7 +264,7 @@ func (s *Store) LookupModule(module string) ([]LookupResult, error) {
 
 func (s *Store) LookupFunction(module, function string) ([]LookupResult, error) {
 	return s.queryLookup(
-		"SELECT file_path, line, kind, delegate_to, delegate_as FROM definitions WHERE module = ? AND function = ? AND kind NOT IN ('module', 'defprotocol', 'defimpl')",
+		"SELECT file_path, line, kind, delegate_to, delegate_as FROM definitions WHERE module = ? AND function = ? AND kind NOT IN ('module', 'defprotocol', 'defimpl') ORDER BY CASE WHEN kind IN ('type', 'typep', 'opaque') THEN 1 ELSE 0 END, line",
 		module, function,
 	)
 }

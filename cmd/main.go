@@ -20,7 +20,7 @@ import (
 func main() {
 	rootCmd := &cobra.Command{
 		Use:          "dexter",
-		Short:        "Elixir module index",
+		Short:        "A lightning-fast Elixir LSP ⚡",
 		SilenceUsage: true,
 	}
 
