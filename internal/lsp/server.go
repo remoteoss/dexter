@@ -577,25 +577,14 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 			items = append(items, item)
 		}
 
-		if afterDot && funcPrefix == "" {
-			subResults, err := s.store.SearchModules(resolved + ".")
+		if afterDot {
+			segments, err := s.store.SearchSubmoduleSegments(resolved, funcPrefix)
 			if err == nil {
-				resolvedPrefix := resolved + "."
-				seenSub := make(map[string]bool)
-				for _, r := range subResults {
-					segment := strings.TrimPrefix(r.Module, resolvedPrefix)
-					// Reduce to the immediate next segment (e.g. "Query.API" → "Query")
-					if dot := strings.IndexByte(segment, '.'); dot >= 0 {
-						segment = segment[:dot]
-					}
-					if seenSub[segment] {
-						continue
-					}
-					seenSub[segment] = true
+				for _, segment := range segments {
 					items = append(items, protocol.CompletionItem{
 						Label:  segment,
 						Kind:   protocol.CompletionItemKindModule,
-						Detail: resolvedPrefix + segment,
+						Detail: resolved + "." + segment,
 					})
 				}
 			}
@@ -626,6 +615,25 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 							Detail: r.Module,
 						})
 					}
+				}
+			}
+		}
+
+		// When moduleRef has dots (e.g. "MyApp.Ser"), also search for
+		// sub-module segments under the parent with the last part as prefix.
+		if dotIdx := strings.LastIndexByte(moduleRef, '.'); dotIdx >= 0 {
+			parentModule := moduleRef[:dotIdx]
+			segmentPrefix := moduleRef[dotIdx+1:]
+			resolved := resolveModule(parentModule, aliases)
+			segments, err := s.store.SearchSubmoduleSegments(resolved, segmentPrefix)
+			if err == nil {
+				for _, segment := range segments {
+					label := parentModule + "." + segment
+					items = append(items, protocol.CompletionItem{
+						Label:  label,
+						Kind:   protocol.CompletionItemKindModule,
+						Detail: resolved + "." + segment,
+					})
 				}
 			}
 		}
@@ -695,7 +703,7 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 	}
 
 	return &protocol.CompletionList{
-		IsIncomplete: false,
+		IsIncomplete: len(items) >= 100,
 		Items:        items,
 	}, nil
 }

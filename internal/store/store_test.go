@@ -632,6 +632,108 @@ end
 	}
 }
 
+func TestSearchSubmoduleSegments(t *testing.T) {
+	s, dir := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	path := writeElixirFile(t, dir, "lib/app.ex", `defmodule MyApp do
+end
+
+defmodule MyApp.Accounts do
+end
+
+defmodule MyApp.Accounts.User do
+end
+
+defmodule MyApp.Accounts.Team do
+end
+
+defmodule MyApp.Services do
+end
+
+defmodule MyApp.Services.Auth do
+end
+
+defmodule MyApp.Schema do
+end
+`)
+
+	defs, err := parser.ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IndexFile(path, defs); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("all immediate children", func(t *testing.T) {
+		segments, err := s.SearchSubmoduleSegments("MyApp", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(segments) != 3 {
+			t.Fatalf("expected 3 segments, got %d: %v", len(segments), segments)
+		}
+		expected := map[string]bool{"Accounts": true, "Schema": true, "Services": true}
+		for _, seg := range segments {
+			if !expected[seg] {
+				t.Errorf("unexpected segment: %q", seg)
+			}
+		}
+	})
+
+	t.Run("with prefix filter", func(t *testing.T) {
+		segments, err := s.SearchSubmoduleSegments("MyApp", "S")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(segments) != 2 {
+			t.Fatalf("expected 2 segments, got %d: %v", len(segments), segments)
+		}
+		for _, seg := range segments {
+			if seg != "Schema" && seg != "Services" {
+				t.Errorf("unexpected segment: %q", seg)
+			}
+		}
+	})
+
+	t.Run("with specific prefix", func(t *testing.T) {
+		segments, err := s.SearchSubmoduleSegments("MyApp", "Ser")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(segments) != 1 || segments[0] != "Services" {
+			t.Errorf("expected [Services], got %v", segments)
+		}
+	})
+
+	t.Run("nested parent", func(t *testing.T) {
+		segments, err := s.SearchSubmoduleSegments("MyApp.Accounts", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(segments) != 2 {
+			t.Fatalf("expected 2 segments, got %d: %v", len(segments), segments)
+		}
+		expected := map[string]bool{"Team": true, "User": true}
+		for _, seg := range segments {
+			if !expected[seg] {
+				t.Errorf("unexpected segment: %q", seg)
+			}
+		}
+	})
+
+	t.Run("no matches", func(t *testing.T) {
+		segments, err := s.SearchSubmoduleSegments("MyApp", "Z")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(segments) != 0 {
+			t.Errorf("expected 0 segments, got %v", segments)
+		}
+	})
+}
+
 func TestStdlibRoot(t *testing.T) {
 	s, _ := setupTestStore(t)
 	defer func() { _ = s.Close() }()

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	_ "github.com/mattn/go-sqlite3"
 	"gitlab.com/remote-com/employ-starbase/dexter/internal/parser"
@@ -352,6 +353,46 @@ func (s *Store) SearchModules(prefix string) ([]CompletionResult, error) {
 		results = append(results, r)
 	}
 	return results, rows.Err()
+}
+
+// SearchSubmoduleSegments returns distinct immediate child segments under parentModule
+// that match an optional segment prefix. For example, with parentModule="MyApp" and
+// segmentPrefix="S", it returns segments like "Services", "Schema", etc. without
+// the LIMIT 100 truncation issue that affects SearchModules + client-side dedup.
+func (s *Store) SearchSubmoduleSegments(parentModule string, segmentPrefix string) ([]string, error) {
+	// Build prefix: "MyApp.S%"
+	likePrefix := parentModule + "." + segmentPrefix + "%"
+
+	rows, err := s.db.Query(
+		"SELECT DISTINCT module FROM definitions WHERE module LIKE ? AND function = '' AND kind IN ('module', 'defprotocol') ORDER BY module",
+		likePrefix,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	parentDot := parentModule + "."
+	seen := make(map[string]bool)
+	var segments []string
+	for rows.Next() {
+		var module string
+		if err := rows.Scan(&module); err != nil {
+			return nil, err
+		}
+		segment := strings.TrimPrefix(module, parentDot)
+		if dot := strings.IndexByte(segment, '.'); dot >= 0 {
+			segment = segment[:dot]
+		}
+		if !seen[segment] {
+			seen[segment] = true
+			segments = append(segments, segment)
+			if len(segments) >= 100 {
+				break
+			}
+		}
+	}
+	return segments, rows.Err()
 }
 
 func (s *Store) ListModuleFunctions(module string, publicOnly bool) ([]CompletionResult, error) {
