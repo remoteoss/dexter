@@ -282,9 +282,11 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 					IncludeText: false,
 				},
 			},
-			DefinitionProvider: true,
-			ReferencesProvider: true,
-			HoverProvider:      true,
+			DefinitionProvider:      true,
+			ReferencesProvider:      true,
+			HoverProvider:           true,
+			DocumentSymbolProvider:  true,
+			WorkspaceSymbolProvider: true,
 			CompletionProvider: &protocol.CompletionOptions{
 				TriggerCharacters: []string{"."},
 				ResolveProvider:   true,
@@ -1124,7 +1126,392 @@ func (s *Server) DocumentLinkResolve(ctx context.Context, params *protocol.Docum
 	return nil, nil
 }
 func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSymbolParams) ([]interface{}, error) {
-	return nil, nil
+	docURI := string(params.TextDocument.URI)
+	text, ok := s.docs.Get(docURI)
+	if !ok {
+		return nil, nil
+	}
+
+	lines := strings.Split(text, "\n")
+	lastLine := len(lines) - 1
+
+	type symbolEntry struct {
+		symbol    protocol.DocumentSymbol
+		module    string // owning module name (empty for top-level modules)
+		parentIdx int    // index of parent entry (-1 for top-level)
+	}
+
+	type blockFrame struct {
+		name     string // module full name, or "" for functions
+		indent   int
+		entryIdx int // index into entries slice
+	}
+
+	var entries []symbolEntry
+	var moduleStack []blockFrame // defmodule/defprotocol/defimpl
+	var funcStack []blockFrame   // def/defp/defmacro/describe/test/etc with do...end bodies
+	inHeredoc := false
+
+	// currentParentIdx returns the index of the innermost enclosing block.
+	// funcStack entries (describe blocks) take priority over moduleStack.
+	currentParentIdx := func() int {
+		if len(funcStack) > 0 {
+			return funcStack[len(funcStack)-1].entryIdx
+		}
+		if len(moduleStack) > 0 {
+			return moduleStack[len(moduleStack)-1].entryIdx
+		}
+		return -1
+	}
+
+	for lineIdx, line := range lines {
+		if strings.IndexByte(line, '"') >= 0 {
+			quoteCount := strings.Count(line, `"""`)
+			if quoteCount > 0 {
+				if quoteCount >= 2 {
+					continue
+				}
+				inHeredoc = !inHeredoc
+				continue
+			}
+		}
+		if inHeredoc {
+			continue
+		}
+
+		trimStart := 0
+		for trimStart < len(line) && (line[trimStart] == ' ' || line[trimStart] == '\t') {
+			trimStart++
+		}
+		if trimStart >= len(line) {
+			continue
+		}
+		first := line[trimStart]
+		rest := line[trimStart:]
+
+		// Fast first-character dispatch — only 'd', 'e', '@', and lowercase
+		// letters (bare macro calls) can start a symbol-producing line.
+		// Everything else is skipped with zero further work.
+		if first != 'd' && first != 'e' && first != '@' && (first < 'a' || first > 'z') {
+			continue
+		}
+
+		// 'e' — pop stacks on "end", patch the symbol's Range.End
+		if first == 'e' {
+			if len(rest) >= 3 && rest[0] == 'e' && rest[1] == 'n' && rest[2] == 'd' &&
+				(len(rest) == 3 || rest[3] == ' ' || rest[3] == '\t' || rest[3] == '\r') {
+				trimmedEnd := strings.TrimRight(rest, " \t\r")
+				if trimmedEnd == "end" {
+					endPos := protocol.Position{Line: uint32(lineIdx), Character: uint32(len(line))}
+					if len(funcStack) > 0 && funcStack[len(funcStack)-1].indent == trimStart {
+						entries[funcStack[len(funcStack)-1].entryIdx].symbol.Range.End = endPos
+						funcStack = funcStack[:len(funcStack)-1]
+					} else if len(moduleStack) > 0 && moduleStack[len(moduleStack)-1].indent == trimStart {
+						entries[moduleStack[len(moduleStack)-1].entryIdx].symbol.Range.End = endPos
+						moduleStack = moduleStack[:len(moduleStack)-1]
+					}
+				}
+			}
+			continue
+		}
+
+		currentModule := ""
+		if len(moduleStack) > 0 {
+			currentModule = moduleStack[len(moduleStack)-1].name
+		}
+
+		// 'd' — defmodule/defprotocol/defimpl/def*/defstruct/defexception
+		// Lines starting with 'd' that aren't "def*" fall through to bare macro handling.
+		if first == 'd' && strings.HasPrefix(rest, "def") {
+
+			// Try module-level keywords first, ordered by frequency
+			var matchedKeyword string
+			switch {
+			case strings.HasPrefix(rest, "defmodule") && len(rest) > 9 && (rest[9] == ' ' || rest[9] == '\t'):
+				matchedKeyword = "defmodule"
+			case strings.HasPrefix(rest, "defimpl") && len(rest) > 7 && (rest[7] == ' ' || rest[7] == '\t'):
+				matchedKeyword = "defimpl"
+			case strings.HasPrefix(rest, "defprotocol") && len(rest) > 11 && (rest[11] == ' ' || rest[11] == '\t'):
+				matchedKeyword = "defprotocol"
+			}
+			if matchedKeyword != "" {
+				after := strings.TrimLeft(rest[len(matchedKeyword)+1:], " \t")
+				name := parser.ScanModuleName(after)
+				if name != "" {
+					fullName := name
+					if !strings.Contains(name, ".") && currentModule != "" {
+						fullName = currentModule + "." + name
+					}
+
+					kind := defKindToSymbolKind(matchedKeyword)
+					if matchedKeyword == "defmodule" {
+						kind = defKindToSymbolKind("module")
+					}
+
+					nameCol := strings.Index(line, name)
+					if nameCol < 0 {
+						nameCol = trimStart
+					}
+
+					entryIdx := len(entries)
+					moduleParentIdx := -1
+					if len(moduleStack) > 0 {
+						moduleParentIdx = moduleStack[len(moduleStack)-1].entryIdx
+					}
+					entries = append(entries, symbolEntry{
+						symbol: protocol.DocumentSymbol{
+							Name:   name,
+							Detail: matchedKeyword,
+							Kind:   kind,
+							Range: protocol.Range{
+								Start: protocol.Position{Line: uint32(lineIdx), Character: 0},
+								End:   protocol.Position{Line: uint32(lastLine), Character: 0},
+							},
+							SelectionRange: protocol.Range{
+								Start: protocol.Position{Line: uint32(lineIdx), Character: uint32(nameCol)},
+								End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(nameCol + len(name))},
+							},
+						},
+						module:    currentModule,
+						parentIdx: moduleParentIdx,
+					})
+					moduleStack = append(moduleStack, blockFrame{name: fullName, indent: trimStart, entryIdx: entryIdx})
+					continue
+				}
+			}
+
+			// Function/macro/guard/delegate definitions
+			if currentModule != "" {
+				if kind, funcName, ok := parser.ScanFuncDef(rest); ok {
+					arity := parser.ExtractArity(line, funcName)
+					nameWithArity := fmt.Sprintf("%s/%d", funcName, arity)
+
+					nameCol := strings.Index(line, funcName)
+					if nameCol < 0 {
+						nameCol = trimStart
+					}
+
+					hasDoBlock := false
+					trimmedRight := strings.TrimRight(rest, " \t\r")
+					if strings.HasSuffix(trimmedRight, " do") || strings.HasSuffix(trimmedRight, "\tdo") {
+						hasDoBlock = true
+					}
+
+					rangeEnd := protocol.Position{Line: uint32(lineIdx), Character: uint32(len(line))}
+					if hasDoBlock {
+						rangeEnd = protocol.Position{Line: uint32(lastLine), Character: 0}
+					}
+
+					entryIdx := len(entries)
+					entries = append(entries, symbolEntry{
+						symbol: protocol.DocumentSymbol{
+							Name:   nameWithArity,
+							Detail: kind,
+							Kind:   defKindToSymbolKind(kind),
+							Range: protocol.Range{
+								Start: protocol.Position{Line: uint32(lineIdx), Character: 0},
+								End:   rangeEnd,
+							},
+							SelectionRange: protocol.Range{
+								Start: protocol.Position{Line: uint32(lineIdx), Character: uint32(nameCol)},
+								End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(nameCol + len(funcName))},
+							},
+						},
+						module:    currentModule,
+						parentIdx: currentParentIdx(),
+					})
+
+					if hasDoBlock {
+						funcStack = append(funcStack, blockFrame{indent: trimStart, entryIdx: entryIdx})
+					}
+				} else if strings.HasPrefix(rest, "defstruct ") || strings.HasPrefix(rest, "defstruct\t") {
+					entries = append(entries, symbolEntry{
+						symbol: protocol.DocumentSymbol{
+							Name:   "defstruct",
+							Detail: "defstruct",
+							Kind:   defKindToSymbolKind("defstruct"),
+							Range: protocol.Range{
+								Start: protocol.Position{Line: uint32(lineIdx), Character: 0},
+								End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(len(line))},
+							},
+							SelectionRange: protocol.Range{
+								Start: protocol.Position{Line: uint32(lineIdx), Character: uint32(trimStart)},
+								End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(trimStart + 9)},
+							},
+						},
+						module:    currentModule,
+						parentIdx: currentParentIdx(),
+					})
+				} else if strings.HasPrefix(rest, "defexception ") || strings.HasPrefix(rest, "defexception\t") {
+					entries = append(entries, symbolEntry{
+						symbol: protocol.DocumentSymbol{
+							Name:   "defexception",
+							Detail: "defexception",
+							Kind:   defKindToSymbolKind("defexception"),
+							Range: protocol.Range{
+								Start: protocol.Position{Line: uint32(lineIdx), Character: 0},
+								End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(len(line))},
+							},
+							SelectionRange: protocol.Range{
+								Start: protocol.Position{Line: uint32(lineIdx), Character: uint32(trimStart)},
+								End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(trimStart + 12)},
+							},
+						},
+						module:    currentModule,
+						parentIdx: currentParentIdx(),
+					})
+				}
+			}
+			continue
+		}
+
+		// '@' — type definitions (@type, @typep, @opaque)
+		if first == '@' {
+			if currentModule == "" {
+				continue
+			}
+			var kind string
+			var afterKw string
+			if strings.HasPrefix(rest, "@typep") && len(rest) > 6 && (rest[6] == ' ' || rest[6] == '\t') {
+				kind = "typep"
+				afterKw = strings.TrimLeft(rest[6:], " \t")
+			} else if strings.HasPrefix(rest, "@type") && len(rest) > 5 && (rest[5] == ' ' || rest[5] == '\t') {
+				kind = "type"
+				afterKw = strings.TrimLeft(rest[5:], " \t")
+			} else if strings.HasPrefix(rest, "@opaque") && len(rest) > 7 && (rest[7] == ' ' || rest[7] == '\t') {
+				kind = "opaque"
+				afterKw = strings.TrimLeft(rest[7:], " \t")
+			}
+			if kind != "" {
+				name := parser.ScanFuncName(afterKw)
+				if name != "" {
+					arity := parser.ExtractArity(line, name)
+					nameWithArity := fmt.Sprintf("%s/%d", name, arity)
+
+					nameCol := strings.Index(line, name)
+					if nameCol < 0 {
+						nameCol = trimStart
+					}
+
+					entries = append(entries, symbolEntry{
+						symbol: protocol.DocumentSymbol{
+							Name:   nameWithArity,
+							Detail: "@" + kind,
+							Kind:   defKindToSymbolKind(kind),
+							Range: protocol.Range{
+								Start: protocol.Position{Line: uint32(lineIdx), Character: 0},
+								End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(len(line))},
+							},
+							SelectionRange: protocol.Range{
+								Start: protocol.Position{Line: uint32(lineIdx), Character: uint32(nameCol)},
+								End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(nameCol + len(name))},
+							},
+						},
+						module:    currentModule,
+						parentIdx: currentParentIdx(),
+					})
+				}
+			}
+			continue
+		}
+
+		// Lowercase letter — bare macro calls with do blocks (describe, test, setup, etc.)
+		if currentModule != "" && first >= 'a' && first <= 'z' {
+			trimmedRight := strings.TrimRight(rest, " \t\r")
+			if strings.HasSuffix(trimmedRight, " do") || strings.HasSuffix(trimmedRight, "\tdo") {
+				macroName := parser.ScanFuncName(rest)
+				if macroName != "" && !parser.IsElixirKeyword(macroName) {
+					afterName := rest[len(macroName):]
+					doIdx := strings.LastIndex(trimmedRight, " do")
+					if doIdx < 0 {
+						doIdx = strings.LastIndex(trimmedRight, "\tdo")
+					}
+					label := macroName
+					if doIdx > len(macroName) {
+						arg := strings.TrimSpace(afterName[:doIdx-len(macroName)])
+						if len(arg) >= 2 && arg[0] == '"' && arg[len(arg)-1] == '"' {
+							arg = arg[1 : len(arg)-1]
+						}
+						if arg != "" {
+							label = macroName + " " + arg
+						}
+					}
+
+					entryIdx := len(entries)
+					entries = append(entries, symbolEntry{
+						symbol: protocol.DocumentSymbol{
+							Name:   label,
+							Detail: macroName,
+							Kind:   protocol.SymbolKindFunction,
+							Range: protocol.Range{
+								Start: protocol.Position{Line: uint32(lineIdx), Character: 0},
+								End:   protocol.Position{Line: uint32(lastLine), Character: 0},
+							},
+							SelectionRange: protocol.Range{
+								Start: protocol.Position{Line: uint32(lineIdx), Character: uint32(trimStart)},
+								End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(trimStart + len(macroName))},
+							},
+						},
+						module:    currentModule,
+						parentIdx: currentParentIdx(),
+					})
+					funcStack = append(funcStack, blockFrame{indent: trimStart, entryIdx: entryIdx})
+				}
+			}
+		}
+	}
+
+	// Build hierarchical tree using parentIdx references.
+	// Process in reverse so children are attached before their parents are read.
+	type symNode struct {
+		sym      protocol.DocumentSymbol
+		children []int // indices of child entries
+	}
+	nodes := make([]symNode, len(entries))
+	for i, e := range entries {
+		nodes[i] = symNode{sym: e.symbol}
+	}
+
+	var rootIndices []int
+	for i, e := range entries {
+		if e.parentIdx >= 0 && e.parentIdx < len(nodes) {
+			nodes[e.parentIdx].children = append(nodes[e.parentIdx].children, i)
+		} else {
+			rootIndices = append(rootIndices, i)
+		}
+	}
+
+	var buildSymbol func(idx int) protocol.DocumentSymbol
+	buildSymbol = func(idx int) protocol.DocumentSymbol {
+		s := nodes[idx].sym
+		for _, childIdx := range nodes[idx].children {
+			s.Children = append(s.Children, buildSymbol(childIdx))
+		}
+		return s
+	}
+
+	var result []interface{}
+	for _, idx := range rootIndices {
+		result = append(result, buildSymbol(idx))
+	}
+	return result, nil
+}
+
+func defKindToSymbolKind(kind string) protocol.SymbolKind {
+	switch kind {
+	case "module", "defimpl":
+		return protocol.SymbolKindModule
+	case "defprotocol":
+		return protocol.SymbolKindInterface
+	case "def", "defp", "defmacro", "defmacrop", "defguard", "defguardp", "defdelegate":
+		return protocol.SymbolKindFunction
+	case "type", "typep", "opaque":
+		return protocol.SymbolKindTypeParameter
+	case "defstruct", "defexception":
+		return protocol.SymbolKindStruct
+	default:
+		return protocol.SymbolKindVariable
+	}
 }
 func (s *Server) ExecuteCommand(ctx context.Context, params *protocol.ExecuteCommandParams) (interface{}, error) {
 	return nil, nil
@@ -1428,7 +1815,40 @@ func (s *Server) SignatureHelp(ctx context.Context, params *protocol.SignatureHe
 	return nil, nil
 }
 func (s *Server) Symbols(ctx context.Context, params *protocol.WorkspaceSymbolParams) ([]protocol.SymbolInformation, error) {
-	return nil, nil
+	query := params.Query
+	if query == "" {
+		return nil, nil
+	}
+
+	results, err := s.store.SearchSymbols(query)
+	if err != nil {
+		return nil, err
+	}
+
+	var symbols []protocol.SymbolInformation
+	for _, r := range results {
+		if s.stdlibRoot != "" && strings.HasPrefix(r.FilePath, s.stdlibRoot) {
+			continue
+		}
+
+		name := r.Module
+		containerName := ""
+		if r.Function != "" {
+			name = fmt.Sprintf("%s.%s/%d", r.Module, r.Function, r.Arity)
+			containerName = r.Module
+		}
+
+		symbols = append(symbols, protocol.SymbolInformation{
+			Name: name,
+			Kind: defKindToSymbolKind(r.Kind),
+			Location: protocol.Location{
+				URI:   protocol.DocumentURI(uri.File(r.FilePath)),
+				Range: lineRange(r.Line - 1),
+			},
+			ContainerName: containerName,
+		})
+	}
+	return symbols, nil
 }
 func (s *Server) TypeDefinition(ctx context.Context, params *protocol.TypeDefinitionParams) ([]protocol.Location, error) {
 	return nil, nil

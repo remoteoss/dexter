@@ -908,3 +908,136 @@ func TestOpenCorruptedDB(t *testing.T) {
 		t.Fatal("expected Open to fail on a corrupted DB file, got nil")
 	}
 }
+
+func TestSearchSymbols(t *testing.T) {
+	s, dir := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	path := writeElixirFile(t, dir, "lib/accounts.ex", `defmodule MyApp.Accounts do
+  def list_users, do: []
+  def create_user(attrs), do: attrs
+  defp validate(attrs), do: attrs
+end
+`)
+	defs, _, err := parser.ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IndexFile(path, defs); err != nil {
+		t.Fatal(err)
+	}
+
+	path2 := writeElixirFile(t, dir, "lib/users.ex", `defmodule MyApp.Users do
+  def get_user(id), do: nil
+end
+`)
+	defs2, _, err := parser.ParseFile(path2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IndexFile(path2, defs2); err != nil {
+		t.Fatal(err)
+	}
+
+	// Search by module name
+	results, err := s.SearchSymbols("Accounts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundModule := false
+	for _, r := range results {
+		if r.Module == "MyApp.Accounts" && r.Function == "" {
+			foundModule = true
+		}
+	}
+	if !foundModule {
+		t.Error("expected to find MyApp.Accounts module")
+	}
+
+	// Search by function name
+	results, err = s.SearchSymbols("list_users")
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundFunc := false
+	for _, r := range results {
+		if r.Function == "list_users" {
+			foundFunc = true
+			if r.Module != "MyApp.Accounts" {
+				t.Errorf("expected module MyApp.Accounts, got %q", r.Module)
+			}
+		}
+	}
+	if !foundFunc {
+		t.Error("expected to find list_users function")
+	}
+
+	// Search matching both modules and functions
+	results, err = s.SearchSymbols("user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) == 0 {
+		t.Error("expected results for 'user' query")
+	}
+
+	// Verify private functions are included
+	results, err = s.SearchSymbols("validate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundPrivate := false
+	for _, r := range results {
+		if r.Function == "validate" {
+			foundPrivate = true
+		}
+	}
+	if !foundPrivate {
+		t.Error("expected to find private function 'validate'")
+	}
+
+	// Search by partial qualified name: "Accounts.list_users" should match MyApp.Accounts.list_users
+	results, err = s.SearchSymbols("Accounts.list_users")
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundQualified := false
+	for _, r := range results {
+		if r.Module == "MyApp.Accounts" && r.Function == "list_users" {
+			foundQualified = true
+		}
+	}
+	if !foundQualified {
+		t.Error("expected to find list_users via compound query 'Accounts.list_users'")
+	}
+
+	// Case-insensitive: "accounts.list_users" should still find the function
+	results, err = s.SearchSymbols("accounts.list_users")
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundCaseInsensitive := false
+	for _, r := range results {
+		if r.Module == "MyApp.Accounts" && r.Function == "list_users" {
+			foundCaseInsensitive = true
+		}
+	}
+	if !foundCaseInsensitive {
+		t.Error("expected case-insensitive match for 'accounts.list_users'")
+	}
+
+	// Dotted module-only query "MyApp.Accounts" should still find the module
+	results, err = s.SearchSymbols("MyApp.Accounts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundModuleOnly := false
+	for _, r := range results {
+		if r.Module == "MyApp.Accounts" && r.Function == "" {
+			foundModuleOnly = true
+		}
+	}
+	if !foundModuleOnly {
+		t.Error("expected to find MyApp.Accounts module via dotted module query")
+	}
+}

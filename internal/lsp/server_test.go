@@ -2,6 +2,7 @@ package lsp
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1375,5 +1376,707 @@ func TestDetectElixirStdlibRoot(t *testing.T) {
 	enumPath := filepath.Join(root, "elixir", "lib", "enum.ex")
 	if _, err := os.Stat(enumPath); os.IsNotExist(err) {
 		t.Errorf("expected stdlib enum.ex at %s", enumPath)
+	}
+}
+
+// === DocumentSymbol tests ===
+
+func documentSymbols(t *testing.T, server *Server, docURI string) []protocol.DocumentSymbol {
+	t.Helper()
+	result, err := server.DocumentSymbol(context.Background(), &protocol.DocumentSymbolParams{
+		TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(docURI)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var symbols []protocol.DocumentSymbol
+	for _, item := range result {
+		if sym, ok := item.(protocol.DocumentSymbol); ok {
+			symbols = append(symbols, sym)
+		}
+	}
+	return symbols
+}
+
+func findSymbol(symbols []protocol.DocumentSymbol, name string) *protocol.DocumentSymbol {
+	for i := range symbols {
+		if symbols[i].Name == name {
+			return &symbols[i]
+		}
+		if found := findSymbol(symbols[i].Children, name); found != nil {
+			return found
+		}
+	}
+	return nil
+}
+
+func collectNames(symbols []protocol.DocumentSymbol) []string {
+	var names []string
+	for _, s := range symbols {
+		names = append(names, s.Name)
+	}
+	return names
+}
+
+func TestDocumentSymbol_BasicModule(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule MyApp.Accounts do
+  @type status :: :active | :inactive
+
+  defstruct [:name, :email]
+
+  def list_users do
+    []
+  end
+
+  defp format_user(user) do
+    user
+  end
+
+  defmacro is_admin(user) do
+    quote do: unquote(user).role == :admin
+  end
+
+  @opaque internal_state :: map()
+
+  defdelegate create(params), to: MyApp.Creator
+end
+`
+	docURI := "file:///test/accounts.ex"
+	server.docs.Set(docURI, content)
+
+	symbols := documentSymbols(t, server, docURI)
+
+	if len(symbols) != 1 {
+		t.Fatalf("expected 1 top-level symbol, got %d", len(symbols))
+	}
+
+	mod := symbols[0]
+	if mod.Name != "MyApp.Accounts" {
+		t.Errorf("expected module name MyApp.Accounts, got %q", mod.Name)
+	}
+	if mod.Kind != protocol.SymbolKindModule {
+		t.Errorf("expected Module kind, got %v", mod.Kind)
+	}
+	if mod.Detail != "defmodule" {
+		t.Errorf("expected defmodule detail, got %q", mod.Detail)
+	}
+
+	childNames := collectNames(mod.Children)
+	expectedChildren := []string{"status/0", "defstruct", "list_users/0", "format_user/1", "is_admin/1", "internal_state/0", "create/1"}
+	if len(childNames) != len(expectedChildren) {
+		t.Fatalf("expected %d children, got %d: %v", len(expectedChildren), len(childNames), childNames)
+	}
+	for i, name := range expectedChildren {
+		if childNames[i] != name {
+			t.Errorf("child %d: expected %q, got %q", i, name, childNames[i])
+		}
+	}
+
+	// Verify kinds
+	if s := findSymbol(symbols, "status/0"); s != nil && s.Kind != protocol.SymbolKindTypeParameter {
+		t.Errorf("expected TypeParameter for @type, got %v", s.Kind)
+	}
+	if s := findSymbol(symbols, "defstruct"); s != nil && s.Kind != protocol.SymbolKindStruct {
+		t.Errorf("expected Struct for defstruct, got %v", s.Kind)
+	}
+	if s := findSymbol(symbols, "list_users/0"); s != nil && s.Kind != protocol.SymbolKindFunction {
+		t.Errorf("expected Function for def, got %v", s.Kind)
+	}
+	if s := findSymbol(symbols, "list_users/0"); s != nil && s.Detail != "def" {
+		t.Errorf("expected def detail, got %q", s.Detail)
+	}
+	if s := findSymbol(symbols, "format_user/1"); s != nil && s.Detail != "defp" {
+		t.Errorf("expected defp detail, got %q", s.Detail)
+	}
+	if s := findSymbol(symbols, "is_admin/1"); s != nil && s.Detail != "defmacro" {
+		t.Errorf("expected defmacro detail, got %q", s.Detail)
+	}
+}
+
+func TestDocumentSymbol_NestedModules(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule MyApp.Parent do
+  def parent_func, do: :ok
+
+  defmodule Child do
+    def child_func, do: :ok
+
+    defmodule GrandChild do
+      def grandchild_func, do: :ok
+    end
+  end
+end
+`
+	docURI := "file:///test/nested.ex"
+	server.docs.Set(docURI, content)
+
+	symbols := documentSymbols(t, server, docURI)
+	if len(symbols) != 1 {
+		t.Fatalf("expected 1 top-level, got %d", len(symbols))
+	}
+
+	parent := symbols[0]
+	if parent.Name != "MyApp.Parent" {
+		t.Errorf("expected MyApp.Parent, got %q", parent.Name)
+	}
+
+	// Parent should have parent_func and Child as children
+	childNames := collectNames(parent.Children)
+	if len(childNames) != 2 {
+		t.Fatalf("expected 2 children of Parent, got %d: %v", len(childNames), childNames)
+	}
+	if childNames[0] != "parent_func/0" {
+		t.Errorf("expected parent_func/0, got %q", childNames[0])
+	}
+	if childNames[1] != "Child" {
+		t.Errorf("expected Child, got %q", childNames[1])
+	}
+
+	// Child should have child_func and GrandChild
+	child := findSymbol(parent.Children, "Child")
+	if child == nil {
+		t.Fatal("Child not found")
+	}
+	grandChild := findSymbol(child.Children, "GrandChild")
+	if grandChild == nil {
+		t.Fatal("GrandChild not found")
+	}
+	if findSymbol(grandChild.Children, "grandchild_func/0") == nil {
+		t.Error("grandchild_func/0 not found in GrandChild")
+	}
+}
+
+func TestDocumentSymbol_FunctionBodyRanges(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule MyApp do
+  def multi_line(x) do
+    x + 1
+  end
+
+  def inline(x), do: x
+end
+`
+	docURI := "file:///test/ranges.ex"
+	server.docs.Set(docURI, content)
+
+	symbols := documentSymbols(t, server, docURI)
+	mod := symbols[0]
+
+	multiLine := findSymbol(mod.Children, "multi_line/1")
+	if multiLine == nil {
+		t.Fatal("multi_line/1 not found")
+	}
+	// multi_line should span from def line to end line (lines 1-3, 0-based)
+	if multiLine.Range.Start.Line != 1 {
+		t.Errorf("multi_line start line: expected 1, got %d", multiLine.Range.Start.Line)
+	}
+	if multiLine.Range.End.Line != 3 {
+		t.Errorf("multi_line end line: expected 3, got %d", multiLine.Range.End.Line)
+	}
+
+	inline := findSymbol(mod.Children, "inline/1")
+	if inline == nil {
+		t.Fatal("inline/1 not found")
+	}
+	// inline should be single-line (line 5, 0-based)
+	if inline.Range.Start.Line != 5 {
+		t.Errorf("inline start line: expected 5, got %d", inline.Range.Start.Line)
+	}
+	if inline.Range.End.Line != 5 {
+		t.Errorf("inline end line: expected 5, got %d", inline.Range.End.Line)
+	}
+}
+
+func TestDocumentSymbol_SelectionRangeContainedInRange(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule MyApp.Accounts do
+  def list_users do
+    []
+  end
+
+  defmodule Permissions do
+    def can_edit?(user) do
+      true
+    end
+  end
+end
+`
+	docURI := "file:///test/contained.ex"
+	server.docs.Set(docURI, content)
+
+	symbols := documentSymbols(t, server, docURI)
+
+	var checkContainment func(syms []protocol.DocumentSymbol, path string)
+	checkContainment = func(syms []protocol.DocumentSymbol, path string) {
+		for _, s := range syms {
+			fullPath := path + "/" + s.Name
+			r := s.Range
+			sr := s.SelectionRange
+
+			if sr.Start.Line < r.Start.Line || sr.End.Line > r.End.Line {
+				t.Errorf("%s: selectionRange lines [%d-%d] not within range lines [%d-%d]",
+					fullPath, sr.Start.Line, sr.End.Line, r.Start.Line, r.End.Line)
+			}
+			if sr.Start.Line == r.Start.Line && sr.Start.Character < r.Start.Character {
+				t.Errorf("%s: selectionRange start char %d before range start char %d",
+					fullPath, sr.Start.Character, r.Start.Character)
+			}
+			if sr.End.Line == r.End.Line && sr.End.Character > r.End.Character {
+				t.Errorf("%s: selectionRange end char %d after range end char %d",
+					fullPath, sr.End.Character, r.End.Character)
+			}
+			checkContainment(s.Children, fullPath)
+		}
+	}
+	checkContainment(symbols, "")
+}
+
+func TestDocumentSymbol_DescribeTestBlocks(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule MyAppTest do
+  use ExUnit.Case
+
+  describe "user creation" do
+    setup do
+      {:ok, user: build(:user)}
+    end
+
+    test "creates a valid user" do
+      assert true
+    end
+
+    test "fails with invalid data" do
+      assert true
+    end
+  end
+
+  defp build_user(attrs) do
+    Map.merge(%{name: "test"}, attrs)
+  end
+
+  describe "user deletion" do
+    test "deletes user" do
+      assert true
+    end
+  end
+end
+`
+	docURI := "file:///test/my_test.exs"
+	server.docs.Set(docURI, content)
+
+	symbols := documentSymbols(t, server, docURI)
+	mod := symbols[0]
+
+	// Should have 2 describe blocks + 1 defp as direct children of the module
+	describes := []protocol.DocumentSymbol{}
+	var privateFn *protocol.DocumentSymbol
+	for i, c := range mod.Children {
+		if c.Detail == "describe" {
+			describes = append(describes, c)
+		}
+		if c.Detail == "defp" {
+			privateFn = &mod.Children[i]
+		}
+	}
+	if len(describes) != 2 {
+		t.Fatalf("expected 2 describe blocks, got %d", len(describes))
+	}
+	if privateFn == nil {
+		t.Fatal("expected defp build_user/1 as direct child of module")
+	}
+	if privateFn.Name != "build_user/1" {
+		t.Errorf("expected build_user/1, got %q", privateFn.Name)
+	}
+
+	// Verify ordering: first describe, then defp, then second describe
+	childNames := collectNames(mod.Children)
+	if len(childNames) != 3 {
+		t.Fatalf("expected 3 direct children of module, got %d: %v", len(childNames), childNames)
+	}
+	if childNames[0] != "describe user creation" {
+		t.Errorf("expected first child 'describe user creation', got %q", childNames[0])
+	}
+	if childNames[1] != "build_user/1" {
+		t.Errorf("expected second child 'build_user/1', got %q", childNames[1])
+	}
+	if childNames[2] != "describe user deletion" {
+		t.Errorf("expected third child 'describe user deletion', got %q", childNames[2])
+	}
+
+	// First describe should have setup + 2 tests as children
+	desc1 := describes[0]
+	if desc1.Name != "describe user creation" {
+		t.Errorf("expected 'describe user creation', got %q", desc1.Name)
+	}
+	if len(desc1.Children) != 3 {
+		t.Fatalf("expected 3 children in first describe, got %d: %v", len(desc1.Children), collectNames(desc1.Children))
+	}
+
+	// Verify setup is a child
+	if desc1.Children[0].Detail != "setup" {
+		t.Errorf("expected setup as first child, got %q", desc1.Children[0].Detail)
+	}
+	// Verify tests are children
+	if desc1.Children[1].Detail != "test" {
+		t.Errorf("expected test as second child, got detail=%q", desc1.Children[1].Detail)
+	}
+
+	// Second describe should have 1 test
+	desc2 := describes[1]
+	if len(desc2.Children) != 1 {
+		t.Fatalf("expected 1 child in second describe, got %d", len(desc2.Children))
+	}
+}
+
+func TestDocumentSymbol_BrokenCode(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule MyApp.InProgress do
+  def completed_func(x) do
+    x + 1
+  end
+
+  def half_written_func(
+
+  defp another_complete(y) do
+    y * 2
+  end
+`
+	docURI := "file:///test/broken.ex"
+	server.docs.Set(docURI, content)
+
+	symbols := documentSymbols(t, server, docURI)
+	if len(symbols) != 1 {
+		t.Fatalf("expected 1 top-level symbol even with broken code, got %d", len(symbols))
+	}
+
+	mod := symbols[0]
+	names := collectNames(mod.Children)
+	// Should still find all three functions despite the broken one
+	if len(names) < 2 {
+		t.Errorf("expected at least 2 children from broken file, got %d: %v", len(names), names)
+	}
+	if findSymbol(mod.Children, "completed_func/1") == nil {
+		t.Error("completed_func/1 should still be found in broken code")
+	}
+	if findSymbol(mod.Children, "another_complete/1") == nil {
+		t.Error("another_complete/1 should still be found in broken code")
+	}
+}
+
+func TestDocumentSymbol_Protocol(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defprotocol Printable do
+  @spec to_string(t) :: String.t()
+  def to_string(data)
+end
+`
+	docURI := "file:///test/protocol.ex"
+	server.docs.Set(docURI, content)
+
+	symbols := documentSymbols(t, server, docURI)
+	if len(symbols) != 1 {
+		t.Fatalf("expected 1 symbol, got %d", len(symbols))
+	}
+	if symbols[0].Kind != protocol.SymbolKindInterface {
+		t.Errorf("expected Interface kind for defprotocol, got %v", symbols[0].Kind)
+	}
+}
+
+func TestDocumentSymbol_EmptyFile(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	server.docs.Set("file:///test/empty.ex", "")
+	symbols := documentSymbols(t, server, "file:///test/empty.ex")
+	if len(symbols) != 0 {
+		t.Errorf("expected 0 symbols for empty file, got %d", len(symbols))
+	}
+}
+
+func TestDocumentSymbol_UnopenedFile(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	symbols := documentSymbols(t, server, "file:///test/nonexistent.ex")
+	if len(symbols) != 0 {
+		t.Errorf("expected 0 symbols for unopened file, got %d", len(symbols))
+	}
+}
+
+// === Workspace Symbol tests ===
+
+func workspaceSymbols(t *testing.T, server *Server, query string) []protocol.SymbolInformation {
+	t.Helper()
+	result, err := server.Symbols(context.Background(), &protocol.WorkspaceSymbolParams{
+		Query: query,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func TestWorkspaceSymbol_SearchModules(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", `defmodule MyApp.Accounts do
+  def list_users, do: []
+end
+`)
+	indexFile(t, server.store, server.projectRoot, "lib/users.ex", `defmodule MyApp.Users do
+  def get(id), do: nil
+end
+`)
+
+	results := workspaceSymbols(t, server, "Accounts")
+	found := false
+	for _, r := range results {
+		if r.Name == "MyApp.Accounts" {
+			found = true
+			if r.Kind != protocol.SymbolKindModule {
+				t.Errorf("expected Module kind, got %v", r.Kind)
+			}
+			break
+		}
+	}
+	if !found {
+		t.Error("expected to find MyApp.Accounts in results")
+	}
+
+	// Should not find Users when searching for Accounts
+	for _, r := range results {
+		if strings.Contains(r.Name, "Users") && !strings.Contains(r.Name, "Accounts") {
+			t.Errorf("unexpected result %q when searching for Accounts", r.Name)
+		}
+	}
+}
+
+func TestWorkspaceSymbol_SearchFunctions(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", `defmodule MyApp.Accounts do
+  def list_users, do: []
+  def create_user(attrs), do: attrs
+end
+`)
+
+	results := workspaceSymbols(t, server, "list_users")
+	found := false
+	for _, r := range results {
+		if strings.Contains(r.Name, "list_users") {
+			found = true
+			if r.Kind != protocol.SymbolKindFunction {
+				t.Errorf("expected Function kind, got %v", r.Kind)
+			}
+			if r.ContainerName != "MyApp.Accounts" {
+				t.Errorf("expected container MyApp.Accounts, got %q", r.ContainerName)
+			}
+			break
+		}
+	}
+	if !found {
+		t.Error("expected to find list_users in results")
+	}
+}
+
+func TestWorkspaceSymbol_EmptyQuery(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/foo.ex", `defmodule MyApp.Foo do
+  def bar, do: :ok
+end
+`)
+
+	results := workspaceSymbols(t, server, "")
+	if len(results) != 0 {
+		t.Errorf("expected 0 results for empty query, got %d", len(results))
+	}
+}
+
+func TestWorkspaceSymbol_ExcludesStdlib(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Simulate stdlib by setting stdlibRoot and indexing a file under it
+	stdlibDir := filepath.Join(server.projectRoot, "stdlib")
+	server.stdlibRoot = stdlibDir
+
+	indexFile(t, server.store, server.projectRoot, "stdlib/elixir/lib/enum.ex", `defmodule Enum do
+  def map(list, fun), do: list
+end
+`)
+	indexFile(t, server.store, server.projectRoot, "lib/my_enum.ex", `defmodule MyEnum do
+  def my_map(list), do: list
+end
+`)
+
+	results := workspaceSymbols(t, server, "Enum")
+	for _, r := range results {
+		if r.Name == "Enum" {
+			t.Error("stdlib module Enum should be excluded from workspace symbols")
+		}
+	}
+
+	// But MyEnum should be found
+	found := false
+	for _, r := range results {
+		if r.Name == "MyEnum" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected to find MyEnum in results")
+	}
+}
+
+func TestWorkspaceSymbol_LocationIsCorrect(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", `defmodule MyApp.Accounts do
+  def list_users, do: []
+end
+`)
+
+	results := workspaceSymbols(t, server, "list_users")
+	for _, r := range results {
+		if strings.Contains(r.Name, "list_users") {
+			expectedPath := filepath.Join(server.projectRoot, "lib", "accounts.ex")
+			gotPath := uri.URI(r.Location.URI).Filename()
+			if gotPath != expectedPath {
+				t.Errorf("expected path %q, got %q", expectedPath, gotPath)
+			}
+			// list_users is on line 2 (1-indexed) = line 1 (0-indexed)
+			if r.Location.Range.Start.Line != 1 {
+				t.Errorf("expected line 1, got %d", r.Location.Range.Start.Line)
+			}
+			return
+		}
+	}
+	t.Error("list_users not found in results")
+}
+
+func TestWorkspaceSymbol_KindMapping(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/kinds.ex", `defmodule MyApp.Kinds do
+  @type my_type :: atom()
+  defstruct [:field]
+  def my_func, do: :ok
+  defmacro my_macro, do: :ok
+end
+`)
+	indexFile(t, server.store, server.projectRoot, "lib/my_protocol.ex", `defprotocol MyApp.MyProtocol do
+  def to_string(data)
+end
+`)
+
+	tests := []struct {
+		query    string
+		expected protocol.SymbolKind
+	}{
+		{"MyApp.Kinds", protocol.SymbolKindModule},
+		{"my_type", protocol.SymbolKindTypeParameter},
+		{"__struct__", protocol.SymbolKindStruct},
+		{"my_func", protocol.SymbolKindFunction},
+		{"my_macro", protocol.SymbolKindFunction},
+		{"MyApp.MyProtocol", protocol.SymbolKindInterface},
+	}
+
+	for _, tt := range tests {
+		results := workspaceSymbols(t, server, tt.query)
+		found := false
+		for _, r := range results {
+			if strings.Contains(r.Name, tt.query) {
+				found = true
+				if r.Kind != tt.expected {
+					t.Errorf("query %q: expected kind %v, got %v", tt.query, tt.expected, r.Kind)
+				}
+				break
+			}
+		}
+		if !found {
+			names := []string{}
+			for _, r := range results {
+				names = append(names, r.Name)
+			}
+			t.Errorf("query %q: not found in results: %v", tt.query, names)
+		}
+	}
+}
+
+func TestDocumentSymbol_NameWithArity(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule MyApp do
+  def zero_arity, do: :ok
+  def one_arity(a), do: a
+  def two_arity(a, b), do: {a, b}
+  def default_args(a, b \\ nil), do: {a, b}
+end
+`
+	docURI := "file:///test/arity.ex"
+	server.docs.Set(docURI, content)
+
+	symbols := documentSymbols(t, server, docURI)
+	mod := symbols[0]
+
+	expected := map[string]bool{
+		"zero_arity/0":   true,
+		"one_arity/1":    true,
+		"two_arity/2":    true,
+		"default_args/2": true,
+	}
+
+	for _, c := range mod.Children {
+		if !expected[c.Name] {
+			t.Errorf("unexpected symbol %q", c.Name)
+		}
+		delete(expected, c.Name)
+	}
+	for name := range expected {
+		t.Errorf("missing expected symbol %q", name)
+	}
+}
+
+// Verify capabilities are advertised
+func TestServer_Capabilities_DocumentSymbolAndWorkspaceSymbol(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	result, err := server.Initialize(context.Background(), &protocol.InitializeParams{
+		RootURI: protocol.DocumentURI(fmt.Sprintf("file://%s", server.projectRoot)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	caps := result.Capabilities
+	if caps.DocumentSymbolProvider != true {
+		t.Error("DocumentSymbolProvider should be true")
+	}
+	if caps.WorkspaceSymbolProvider != true {
+		t.Error("WorkspaceSymbolProvider should be true")
 	}
 }

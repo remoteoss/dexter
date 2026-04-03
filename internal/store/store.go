@@ -604,6 +604,48 @@ func (s *Store) ListCallerModulesForFunction(function string) ([]string, error) 
 	return modules, rows.Err()
 }
 
+func (s *Store) SearchSymbols(query string) ([]CompletionResult, error) {
+	var (
+		rows *sql.Rows
+		err  error
+	)
+
+	// When the query contains a dot, split at the last dot. The prefix must
+	// match the module and the suffix is matched against both the function name
+	// and the module (covering "Accounts.fetch_user" → function match and
+	// "MyApp.Accounts" → module match). SQLite LIKE is case-insensitive for
+	// ASCII so "accounts.fetch_user" and "Accounts.fetch_user" both work.
+	if dotIndex := strings.LastIndex(query, "."); dotIndex != -1 {
+		modulePart := "%" + query[:dotIndex] + "%"
+		suffixPart := "%" + query[dotIndex+1:] + "%"
+		rows, err = s.db.Query(
+			"SELECT module, function, arity, kind, file_path, line FROM definitions WHERE module LIKE ? AND (function LIKE ? OR module LIKE ?) ORDER BY module, function LIMIT 200",
+			modulePart, suffixPart, suffixPart,
+		)
+	} else {
+		pattern := "%" + query + "%"
+		rows, err = s.db.Query(
+			"SELECT module, function, arity, kind, file_path, line FROM definitions WHERE (module LIKE ? OR function LIKE ?) ORDER BY module, function LIMIT 200",
+			pattern, pattern,
+		)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var results []CompletionResult
+	for rows.Next() {
+		var r CompletionResult
+		if err := rows.Scan(&r.Module, &r.Function, &r.Arity, &r.Kind, &r.FilePath, &r.Line); err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	return results, rows.Err()
+}
+
 func (s *Store) LookupFollowDelegate(module, function string) ([]LookupResult, error) {
 	results, err := s.LookupFunction(module, function)
 	if err != nil {

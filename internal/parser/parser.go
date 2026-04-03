@@ -23,6 +23,12 @@ var (
 	newStatementRe = regexp.MustCompile(`^\s*(defdelegate|defp?|defmacrop?|defguardp?|alias|import|@|end)\b`)
 )
 
+// IsElixirKeyword returns true if the name is an Elixir language keyword
+// (control flow or definition keyword) rather than a user-defined macro.
+func IsElixirKeyword(name string) bool {
+	return elixirKeyword[name]
+}
+
 // elixirKeyword is the set of Elixir language constructs that take do blocks
 // but are NOT user-defined macros — excluded from bare macro call tracking.
 var elixirKeyword = map[string]bool{
@@ -128,7 +134,7 @@ func ParseFile(path string) ([]Definition, []Reference, error) {
 		if first == 'a' {
 			if strings.HasPrefix(rest, "alias") && len(rest) > 5 && (rest[5] == ' ' || rest[5] == '\t') {
 				afterAlias := strings.TrimLeft(rest[5:], " \t")
-				moduleName := scanModuleName(afterAlias)
+				moduleName := ScanModuleName(afterAlias)
 				if moduleName != "" {
 					remaining := afterAlias[len(moduleName):]
 					remaining = strings.TrimLeft(remaining, " \t")
@@ -177,7 +183,7 @@ func ParseFile(path string) ([]Definition, []Reference, error) {
 		if first == 'i' {
 			if strings.HasPrefix(rest, "import") && len(rest) > 6 && (rest[6] == ' ' || rest[6] == '\t') {
 				afterImport := strings.TrimLeft(rest[6:], " \t")
-				moduleName := scanModuleName(afterImport)
+				moduleName := ScanModuleName(afterImport)
 				if moduleName != "" {
 					resolved := resolveModule(moduleName, currentModule)
 					if !strings.Contains(resolved, "__MODULE__") {
@@ -194,7 +200,7 @@ func ParseFile(path string) ([]Definition, []Reference, error) {
 		if first == 'u' {
 			if strings.HasPrefix(rest, "use") && len(rest) > 3 && (rest[3] == ' ' || rest[3] == '\t') {
 				afterUse := strings.TrimLeft(rest[3:], " \t")
-				moduleName := scanModuleName(afterUse)
+				moduleName := ScanModuleName(afterUse)
 				if moduleName != "" {
 					resolved := resolveModule(moduleName, currentModule)
 					if !strings.Contains(resolved, "__MODULE__") {
@@ -223,7 +229,7 @@ func ParseFile(path string) ([]Definition, []Reference, error) {
 					afterKw = strings.TrimLeft(rest[7:], " \t")
 				}
 				if kind != "" {
-					name := scanFuncName(afterKw)
+					name := ScanFuncName(afterKw)
 					if name != "" {
 						defs = append(defs, Definition{
 							Module:   currentModule,
@@ -281,7 +287,7 @@ func ParseFile(path string) ([]Definition, []Reference, error) {
 			}
 
 			if currentModule != "" {
-				if kind, funcName, ok := scanFuncDef(rest); ok {
+				if kind, funcName, ok := ScanFuncDef(rest); ok {
 					def := Definition{
 						Module:   currentModule,
 						Function: funcName,
@@ -327,7 +333,7 @@ func ParseFile(path string) ([]Definition, []Reference, error) {
 			trimmedRest := strings.TrimRight(rest, " \t\r")
 			if strings.HasSuffix(trimmedRest, " do") || strings.HasSuffix(trimmedRest, "\tdo") {
 				// Macro call with do block: embedded_schema do, schema "t" do, test "x" do
-				name := scanFuncName(rest)
+				name := ScanFuncName(rest)
 				if name != "" && !elixirKeyword[name] {
 					for mod := range injectors {
 						refs = append(refs, Reference{Module: mod, Function: name, Line: lineNum, FilePath: path, Kind: "call"})
@@ -335,7 +341,7 @@ func ParseFile(path string) ([]Definition, []Reference, error) {
 				}
 			} else {
 				// DSL call at line start: field :name, :string  or  cast(struct, params)
-				name := scanFuncName(rest)
+				name := ScanFuncName(rest)
 				if name != "" && !elixirKeyword[name] {
 					after := rest[len(name):]
 					if len(after) > 0 && (after[0] == '(' || (after[0] == ' ' && len(after) > 1 && after[1] == ':')) {
@@ -347,7 +353,7 @@ func ParseFile(path string) ([]Definition, []Reference, error) {
 				// Pipe call: |> cast_embed(:jobs), |> validate_required(...)
 				if idx := strings.Index(rest, "|>"); idx >= 0 {
 					afterPipe := strings.TrimLeft(rest[idx+2:], " \t")
-					name := scanFuncName(afterPipe)
+					name := ScanFuncName(afterPipe)
 					if name != "" && !elixirKeyword[name] {
 						for mod := range injectors {
 							refs = append(refs, Reference{Module: mod, Function: name, Line: lineNum, FilePath: path, Kind: "call"})
@@ -400,8 +406,8 @@ func ParseFile(path string) ([]Definition, []Reference, error) {
 	return defs, refs, nil
 }
 
-// scanModuleName reads a module name ([A-Za-z0-9_.]+) from the start of s.
-func scanModuleName(s string) string {
+// ScanModuleName reads a module name ([A-Za-z0-9_.]+) from the start of s.
+func ScanModuleName(s string) string {
 	i := 0
 	for i < len(s) {
 		c := s[i]
@@ -417,8 +423,8 @@ func scanModuleName(s string) string {
 	return s[:i]
 }
 
-// scanFuncName reads a function/type name ([a-z_][a-z0-9_?!]*) from the start of s.
-func scanFuncName(s string) string {
+// ScanFuncName reads a function/type name ([a-z_][a-z0-9_?!]*) from the start of s.
+func ScanFuncName(s string) string {
 	if len(s) == 0 {
 		return ""
 	}
@@ -466,7 +472,7 @@ func scanDefKeyword(rest, keyword string) (string, bool) {
 		return "", false
 	}
 	after = strings.TrimLeft(after, " \t")
-	name := scanModuleName(after)
+	name := ScanModuleName(after)
 	if name == "" {
 		return "", false
 	}
@@ -492,9 +498,9 @@ var funcDefKeywords = []string{
 	"def",
 }
 
-// scanFuncDef checks if rest matches a function definition keyword followed by
+// ScanFuncDef checks if rest matches a function definition keyword followed by
 // whitespace and a function name. Returns the kind, name, and true if matched.
-func scanFuncDef(rest string) (string, string, bool) {
+func ScanFuncDef(rest string) (string, string, bool) {
 	for _, kw := range funcDefKeywords {
 		if !strings.HasPrefix(rest, kw) {
 			continue
@@ -505,7 +511,7 @@ func scanFuncDef(rest string) (string, string, bool) {
 			continue
 		}
 		after = strings.TrimLeft(after, " \t")
-		name := scanFuncName(after)
+		name := ScanFuncName(after)
 		if name == "" {
 			continue
 		}
