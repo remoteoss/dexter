@@ -8,6 +8,7 @@ test:
 
 lint:
 	golangci-lint run ./...
+	go mod tidy && git diff --exit-code go.mod go.sum
 
 release:
 	@if [ -z "$(VERSION)" ]; then echo "Usage: make release VERSION=0.2.0"; exit 1; fi

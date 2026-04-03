@@ -62,4 +62,5 @@ dexter init --force --profile /path/to/elixir/project
 - Keep the CLI commands (`init`, `reindex`, `lookup`) working independently of the LSP server
 - Parser tests should cover real-world Elixir patterns from large codebases
 - Integration tests scaffold a fake Elixir project with `mix.exs` and verify end-to-end behavior
+- Always use fake/generic module names in tests (e.g. `MyApp.Accounts`, `SharedLib.Worker`), never real module names from the user's codebase, even when writing regression tests for bugs found in real code
 - Version strings (`Version` and `IndexVersion`) live in `internal/version/version.go`

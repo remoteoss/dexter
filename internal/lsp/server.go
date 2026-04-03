@@ -1,6 +1,7 @@
 package lsp
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -22,6 +23,7 @@ import (
 	"gitlab.com/remote-com/employ-starbase/dexter/internal/parser"
 	"gitlab.com/remote-com/employ-starbase/dexter/internal/stdlib"
 	"gitlab.com/remote-com/employ-starbase/dexter/internal/store"
+	"gitlab.com/remote-com/employ-starbase/dexter/internal/treesitter"
 	"gitlab.com/remote-com/employ-starbase/dexter/internal/version"
 )
 
@@ -49,12 +51,25 @@ type Server struct {
 
 	usingCache   map[string]*usingCacheEntry // module name → parsed __using__ result
 	usingCacheMu sync.RWMutex
+
+	depsCache   map[string]bool // dir → whether files in that dir are deps
+	depsCacheMu sync.RWMutex
+
+	conn                  jsonrpc2.Conn // raw connection for server-initiated requests not on the Client interface
+	showDocumentSupported bool          // client supports window/showDocument (LSP 3.16+)
 }
 
 func (s *Server) debugf(format string, args ...interface{}) {
 	if s.debug {
 		log.Printf("[debug] "+format, args...)
 	}
+}
+
+func (s *Server) debugNow() time.Time {
+	if s.debug {
+		return time.Now()
+	}
+	return time.Time{}
 }
 
 func NewServer(s *store.Store, projectRoot string) *Server {
@@ -65,6 +80,7 @@ func NewServer(s *store.Store, projectRoot string) *Server {
 		explicitRoot:    projectRoot != "",
 		followDelegates: true,
 		usingCache:      make(map[string]*usingCacheEntry),
+		depsCache:       make(map[string]bool),
 	}
 }
 
@@ -83,6 +99,7 @@ func Serve(in io.Reader, out io.Writer, s *store.Store, projectRoot string) erro
 	stream := jsonrpc2.NewStream(stdinoutCloser{in, out})
 	conn := jsonrpc2.NewConn(stream)
 	server.client = protocol.ClientDispatcher(conn, logger)
+	server.conn = conn
 
 	handler := protocol.ServerHandler(server, nil)
 	ctx := context.Background()
@@ -144,13 +161,12 @@ func (s *Server) backgroundReindex() {
 			})
 		}
 
-		walkAndIndex(s.projectRoot, true)
-
+		// Index stdlib first (definitions only).
 		if s.stdlibRoot != "" {
-			// Skip reference indexing for stdlib — we only need definitions
-			// from stdlib, and references within stdlib are not useful to users.
 			walkAndIndex(s.stdlibRoot, false)
 		}
+
+		walkAndIndex(s.projectRoot, true)
 
 		// Prune store entries for files no longer on disk
 		if storedPaths, err := s.store.ListFilePaths(); err == nil {
@@ -273,6 +289,10 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 		s.periodicReindex()
 	}
 
+	if params.Capabilities.Window != nil && params.Capabilities.Window.ShowDocument != nil {
+		s.showDocumentSupported = params.Capabilities.Window.ShowDocument.Support
+	}
+
 	return &protocol.InitializeResult{
 		Capabilities: protocol.ServerCapabilities{
 			TextDocumentSync: protocol.TextDocumentSyncOptions{
@@ -287,6 +307,8 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 			HoverProvider:           true,
 			DocumentSymbolProvider:  true,
 			WorkspaceSymbolProvider: true,
+			RenameProvider:          &protocol.RenameOptions{PrepareProvider: true},
+			CallHierarchyProvider:   true,
 			CompletionProvider: &protocol.CompletionOptions{
 				TriggerCharacters: []string{"."},
 				ResolveProvider:   true,
@@ -364,6 +386,7 @@ func (s *Server) DidSave(ctx context.Context, params *protocol.DidSaveTextDocume
 			log.Printf("Error parsing %s: %v", path, err)
 			return
 		}
+
 		if err := s.store.IndexFileWithRefs(path, defs, refs); err != nil {
 			log.Printf("Error indexing %s: %v", path, err)
 		}
@@ -376,6 +399,11 @@ func (s *Server) DidSave(ctx context.Context, params *protocol.DidSaveTextDocume
 
 func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionParams) ([]protocol.Location, error) {
 	docURI := string(params.TextDocument.URI)
+	if s.debug {
+		t0 := time.Now()
+		s.debugf("Definition request: uri=%s line=%d col=%d", docURI, params.Position.Line, params.Position.Character)
+		defer func() { s.debugf("Definition: total %s", time.Since(t0).Round(time.Microsecond)) }()
+	}
 
 	text, ok := s.docs.Get(docURI)
 	if !ok {
@@ -420,10 +448,19 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 	moduleRef, functionName := ExtractModuleAndFunction(expr)
 	aliases := ExtractAliases(text)
 
-	// Bare function call — check local buffer, then imports
+	// Bare identifier — check variable first (cheap tree-sitter lookup), then functions
 	if moduleRef == "" {
 		if functionName == "" {
 			return nil, nil
+		}
+
+		// Variable go-to-definition via tree-sitter.
+		// The first occurrence in scope is the definition (pattern/assignment).
+		if occs := treesitter.FindVariableOccurrences([]byte(text), uint(lineNum), uint(col)); len(occs) > 0 {
+			return []protocol.Location{{
+				URI:   params.TextDocument.URI,
+				Range: lineRange(int(occs[0].Line)),
+			}}, nil
 		}
 
 		// Check current buffer first
@@ -492,6 +529,11 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 			results, err = s.store.LookupFunction(fullModule, functionName)
 		}
 		if err == nil && len(results) > 0 {
+			return storeResultsToLocations(results), nil
+		}
+		// Not directly defined — the function may have been injected by a
+		// `use` macro in fullModule's source (e.g. Oban.Worker injects `new`).
+		if results := s.lookupThroughUseOf(fullModule, functionName); len(results) > 0 {
 			return storeResultsToLocations(results), nil
 		}
 	}
@@ -733,6 +775,18 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 		for _, usedModule := range ExtractUses(text) {
 			s.addCompletionsFromUsing(resolveModule(usedModule, aliases), funcPrefix, seen, &items, visitedCompletion)
 		}
+
+		// Variables in scope via tree-sitter
+		for _, varName := range treesitter.FindVariablesInScope([]byte(text), uint(lineNum), uint(col)) {
+			if strings.HasPrefix(varName, funcPrefix) && !seen[varName] {
+				seen[varName] = true
+				items = append(items, protocol.CompletionItem{
+					Label:  varName,
+					Kind:   protocol.CompletionItemKindVariable,
+					Detail: "variable",
+				})
+			}
+		}
 	}
 
 	if len(items) == 0 {
@@ -802,6 +856,21 @@ func (s *Server) parseUsingFile(filePath string) *usingCacheEntry {
 		inlineDefs: inlineDefs,
 		transUses:  transUses,
 	}
+}
+
+// lookupThroughUseOf looks up functionName through the `use` declarations in
+// fullModule's source file. This handles qualified calls like M.func() where
+// func is not defined directly in M but is injected by a macro M uses.
+func (s *Server) lookupThroughUseOf(fullModule, functionName string) []store.LookupResult {
+	modResults, err := s.store.LookupModule(fullModule)
+	if err != nil || len(modResults) == 0 {
+		return nil
+	}
+	fileText, _, ok := s.readFileText(modResults[0].FilePath)
+	if !ok {
+		return nil
+	}
+	return s.lookupThroughUse(fileText, functionName, ExtractAliases(fileText))
 }
 
 // lookupThroughUse searches for functionName in definitions injected by `use`
@@ -988,6 +1057,25 @@ func (s *Server) addCompletionsFromUsing(moduleName, funcPrefix string, seen map
 	}
 }
 
+// resolveBareFunctionModule finds the module that defines a bare function name
+// by checking imports, use chains, the current module, and Kernel (in order).
+func (s *Server) resolveBareFunctionModule(text string, lines []string, functionName string) string {
+	imports := ExtractImports(text)
+	for _, mod := range imports {
+		if results, err := s.store.LookupFunction(mod, functionName); err == nil && len(results) > 0 {
+			return mod
+		}
+	}
+	for _, l := range lines {
+		if m := parser.DefmoduleRe.FindStringSubmatch(l); m != nil {
+			if results, err := s.store.LookupFunction(m[1], functionName); err == nil && len(results) > 0 {
+				return m[1]
+			}
+		}
+	}
+	return ""
+}
+
 func resolveModule(moduleRef string, aliases map[string]string) string {
 	if resolved, ok := aliases[moduleRef]; ok {
 		return resolved
@@ -1023,6 +1111,8 @@ func kindToCompletionItemKind(kind string) protocol.CompletionItemKind {
 	switch kind {
 	case "module", "defprotocol":
 		return protocol.CompletionItemKindModule
+	case "type", "typep", "opaque":
+		return protocol.CompletionItemKindTypeParameter
 	default:
 		return protocol.CompletionItemKindFunction
 	}
@@ -1096,6 +1186,7 @@ func (s *Server) DidChangeWatchedFiles(ctx context.Context, params *protocol.Did
 					log.Printf("Error parsing %s: %v", filePath, err)
 					return
 				}
+
 				if err := s.store.IndexFileWithRefs(filePath, defs, refs); err != nil {
 					log.Printf("Error indexing %s: %v", filePath, err)
 				}
@@ -1189,14 +1280,12 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 		first := line[trimStart]
 		rest := line[trimStart:]
 
-		// Fast first-character dispatch — only 'd', 'e', '@', and lowercase
-		// letters (bare macro calls) can start a symbol-producing line.
-		// Everything else is skipped with zero further work.
+		// Fast first-character dispatch
 		if first != 'd' && first != 'e' && first != '@' && (first < 'a' || first > 'z') {
 			continue
 		}
 
-		// 'e' — pop stacks on "end", patch the symbol's Range.End
+		// 'e' — pop stacks on "end"
 		if first == 'e' {
 			if len(rest) >= 3 && rest[0] == 'e' && rest[1] == 'n' && rest[2] == 'd' &&
 				(len(rest) == 3 || rest[3] == ' ' || rest[3] == '\t' || rest[3] == '\r') {
@@ -1221,7 +1310,6 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 		}
 
 		// 'd' — defmodule/defprotocol/defimpl/def*/defstruct/defexception
-		// Lines starting with 'd' that aren't "def*" fall through to bare macro handling.
 		if first == 'd' && strings.HasPrefix(rest, "def") {
 
 			// Try module-level keywords first, ordered by frequency
@@ -1365,7 +1453,7 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 			continue
 		}
 
-		// '@' — type definitions (@type, @typep, @opaque)
+		// '@' — type definitions and @behaviour refs
 		if first == '@' {
 			if currentModule == "" {
 				continue
@@ -1415,7 +1503,7 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 			continue
 		}
 
-		// Lowercase letter — bare macro calls with do blocks (describe, test, setup, etc.)
+		// Bare macro calls with do blocks (describe, test, setup, etc.)
 		if currentModule != "" && first >= 'a' && first <= 'z' {
 			trimmedRight := strings.TrimRight(rest, " \t\r")
 			if strings.HasSuffix(trimmedRight, " do") || strings.HasSuffix(trimmedRight, "\tdo") {
@@ -1619,6 +1707,108 @@ func (s *Server) OnTypeFormatting(ctx context.Context, params *protocol.Document
 	return nil, nil
 }
 func (s *Server) PrepareRename(ctx context.Context, params *protocol.PrepareRenameParams) (*protocol.Range, error) {
+	docURI := string(params.TextDocument.URI)
+	text, ok := s.docs.Get(docURI)
+	if !ok {
+		return nil, nil
+	}
+
+	lines := strings.Split(text, "\n")
+	lineNum := int(params.Position.Line)
+	col := int(params.Position.Character)
+	if lineNum >= len(lines) {
+		return nil, nil
+	}
+
+	// Try module/function rename first via the index
+	expr, exprStart := extractExpressionBounds(lines[lineNum], col)
+	if expr != "" {
+		moduleRef, functionName := ExtractModuleAndFunction(expr)
+		aliases := ExtractAliases(text)
+
+		var tokenName string
+		var fullModule string
+		found := false
+
+		if functionName != "" {
+			tokenName = functionName
+			if moduleRef != "" {
+				fullModule = resolveModule(moduleRef, aliases)
+			} else {
+				fullModule = s.resolveBareFunctionModule(text, lines, functionName)
+			}
+			found = fullModule != ""
+		} else if moduleRef != "" {
+			tokenName = moduleLastSegment(moduleRef)
+			fullModule = resolveModule(moduleRef, aliases)
+			if defResults, err := s.store.LookupModule(fullModule); err == nil && len(defResults) > 0 {
+				found = true
+			}
+		}
+
+		if found {
+			// Reject stdlib and dependency symbols
+			var defPaths []string
+			if functionName != "" {
+				if results, err := s.store.LookupFunction(fullModule, functionName); err == nil {
+					for _, r := range results {
+						defPaths = append(defPaths, r.FilePath)
+					}
+				}
+				// Not directly defined — check if injected via fullModule's use chain
+				// (e.g. Oban.Worker injects `new`). Block rename if from a dep.
+				if len(defPaths) == 0 {
+					for _, r := range s.lookupThroughUseOf(fullModule, functionName) {
+						defPaths = append(defPaths, r.FilePath)
+					}
+				}
+			} else {
+				if results, err := s.store.LookupModule(fullModule); err == nil {
+					for _, r := range results {
+						defPaths = append(defPaths, r.FilePath)
+					}
+				}
+			}
+			hasFirstPartyDef := false
+			for _, p := range defPaths {
+				if (s.stdlibRoot != "" && strings.HasPrefix(p, s.stdlibRoot)) || s.isDepsFile(p) {
+					continue
+				}
+				hasFirstPartyDef = true
+				break
+			}
+			if len(defPaths) > 0 && !hasFirstPartyDef {
+				return nil, nil
+			}
+
+			exprInLine := lines[lineNum][exprStart:]
+			tokenOffset := findTokenColumn(exprInLine, tokenName)
+			if tokenOffset >= 0 {
+				tokenStart := exprStart + tokenOffset
+				return &protocol.Range{
+					Start: protocol.Position{Line: uint32(lineNum), Character: uint32(tokenStart)},
+					End:   protocol.Position{Line: uint32(lineNum), Character: uint32(tokenStart + len(tokenName))},
+				}, nil
+			}
+		}
+	}
+
+	// Not a known module/function — try variable rename via tree-sitter
+	if occs := treesitter.FindVariableOccurrences([]byte(text), uint(lineNum), uint(col)); len(occs) > 0 {
+		for _, occ := range occs {
+			if occ.Line == uint(lineNum) && uint(col) >= occ.StartCol && uint(col) < occ.EndCol {
+				return &protocol.Range{
+					Start: protocol.Position{Line: uint32(occ.Line), Character: uint32(occ.StartCol)},
+					End:   protocol.Position{Line: uint32(occ.Line), Character: uint32(occ.EndCol)},
+				}, nil
+			}
+		}
+		return &protocol.Range{
+			Start: protocol.Position{Line: uint32(occs[0].Line), Character: uint32(occs[0].StartCol)},
+			End:   protocol.Position{Line: uint32(occs[0].Line), Character: uint32(occs[0].EndCol)},
+		}, nil
+	}
+
 	return nil, nil
 }
 func (s *Server) RangeFormatting(ctx context.Context, params *protocol.DocumentRangeFormattingParams) ([]protocol.TextEdit, error) {
@@ -1626,7 +1816,11 @@ func (s *Server) RangeFormatting(ctx context.Context, params *protocol.DocumentR
 }
 func (s *Server) References(ctx context.Context, params *protocol.ReferenceParams) ([]protocol.Location, error) {
 	docURI := string(params.TextDocument.URI)
-	s.debugf("References request: uri=%s line=%d col=%d", docURI, params.Position.Line, params.Position.Character)
+	if s.debug {
+		t := time.Now()
+		s.debugf("References request: uri=%s line=%d col=%d", docURI, params.Position.Line, params.Position.Character)
+		defer func() { s.debugf("References: total %s", time.Since(t).Round(time.Microsecond)) }()
+	}
 
 	text, ok := s.docs.Get(docURI)
 	if !ok {
@@ -1731,22 +1925,26 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 		s.debugf("References: resolved module %q -> %q", moduleRef, fullModule)
 	}
 
-	t0 := time.Now()
 	s.debugf("References: looking up refs for %s.%s", fullModule, functionName)
+	tStep := s.debugNow()
 	refResults, err := s.store.LookupReferences(fullModule, functionName)
 	if err != nil {
 		s.debugf("References: store error: %v", err)
 		return nil, nil
 	}
-	s.debugf("References: direct lookup: %d results (%s)", len(refResults), time.Since(t0).Round(time.Microsecond))
+	if s.debug {
+		s.debugf("References: direct lookup: %d results (%s)", len(refResults), time.Since(tStep).Round(time.Microsecond))
+	}
 
 	// Also find refs attributed to modules whose __using__ transitively imports
 	// fullModule — following both direct imports and transitive use chains,
 	// matching the same logic as lookupInUsingEntry for go-to-definition.
 	if functionName != "" {
-		t1 := time.Now()
+		tStep = s.debugNow()
 		callerModules, err := s.store.ListCallerModulesForFunction(functionName)
-		s.debugf("References: ListCallerModulesForFunction: %d modules (%s)", len(callerModules), time.Since(t1).Round(time.Microsecond))
+		if s.debug {
+			s.debugf("References: ListCallerModulesForFunction: %d modules (%s)", len(callerModules), time.Since(tStep).Round(time.Microsecond))
+		}
 		if err == nil {
 			visited := make(map[string]bool)
 			for _, mod := range callerModules {
@@ -1763,7 +1961,37 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 			}
 		}
 	}
-	s.debugf("References: total lookup: %s", time.Since(t0).Round(time.Microsecond))
+
+	// Scan definition files for bare intra-module calls (not indexed in store)
+	if functionName != "" {
+		tStep = s.debugNow()
+		refResults = append(refResults, s.findBareCallRefs(fullModule, functionName)...)
+		if s.debug {
+			s.debugf("References: bare call scan (%s)", time.Since(tStep).Round(time.Microsecond))
+		}
+	}
+
+	// Follow defdelegate in reverse: if other modules delegate this function
+	// to fullModule, include refs to those delegating modules too.
+	if functionName != "" && s.followDelegates {
+		tStep = s.debugNow()
+		delegates, err := s.store.LookupDelegatesTo(fullModule, functionName)
+		if err == nil {
+			for _, del := range delegates {
+				// The facade function name may differ from the target if as: is used
+				facadeFunc := del.Function
+				delegateRefs, err := s.store.LookupReferences(del.Module, facadeFunc)
+				if err == nil {
+					refResults = append(refResults, delegateRefs...)
+					s.debugf("References: via delegate %s.%s: +%d results", del.Module, facadeFunc, len(delegateRefs))
+				}
+				refResults = append(refResults, s.findBareCallRefs(del.Module, facadeFunc)...)
+			}
+		}
+		if s.debug {
+			s.debugf("References: delegate follow (%s)", time.Since(tStep).Round(time.Microsecond))
+		}
+	}
 
 	// Deduplicate by file+line (multiple injector modules may attribute the same call)
 	type refKey struct {
@@ -1809,7 +2037,879 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 	return locations, nil
 }
 func (s *Server) Rename(ctx context.Context, params *protocol.RenameParams) (*protocol.WorkspaceEdit, error) {
+	docURI := string(params.TextDocument.URI)
+	text, ok := s.docs.Get(docURI)
+	if !ok {
+		return nil, nil
+	}
+
+	lines := strings.Split(text, "\n")
+	lineNum := int(params.Position.Line)
+	col := int(params.Position.Character)
+	if lineNum >= len(lines) {
+		return nil, nil
+	}
+
+	// Try module/function rename first via the index
+	expr, _ := extractExpressionBounds(lines[lineNum], col)
+	if expr != "" {
+		moduleRef, functionName := ExtractModuleAndFunction(expr)
+		aliases := ExtractAliases(text)
+
+		if functionName != "" {
+			var fullModule string
+			if moduleRef != "" {
+				fullModule = resolveModule(moduleRef, aliases)
+			} else {
+				fullModule = s.resolveBareFunctionModule(text, lines, functionName)
+			}
+			if fullModule != "" {
+				if !isValidFunctionName(params.NewName) {
+					return nil, fmt.Errorf("invalid function name %q: must match [a-z_][a-z0-9_?!]*", params.NewName)
+				}
+				return s.renameFunctionEdits(fullModule, functionName, params.NewName)
+			}
+		} else if moduleRef != "" {
+			fullModule := resolveModule(moduleRef, aliases)
+			if defResults, err := s.store.LookupModule(fullModule); err == nil && len(defResults) > 0 {
+				// PrepareRename highlights just the last segment, so the user's
+				// input replaces that segment. Prepend the parent namespace.
+				newModule := params.NewName
+				if dot := strings.LastIndex(fullModule, "."); dot >= 0 {
+					newModule = fullModule[:dot+1] + params.NewName
+				}
+				if !isValidModuleName(newModule) {
+					return nil, fmt.Errorf("invalid module name %q: must be CamelCase segments separated by dots", params.NewName)
+				}
+				return s.renameModuleEdits(ctx, fullModule, newModule, uriToPath(params.TextDocument.URI))
+			}
+		}
+	}
+
+	// Not a known module/function — try variable rename via tree-sitter
+	if occs := treesitter.FindVariableOccurrences([]byte(text), uint(lineNum), uint(col)); len(occs) > 0 {
+		changes := make(map[protocol.DocumentURI][]protocol.TextEdit)
+		for _, occ := range occs {
+			changes[protocol.DocumentURI(docURI)] = append(changes[protocol.DocumentURI(docURI)], protocol.TextEdit{
+				Range: protocol.Range{
+					Start: protocol.Position{Line: uint32(occ.Line), Character: uint32(occ.StartCol)},
+					End:   protocol.Position{Line: uint32(occ.Line), Character: uint32(occ.EndCol)},
+				},
+				NewText: params.NewName,
+			})
+		}
+		return &protocol.WorkspaceEdit{Changes: changes}, nil
+	}
+
 	return nil, nil
+}
+
+// renameFunctionEdits builds a WorkspaceEdit renaming all occurrences of
+// module.functionName to newName across the codebase.
+func (s *Server) renameFunctionEdits(module, functionName, newName string) (*protocol.WorkspaceEdit, error) {
+	// Collect all (filePath, lineNumber) pairs — definitions + references
+	seen := make(map[renameSite]bool)
+	var sites []renameSite
+
+	addSite := func(filePath string, line int) {
+		if s.stdlibRoot != "" && strings.HasPrefix(filePath, s.stdlibRoot) {
+			return
+		}
+		if s.isDepsFile(filePath) {
+			return
+		}
+		k := renameSite{filePath, line}
+		if !seen[k] {
+			seen[k] = true
+			sites = append(sites, k)
+		}
+	}
+
+	// Definition sites
+	defResults, err := s.store.LookupFunction(module, functionName)
+	if err != nil {
+		return nil, nil
+	}
+	for _, r := range defResults {
+		addSite(r.FilePath, r.Line)
+	}
+
+	// Direct reference sites (calls, imports — skip alias/use which are module-level)
+	refResults, err := s.store.LookupReferences(module, functionName)
+	if err != nil {
+		return nil, nil
+	}
+	for _, r := range refResults {
+		if r.Kind == "alias" || r.Kind == "use" {
+			continue
+		}
+		addSite(r.FilePath, r.Line)
+	}
+
+	// Transitive refs via __using__ chains
+	callerModules, err := s.store.ListCallerModulesForFunction(functionName)
+	if err == nil {
+		visited := make(map[string]bool)
+		for _, mod := range callerModules {
+			if mod == module {
+				continue
+			}
+			if s.usingChainImports(mod, module, visited) {
+				transitive, err := s.store.LookupReferences(mod, functionName)
+				if err == nil {
+					for _, r := range transitive {
+						if r.Kind == "alias" || r.Kind == "use" {
+							continue
+						}
+						addSite(r.FilePath, r.Line)
+					}
+				}
+			}
+		}
+	}
+
+	// Collect definition file paths for file-scanning passes below
+	defFilePaths := make(map[string]bool)
+	for _, r := range defResults {
+		defFilePaths[r.FilePath] = true
+	}
+
+	// Scan definition files for @spec/@callback lines and bare intra-module calls
+	// (none of these are indexed in the store).
+	specPrefix := "@spec " + functionName
+	callbackPrefix := "@callback " + functionName
+	for filePath := range defFilePaths {
+		fileText, _, ok := s.readFileText(filePath)
+		if !ok {
+			continue
+		}
+		// @spec and @callback lines
+		for i, line := range strings.Split(fileText, "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, specPrefix) {
+				rest := trimmed[len(specPrefix):]
+				if len(rest) == 0 || rest[0] == '(' || rest[0] == ' ' || rest[0] == '\t' {
+					addSite(filePath, i+1)
+				}
+			}
+			if strings.HasPrefix(trimmed, callbackPrefix) {
+				rest := trimmed[len(callbackPrefix):]
+				if len(rest) == 0 || rest[0] == '(' || rest[0] == ' ' || rest[0] == '\t' {
+					addSite(filePath, i+1)
+				}
+			}
+		}
+		// Bare calls: functionName(...) and |> functionName
+		for _, lineNum := range FindBareFunctionCalls(fileText, functionName) {
+			addSite(filePath, lineNum)
+		}
+	}
+
+	// Scan all files that import the module for `import Module, only: [functionName: N]` lines
+	importRefs, _ := s.store.LookupReferences(module, "")
+	for _, r := range importRefs {
+		if r.Kind != "import" {
+			continue
+		}
+		lineText, ok := s.getFileLine(r.FilePath, r.Line)
+		if !ok {
+			continue
+		}
+		if findTokenColumn(lineText, functionName) >= 0 {
+			addSite(r.FilePath, r.Line)
+		}
+	}
+
+	edit := s.buildTextEdits(sites, functionName, newName)
+
+	// Update defdelegate lines that forward to this function: add or update
+	// the `as:` option so the facade keeps working after the rename.
+	if s.followDelegates {
+		delegates, err := s.store.LookupDelegatesTo(module, functionName)
+		if err == nil {
+			for _, del := range delegates {
+				if s.stdlibRoot != "" && strings.HasPrefix(del.FilePath, s.stdlibRoot) {
+					continue
+				}
+				if s.isDepsFile(del.FilePath) {
+					continue
+				}
+				lineText, ok := s.getFileLine(del.FilePath, del.Line)
+				if !ok {
+					continue
+				}
+				updatedLine := updateDelegateAs(lineText, del.Function, newName)
+				if updatedLine == lineText {
+					continue
+				}
+				lineIdx := uint32(del.Line - 1)
+				fileURI := protocol.DocumentURI(uri.File(del.FilePath))
+
+				if _, open := s.docs.Get(string(uri.File(del.FilePath))); open {
+					if edit.Changes == nil {
+						edit.Changes = make(map[protocol.DocumentURI][]protocol.TextEdit)
+					}
+					edit.Changes[fileURI] = append(edit.Changes[fileURI], protocol.TextEdit{
+						Range: protocol.Range{
+							Start: protocol.Position{Line: lineIdx, Character: 0},
+							End:   protocol.Position{Line: lineIdx, Character: uint32(len(lineText))},
+						},
+						NewText: updatedLine,
+					})
+				} else {
+					// Closed file: read, replace the line, write back
+					fileText, _, ok := s.readFileText(del.FilePath)
+					if !ok {
+						continue
+					}
+					fileLines := strings.Split(fileText, "\n")
+					if del.Line-1 < len(fileLines) {
+						fileLines[del.Line-1] = updatedLine
+						_ = os.WriteFile(del.FilePath, []byte(strings.Join(fileLines, "\n")), 0644)
+					}
+				}
+			}
+		}
+	}
+
+	return edit, nil
+}
+
+// renameModuleEdits builds a WorkspaceEdit renaming oldModule to newModule,
+// including all submodules and their references.
+//
+// Files not currently open in the editor are written directly to disk in
+// parallel goroutines. Only open buffers are included in the returned
+// WorkspaceEdit, keeping the response small and avoiding editor freezes.
+// Files following the naming convention are also renamed/moved.
+func (s *Server) renameModuleEdits(ctx context.Context, oldModule, newModule, triggerFilePath string) (*protocol.WorkspaceEdit, error) {
+	mr := s.buildModuleRename(oldModule, newModule)
+	mr.collectSites()
+
+	fileCache := mr.readFiles()
+
+	movedFiles, showDocumentPath := mr.moveConventionalFiles(fileCache, triggerFilePath)
+	openChanges := mr.applyEdits(fileCache, movedFiles)
+	mr.reindex(fileCache, movedFiles)
+
+	if showDocumentPath != "" && s.showDocumentSupported && s.conn != nil {
+		showURI := protocol.URI(string(uri.File(showDocumentPath)))
+		go func() {
+			var result protocol.ShowDocumentResult
+			_ = protocol.Call(context.Background(), s.conn, "window/showDocument", &protocol.ShowDocumentParams{
+				URI:       showURI,
+				TakeFocus: true,
+			}, &result)
+		}()
+	}
+
+	return &protocol.WorkspaceEdit{Changes: openChanges}, nil
+}
+
+// moduleRename holds the state for a module rename operation.
+type moduleRename struct {
+	server            *Server
+	oldModule         string
+	newModule         string
+	moduleRenames     map[string]string // old module → new module
+	tokenReplacements map[string]string // old token → new token
+	allModuleDefs     []store.LookupResult
+	sitesByFile       map[string][]moduleEditSite
+}
+
+type moduleEditSite struct {
+	filePath string
+	line     int
+	token    string
+}
+
+type moduleFileInfo struct {
+	lines []string
+	open  bool
+}
+
+func (s *Server) buildModuleRename(oldModule, newModule string) *moduleRename {
+	moduleRenames := map[string]string{oldModule: newModule}
+	submodules, _ := s.store.ListSubmodules(oldModule)
+	for _, sub := range submodules {
+		moduleRenames[sub] = newModule + sub[len(oldModule):]
+	}
+
+	tokenReplacements := make(map[string]string, len(moduleRenames)*2)
+	for old, newName := range moduleRenames {
+		tokenReplacements[old] = newName
+		oldSeg := moduleLastSegment(old)
+		newSeg := moduleLastSegment(newName)
+		if _, exists := tokenReplacements[oldSeg]; !exists {
+			tokenReplacements[oldSeg] = newSeg
+		}
+	}
+
+	return &moduleRename{
+		server:            s,
+		oldModule:         oldModule,
+		newModule:         newModule,
+		moduleRenames:     moduleRenames,
+		tokenReplacements: tokenReplacements,
+		sitesByFile:       make(map[string][]moduleEditSite),
+	}
+}
+
+func (mr *moduleRename) isExcluded(filePath string) bool {
+	return (mr.server.stdlibRoot != "" && strings.HasPrefix(filePath, mr.server.stdlibRoot)) || mr.server.isDepsFile(filePath)
+}
+
+func (mr *moduleRename) collectSites() {
+	seen := make(map[string]bool)
+	addSite := func(filePath string, line int, token string) {
+		if mr.isExcluded(filePath) {
+			return
+		}
+		k := filePath + "\x00" + strconv.Itoa(line) + "\x00" + token
+		if !seen[k] {
+			seen[k] = true
+			mr.sitesByFile[filePath] = append(mr.sitesByFile[filePath], moduleEditSite{filePath, line, token})
+		}
+	}
+
+	// Definition sites
+	allModuleDefs, err := mr.server.store.LookupModulesByPrefix(mr.oldModule)
+	if err == nil {
+		for _, r := range allModuleDefs {
+			if _, ok := mr.moduleRenames[r.Module]; ok {
+				addSite(r.FilePath, r.Line, r.Module)
+			}
+		}
+	}
+	mr.allModuleDefs = allModuleDefs
+
+	// Reference sites
+	refs, err := mr.server.store.LookupReferencesByPrefix(mr.oldModule)
+	if err == nil {
+		for _, r := range refs {
+			if _, ok := mr.moduleRenames[r.Module]; !ok {
+				newMod := mr.newModule + r.Module[len(mr.oldModule):]
+				mr.moduleRenames[r.Module] = newMod
+				mr.tokenReplacements[r.Module] = newMod
+			}
+			addSite(r.FilePath, r.Line, r.Module)
+		}
+	}
+}
+
+func (mr *moduleRename) readFiles() map[string]moduleFileInfo {
+	type fileResult struct {
+		path  string
+		lines []string
+		open  bool
+	}
+	resultsCh := make(chan fileResult, len(mr.sitesByFile))
+	for fp := range mr.sitesByFile {
+		go func() {
+			text, open, ok := mr.server.readFileText(fp)
+			if ok {
+				resultsCh <- fileResult{fp, strings.Split(text, "\n"), open}
+			} else {
+				resultsCh <- fileResult{fp, nil, false}
+			}
+		}()
+	}
+	fileCache := make(map[string]moduleFileInfo, len(mr.sitesByFile))
+	for range mr.sitesByFile {
+		r := <-resultsCh
+		if r.lines != nil {
+			fileCache[r.path] = moduleFileInfo{r.lines, r.open}
+		}
+	}
+	return fileCache
+}
+
+// findModuleEdits finds token replacements on a single line, trying the full
+// qualified name first and falling back to progressively shorter dot-suffixes
+// to handle aliased forms.
+func (mr *moduleRename) findModuleEdits(lineText string, token string) []moduleEditResult {
+	newToken, ok := mr.tokenReplacements[token]
+	if !ok {
+		return nil
+	}
+	if cols := findAllTokenColumns(lineText, token); len(cols) > 0 {
+		var results []moduleEditResult
+		for _, col := range cols {
+			results = append(results, moduleEditResult{col, len(token), newToken})
+		}
+		return results
+	}
+	oldSuffix := token
+	newSuffix := newToken
+	for {
+		dotIdx := strings.IndexByte(oldSuffix, '.')
+		if dotIdx < 0 {
+			break
+		}
+		oldSuffix = oldSuffix[dotIdx+1:]
+		newDot := strings.IndexByte(newSuffix, '.')
+		if newDot < 0 {
+			break
+		}
+		newSuffix = newSuffix[newDot+1:]
+		if oldSuffix == newSuffix {
+			continue
+		}
+		if cols := findAllTokenColumns(lineText, oldSuffix); len(cols) > 0 {
+			var results []moduleEditResult
+			for _, col := range cols {
+				results = append(results, moduleEditResult{col, len(oldSuffix), newSuffix})
+			}
+			return results
+		}
+	}
+	return nil
+}
+
+type moduleEditResult struct {
+	col      int
+	length   int
+	newToken string
+}
+
+func (mr *moduleRename) applyEditsToLines(lines []string, sites []moduleEditSite) []string {
+	result := make([]string, len(lines))
+	copy(result, lines)
+	for _, es := range sites {
+		if es.line-1 >= len(result) {
+			continue
+		}
+		lineText := result[es.line-1]
+		edits := mr.findModuleEdits(lineText, es.token)
+		for i := len(edits) - 1; i >= 0; i-- {
+			e := edits[i]
+			lineText = lineText[:e.col] + e.newToken + lineText[e.col+e.length:]
+		}
+		result[es.line-1] = lineText
+	}
+	return result
+}
+
+func (mr *moduleRename) conventionalNewPath(r store.LookupResult) (string, bool) {
+	oldDirSeg := camelToSnake(moduleLastSegment(mr.oldModule))
+	newDirSeg := camelToSnake(moduleLastSegment(mr.newModule))
+
+	if r.Module == mr.oldModule {
+		if !fileMatchesModuleConvention(r.FilePath, mr.oldModule) {
+			return "", false
+		}
+		return conventionalNewPath(r.FilePath, mr.oldModule, mr.newModule), true
+	}
+	// Submodule: compute expected path suffix and check it matches
+	suffix := r.Module[len(mr.oldModule):]
+	segments := strings.Split(strings.TrimPrefix(suffix, "."), ".")
+	parts := make([]string, 0, len(segments)+1)
+	parts = append(parts, oldDirSeg)
+	for i, seg := range segments {
+		if i == len(segments)-1 {
+			parts = append(parts, camelToSnake(seg)+".ex")
+		} else {
+			parts = append(parts, camelToSnake(seg))
+		}
+	}
+	expectedSuffix := filepath.Join(parts...)
+	slashSuffix := string(os.PathSeparator) + filepath.FromSlash(expectedSuffix)
+	if !strings.HasSuffix(r.FilePath, slashSuffix) {
+		return "", false
+	}
+	newSuffix := newDirSeg + expectedSuffix[len(oldDirSeg):]
+	prefix := r.FilePath[:len(r.FilePath)-len(slashSuffix)+1]
+	return filepath.Join(prefix, filepath.FromSlash(newSuffix)), true
+}
+
+// moveConventionalFiles moves files that follow the naming convention to their
+// new paths, applying edits in the process. Returns moved files and the path
+// to show in the editor (if the trigger file was moved).
+func (mr *moduleRename) moveConventionalFiles(fileCache map[string]moduleFileInfo, triggerFilePath string) (movedFiles map[string]string, showDocumentPath string) {
+	movedFiles = make(map[string]string)
+	for _, r := range mr.allModuleDefs {
+		if _, ok := mr.moduleRenames[r.Module]; !ok {
+			continue
+		}
+		newPath, follows := mr.conventionalNewPath(r)
+		if !follows {
+			continue
+		}
+		fi, hasContent := fileCache[r.FilePath]
+		if !hasContent {
+			continue
+		}
+		updatedLines := mr.applyEditsToLines(fi.lines, mr.sitesByFile[r.FilePath])
+		content := strings.Join(updatedLines, "\n")
+
+		if err := os.MkdirAll(filepath.Dir(newPath), 0755); err != nil {
+			log.Printf("Rename: cannot create dir for %s: %v", newPath, err)
+			continue
+		}
+		if err := os.WriteFile(newPath, []byte(content), 0644); err != nil {
+			log.Printf("Rename: cannot write %s: %v", newPath, err)
+			continue
+		}
+		if err := os.Remove(r.FilePath); err != nil {
+			log.Printf("Rename: cannot remove %s: %v", r.FilePath, err)
+		}
+		mr.server.debugf("Rename: %s → %s", r.FilePath, newPath)
+		movedFiles[r.FilePath] = newPath
+
+		if r.Module == mr.oldModule && r.FilePath == triggerFilePath && showDocumentPath == "" {
+			showDocumentPath = newPath
+		}
+	}
+	return movedFiles, showDocumentPath
+}
+
+// applyEdits applies text edits to all non-moved files: open buffers get
+// TextEdits in the WorkspaceEdit, closed files are written directly to disk.
+func (mr *moduleRename) applyEdits(fileCache map[string]moduleFileInfo, movedFiles map[string]string) map[protocol.DocumentURI][]protocol.TextEdit {
+	openChanges := make(map[protocol.DocumentURI][]protocol.TextEdit)
+	var wg sync.WaitGroup
+
+	for fp, sites := range mr.sitesByFile {
+		if _, moved := movedFiles[fp]; moved {
+			continue
+		}
+		fi, ok := fileCache[fp]
+		if !ok {
+			continue
+		}
+		if fi.open {
+			fileURI := protocol.DocumentURI(uri.File(fp))
+			for _, es := range sites {
+				if es.line-1 >= len(fi.lines) {
+					continue
+				}
+				lineText := fi.lines[es.line-1]
+				for _, e := range mr.findModuleEdits(lineText, es.token) {
+					openChanges[fileURI] = append(openChanges[fileURI], protocol.TextEdit{
+						Range: protocol.Range{
+							Start: protocol.Position{Line: uint32(es.line - 1), Character: uint32(e.col)},
+							End:   protocol.Position{Line: uint32(es.line - 1), Character: uint32(e.col + e.length)},
+						},
+						NewText: e.newToken,
+					})
+				}
+			}
+		} else {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				updatedLines := mr.applyEditsToLines(fi.lines, sites)
+				if err := os.WriteFile(fp, []byte(strings.Join(updatedLines, "\n")), 0644); err != nil {
+					log.Printf("Rename: cannot write %s: %v", fp, err)
+				}
+			}()
+		}
+	}
+	wg.Wait()
+	return openChanges
+}
+
+// reindex re-parses all touched files asynchronously after the rename.
+func (mr *moduleRename) reindex(fileCache map[string]moduleFileInfo, movedFiles map[string]string) {
+	for oldPath := range movedFiles {
+		_ = mr.server.store.RemoveFile(oldPath)
+	}
+
+	var reindexPaths []string
+	for _, newPath := range movedFiles {
+		reindexPaths = append(reindexPaths, newPath)
+	}
+
+	type textReindex struct {
+		path string
+		text string
+	}
+	var openReindexes []textReindex
+	for fp := range mr.sitesByFile {
+		if _, moved := movedFiles[fp]; moved {
+			continue
+		}
+		fi, ok := fileCache[fp]
+		if !ok {
+			continue
+		}
+		if fi.open {
+			updatedLines := mr.applyEditsToLines(fi.lines, mr.sitesByFile[fp])
+			openReindexes = append(openReindexes, textReindex{fp, strings.Join(updatedLines, "\n")})
+		} else {
+			reindexPaths = append(reindexPaths, fp)
+		}
+	}
+
+	go func() {
+		mr.server.reindexPaths(reindexPaths)
+		for _, r := range openReindexes {
+			defs, refs, err := parser.ParseText(r.path, r.text)
+			if err != nil {
+				continue
+			}
+			_ = mr.server.store.IndexFileWithRefs(r.path, defs, refs)
+		}
+	}()
+}
+
+type renameSite struct {
+	filePath string
+	line     int
+}
+
+// buildTextEdits creates a WorkspaceEdit replacing all whole-token occurrences
+// of oldToken with newToken. Open buffers are returned in the WorkspaceEdit;
+// closed files are written directly to disk in parallel goroutines.
+func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string) *protocol.WorkspaceEdit {
+	// Group sites by file
+	sitesByFile := make(map[string][]renameSite, len(sites))
+	for _, site := range sites {
+		sitesByFile[site.filePath] = append(sitesByFile[site.filePath], site)
+	}
+
+	// Read all files in parallel, tracking whether each is open in the editor
+	type fileResult struct {
+		path  string
+		lines []string
+		open  bool
+	}
+	resultsCh := make(chan fileResult, len(sitesByFile))
+	for fp := range sitesByFile {
+		go func() {
+			text, open, ok := s.readFileText(fp)
+			if ok {
+				resultsCh <- fileResult{fp, strings.Split(text, "\n"), open}
+			} else {
+				resultsCh <- fileResult{fp, nil, false}
+			}
+		}()
+	}
+	type fileInfo struct {
+		lines []string
+		open  bool
+	}
+	fileCache := make(map[string]fileInfo, len(sitesByFile))
+	for range sitesByFile {
+		r := <-resultsCh
+		if r.lines != nil {
+			fileCache[r.path] = fileInfo{r.lines, r.open}
+		}
+	}
+
+	// applyTokenEdits applies right-to-left token replacements for the given
+	// sites, returning the updated lines. Shared by open and closed file paths.
+	applyTokenEdits := func(origLines []string, fileSites []renameSite) []string {
+		lines := make([]string, len(origLines))
+		copy(lines, origLines)
+		for _, site := range fileSites {
+			if site.line-1 >= len(lines) {
+				continue
+			}
+			lineText := lines[site.line-1]
+			cols := findAllTokenColumns(lineText, oldToken)
+			for i := len(cols) - 1; i >= 0; i-- {
+				lineText = lineText[:cols[i]] + newToken + lineText[cols[i]+len(oldToken):]
+			}
+			lines[site.line-1] = lineText
+		}
+		return lines
+	}
+
+	openChanges := make(map[protocol.DocumentURI][]protocol.TextEdit)
+	var wg sync.WaitGroup
+	var reindexPaths []string
+	type textReindex struct {
+		path string
+		text string
+	}
+	var openReindexes []textReindex
+
+	for fp, fileSites := range sitesByFile {
+		fi, ok := fileCache[fp]
+		if !ok {
+			continue
+		}
+
+		// Compute edits once for both TextEdits and reindexing
+		updatedLines := applyTokenEdits(fi.lines, fileSites)
+
+		if fi.open {
+			// Open buffer: build TextEdits for the editor AND capture updated
+			// text for reindexing (computed once, used for both purposes).
+			fileURI := protocol.DocumentURI(uri.File(fp))
+			for _, site := range fileSites {
+				if site.line-1 >= len(fi.lines) {
+					continue
+				}
+				lineText := fi.lines[site.line-1]
+				for _, col := range findAllTokenColumns(lineText, oldToken) {
+					openChanges[fileURI] = append(openChanges[fileURI], protocol.TextEdit{
+						Range: protocol.Range{
+							Start: protocol.Position{Line: uint32(site.line - 1), Character: uint32(col)},
+							End:   protocol.Position{Line: uint32(site.line - 1), Character: uint32(col + len(oldToken))},
+						},
+						NewText: newToken,
+					})
+				}
+			}
+			openReindexes = append(openReindexes, textReindex{fp, strings.Join(updatedLines, "\n")})
+		} else {
+			// Closed file: write to disk in parallel
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := os.WriteFile(fp, []byte(strings.Join(updatedLines, "\n")), 0644); err != nil {
+					log.Printf("Rename: cannot write %s: %v", fp, err)
+				}
+			}()
+			reindexPaths = append(reindexPaths, fp)
+		}
+	}
+	wg.Wait()
+
+	go func() {
+		s.reindexPaths(reindexPaths)
+		for _, r := range openReindexes {
+			defs, refs, err := parser.ParseText(r.path, r.text)
+			if err != nil {
+				continue
+			}
+			_ = s.store.IndexFileWithRefs(r.path, defs, refs)
+		}
+	}()
+
+	return &protocol.WorkspaceEdit{Changes: openChanges}
+}
+
+// reindexPaths re-parses and reindexes a specific set of files sequentially.
+// Used after rename to avoid a full project walk.
+func (s *Server) reindexPaths(paths []string) {
+	for _, fp := range paths {
+		defs, refs, err := parser.ParseFile(fp)
+		if err != nil {
+			continue
+		}
+
+		_ = s.store.IndexFileWithRefs(fp, defs, refs)
+	}
+	if len(paths) > 0 {
+		log.Printf("Rename: reindexed %d files", len(paths)) // intentionally always logged — useful for user feedback
+	}
+}
+
+// isDepsFile returns true if filePath lives under the deps/ directory of some
+// Mix project root (a directory containing mix.exs). It walks up from the
+// file, and for each mix.exs found checks whether the file falls under that
+// directory's deps/ subdirectory. Results are cached by directory so repeated
+// calls for files in the same folder are O(1).
+func (s *Server) isDepsFile(filePath string) bool {
+	dir := filepath.Dir(filePath)
+
+	if s.depsCache != nil {
+		s.depsCacheMu.RLock()
+		result, ok := s.depsCache[dir]
+		s.depsCacheMu.RUnlock()
+		if ok {
+			return result
+		}
+	}
+
+	result := isDepsFileUncached(filePath)
+
+	if s.depsCache != nil {
+		s.depsCacheMu.Lock()
+		s.depsCache[dir] = result
+		s.depsCacheMu.Unlock()
+	}
+	return result
+}
+
+func isDepsFileUncached(filePath string) bool {
+	sep := string(os.PathSeparator)
+	current := filepath.Dir(filePath)
+	for {
+		parent := filepath.Dir(current)
+		if _, err := os.Stat(filepath.Join(current, "mix.exs")); err == nil {
+			if strings.HasPrefix(filePath, filepath.Join(current, "deps")+sep) {
+				return true
+			}
+		}
+		if parent == current {
+			return false
+		}
+		current = parent
+	}
+}
+
+// readFileText returns the contents of filePath, preferring the in-memory
+// document store for open buffers. The second return indicates whether the
+// file is currently open in the editor.
+func (s *Server) readFileText(filePath string) (text string, open bool, ok bool) {
+	if t, found := s.docs.Get(string(uri.File(filePath))); found {
+		return t, true, true
+	}
+	if data, err := os.ReadFile(filePath); err == nil {
+		return string(data), false, true
+	}
+	return "", false, false
+}
+
+// getFileLine returns the text of line lineNum (1-based) from the file at
+// filePath, preferring the in-memory document store for open buffers.
+// For closed files, only reads up to the target line instead of the whole file.
+func (s *Server) getFileLine(filePath string, lineNum int) (string, bool) {
+	// Open buffer: split from in-memory text (already loaded, cheap)
+	if text, ok := s.docs.Get(string(uri.File(filePath))); ok {
+		lines := strings.Split(text, "\n")
+		if lineNum-1 < len(lines) {
+			return lines[lineNum-1], true
+		}
+		return "", false
+	}
+	// Closed file: scan only up to the target line
+	f, err := os.Open(filePath)
+	if err != nil {
+		return "", false
+	}
+	defer func() { _ = f.Close() }()
+	scanner := bufio.NewScanner(f)
+	current := 0
+	for scanner.Scan() {
+		current++
+		if current == lineNum {
+			return scanner.Text(), true
+		}
+	}
+	return "", false
+}
+
+// findBareCallRefs scans definition files for bare intra-module calls to
+// functionName (not indexed in the store) and returns them as ReferenceResults.
+func (s *Server) findBareCallRefs(module, functionName string) []store.ReferenceResult {
+	defResults, err := s.store.LookupFunction(module, functionName)
+	if err != nil {
+		return nil
+	}
+	defFilePaths := make(map[string]bool, len(defResults))
+	for _, r := range defResults {
+		defFilePaths[r.FilePath] = true
+	}
+	var refs []store.ReferenceResult
+	for filePath := range defFilePaths {
+		fileText, _, ok := s.readFileText(filePath)
+		if !ok {
+			continue
+		}
+		for _, lineNum := range FindBareFunctionCalls(fileText, functionName) {
+			refs = append(refs, store.ReferenceResult{
+				FilePath: filePath,
+				Line:     lineNum,
+				Kind:     "call",
+			})
+		}
+	}
+	return refs
 }
 func (s *Server) SignatureHelp(ctx context.Context, params *protocol.SignatureHelpParams) (*protocol.SignatureHelp, error) {
 	return nil, nil
@@ -1820,17 +2920,13 @@ func (s *Server) Symbols(ctx context.Context, params *protocol.WorkspaceSymbolPa
 		return nil, nil
 	}
 
-	results, err := s.store.SearchSymbols(query)
+	results, err := s.store.SearchSymbols(query, s.stdlibRoot)
 	if err != nil {
 		return nil, err
 	}
 
 	var symbols []protocol.SymbolInformation
 	for _, r := range results {
-		if s.stdlibRoot != "" && strings.HasPrefix(r.FilePath, s.stdlibRoot) {
-			continue
-		}
-
 		name := r.Module
 		containerName := ""
 		if r.Function != "" {
@@ -1882,11 +2978,158 @@ func (s *Server) DidDeleteFiles(ctx context.Context, params *protocol.DeleteFile
 }
 func (s *Server) CodeLensRefresh(ctx context.Context) error { return nil }
 func (s *Server) PrepareCallHierarchy(ctx context.Context, params *protocol.CallHierarchyPrepareParams) ([]protocol.CallHierarchyItem, error) {
-	return nil, nil
+	docURI := string(params.TextDocument.URI)
+	text, ok := s.docs.Get(docURI)
+	if !ok {
+		return nil, nil
+	}
+
+	lines := strings.Split(text, "\n")
+	lineNum := int(params.Position.Line)
+	col := int(params.Position.Character)
+	if lineNum >= len(lines) {
+		return nil, nil
+	}
+
+	expr := ExtractExpression(lines[lineNum], col)
+	if expr == "" {
+		return nil, nil
+	}
+
+	moduleRef, functionName := ExtractModuleAndFunction(expr)
+	if functionName == "" {
+		return nil, nil
+	}
+
+	aliases := ExtractAliases(text)
+	var fullModule string
+	if moduleRef != "" {
+		fullModule = resolveModule(moduleRef, aliases)
+	} else {
+		fullModule = s.resolveBareFunctionModule(text, lines, functionName)
+	}
+	if fullModule == "" {
+		return nil, nil
+	}
+
+	defResults, err := s.store.LookupFunction(fullModule, functionName)
+	if err != nil || len(defResults) == 0 {
+		return nil, nil
+	}
+
+	r := defResults[0]
+	nameCol := 0
+	if defLine, ok := s.getFileLine(r.FilePath, r.Line); ok {
+		if col := findTokenColumn(defLine, functionName); col >= 0 {
+			nameCol = col
+		}
+	}
+
+	item := protocol.CallHierarchyItem{
+		Name:   fmt.Sprintf("%s.%s/%d", fullModule, functionName, parser.ExtractArity(lines[lineNum], functionName)),
+		Kind:   protocol.SymbolKindFunction,
+		Detail: r.Kind,
+		URI:    protocol.DocumentURI(uri.File(r.FilePath)),
+		Range:  lineRange(r.Line - 1),
+		SelectionRange: protocol.Range{
+			Start: protocol.Position{Line: uint32(r.Line - 1), Character: uint32(nameCol)},
+			End:   protocol.Position{Line: uint32(r.Line - 1), Character: uint32(nameCol + len(functionName))},
+		},
+		Data: map[string]string{"module": fullModule, "function": functionName},
+	}
+	return []protocol.CallHierarchyItem{item}, nil
 }
+
 func (s *Server) IncomingCalls(ctx context.Context, params *protocol.CallHierarchyIncomingCallsParams) ([]protocol.CallHierarchyIncomingCall, error) {
-	return nil, nil
+	data, ok := params.Item.Data.(map[string]interface{})
+	if !ok {
+		return nil, nil
+	}
+	module, _ := data["module"].(string)
+	functionName, _ := data["function"].(string)
+	if module == "" || functionName == "" {
+		return nil, nil
+	}
+
+	// Reuse the same ref collection as References
+	refResults, err := s.store.LookupReferences(module, functionName)
+	if err != nil {
+		return nil, nil
+	}
+
+	// Transitive refs via __using__ chains
+	if callerModules, err := s.store.ListCallerModulesForFunction(functionName); err == nil {
+		visited := make(map[string]bool)
+		for _, mod := range callerModules {
+			if mod == module {
+				continue
+			}
+			if s.usingChainImports(mod, module, visited) {
+				if transitive, err := s.store.LookupReferences(mod, functionName); err == nil {
+					refResults = append(refResults, transitive...)
+				}
+			}
+		}
+	}
+
+	// Scan definition files for bare intra-module calls (not indexed in store)
+	refResults = append(refResults, s.findBareCallRefs(module, functionName)...)
+
+	// Dedup and build incoming calls
+	type refKey struct {
+		filePath string
+		line     int
+	}
+	seen := make(map[refKey]bool)
+	var calls []protocol.CallHierarchyIncomingCall
+
+	for _, r := range refResults {
+		if s.stdlibRoot != "" && strings.HasPrefix(r.FilePath, s.stdlibRoot) {
+			continue
+		}
+		k := refKey{r.FilePath, r.Line}
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+
+		// Find the enclosing function for this call site
+		callerMod, callerFunc, callerArity, callerLine, found := s.store.LookupEnclosingFunction(r.FilePath, r.Line)
+		if !found {
+			continue
+		}
+
+		nameCol := 0
+		if defLine, ok := s.getFileLine(r.FilePath, callerLine); ok {
+			if col := findTokenColumn(defLine, callerFunc); col >= 0 {
+				nameCol = col
+			}
+		}
+
+		fromItem := protocol.CallHierarchyItem{
+			Name:  fmt.Sprintf("%s.%s/%d", callerMod, callerFunc, callerArity),
+			Kind:  protocol.SymbolKindFunction,
+			URI:   protocol.DocumentURI(uri.File(r.FilePath)),
+			Range: lineRange(callerLine - 1),
+			SelectionRange: protocol.Range{
+				Start: protocol.Position{Line: uint32(callerLine - 1), Character: uint32(nameCol)},
+				End:   protocol.Position{Line: uint32(callerLine - 1), Character: uint32(nameCol + len(callerFunc))},
+			},
+			Data: map[string]string{"module": callerMod, "function": callerFunc},
+		}
+
+		// The call range is the ref line itself
+		callRange := lineRange(r.Line - 1)
+
+		calls = append(calls, protocol.CallHierarchyIncomingCall{
+			From:       fromItem,
+			FromRanges: []protocol.Range{callRange},
+		})
+	}
+
+	return calls, nil
 }
+
 func (s *Server) OutgoingCalls(ctx context.Context, params *protocol.CallHierarchyOutgoingCallsParams) ([]protocol.CallHierarchyOutgoingCall, error) {
 	return nil, nil
 }

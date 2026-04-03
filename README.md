@@ -124,7 +124,8 @@ make install   # for Cursor, or make install-vscode for VSCode
 - **Delegate following** — `defdelegate fetch(id), to: MyApp.Repo` jumps to `MyApp.Repo.fetch`, respecting `as:` renames
 - **Local buffer search** — private function calls resolve without leaving the current file
 - **All def forms** — `def`, `defp`, `defmacro`, `defmacrop`, `defguard`, `defguardp`, `defdelegate`, `defprotocol`, `defimpl`, `defstruct`, `defexception`
-- **Type definitions** — `@type`, `@typep`, and `@opaque` are indexed for go-to-definition and hover
+- **Type definitions** — `@type` and `@opaque` are indexed for go-to-definition, hover, and autocompletion
+- **Variable support** — go-to-definition and autocompletion for local variables via tree-sitter, with correct scoping across `case`, `with`, `for`, and other block constructs
 - **Heredoc awareness** — code examples in `@moduledoc`/`@doc` are skipped
 - **Module nesting** — correctly tracks `end` keywords to attribute functions to the right module
 - **Git branch detection** — automatically reindexes when you switch branches
@@ -142,6 +143,9 @@ dexter init ~/code/my-elixir-project
 
 # Re-init from scratch (deletes existing index)
 dexter init --force ~/code/my-elixir-project
+
+# Print timing breakdown for each indexing phase (walk, parse, store)
+dexter init --profile ~/code/my-elixir-project
 ```
 
 Dexter auto-detects your Elixir installation. If it can't find it (e.g. a non-standard install), set:
@@ -208,12 +212,51 @@ Dexter resolves hover (and go-to-definition) based on which segment of a dotted 
 | On `all` in `MyApp.Repo.all` | `MyApp.Repo.all` | The `all` function |
 | On `MyApp` in `MyApp.Repo.all` | `MyApp` | The `MyApp` module |
 
+## Rename
+
+Dexter supports `textDocument/rename` (F2 in most editors) for three kinds of symbols:
+
+### Modules
+
+Place your cursor on any segment of a module name and invoke rename. Dexter highlights just the last segment for editing — the parent namespace is preserved automatically. For example, renaming `Repo` in `MyApp.Repo` to `Repository` renames the module to `MyApp.Repository`.
+
+**What gets updated:**
+- The `defmodule` declaration
+- All aliases, imports, and uses referencing the module
+- All call sites
+- All submodules (renaming `MyApp.Foo` also renames `MyApp.Foo.Bar`, `MyApp.Foo.Baz`, etc.)
+
+**File renaming:** If the source file follows the Elixir naming convention (module `MyApp.SomeRepo` → file `some_repo.ex`), dexter renames the file alongside the module. For submodules, the containing directory segment is also renamed to match (e.g., renaming `MyApp.Companies` to `MyApp.Clients` moves `lib/companies/services/do_something.ex` → `lib/clients/services/do_something.ex`). After the rename, dexter opens the new file automatically if your editor supports `window/showDocument`.
+
+**When path renaming won't happen:** If the file name doesn't match the snake_case form of the module's last segment — for example, a file named `my_custom_name.ex` that defines `MyModule.SomeRepo` — the file stays in place and only the contents are updated.
+
+Files not open in the editor are written directly to disk; open buffers receive edits via the LSP workspace edit response.
+
+### Functions
+
+Place your cursor on a function name (qualified or bare) and invoke rename. Dexter updates:
+- All `def`/`defp`/`defmacro`/`defguard`/etc. clauses
+- `@spec` and `@callback` annotations
+- Direct calls and pipe calls (`|> function_name`)
+- `import Module, only: [function_name: ...]` lines
+- Transitive call sites via `__using__` chains
+
+Renaming is blocked for functions defined in stdlib or deps.
+
+### Variables
+
+Place your cursor on a local variable and invoke rename. Dexter uses tree-sitter to find all occurrences within the
+enclosing function scope and renames them in a single edit. This is file-local only.
+
+Go-to-definition also works for variables — it jumps to the first occurrence (pattern match or assignment) in scope.
+
 ## LSP options
 
 Dexter reads `initializationOptions` from your editor configuration:
 
 - **`followDelegates`** (boolean, default: `true`): follow `defdelegate` targets on lookup.
 - **`stdlibPath`** (string): override the Elixir stdlib directory to index. Defaults to auto-detection; use this if your install is non-standard.
+- **`debug`** (boolean, default: `false`): enable verbose logging to stderr. Logs timing and resolution details for every definition, hover, references, and rename request. Can also be enabled via the `DEXTER_DEBUG=true` environment variable.
 
 ## Index location (.dexter.db)
 
@@ -249,11 +292,11 @@ If no `.dexter.db` exists anywhere, the LSP server builds the index automaticall
 
 ## Performance
 
-Measured on a 57k-file Elixir monorepo (2.5M lines, 340k+ definitions):
+Measured on a 55k-file Elixir monorepo (337k definitions, 2.7M references):
 
 | Operation | Time |
 |-----------|------|
-| Full init | ~8s |
+| Full init | ~11s |
 | Lookup (LSP or CLI) | ~10ms |
 | Single file reindex (on save) | ~10ms |
 | Full reindex (no changes) | ~2s |

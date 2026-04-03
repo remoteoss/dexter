@@ -737,6 +737,131 @@ end`)
 	}
 }
 
+func TestCompletion_TypesAfterDot(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", `defmodule MyApp.Accounts do
+  @type status :: :active | :inactive
+  @opaque token :: binary()
+  @typep internal_id :: integer()
+
+  def create(attrs) do
+    :ok
+  end
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, "  MyApp.Accounts.")
+
+	items := completionAt(t, server, uri, 0, 17)
+	if !hasCompletionItem(items, "status") {
+		t.Error("expected public @type 'status' in completions")
+	}
+	if !hasCompletionItem(items, "token") {
+		t.Error("expected @opaque 'token' in completions")
+	}
+	if hasCompletionItem(items, "internal_id") {
+		t.Error("should not include private @typep 'internal_id' from another module")
+	}
+
+	var statusItem *protocol.CompletionItem
+	for _, item := range items {
+		if item.Label == "status" {
+			item := item
+			statusItem = &item
+			break
+		}
+	}
+	if statusItem == nil {
+		t.Fatal("status item not found")
+	}
+	if statusItem.Kind != protocol.CompletionItemKindTypeParameter {
+		t.Errorf("expected TypeParameter kind for @type, got %v", statusItem.Kind)
+	}
+}
+
+func TestCompletion_BufferLocalTypes(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyModule do
+  @type status :: :active | :inactive
+  @typep internal_id :: integer()
+
+  sta
+end`)
+
+	// "sta" prefix should surface @type status
+	items := completionAt(t, server, uri, 4, 5)
+	if !hasCompletionItem(items, "status") {
+		t.Error("expected @type 'status' from buffer")
+	}
+
+	// "inter" prefix should surface @typep internal_id (private types visible in same file)
+	server.docs.Set(uri, `defmodule MyModule do
+  @type status :: :active | :inactive
+  @typep internal_id :: integer()
+
+  inter
+end`)
+	items = completionAt(t, server, uri, 4, 7)
+	if !hasCompletionItem(items, "internal_id") {
+		t.Error("expected @typep 'internal_id' from same buffer")
+	}
+}
+
+func TestCompletion_Variables(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyModule do
+  def process(user, account) do
+    name = user.name
+    email = user.email
+    na
+  end
+end`)
+
+	items := completionAt(t, server, uri, 4, 6)
+	if !hasCompletionItem(items, "name") {
+		t.Error("expected variable 'name' in completions")
+	}
+	if hasCompletionItem(items, "email") {
+		t.Error("should not include 'email' — doesn't match prefix 'na'")
+	}
+
+	// Check it returns the right kind
+	for _, item := range items {
+		if item.Label == "name" {
+			if item.Kind != protocol.CompletionItemKindVariable {
+				t.Errorf("expected Variable kind, got %v", item.Kind)
+			}
+			break
+		}
+	}
+}
+
+func TestCompletion_VariablesIncludesParams(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyModule do
+  def process(user_data, opts) do
+    us
+  end
+end`)
+
+	items := completionAt(t, server, uri, 2, 6)
+	if !hasCompletionItem(items, "user_data") {
+		t.Error("expected function param 'user_data' in completions")
+	}
+}
+
 func TestCompletion_NoResults(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
@@ -1238,6 +1363,51 @@ end`
 	}
 }
 
+func TestDefinition_Variable(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyModule do
+  def process(user) do
+    name = user.name
+    IO.puts(name)
+  end
+end`)
+
+	// Cursor on "name" at line 3 col 12 (the reference in IO.puts)
+	locs := definitionAt(t, server, uri, 3, 12)
+	if len(locs) == 0 {
+		t.Fatal("expected go-to-definition for variable 'name'")
+	}
+	// Should jump to line 2 where name is first assigned
+	if locs[0].Range.Start.Line != 2 {
+		t.Errorf("expected definition on line 2, got line %d", locs[0].Range.Start.Line)
+	}
+}
+
+func TestDefinition_VariableParam(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyModule do
+  def process(user) do
+    IO.puts(user)
+  end
+end`)
+
+	// Cursor on "user" at line 2 col 12 (the reference in IO.puts)
+	locs := definitionAt(t, server, uri, 2, 12)
+	if len(locs) == 0 {
+		t.Fatal("expected go-to-definition for param 'user'")
+	}
+	// Should jump to line 1 where user is the function param
+	if locs[0].Range.Start.Line != 1 {
+		t.Errorf("expected definition on line 1, got line %d", locs[0].Range.Start.Line)
+	}
+}
+
 func TestReferences_TransitiveUseChain(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
@@ -1364,6 +1534,189 @@ end`
 	}
 	if !found {
 		t.Errorf("expected caller.ex:3 in references for deep transitive use chain, got: %v", locs)
+	}
+}
+
+func TestReferences_BareFunctionCalls(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	src := `defmodule MyApp.Service do
+  def run(args) do
+    result = do_work(args)
+    result |> validate
+  end
+
+  defp do_work(args) do
+    {:ok, args}
+  end
+
+  defp validate(result) do
+    result
+  end
+end`
+
+	indexFile(t, server.store, server.projectRoot, "lib/service.ex", src)
+	serviceURI := "file://" + filepath.Join(server.projectRoot, "lib/service.ex")
+	server.docs.Set(serviceURI, src)
+
+	// References for do_work (private function) — cursor on the defp line
+	locs := referencesAt(t, server, serviceURI, 6, 8)
+	found := false
+	for _, loc := range locs {
+		if loc.Range.Start.Line == 2 { // call on line 3 (0-indexed = 2)
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected bare call to do_work on line 3, got: %v", locs)
+	}
+
+	// References for validate (pipe call) — cursor on the defp line
+	locs = referencesAt(t, server, serviceURI, 10, 8)
+	found = false
+	for _, loc := range locs {
+		if loc.Range.Start.Line == 3 { // pipe call on line 4 (0-indexed = 3)
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected pipe call to validate on line 4, got: %v", locs)
+	}
+}
+
+func TestReferences_PublicBarePipeCall(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Mimics: def get_company_by_slug, then |> get_company_by_slug() in same module,
+	// plus a qualified call from another file.
+	defSrc := `defmodule MyApp.Companies.CRUD do
+  def get_company_by_slug(slug), do: {:ok, slug}
+  def get_company_by_slug!(slug), do: slug
+
+  def fetch_company_by_slug(slug) do
+    slug
+    |> get_company_by_slug()
+  end
+end`
+
+	callerSrc := `defmodule MyApp.Web do
+  def show(slug) do
+    MyApp.Companies.CRUD.get_company_by_slug(slug)
+  end
+end`
+
+	indexFile(t, server.store, server.projectRoot, "lib/crud.ex", defSrc)
+	indexFile(t, server.store, server.projectRoot, "lib/web.ex", callerSrc)
+	defURI := "file://" + filepath.Join(server.projectRoot, "lib/crud.ex")
+	server.docs.Set(defURI, defSrc)
+
+	// Trigger refs from the def line (line 1, col 6) — cursor on "get_company_by_slug"
+	locs := referencesAt(t, server, defURI, 1, 6)
+
+	// Should find:
+	// - line 6: |> get_company_by_slug() (bare pipe call in same module)
+	// - line 2 in web.ex: qualified call
+	foundPipe := false
+	foundQualified := false
+	for _, loc := range locs {
+		if loc.Range.Start.Line == 6 { // pipe call (0-indexed)
+			foundPipe = true
+		}
+		if strings.Contains(string(loc.URI), "web.ex") {
+			foundQualified = true
+		}
+	}
+	if !foundPipe {
+		lines := make([]string, len(locs))
+		for i, loc := range locs {
+			lines[i] = fmt.Sprintf("  %s:%d", loc.URI, loc.Range.Start.Line)
+		}
+		t.Errorf("expected bare pipe call on line 6, got:\n%s", strings.Join(lines, "\n"))
+	}
+	if !foundQualified {
+		t.Error("expected qualified call from web.ex")
+	}
+
+	// Also trigger refs from the pipe call site (line 6, col 7) — cursor on "get_company_by_slug" in the pipe
+	locs2 := referencesAt(t, server, defURI, 6, 7)
+	foundDef := false
+	foundQualified2 := false
+	for _, loc := range locs2 {
+		if loc.Range.Start.Line == 1 || loc.Range.Start.Line == 2 { // def lines
+			foundDef = true
+		}
+		if strings.Contains(string(loc.URI), "web.ex") {
+			foundQualified2 = true
+		}
+	}
+	if !foundDef {
+		lines := make([]string, len(locs2))
+		for i, loc := range locs2 {
+			lines[i] = fmt.Sprintf("  %s:%d", loc.URI, loc.Range.Start.Line)
+		}
+		t.Errorf("refs from pipe call site: expected def lines, got:\n%s", strings.Join(lines, "\n"))
+	}
+	if !foundQualified2 {
+		lines := make([]string, len(locs2))
+		for i, loc := range locs2 {
+			lines[i] = fmt.Sprintf("  %s:%d", loc.URI, loc.Range.Start.Line)
+		}
+		t.Errorf("refs from pipe call site: expected qualified call from web.ex, got:\n%s", strings.Join(lines, "\n"))
+	}
+}
+
+func TestReferences_FollowDelegateReverse(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// MyApp.Accounts.CRUD defines the real function
+	crudSrc := `defmodule MyApp.Accounts.CRUD do
+  def list_users, do: []
+
+  def other do
+    list_users()
+  end
+end`
+
+	// MyApp.Accounts delegates to CRUD
+	facadeSrc := `defmodule MyApp.Accounts do
+  defdelegate list_users(), to: MyApp.Accounts.CRUD
+end`
+
+	// Callers use the facade module
+	callerSrc := `defmodule MyApp.Web do
+  alias MyApp.Accounts
+
+  def index do
+    Accounts.list_users()
+  end
+end`
+
+	indexFile(t, server.store, server.projectRoot, "lib/crud.ex", crudSrc)
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", facadeSrc)
+	indexFile(t, server.store, server.projectRoot, "lib/web.ex", callerSrc)
+
+	crudURI := "file://" + filepath.Join(server.projectRoot, "lib/crud.ex")
+	server.docs.Set(crudURI, crudSrc)
+
+	// Go-to-refs on the real definition in CRUD (line 1: "def list_users")
+	locs := referencesAt(t, server, crudURI, 1, 6)
+
+	// Should find the call through the delegate facade in web.ex
+	foundDelegateRef := false
+	for _, loc := range locs {
+		if strings.Contains(string(loc.URI), "web.ex") {
+			foundDelegateRef = true
+		}
+	}
+	if !foundDelegateRef {
+		lines := make([]string, len(locs))
+		for i, loc := range locs {
+			lines[i] = fmt.Sprintf("  %s:%d", loc.URI, loc.Range.Start.Line)
+		}
+		t.Errorf("expected ref from web.ex (via defdelegate), got:\n%s", strings.Join(lines, "\n"))
 	}
 }
 

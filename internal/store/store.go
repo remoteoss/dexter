@@ -487,7 +487,7 @@ func (s *Store) SearchSubmoduleSegments(parentModule string, segmentPrefix strin
 func (s *Store) ListModuleFunctions(module string, publicOnly bool) ([]CompletionResult, error) {
 	query := "SELECT module, function, arity, kind, file_path, line FROM definitions WHERE module = ? AND function != ''"
 	if publicOnly {
-		query += " AND kind IN ('def', 'defmacro', 'defguard', 'defdelegate')"
+		query += " AND kind IN ('def', 'defmacro', 'defguard', 'defdelegate', 'type', 'opaque')"
 	}
 	query += " GROUP BY function, arity ORDER BY function, arity LIMIT 100"
 
@@ -509,6 +509,7 @@ func (s *Store) ListModuleFunctions(module string, publicOnly bool) ([]Completio
 }
 
 type LookupResult struct {
+	Module     string // populated by bulk queries; empty for single-module lookups
 	FilePath   string
 	Line       int
 	Kind       string
@@ -525,7 +526,7 @@ func (s *Store) LookupModule(module string) ([]LookupResult, error) {
 
 func (s *Store) LookupFunction(module, function string) ([]LookupResult, error) {
 	return s.queryLookup(
-		"SELECT file_path, line, kind, delegate_to, delegate_as FROM definitions WHERE module = ? AND function = ? AND kind NOT IN ('module', 'defprotocol', 'defimpl') ORDER BY CASE WHEN kind IN ('type', 'typep', 'opaque') THEN 1 ELSE 0 END, line",
+		"SELECT file_path, line, kind, delegate_to, delegate_as FROM definitions WHERE module = ? AND function = ? AND kind NOT IN ('module', 'defprotocol', 'defimpl') ORDER BY CASE WHEN kind IN ('type', 'opaque') THEN 1 ELSE 0 END, line",
 		module, function,
 	)
 }
@@ -580,6 +581,100 @@ func (s *Store) LookupReferences(module, function string) ([]ReferenceResult, er
 	return results, rows.Err()
 }
 
+// ModuleReferenceResult is like ReferenceResult but also carries the module
+// name, used by bulk prefix queries where refs from multiple modules are returned.
+type ModuleReferenceResult struct {
+	Module   string
+	FilePath string
+	Line     int
+	Kind     string
+}
+
+// LookupReferencesByPrefix returns all refs whose module equals prefix or starts
+// with prefix + ".". Used for bulk module renames to avoid N+1 queries.
+func (s *Store) LookupReferencesByPrefix(prefix string) ([]ModuleReferenceResult, error) {
+	rows, err := s.db.Query(
+		"SELECT module, file_path, line, kind FROM refs WHERE module = ? OR module LIKE ? ORDER BY file_path, line",
+		prefix, prefix+".%",
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var results []ModuleReferenceResult
+	for rows.Next() {
+		var r ModuleReferenceResult
+		if err := rows.Scan(&r.Module, &r.FilePath, &r.Line, &r.Kind); err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	return results, rows.Err()
+}
+
+// LookupModulesByPrefix returns all module definitions whose name equals prefix
+// or starts with prefix + ".". The Module field is populated on each result.
+// Used for bulk module renames to replace N per-module LookupModule calls with one.
+func (s *Store) LookupModulesByPrefix(prefix string) ([]LookupResult, error) {
+	rows, err := s.db.Query(
+		"SELECT module, file_path, line, kind, delegate_to, delegate_as FROM definitions WHERE function = '' AND (module = ? OR module LIKE ?) AND kind IN ('module', 'defprotocol', 'defimpl') ORDER BY module",
+		prefix, prefix+".%",
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var results []LookupResult
+	for rows.Next() {
+		var r LookupResult
+		if err := rows.Scan(&r.Module, &r.FilePath, &r.Line, &r.Kind, &r.DelegateTo, &r.DelegateAs); err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	return results, rows.Err()
+}
+
+// DelegateEntry represents a defdelegate definition that forwards to a target module.
+type DelegateEntry struct {
+	Module     string // the delegating module (facade)
+	Function   string // the facade function name
+	DelegateAs string // the target function name (empty if same as Function)
+	FilePath   string
+	Line       int
+}
+
+// LookupDelegatesTo returns all defdelegate definitions that forward the given
+// function to the target module. Matches both the no-as: case (function name
+// equals target) and the as: case (delegate_as equals target function name).
+func (s *Store) LookupDelegatesTo(targetModule, targetFunction string) ([]DelegateEntry, error) {
+	rows, err := s.db.Query(
+		`SELECT module, function, delegate_as, file_path, line FROM definitions
+		 WHERE kind = 'defdelegate' AND delegate_to = ?
+		 AND (
+		   (delegate_as = '' AND function = ?) OR
+		   (delegate_as = ?)
+		 )`,
+		targetModule, targetFunction, targetFunction,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var results []DelegateEntry
+	for rows.Next() {
+		var r DelegateEntry
+		if err := rows.Scan(&r.Module, &r.Function, &r.DelegateAs, &r.FilePath, &r.Line); err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	return results, rows.Err()
+}
+
 // ListCallerModulesForFunction returns the distinct set of modules that have
 // call-site refs for the given function name. Used to find transitive references
 // through use/import chains.
@@ -604,11 +699,20 @@ func (s *Store) ListCallerModulesForFunction(function string) ([]string, error) 
 	return modules, rows.Err()
 }
 
-func (s *Store) SearchSymbols(query string) ([]CompletionResult, error) {
+func (s *Store) SearchSymbols(query string, excludePathPrefix ...string) ([]CompletionResult, error) {
 	var (
 		rows *sql.Rows
 		err  error
 	)
+
+	// Optional path exclusion (e.g. stdlib root) pushed into SQL so the
+	// LIMIT applies to user-visible results, not filtered-out stdlib entries.
+	pathFilter := ""
+	var extraArgs []interface{}
+	if len(excludePathPrefix) > 0 && excludePathPrefix[0] != "" {
+		pathFilter = " AND file_path NOT LIKE ?"
+		extraArgs = append(extraArgs, excludePathPrefix[0]+"%")
+	}
 
 	// When the query contains a dot, split at the last dot. The prefix must
 	// match the module and the suffix is matched against both the function name
@@ -618,15 +722,17 @@ func (s *Store) SearchSymbols(query string) ([]CompletionResult, error) {
 	if dotIndex := strings.LastIndex(query, "."); dotIndex != -1 {
 		modulePart := "%" + query[:dotIndex] + "%"
 		suffixPart := "%" + query[dotIndex+1:] + "%"
+		args := append([]interface{}{modulePart, suffixPart, suffixPart}, extraArgs...)
 		rows, err = s.db.Query(
-			"SELECT module, function, arity, kind, file_path, line FROM definitions WHERE module LIKE ? AND (function LIKE ? OR module LIKE ?) ORDER BY module, function LIMIT 200",
-			modulePart, suffixPart, suffixPart,
+			"SELECT module, function, arity, kind, file_path, line FROM definitions WHERE module LIKE ? AND (function LIKE ? OR module LIKE ?)"+pathFilter+" ORDER BY module, function LIMIT 200",
+			args...,
 		)
 	} else {
 		pattern := "%" + query + "%"
+		args := append([]interface{}{pattern, pattern}, extraArgs...)
 		rows, err = s.db.Query(
-			"SELECT module, function, arity, kind, file_path, line FROM definitions WHERE (module LIKE ? OR function LIKE ?) ORDER BY module, function LIMIT 200",
-			pattern, pattern,
+			"SELECT module, function, arity, kind, file_path, line FROM definitions WHERE (module LIKE ? OR function LIKE ?)"+pathFilter+" ORDER BY module, function LIMIT 200",
+			args...,
 		)
 	}
 
@@ -644,6 +750,42 @@ func (s *Store) SearchSymbols(query string) ([]CompletionResult, error) {
 		results = append(results, r)
 	}
 	return results, rows.Err()
+}
+
+// ListSubmodules returns all modules whose name starts with prefix + ".".
+// Used for cascading module renames (e.g. renaming MyApp.Accounts also catches MyApp.Accounts.User).
+func (s *Store) ListSubmodules(prefix string) ([]string, error) {
+	rows, err := s.db.Query(
+		"SELECT DISTINCT module FROM definitions WHERE module LIKE ? AND function = '' ORDER BY module",
+		prefix+".%",
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var modules []string
+	for rows.Next() {
+		var mod string
+		if err := rows.Scan(&mod); err != nil {
+			return nil, err
+		}
+		modules = append(modules, mod)
+	}
+	return modules, rows.Err()
+}
+
+// LookupEnclosingFunction returns the function definition that encloses the
+// given line in a file (the nearest def/defp/defmacro at or before lineNum).
+func (s *Store) LookupEnclosingFunction(filePath string, lineNum int) (module, function string, arity int, line int, found bool) {
+	err := s.db.QueryRow(
+		"SELECT module, function, arity, line FROM definitions WHERE file_path = ? AND function != '' AND line <= ? ORDER BY line DESC LIMIT 1",
+		filePath, lineNum,
+	).Scan(&module, &function, &arity, &line)
+	if err != nil {
+		return "", "", 0, 0, false
+	}
+	return module, function, arity, line, true
 }
 
 func (s *Store) LookupFollowDelegate(module, function string) ([]LookupResult, error) {

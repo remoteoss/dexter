@@ -33,6 +33,7 @@ lint:
       - /go/pkg/mod/
   script:
     - golangci-lint run ./...
+    - go mod tidy && git diff --exit-code go.mod go.sum
   tags:
     - size-m
   rules:

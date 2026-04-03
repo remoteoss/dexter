@@ -25,8 +25,16 @@ func isExprChar(b byte) bool {
 //	"Ti|ger.Repo.all"  →  "MyApp"
 //	"MyApp|.Repo.all"  →  "MyApp.Repo"   (cursor on dot → include next segment)
 func ExtractExpression(line string, col int) string {
+	expr, _ := extractExpressionBounds(line, col)
+	return expr
+}
+
+// extractExpressionBounds returns the same expression as ExtractExpression plus
+// the start column (0-based) of that expression within the line. Returns ("", 0)
+// when there is no expression at the cursor position.
+func extractExpressionBounds(line string, col int) (expr string, startCol int) {
 	if len(line) == 0 {
-		return ""
+		return "", 0
 	}
 	if col >= len(line) {
 		col = len(line) - 1
@@ -34,16 +42,14 @@ func ExtractExpression(line string, col int) string {
 	if col < 0 {
 		col = 0
 	}
-
 	if !isExprChar(line[col]) {
-		return ""
+		return "", 0
 	}
 
 	start := col
 	for start > 0 && isExprChar(line[start-1]) {
 		start--
 	}
-
 	end := col
 	for end+1 < len(line) && isExprChar(line[end+1]) {
 		end++
@@ -51,19 +57,15 @@ func ExtractExpression(line string, col int) string {
 
 	fullExpr := line[start : end+1]
 	cursorOffset := col - start
-
-	// Scan right from the cursor to find the next dot, which marks the end of
-	// the current segment. If the cursor lands on a dot, skip it so that the
-	// next segment is included (hovering on "MyApp|.Repo" resolves MyApp.Repo).
 	searchFrom := cursorOffset
 	if fullExpr[searchFrom] == '.' {
 		searchFrom++
 	}
 	nextDot := strings.IndexByte(fullExpr[searchFrom:], '.')
 	if nextDot == -1 {
-		return fullExpr
+		return fullExpr, start
 	}
-	return fullExpr[:searchFrom+nextDot]
+	return fullExpr[:searchFrom+nextDot], start
 }
 
 // ExtractModuleAndFunction splits a dotted expression into module reference and optional function name.
@@ -127,13 +129,22 @@ type BufferFunction struct {
 	Kind  string
 }
 
-// FindBufferFunctions scans document text for all function definitions.
+// FindBufferFunctions scans document text for all function and type definitions.
 // Returns a deduplicated list (multi-clause functions with the same arity appear once).
+// Private types (@typep) are included since they are accessible within the same file.
 func FindBufferFunctions(text string) []BufferFunction {
 	seen := make(map[string]bool)
 	var results []BufferFunction
 	for _, line := range strings.Split(text, "\n") {
 		if m := parser.FuncDefRe.FindStringSubmatch(line); m != nil {
+			name := m[2]
+			arity := parser.ExtractArity(line, name)
+			key := name + "/" + strconv.Itoa(arity)
+			if !seen[key] {
+				seen[key] = true
+				results = append(results, BufferFunction{Name: name, Arity: arity, Kind: m[1]})
+			}
+		} else if m := parser.TypeDefRe.FindStringSubmatch(line); m != nil {
 			name := m[2]
 			arity := parser.ExtractArity(line, name)
 			key := name + "/" + strconv.Itoa(arity)
@@ -441,4 +452,49 @@ func FindFunctionDefinition(text string, functionName string) (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+// FindBareFunctionCalls scans text for unqualified calls to functionName,
+// including direct calls like functionName(...) and pipe calls like |> functionName.
+// Returns 1-based line numbers. Definition lines are excluded.
+func FindBareFunctionCalls(text string, functionName string) []int {
+	var lineNums []int
+	for i, line := range strings.Split(text, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if m := parser.FuncDefRe.FindStringSubmatch(trimmed); m != nil && m[2] == functionName {
+			continue
+		}
+
+		found := false
+
+		// Direct bare call: functionName(
+		if col := findTokenColumn(line, functionName); col >= 0 {
+			afterToken := line[col+len(functionName):]
+			afterTrimmed := strings.TrimLeft(afterToken, " \t")
+			if strings.HasPrefix(afterTrimmed, "(") {
+				found = true
+			}
+		}
+
+		// Pipe call: |> functionName
+		if !found {
+			for pipeSearch := line; ; {
+				idx := strings.Index(pipeSearch, "|>")
+				if idx < 0 {
+					break
+				}
+				afterPipe := strings.TrimLeft(pipeSearch[idx+2:], " \t")
+				if col := findTokenColumn(afterPipe, functionName); col == 0 {
+					found = true
+					break
+				}
+				pipeSearch = pipeSearch[idx+2:]
+			}
+		}
+
+		if found {
+			lineNums = append(lineNums, i+1)
+		}
+	}
+	return lineNums
 }

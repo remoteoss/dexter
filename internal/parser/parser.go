@@ -70,13 +70,18 @@ func ParseFile(path string) ([]Definition, []Reference, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	return ParseText(path, string(data))
+}
 
+// ParseText parses Elixir source text and returns definitions and references.
+// The path is used to populate FilePath fields but the text is not read from disk.
+func ParseText(path, text string) ([]Definition, []Reference, error) {
 	type moduleFrame struct {
 		name   string
 		indent int // leading whitespace count when defmodule was found
 	}
 
-	lines := strings.Split(string(data), "\n")
+	lines := strings.Split(text, "\n")
 	var defs []Definition
 	var refs []Reference
 	var moduleStack []moduleFrame
@@ -138,6 +143,31 @@ func ParseFile(path string) ([]Definition, []Reference, error) {
 				if moduleName != "" {
 					remaining := afterAlias[len(moduleName):]
 					remaining = strings.TrimLeft(remaining, " \t")
+
+					// Multi-alias: alias MyApp.{Accounts, Users}
+					// ScanModuleName consumes the trailing "." so remaining starts with "{"
+					if strings.HasPrefix(remaining, "{") {
+						braceEnd := strings.IndexByte(remaining, '}')
+						if braceEnd >= 0 {
+							inner := remaining[1:braceEnd]
+							// Trim trailing dot from parent module name
+							parent := strings.TrimRight(moduleName, ".")
+							parentResolved := resolveModule(parent, currentModule)
+							for _, segment := range strings.Split(inner, ",") {
+								segment = strings.TrimSpace(segment)
+								childName := scanIdentifier(segment)
+								if childName != "" {
+									fullChild := parentResolved + "." + childName
+									aliases[childName] = fullChild
+									if !strings.Contains(fullChild, "__MODULE__") {
+										refs = append(refs, Reference{Module: fullChild, Line: lineNum, FilePath: path, Kind: "alias"})
+									}
+								}
+							}
+							continue
+						}
+					}
+
 					if strings.HasPrefix(remaining, ", as:") {
 						asStr := strings.TrimLeft(remaining[5:], " \t") // skip ", as:"
 						asName := scanIdentifier(asStr)
@@ -213,15 +243,13 @@ func ParseFile(path string) ([]Definition, []Reference, error) {
 			goto extractCallRefs
 		}
 
-		// '@' — type definitions (@type, @typep, @opaque)
+		// '@' — type definitions (@type, @opaque) and @behaviour refs
+		// @typep is private-to-file and not indexed.
 		if first == '@' {
 			if currentModule != "" {
 				var kind string
 				var afterKw string
-				if strings.HasPrefix(rest, "@typep") && len(rest) > 6 && (rest[6] == ' ' || rest[6] == '\t') {
-					kind = "typep"
-					afterKw = strings.TrimLeft(rest[6:], " \t")
-				} else if strings.HasPrefix(rest, "@type") && len(rest) > 5 && (rest[5] == ' ' || rest[5] == '\t') {
+				if strings.HasPrefix(rest, "@type") && len(rest) > 5 && (rest[5] == ' ' || rest[5] == '\t') {
 					kind = "type"
 					afterKw = strings.TrimLeft(rest[5:], " \t")
 				} else if strings.HasPrefix(rest, "@opaque") && len(rest) > 7 && (rest[7] == ' ' || rest[7] == '\t') {
@@ -241,8 +269,24 @@ func ParseFile(path string) ([]Definition, []Reference, error) {
 						})
 					}
 				}
+
+				// @behaviour ModuleName — record as a ref so module renames update it
+				if strings.HasPrefix(rest, "@behaviour") && len(rest) > 10 && (rest[10] == ' ' || rest[10] == '\t') {
+					afterBehaviour := strings.TrimLeft(rest[10:], " \t")
+					moduleName := ScanModuleName(afterBehaviour)
+					if moduleName != "" {
+						resolved := resolveModule(moduleName, currentModule)
+						if !strings.Contains(resolved, "__MODULE__") {
+							refs = append(refs, Reference{Module: resolved, Line: lineNum, FilePath: path, Kind: "behaviour"})
+						}
+					}
+				}
+
 			}
-			continue
+			// Don't continue — fall through to extractCallRefs so that module
+			// references in @spec/@type/@callback annotations are captured
+			// (e.g. User.t() in "@spec get_user() :: User.t()").
+			goto extractCallRefs
 		}
 
 		// 'd' — defmodule, defprotocol, defimpl, def*, defstruct, defexception
@@ -363,42 +407,55 @@ func ParseFile(path string) ([]Definition, []Reference, error) {
 			}
 		}
 
-		// Extract Module.function call references from any line.
-		// Quick check: moduleCallRe requires an uppercase letter, so skip lines without one.
+		// Extract Module.function calls and %Module{} struct literals from any line.
 		if !hasUppercase(line) {
 			continue
 		}
 		{
 			codeLine := stripCommentsAndStrings(line)
-			for _, match := range moduleCallRe.FindAllStringSubmatch(codeLine, -1) {
-				modRef := match[1]
-				funcName := match[2]
 
+			// Module.function calls (including type refs like User.t())
+			for _, match := range moduleCallRe.FindAllStringSubmatch(codeLine, -1) {
+				modRef, funcName := match[1], match[2]
 				if elixirKeyword[funcName] {
 					continue
 				}
-
-				resolved := modRef
-				if full, ok := aliases[modRef]; ok {
-					resolved = full
-				} else if parts := strings.SplitN(modRef, ".", 2); len(parts) == 2 {
-					if full, ok := aliases[parts[0]]; ok {
-						resolved = full + "." + parts[1]
-					}
+				resolved := resolveModuleRef(modRef, aliases, currentModule)
+				if resolved != "" {
+					refs = append(refs, Reference{Module: resolved, Function: funcName, Line: lineNum, FilePath: path, Kind: "call"})
 				}
-				resolved = resolveModule(resolved, currentModule)
+			}
 
-				if strings.Contains(resolved, "__MODULE__") {
+			// %Module{} struct literals and pattern matches
+			for _, match := range structLiteralRe.FindAllStringSubmatch(codeLine, -1) {
+				resolved := resolveModuleRef(match[1], aliases, currentModule)
+				if resolved != "" {
+					refs = append(refs, Reference{Module: resolved, Line: lineNum, FilePath: path, Kind: "call"})
+				}
+			}
+
+			// Standalone module references: @impl GenServer, @derive [Jason.Encoder],
+			// rescue e in MyError, is_struct(x, User), etc.
+			for _, match := range standaloneModuleRe.FindAllStringSubmatchIndex(codeLine, -1) {
+				modStart, modEnd := match[2], match[3]
+				modRef := codeLine[modStart:modEnd]
+				// Skip Module.function — already caught by moduleCallRe
+				if modEnd < len(codeLine) && codeLine[modEnd] == '.' &&
+					modEnd+1 < len(codeLine) && ((codeLine[modEnd+1] >= 'a' && codeLine[modEnd+1] <= 'z') || codeLine[modEnd+1] == '_') {
 					continue
 				}
-
-				refs = append(refs, Reference{
-					Module:   resolved,
-					Function: funcName,
-					Line:     lineNum,
-					FilePath: path,
-					Kind:     "call",
-				})
+				// Skip %Module{ — already caught by structLiteralRe
+				if modStart > 0 && codeLine[modStart-1] == '%' {
+					continue
+				}
+				// Skip self-references to the current module
+				if modRef == currentModule {
+					continue
+				}
+				resolved := resolveModuleRef(modRef, aliases, currentModule)
+				if resolved != "" {
+					refs = append(refs, Reference{Module: resolved, Line: lineNum, FilePath: path, Kind: "call"})
+				}
 			}
 		}
 	}
@@ -625,6 +682,32 @@ func resolveModule(s, currentModule string) string {
 // moduleCallRe matches Module.function calls — an uppercase module segment
 // followed by a dot and a lowercase function name.
 var moduleCallRe = regexp.MustCompile(`([A-Z][A-Za-z0-9_]*(?:\.[A-Z][A-Za-z0-9_]*)*)\.([a-z_][a-z0-9_?!]*)`)
+
+// structLiteralRe matches %Module{...} struct literals and pattern matches.
+var structLiteralRe = regexp.MustCompile(`%([A-Z][A-Za-z0-9_]*(?:\.[A-Z][A-Za-z0-9_]*)*)\{`)
+
+// standaloneModuleRe matches module names that appear without a .function or %{
+// suffix — covers @impl GenServer, @derive [Jason.Encoder], rescue e in MyError,
+// is_struct(x, User), etc. The negative lookahead for . and { is handled in code.
+var standaloneModuleRe = regexp.MustCompile(`(?:^|[^A-Za-z0-9_.%])([A-Z][A-Za-z0-9_]*(?:\.[A-Z][A-Za-z0-9_]*)*)`)
+
+// resolveModuleRef resolves a module reference through aliases and __MODULE__.
+// Returns "" if the reference contains unresolvable __MODULE__.
+func resolveModuleRef(modRef string, aliases map[string]string, currentModule string) string {
+	resolved := modRef
+	if full, ok := aliases[modRef]; ok {
+		resolved = full
+	} else if parts := strings.SplitN(modRef, ".", 2); len(parts) == 2 {
+		if full, ok := aliases[parts[0]]; ok {
+			resolved = full + "." + parts[1]
+		}
+	}
+	resolved = resolveModule(resolved, currentModule)
+	if strings.Contains(resolved, "__MODULE__") {
+		return ""
+	}
+	return resolved
+}
 
 func hasUppercase(s string) bool {
 	for i := 0; i < len(s); i++ {

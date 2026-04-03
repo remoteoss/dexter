@@ -199,6 +199,7 @@ func cmdInit(projectRoot string, force bool, profile bool) {
 		mtimeNano int64
 	}
 	var files []fileEntry
+	var stdlibFiles []fileEntry
 	err = parser.WalkElixirFiles(projectRoot, func(path string, d fs.DirEntry) error {
 		info, err := d.Info()
 		if err != nil {
@@ -210,19 +211,58 @@ func cmdInit(projectRoot string, force bool, profile bool) {
 	if err != nil {
 		fatal(err)
 	}
-	if stdlibRoot, ok := stdlib.Resolve(s, ""); ok {
+	var stdlibRoot string
+	if root, ok := stdlib.Resolve(s, ""); ok {
+		stdlibRoot = root
 		_ = parser.WalkElixirFiles(stdlibRoot, func(path string, d fs.DirEntry) error {
 			info, err := d.Info()
 			if err != nil {
 				return nil
 			}
-			files = append(files, fileEntry{path: path, mtimeNano: info.ModTime().UnixNano()})
+			stdlibFiles = append(stdlibFiles, fileEntry{path: path, mtimeNano: info.ModTime().UnixNano()})
 			return nil
 		})
 	}
-	prof.log("  walk: %s (%s files)\n", prof.since(start).Round(time.Millisecond), formatInt(len(files)))
+	prof.log("  walk: %s (%s files)\n", prof.since(start).Round(time.Millisecond), formatInt(len(files)+len(stdlibFiles)))
 
-	// Phase 2: parse in parallel
+	// Parse stdlib files in parallel (definitions only — refs are not indexed for stdlib).
+	type stdlibResult struct {
+		path      string
+		mtimeNano int64
+		defs      []parser.Definition
+	}
+	stdlibCh := make(chan stdlibResult, len(stdlibFiles))
+	var stdlibWg sync.WaitGroup
+	stdlibWorkers := runtime.NumCPU()
+	stdlibFileCh := make(chan fileEntry, stdlibWorkers)
+	for i := 0; i < stdlibWorkers; i++ {
+		stdlibWg.Add(1)
+		go func() {
+			defer stdlibWg.Done()
+			for f := range stdlibFileCh {
+				defs, _, err := parser.ParseFile(f.path)
+				if err != nil {
+					continue
+				}
+				stdlibCh <- stdlibResult{f.path, f.mtimeNano, defs}
+			}
+		}()
+	}
+	go func() {
+		for _, f := range stdlibFiles {
+			stdlibFileCh <- f
+		}
+		close(stdlibFileCh)
+		stdlibWg.Wait()
+		close(stdlibCh)
+	}()
+	var stdlibResults []stdlibResult
+	for r := range stdlibCh {
+		stdlibResults = append(stdlibResults, r)
+	}
+	prof.log("  stdlib parse: %s files\n", formatInt(len(stdlibFiles)))
+
+	// Phase 2: parse user files in parallel
 	type parseResult struct {
 		path      string
 		mtimeNano int64
@@ -271,8 +311,20 @@ func cmdInit(projectRoot string, force bool, profile bool) {
 	if err != nil {
 		fatal(err)
 	}
-	count := 0
+
+	// Insert pre-parsed stdlib definitions (no refs)
+	for _, sr := range stdlibResults {
+		if err := batch.IndexFileWithMtimeAndRefs(sr.path, sr.mtimeNano, sr.defs, nil); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: %s: %v\n", sr.path, err)
+		}
+	}
+
+	// Insert user file results as they stream in (store filters stdlib refs)
+	count := len(stdlibResults)
 	defCount := 0
+	for _, sr := range stdlibResults {
+		defCount += len(sr.defs)
+	}
 	refCount := 0
 	var writeNanos int64
 	for res := range resultCh {
@@ -369,9 +421,6 @@ func cmdReindex(target string) {
 	err = parser.WalkElixirFiles(target, walkFn)
 	if err != nil {
 		fatal(err)
-	}
-	if stdlibRoot, ok := stdlib.Resolve(s, ""); ok {
-		_ = parser.WalkElixirFiles(stdlibRoot, walkFn)
 	}
 
 	fmt.Fprintf(os.Stderr, "Reindexed %d files, %d unchanged (%s)\n", reindexed, skipped, time.Since(start).Round(time.Millisecond))

@@ -1368,7 +1368,6 @@ end
 	}{
 		{"t", "type", 2},
 		{"id", "type", 3},
-		{"internal", "typep", 4},
 		{"token", "opaque", 5},
 	}
 
@@ -1389,9 +1388,9 @@ end
 		}
 	}
 
-	// Parameterized type arity
-	if byFunc["internal"].Arity != 2 {
-		t.Errorf("internal: expected arity 2, got %d", byFunc["internal"].Arity)
+	// @typep is not indexed
+	if _, ok := byFunc["internal"]; ok {
+		t.Error("@typep 'internal' should not be indexed in the DB")
 	}
 	// Non-parameterized type arity
 	if byFunc["t"].Arity != 0 {
