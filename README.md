@@ -1,8 +1,6 @@
 # Dexter
 
-A fast, lightweight Elixir LSP built for large codebases where traditional Elixir LSP servers are too slow. Dexter provides go-to-definition, hover documentation, and autocompletion — all backed by a local SQLite index that stays up to date automatically.
-
-Dexter can run standalone or alongside your existing Elixir LSP. It covers navigation, documentation, and completions out of the box — the only thing missing compared to a full Elixir LSP is diagnostics, and that's on the roadmap.
+A fast, full-featured Elixir LSP built for large codebases where other Elixir LSPs are too slow or don't work at all. Dexter backs everything with a local SQLite index and a persistent Elixir process for formatting — no compilation required, no resource exhaustion.
 
 ## Quick start
 
@@ -72,7 +70,7 @@ local configs = require("lspconfig.configs")
 configs.dexter = {
   default_config = {
     cmd = { "dexter", "lsp" },
-    filetypes = { "elixir", "eelixir" },
+    filetypes = { "elixir", "eelixir", "heex" },
     root_dir = lspconfig.util.root_pattern(".dexter.db", "mix.exs", ".git"),
   },
 }
@@ -119,8 +117,18 @@ make install   # for Cursor, or make install-vscode for VSCode
 }
 ```
 
+To enable format-on-save, add this to your VS Code settings:
+
+```json
+{
+  "[elixir]": { "editor.formatOnSave": true },
+  "[phoenix-heex]": { "editor.formatOnSave": true }
+}
+```
+
 ## Features
 
+- **Autocompletion** — modules, functions, types, and variables with full snippet support. Resolves through aliases, imports, `use` injections, and the Elixir stdlib. Works for qualified calls (`MyApp.Repo.|`), bare function calls, and module prefixes
 - **Elixir stdlib indexing** — jump to `Enum`, `String`, `Mix`, and other bundled modules by indexing your local Elixir installation sources
 - **Hover documentation** — `@doc`, `@moduledoc`, `@typedoc`, and `@spec` annotations rendered as Markdown when you hover over a symbol
 - **Cursor-position-aware resolution** — hovering on `MyApp.Repo` in `MyApp.Repo.all` shows docs for the module, hovering on `all` shows docs for the function
@@ -129,12 +137,22 @@ make install   # for Cursor, or make install-vscode for VSCode
 - **Delegate following** — `defdelegate fetch(id), to: MyApp.Repo` jumps to `MyApp.Repo.fetch`, respecting `as:` renames
 - **Local buffer search** — private function calls resolve without leaving the current file
 - **All def forms** — `def`, `defp`, `defmacro`, `defmacrop`, `defguard`, `defguardp`, `defdelegate`, `defprotocol`, `defimpl`, `defstruct`, `defexception`
-- **Type definitions** — `@type` and `@opaque` are indexed for go-to-definition, hover, and autocompletion
-- **Variable support** — go-to-definition and autocompletion for local variables via tree-sitter, with correct scoping across `case`, `with`, `for`, and other block constructs
+- **Type definitions** — `@type` and `@opaque` are indexed for go-to-definition and hover
+- **Variable support** — go-to-definition, rename, and completion for local variables via tree-sitter, with correct scoping across `case`, `with`, `for`, and other block constructs
+- **References** — find all usages of a function or module across the codebase, including through `import`, `use` chains, and `defdelegate`
+- **Rename** — rename modules, functions, and variables with automatic file renaming when the convention is followed
+- **Document symbols** — outline view of all functions and modules in the current file
+- **Workspace symbols** — search for any module or function across the entire codebase
+- **Signature help** — parameter hints as you type function calls
+- **Type definition** — jump to `@type` and `@opaque` definitions
+- **Document highlight** — highlight all occurrences of the symbol under the cursor
+- **Call hierarchy** — navigate incoming and outgoing calls
+- **Folding ranges** — collapse functions and modules in your editor
+- **Code actions** — add missing aliases with a single action
+- **Format on save** — formats `.ex`, `.exs`, and `.heex` files on save via a persistent Elixir process. Near-instant after the first save. Formatter plugins (Styler, Phoenix.LiveView.HTMLFormatter) are loaded from your project's `_build` — no install needed. Syntax errors are surfaced as diagnostics.
+- **Monorepo-aware formatting** — walks up from the file to find the nearest `.formatter.exs`, so subprojects with their own formatter configs (including nested `subdirectories:` configs) just work
 - **Heredoc awareness** — code examples in `@moduledoc`/`@doc` are skipped
 - **Module nesting** — correctly tracks `end` keywords to attribute functions to the right module
-- **Format on save** — automatically formats Elixir files on save via `mix format`, running asynchronously so saves are never blocked. Stale results are discarded if the buffer changes. Manual formatting via `textDocument/formatting` is also available.
-- **Monorepo-aware formatting** — uses the nearest `mix.exs` ancestor to find the correct `.formatter.exs`, so subprojects with different formatter configs just work
 - **Git branch detection** — automatically reindexes when you switch branches
 - **Parallel indexing** — uses all CPU cores for initial index
 
@@ -265,15 +283,21 @@ Dexter reads `initializationOptions` from your editor configuration:
 - **`stdlibPath`** (string): override the Elixir stdlib directory to index. Defaults to auto-detection; use this if your install is non-standard.
 - **`debug`** (boolean, default: `false`): enable verbose logging to stderr. Logs timing and resolution details for every definition, hover, references, and rename request. Can also be enabled via the `DEXTER_DEBUG=true` environment variable.
 
-## Formatting
+## Lightning-fast Formatting
 
-Dexter automatically formats Elixir files on save via `mix format`. Formatting runs asynchronously — saves are never blocked, and the formatted result is pushed back to the editor via `workspace/applyEdit` when ready. If the buffer changes while formatting is in progress, the stale result is discarded.
+Dexter formats files on save via `textDocument/willSaveWaitUntil` using a persistent Elixir process per `.formatter.exs`. This persistent formatter server starts once when you open the first file in a project under a given `.formatter.exs`, so formatting is near-instant.
 
-Manual formatting is also available via `textDocument/formatting` (e.g. `:lua vim.lsp.buf.format()` in Neovim). No editor-side format-on-save config is needed.
+Plugins ([`Styler`](https://github.com/remoteoss/elixir-styler), `Phoenix.LiveView.HTMLFormatter`, etc.) are loaded from
+your project's `_build/dev/lib`. So as long as your formatter plugins are installed and compiled, everything is ready to
+go.
 
-Formatting uses the nearest `mix.exs` ancestor of the file being formatted to find the correct `.formatter.exs` — this means it works correctly in monorepos where subprojects may have different formatter configs.
+If the persistent process can't start, dexter falls back to running `mix format` directly.
 
-Dexter automatically detects `mix` through mise or asdf to respect project-specific Elixir versions. The detection order is: mise → asdf → login shell → PATH.
+**Syntax errors** found by the formatter are surfaced as LSP diagnostics pointing to the exact line and column, with a warning at the hint location (e.g. "the `do` on line 52 does not have a matching `end`"). Diagnostics clear on the next successful format (which again, is nearly instantaneous!).
+
+**Nested `.formatter.exs`:** Dexter walks up from the file to the mix root and uses the nearest `.formatter.exs`. A file in `config/` uses `config/.formatter.exs` if it exists (for projects using `subdirectories:`), falling back to the root config.
+
+**Elixir detection:** The `mix` and `elixir` binaries are derived from the same Elixir install used for stdlib detection, so the correct version is always used regardless of which tool manager you use (mise, asdf, etc.).
 
 ## Index location (.dexter.db)
 
@@ -307,6 +331,8 @@ If no `.dexter.db` exists anywhere, the LSP server builds the index automaticall
 
 4. **Incremental updates** — File mtimes are tracked. Reindex only re-parses files that changed.
 
+5. **Persistent formatter** — A long-running Elixir process per `.formatter.exs` handles formatting via a binary protocol. Plugins are loaded from `_build` at startup. The process restarts automatically when `.formatter.exs` changes.
+
 ## Performance
 
 Measured on a 55k-file Elixir monorepo (337k definitions, 2.7M references):
@@ -317,10 +343,11 @@ Measured on a 55k-file Elixir monorepo (337k definitions, 2.7M references):
 | Lookup (LSP or CLI) | ~10ms |
 | Single file reindex (on save) | ~10ms |
 | Full reindex (no changes) | ~2s |
+| Format on save | <1ms |
 
 ## Why?
 
-Elixir LSP servers (ElixirLS, Lexical, etc.) can struggle with very large monorepos. Ctags works but doesn't understand Elixir module namespacing, so `Foo` often resolves to the wrong module. Dexter sits in between — it's Elixir-aware but stays fast by backing everything with a lightweight SQLite index instead of compiling your project. Navigation, docs, completions, and formatting — without the wait.
+ElixirLS and Lexical don't work on large codebases — they eat all resources and still fail. Dexter takes a different approach: back everything with a lightweight SQLite index instead of compiling your project, and use a persistent Elixir process for formatting instead of spawning subprocesses. The result is an LSP that stays fast regardless of codebase size.
 
 ## Development
 
