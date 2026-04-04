@@ -106,6 +106,7 @@ func createIndexes(db dbExecer) error {
 		CREATE INDEX IF NOT EXISTS idx_refs_module_function ON refs(module, function);
 		CREATE INDEX IF NOT EXISTS idx_refs_file_path ON refs(file_path);
 		CREATE INDEX IF NOT EXISTS idx_refs_function_kind ON refs(function, kind);
+		CREATE INDEX IF NOT EXISTS idx_definitions_delegate_to ON definitions(delegate_to);
 	`)
 	return err
 }
@@ -118,6 +119,7 @@ func (s *Store) DropIndexes() error {
 		DROP INDEX IF EXISTS idx_refs_module_function;
 		DROP INDEX IF EXISTS idx_refs_file_path;
 		DROP INDEX IF EXISTS idx_refs_function_kind;
+		DROP INDEX IF EXISTS idx_definitions_delegate_to;
 	`)
 	return err
 }
@@ -422,6 +424,31 @@ type CompletionResult struct {
 	Line     int
 }
 
+// SearchModulesBySuffix returns modules whose name ends with the given suffix.
+// For example, "Accounts" matches "MyApp.Accounts" and "DocuSign.Client"
+// matches "MyApp.DocuSign.Client".
+func (s *Store) SearchModulesBySuffix(segment string) ([]CompletionResult, error) {
+	rows, err := s.db.Query(
+		"SELECT DISTINCT module FROM definitions WHERE (module = ? OR module LIKE ?) AND function = '' AND kind IN ('module', 'defprotocol') ORDER BY module LIMIT 20",
+		segment, "%."+segment,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var results []CompletionResult
+	for rows.Next() {
+		var r CompletionResult
+		if err := rows.Scan(&r.Module); err != nil {
+			return nil, err
+		}
+		r.Kind = "module"
+		results = append(results, r)
+	}
+	return results, rows.Err()
+}
+
 func (s *Store) SearchModules(prefix string) ([]CompletionResult, error) {
 	rows, err := s.db.Query(
 		"SELECT DISTINCT module FROM definitions WHERE module LIKE ? AND function = '' AND kind IN ('module', 'defprotocol') ORDER BY module LIMIT 100",
@@ -652,12 +679,11 @@ type DelegateEntry struct {
 func (s *Store) LookupDelegatesTo(targetModule, targetFunction string) ([]DelegateEntry, error) {
 	rows, err := s.db.Query(
 		`SELECT module, function, delegate_as, file_path, line FROM definitions
-		 WHERE kind = 'defdelegate' AND delegate_to = ?
-		 AND (
-		   (delegate_as = '' AND function = ?) OR
-		   (delegate_as = ?)
-		 )`,
-		targetModule, targetFunction, targetFunction,
+		 WHERE kind = 'defdelegate' AND delegate_to = ? AND delegate_as = '' AND function = ?
+		 UNION ALL
+		 SELECT module, function, delegate_as, file_path, line FROM definitions
+		 WHERE kind = 'defdelegate' AND delegate_to = ? AND delegate_as = ?`,
+		targetModule, targetFunction, targetModule, targetFunction,
 	)
 	if err != nil {
 		return nil, err
@@ -673,30 +699,6 @@ func (s *Store) LookupDelegatesTo(targetModule, targetFunction string) ([]Delega
 		results = append(results, r)
 	}
 	return results, rows.Err()
-}
-
-// ListCallerModulesForFunction returns the distinct set of modules that have
-// call-site refs for the given function name. Used to find transitive references
-// through use/import chains.
-func (s *Store) ListCallerModulesForFunction(function string) ([]string, error) {
-	rows, err := s.db.Query(
-		"SELECT DISTINCT module FROM refs WHERE function = ? AND kind = 'call'",
-		function,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-
-	var modules []string
-	for rows.Next() {
-		var mod string
-		if err := rows.Scan(&mod); err != nil {
-			return nil, err
-		}
-		modules = append(modules, mod)
-	}
-	return modules, rows.Err()
 }
 
 func (s *Store) SearchSymbols(query string, excludePathPrefix ...string) ([]CompletionResult, error) {
@@ -719,19 +721,25 @@ func (s *Store) SearchSymbols(query string, excludePathPrefix ...string) ([]Comp
 	// and the module (covering "Accounts.fetch_user" → function match and
 	// "MyApp.Accounts" → module match). SQLite LIKE is case-insensitive for
 	// ASCII so "accounts.fetch_user" and "Accounts.fetch_user" both work.
+	// Results are ranked: exact module match first, then case-sensitive
+	// substring match (via INSTR), then the rest alphabetically.
 	if dotIndex := strings.LastIndex(query, "."); dotIndex != -1 {
 		modulePart := "%" + query[:dotIndex] + "%"
 		suffixPart := "%" + query[dotIndex+1:] + "%"
 		args := append([]interface{}{modulePart, suffixPart, suffixPart}, extraArgs...)
+		args = append(args, query, query)
 		rows, err = s.db.Query(
-			"SELECT module, function, arity, kind, file_path, line FROM definitions WHERE module LIKE ? AND (function LIKE ? OR module LIKE ?)"+pathFilter+" ORDER BY module, function LIMIT 200",
+			"SELECT module, function, arity, kind, file_path, line FROM definitions WHERE module LIKE ? AND (function LIKE ? OR module LIKE ?)"+pathFilter+
+				" ORDER BY CASE WHEN module = ? THEN 0 WHEN INSTR(module || '.' || function, ?) > 0 THEN 1 ELSE 2 END, module, function LIMIT 50",
 			args...,
 		)
 	} else {
 		pattern := "%" + query + "%"
 		args := append([]interface{}{pattern, pattern}, extraArgs...)
+		args = append(args, query, query, query)
 		rows, err = s.db.Query(
-			"SELECT module, function, arity, kind, file_path, line FROM definitions WHERE (module LIKE ? OR function LIKE ?)"+pathFilter+" ORDER BY module, function LIMIT 200",
+			"SELECT module, function, arity, kind, file_path, line FROM definitions WHERE (module LIKE ? OR function LIKE ?)"+pathFilter+
+				" ORDER BY CASE WHEN module = ? THEN 0 WHEN INSTR(module, ?) > 0 OR INSTR(function, ?) > 0 THEN 1 ELSE 2 END, module, function LIMIT 50",
 			args...,
 		)
 	}
@@ -786,6 +794,50 @@ func (s *Store) LookupEnclosingFunction(filePath string, lineNum int) (module, f
 		return "", "", 0, 0, false
 	}
 	return module, function, arity, line, true
+}
+
+// OutgoingRef represents a call made from within a function body.
+type OutgoingRef struct {
+	Module   string
+	Function string
+	Line     int
+}
+
+// LookupRefsInRange returns all call refs in filePath between startLine and
+// endLine (inclusive, 1-based). Used for outgoing call hierarchy.
+func (s *Store) LookupRefsInRange(filePath string, startLine, endLine int) ([]OutgoingRef, error) {
+	rows, err := s.db.Query(
+		"SELECT module, function, line FROM refs WHERE file_path = ? AND line >= ? AND line <= ? AND kind = 'call' AND function != ''",
+		filePath, startLine, endLine,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var results []OutgoingRef
+	for rows.Next() {
+		var r OutgoingRef
+		if err := rows.Scan(&r.Module, &r.Function, &r.Line); err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	return results, rows.Err()
+}
+
+// NextFunctionLine returns the line number of the next function definition
+// after startLine in filePath, or 0 if none exists.
+func (s *Store) NextFunctionLine(filePath string, startLine int) int {
+	var line int
+	err := s.db.QueryRow(
+		"SELECT line FROM definitions WHERE file_path = ? AND function != '' AND line > ? ORDER BY line LIMIT 1",
+		filePath, startLine,
+	).Scan(&line)
+	if err != nil {
+		return 0
+	}
+	return line
 }
 
 func (s *Store) LookupFollowDelegate(module, function string) ([]LookupResult, error) {

@@ -149,30 +149,64 @@ func isValidFunctionName(name string) bool {
 	return len(name) > 0 && parser.ScanFuncName(name) == name
 }
 
-var delegateAsRe = regexp.MustCompile(`,\s*as:\s*:[a-z_][a-z0-9_?!]*`)
+var delegateAsLineRe = regexp.MustCompile(`,?\s*as:\s*:[a-z_][a-z0-9_?!]*`)
+var delegateAsValueRe = regexp.MustCompile(`(as:\s*):([a-z_][a-z0-9_?!]*)`)
 
-// updateDelegateAs modifies a defdelegate line to add, update, or remove the
-// `as: :name` option so that the delegate points to newTargetName.
-// If facadeName == newTargetName the as: clause is removed (it would be redundant).
+// delegateStatementSpan returns the range of lines [startLine, endLine) that
+// make up a multi-line defdelegate statement starting at startLine (0-based).
+// A continuation line starts with whitespace followed by a keyword arg (to:, as:).
+func delegateStatementSpan(lines []string, startLine int) (int, int) {
+	end := startLine + 1
+	for end < len(lines) {
+		trimmed := strings.TrimSpace(lines[end])
+		if strings.HasPrefix(trimmed, "to:") || strings.HasPrefix(trimmed, "as:") {
+			end++
+		} else {
+			break
+		}
+	}
+	return startLine, end
+}
+
+// updateDelegateAs modifies a defdelegate statement (possibly multi-line) to
+// add, update, or remove the `as:` option so that the delegate points to
+// newTargetName. If facadeName == newTargetName, any existing as: is removed.
 //
-// Examples (facadeName="foo"):
-//
-//	"  defdelegate foo(x), to: Mod"              + newTarget="bar" → "  defdelegate foo(x), to: Mod, as: :bar"
-//	"  defdelegate foo(x), to: Mod, as: :old"    + newTarget="bar" → "  defdelegate foo(x), to: Mod, as: :bar"
-//	"  defdelegate foo(x), to: Mod, as: :old"    + newTarget="foo" → "  defdelegate foo(x), to: Mod"
-func updateDelegateAs(line, facadeName, newTargetName string) string {
+// lines is the full file content; startLine is the 0-based line where the
+// defdelegate begins. Returns the replacement lines for the statement span.
+func updateDelegateAs(lines []string, startLine int, facadeName, newTargetName string) (updatedLines []string, spanStart, spanEnd int) {
+	spanStart, spanEnd = delegateStatementSpan(lines, startLine)
+	span := make([]string, spanEnd-spanStart)
+	copy(span, lines[spanStart:spanEnd])
+
 	if facadeName == newTargetName {
-		// Remove the as: clause — names match, so it's redundant
-		return delegateAsRe.ReplaceAllString(line, "")
+		// Remove as: clause from whichever line has it
+		for i, line := range span {
+			span[i] = delegateAsLineRe.ReplaceAllString(line, "")
+		}
+		// Remove lines that are now empty (contained only as: :name)
+		var filtered []string
+		for _, line := range span {
+			if strings.TrimSpace(line) != "" {
+				filtered = append(filtered, line)
+			}
+		}
+		return filtered, spanStart, spanEnd
 	}
-	// Try to find and replace existing as: :atom
-	asValueRe := regexp.MustCompile(`(as:\s*):([a-z_][a-z0-9_?!]*)`)
-	if asValueRe.MatchString(line) {
-		return asValueRe.ReplaceAllString(line, "${1}:"+newTargetName)
+
+	// Check if any line in the span has an existing as:
+	for i, line := range span {
+		if delegateAsValueRe.MatchString(line) {
+			span[i] = delegateAsValueRe.ReplaceAllString(line, "${1}:"+newTargetName)
+			return span, spanStart, spanEnd
+		}
 	}
-	// No existing as: — append
-	trimmed := strings.TrimRight(line, " \t\r\n")
-	return trimmed + ", as: :" + newTargetName
+
+	// No existing as: — append to the last line of the statement
+	lastIdx := len(span) - 1
+	trimmed := strings.TrimRight(span[lastIdx], " \t\r\n")
+	span[lastIdx] = trimmed + ", as: :" + newTargetName
+	return span, spanStart, spanEnd
 }
 
 // isValidModuleName returns true if name is a valid Elixir module name.

@@ -302,16 +302,24 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 					IncludeText: false,
 				},
 			},
-			DefinitionProvider:      true,
-			ReferencesProvider:      true,
-			HoverProvider:           true,
-			DocumentSymbolProvider:  true,
-			WorkspaceSymbolProvider: true,
-			RenameProvider:          &protocol.RenameOptions{PrepareProvider: true},
-			CallHierarchyProvider:   true,
+			DefinitionProvider:        true,
+			TypeDefinitionProvider:    true,
+			ReferencesProvider:        true,
+			HoverProvider:             true,
+			DocumentHighlightProvider: true,
+			DocumentSymbolProvider:    true,
+			WorkspaceSymbolProvider:   true,
+			FoldingRangeProvider:      true,
+			CodeActionProvider:        true,
+			RenameProvider:            &protocol.RenameOptions{PrepareProvider: true},
+			CallHierarchyProvider:     true,
 			CompletionProvider: &protocol.CompletionOptions{
 				TriggerCharacters: []string{"."},
 				ResolveProvider:   true,
+			},
+			SignatureHelpProvider: &protocol.SignatureHelpOptions{
+				TriggerCharacters:   []string{"(", ","},
+				RetriggerCharacters: []string{")"},
 			},
 		},
 		ServerInfo: &protocol.ServerInfo{
@@ -456,11 +464,13 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 
 		// Variable go-to-definition via tree-sitter.
 		// The first occurrence in scope is the definition (pattern/assignment).
-		if occs := treesitter.FindVariableOccurrences([]byte(text), uint(lineNum), uint(col)); len(occs) > 0 {
-			return []protocol.Location{{
-				URI:   params.TextDocument.URI,
-				Range: lineRange(int(occs[0].Line)),
-			}}, nil
+		if tree, src, ok := s.docs.GetTree(docURI); ok {
+			if occs := treesitter.FindVariableOccurrencesWithTree(tree.RootNode(), src, uint(lineNum), uint(col)); len(occs) > 0 {
+				return []protocol.Location{{
+					URI:   params.TextDocument.URI,
+					Range: lineRange(int(occs[0].Line)),
+				}}, nil
+			}
 		}
 
 		// Check current buffer first
@@ -547,8 +557,18 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 }
 
 func storeResultsToLocations(results []store.LookupResult) []protocol.Location {
+	type locKey struct {
+		filePath string
+		line     int
+	}
+	seen := make(map[locKey]struct{}, len(results))
 	var locations []protocol.Location
 	for _, r := range results {
+		k := locKey{r.FilePath, r.Line}
+		if _, ok := seen[k]; ok {
+			continue
+		}
+		seen[k] = struct{}{}
 		locations = append(locations, protocol.Location{
 			URI:   uri.File(r.FilePath),
 			Range: lineRange(r.Line - 1), // LSP lines are 0-based
@@ -562,6 +582,24 @@ func lineRange(line int) protocol.Range {
 		Start: protocol.Position{Line: uint32(line), Character: 0},
 		End:   protocol.Position{Line: uint32(line), Character: 0},
 	}
+}
+
+// nthLine returns the n-th line (0-based) from text without splitting the
+// entire string. Returns "" if n is out of range.
+func nthLine(text string, n int) string {
+	start := 0
+	for i := 0; i < n; i++ {
+		idx := strings.IndexByte(text[start:], '\n')
+		if idx < 0 {
+			return ""
+		}
+		start += idx + 1
+	}
+	end := strings.IndexByte(text[start:], '\n')
+	if end < 0 {
+		return text[start:]
+	}
+	return text[start : start+end]
 }
 
 // findDexterRoot walks up from the given path looking for .dexter.db first,
@@ -596,7 +634,163 @@ func (s *Server) WorkDoneProgressCancel(ctx context.Context, params *protocol.Wo
 func (s *Server) LogTrace(ctx context.Context, params *protocol.LogTraceParams) error { return nil }
 func (s *Server) SetTrace(ctx context.Context, params *protocol.SetTraceParams) error { return nil }
 func (s *Server) CodeAction(ctx context.Context, params *protocol.CodeActionParams) ([]protocol.CodeAction, error) {
-	return nil, nil
+	docURI := string(params.TextDocument.URI)
+	text, ok := s.docs.Get(docURI)
+	if !ok {
+		return nil, nil
+	}
+
+	lines := strings.Split(text, "\n")
+	lineNum := int(params.Range.Start.Line)
+	if lineNum >= len(lines) {
+		return nil, nil
+	}
+
+	// Find the full dotted expression at the cursor so that "DocuSign.Client.request"
+	// gives us the complete module reference, not just the segment under the cursor.
+	col := int(params.Range.Start.Character)
+	fullExpr := ExtractFullExpression(lines[lineNum], col)
+	if fullExpr == "" {
+		return nil, nil
+	}
+
+	moduleRef, _ := ExtractModuleAndFunction(fullExpr)
+	if moduleRef == "" {
+		return nil, nil
+	}
+
+	aliases := ExtractAliases(text)
+
+	// Check if the first segment is already aliased — if so, the reference
+	// already resolves and no code action is needed.
+	firstSegment := moduleRef
+	if dot := strings.IndexByte(moduleRef, '.'); dot >= 0 {
+		firstSegment = moduleRef[:dot]
+	}
+	if _, aliased := aliases[firstSegment]; aliased {
+		return nil, nil
+	}
+
+	insertLine, indent := findAliasInsertPoint(lines)
+	var actions []protocol.CodeAction
+
+	// Case 1: Fully qualified module in the store (e.g. "MyApp.RandomAPI.Client").
+	// Offer to alias it and replace the usage with the short form.
+	if strings.Contains(moduleRef, ".") {
+		if defResults, err := s.store.LookupModule(moduleRef); err == nil && len(defResults) > 0 {
+			lastSegment := moduleLastSegment(moduleRef)
+			aliasText := indent + "alias " + moduleRef + "\n"
+
+			// Replace the module part of the expression on the current line
+			// with just the last segment (e.g. "MyApp.RandomAPI.Client" → "Client").
+			exprStart := strings.Index(lines[lineNum], moduleRef)
+			if exprStart >= 0 {
+				var edits []protocol.TextEdit
+				// Insert the alias line
+				edits = append(edits, protocol.TextEdit{
+					Range: protocol.Range{
+						Start: protocol.Position{Line: uint32(insertLine), Character: 0},
+						End:   protocol.Position{Line: uint32(insertLine), Character: 0},
+					},
+					NewText: aliasText,
+				})
+				// Replace the qualified module reference with the short name
+				edits = append(edits, protocol.TextEdit{
+					Range: protocol.Range{
+						Start: protocol.Position{Line: uint32(lineNum), Character: uint32(exprStart)},
+						End:   protocol.Position{Line: uint32(lineNum), Character: uint32(exprStart + len(moduleRef))},
+					},
+					NewText: lastSegment,
+				})
+				actions = append(actions, protocol.CodeAction{
+					Title: "Add alias " + moduleRef,
+					Kind:  protocol.QuickFix,
+					Edit: &protocol.WorkspaceEdit{
+						Changes: map[protocol.DocumentURI][]protocol.TextEdit{
+							protocol.DocumentURI(docURI): edits,
+						},
+					},
+				})
+			}
+		}
+	}
+
+	// Case 2: Short or partially-qualified name not in the store
+	// (e.g. "Client" or "DocuSign.Client"). Search for matching modules.
+	if len(actions) == 0 {
+		results, err := s.store.SearchModulesBySuffix(moduleRef)
+		if err == nil {
+			for _, r := range results {
+				if r.Module == moduleRef {
+					continue
+				}
+				suffix := "." + moduleRef
+				if !strings.HasSuffix(r.Module, suffix) {
+					continue
+				}
+
+				aliasTarget := r.Module
+				if strings.Contains(moduleRef, ".") {
+					aliasTarget = strings.TrimSuffix(r.Module, moduleRef[len(firstSegment):])
+				}
+
+				aliasText := indent + "alias " + aliasTarget + "\n"
+				actions = append(actions, protocol.CodeAction{
+					Title: "Add alias " + aliasTarget,
+					Kind:  protocol.QuickFix,
+					Edit: &protocol.WorkspaceEdit{
+						Changes: map[protocol.DocumentURI][]protocol.TextEdit{
+							protocol.DocumentURI(docURI): {
+								{
+									Range: protocol.Range{
+										Start: protocol.Position{Line: uint32(insertLine), Character: 0},
+										End:   protocol.Position{Line: uint32(insertLine), Character: 0},
+									},
+									NewText: aliasText,
+								},
+							},
+						},
+					},
+				})
+
+				if len(actions) >= 5 {
+					break
+				}
+			}
+		}
+	}
+
+	return actions, nil
+}
+
+// findAliasInsertPoint returns the 0-based line number where a new alias should
+// be inserted and the indentation prefix to use. Places it after the last
+// existing alias/import/use block, matching their indentation.
+func findAliasInsertPoint(lines []string) (insertLine int, indent string) {
+	lastDirective := -1
+	lastIndent := "  " // default to two spaces
+	moduleLineFound := false
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "defmodule ") {
+			moduleLineFound = true
+			if lastDirective < 0 {
+				lastDirective = i
+			}
+			continue
+		}
+		if moduleLineFound {
+			if strings.HasPrefix(trimmed, "alias ") || strings.HasPrefix(trimmed, "import ") ||
+				strings.HasPrefix(trimmed, "use ") || strings.HasPrefix(trimmed, "require ") {
+				lastDirective = i
+				lastIndent = line[:len(line)-len(strings.TrimLeft(line, " \t"))]
+			}
+		}
+	}
+	if lastDirective >= 0 {
+		return lastDirective + 1, lastIndent
+	}
+	return 0, lastIndent
 }
 func (s *Server) CodeLens(ctx context.Context, params *protocol.CodeLensParams) ([]protocol.CodeLens, error) {
 	return nil, nil
@@ -623,9 +817,16 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 		return nil, nil
 	}
 
-	prefix, afterDot := ExtractCompletionContext(lines[lineNum], col)
+	prefix, afterDot, prefixStartCol := ExtractCompletionContext(lines[lineNum], col)
 	if prefix == "" && !afterDot {
 		return nil, nil
+	}
+
+	// Range covering the already-typed prefix through cursor — used for
+	// textEdit on module items so the editor replaces rather than appends.
+	prefixRange := protocol.Range{
+		Start: protocol.Position{Line: uint32(lineNum), Character: uint32(prefixStartCol)},
+		End:   protocol.Position{Line: uint32(lineNum), Character: uint32(col)},
 	}
 
 	moduleRef, funcPrefix := ExtractModuleAndFunction(prefix)
@@ -670,14 +871,27 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 		}
 	} else if moduleRef != "" {
 		aliases := ExtractAliases(text)
+		seenModules := make(map[string]bool)
+
+		addModuleItem := func(label, detail string) {
+			if seenModules[label] {
+				return
+			}
+			seenModules[label] = true
+			items = append(items, protocol.CompletionItem{
+				Label:  label,
+				Kind:   protocol.CompletionItemKindModule,
+				Detail: detail,
+				TextEdit: &protocol.TextEdit{
+					Range:   prefixRange,
+					NewText: label,
+				},
+			})
+		}
 
 		for shortName, fullModule := range aliases {
 			if strings.HasPrefix(shortName, moduleRef) {
-				items = append(items, protocol.CompletionItem{
-					Label:  shortName,
-					Kind:   protocol.CompletionItemKindModule,
-					Detail: fullModule,
-				})
+				addModuleItem(shortName, fullModule)
 			}
 		}
 
@@ -688,18 +902,12 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 				if err == nil {
 					for _, r := range aliasResults {
 						label := parts[0] + strings.TrimPrefix(r.Module, resolved)
-						items = append(items, protocol.CompletionItem{
-							Label:  label,
-							Kind:   protocol.CompletionItemKindModule,
-							Detail: r.Module,
-						})
+						addModuleItem(label, r.Module)
 					}
 				}
 			}
 		}
 
-		// When moduleRef has dots (e.g. "MyApp.Ser"), also search for
-		// sub-module segments under the parent with the last part as prefix.
 		if dotIdx := strings.LastIndexByte(moduleRef, '.'); dotIdx >= 0 {
 			parentModule := moduleRef[:dotIdx]
 			segmentPrefix := moduleRef[dotIdx+1:]
@@ -708,11 +916,7 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 			if err == nil {
 				for _, segment := range segments {
 					label := parentModule + "." + segment
-					items = append(items, protocol.CompletionItem{
-						Label:  label,
-						Kind:   protocol.CompletionItemKindModule,
-						Detail: resolved + "." + segment,
-					})
+					addModuleItem(label, resolved+"."+segment)
 				}
 			}
 		}
@@ -722,11 +926,7 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 			return nil, nil
 		}
 		for _, r := range results {
-			items = append(items, protocol.CompletionItem{
-				Label:  r.Module,
-				Kind:   protocol.CompletionItemKindModule,
-				Detail: "module",
-			})
+			addModuleItem(r.Module, "module")
 		}
 	} else if funcPrefix != "" {
 		seen := make(map[string]bool)
@@ -777,7 +977,11 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 		}
 
 		// Variables in scope via tree-sitter
-		for _, varName := range treesitter.FindVariablesInScope([]byte(text), uint(lineNum), uint(col)) {
+		var varsInScope []string
+		if tree, src, ok := s.docs.GetTree(docURI); ok {
+			varsInScope = treesitter.FindVariablesInScopeWithTree(tree.RootNode(), src, uint(lineNum), uint(col))
+		}
+		for _, varName := range varsInScope {
 			if strings.HasPrefix(varName, funcPrefix) && !seen[varName] {
 				seen[varName] = true
 				items = append(items, protocol.CompletionItem{
@@ -967,29 +1171,87 @@ func (s *Server) resolveModuleViaUseChain(moduleName, functionName string, visit
 	return ""
 }
 
-// usingChainImports returns true if moduleName's __using__ chain imports targetModule,
-// following both direct imports and transitive use chains to any depth.
-func (s *Server) usingChainImports(moduleName, targetModule string, visited map[string]bool) bool {
-	if visited[moduleName] {
-		return false
+// findModulesWhoseUsingImports returns modules whose __using__ chain
+// (directly or transitively via use) imports targetModule. Follows the chain
+// upward: if C.__using__ imports targetModule, and B.__using__ uses C, and
+// A.__using__ uses B, then all of [C, B, A] are returned.
+func (s *Server) findModulesWhoseUsingImports(targetModule string) []string {
+	// Step 1: Find modules whose __using__ directly imports targetModule
+	importRefs, err := s.store.LookupReferences(targetModule, "")
+	if err != nil {
+		return nil
 	}
-	visited[moduleName] = true
 
-	entry := s.cachedUsing(moduleName)
-	if entry == nil {
-		return false
-	}
-	for _, imp := range entry.imports {
-		if imp == targetModule {
-			return true
+	seen := make(map[string]bool)
+	var directInjectors []string
+	for _, ref := range importRefs {
+		if ref.Kind != "import" {
+			continue
+		}
+		mod, _, _, _, found := s.store.LookupEnclosingFunction(ref.FilePath, ref.Line)
+		if !found || seen[mod] {
+			continue
+		}
+		seen[mod] = true
+		entry := s.cachedUsing(mod)
+		if entry == nil {
+			continue
+		}
+		for _, imp := range entry.imports {
+			if imp == targetModule {
+				directInjectors = append(directInjectors, mod)
+				break
+			}
 		}
 	}
-	for _, transUse := range entry.transUses {
-		if s.usingChainImports(transUse, targetModule, visited) {
-			return true
+
+	if len(directInjectors) == 0 {
+		return nil
+	}
+
+	// Step 2: Walk upward — find modules whose __using__ transitively uses
+	// any of the direct injectors (via transUses in __using__ bodies).
+	// Use refs to find who `use`s these modules, then check their __using__.
+	var allInjectors []string
+	allInjectors = append(allInjectors, directInjectors...)
+
+	queue := make([]string, len(directInjectors))
+	copy(queue, directInjectors)
+
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+
+		// Find modules that reference `current` with kind='use'
+		useRefs, err := s.store.LookupReferences(current, "")
+		if err != nil {
+			continue
+		}
+		for _, ref := range useRefs {
+			if ref.Kind != "use" {
+				continue
+			}
+			mod, _, _, _, found := s.store.LookupEnclosingFunction(ref.FilePath, ref.Line)
+			if !found || seen[mod] {
+				continue
+			}
+			seen[mod] = true
+			// Check if this use is inside a __using__ body (making it a transitive injector)
+			entry := s.cachedUsing(mod)
+			if entry == nil {
+				continue
+			}
+			for _, tu := range entry.transUses {
+				if tu == current {
+					allInjectors = append(allInjectors, mod)
+					queue = append(queue, mod)
+					break
+				}
+			}
 		}
 	}
-	return false
+
+	return allInjectors
 }
 
 // addCompletionsFromUsing adds completion items injected by a module's __using__
@@ -1093,9 +1355,13 @@ func funcKey(name string, arity int) string {
 }
 
 func applySnippet(item *protocol.CompletionItem, name string, arity int) {
+	item.Label = fmt.Sprintf("%s/%d", name, arity)
+	item.FilterText = name
+	item.InsertTextFormat = protocol.InsertTextFormatSnippet
 	if arity > 0 {
 		item.InsertText = functionSnippet(name, arity)
-		item.InsertTextFormat = protocol.InsertTextFormatSnippet
+	} else {
+		item.InsertText = name + "()"
 	}
 }
 
@@ -1208,7 +1474,73 @@ func (s *Server) DocumentColor(ctx context.Context, params *protocol.DocumentCol
 	return nil, nil
 }
 func (s *Server) DocumentHighlight(ctx context.Context, params *protocol.DocumentHighlightParams) ([]protocol.DocumentHighlight, error) {
-	return nil, nil
+	docURI := string(params.TextDocument.URI)
+	text, ok := s.docs.Get(docURI)
+	if !ok {
+		return nil, nil
+	}
+
+	lineNum := int(params.Position.Line)
+	col := int(params.Position.Character)
+
+	tree, src, hasTree := s.docs.GetTree(docURI)
+	if !hasTree {
+		return nil, nil
+	}
+	root := tree.RootNode()
+
+	// Try scope-aware variable highlight first
+	if occs := treesitter.FindVariableOccurrencesWithTree(root, src, uint(lineNum), uint(col)); len(occs) > 0 {
+		var highlights []protocol.DocumentHighlight
+		for _, occ := range occs {
+			highlights = append(highlights, protocol.DocumentHighlight{
+				Range: protocol.Range{
+					Start: protocol.Position{Line: uint32(occ.Line), Character: uint32(occ.StartCol)},
+					End:   protocol.Position{Line: uint32(occ.Line), Character: uint32(occ.EndCol)},
+				},
+				Kind: protocol.DocumentHighlightKindText,
+			})
+		}
+		return highlights, nil
+	}
+
+	// Extract the cursor's line without splitting the entire document
+	line := nthLine(text, lineNum)
+	if line == "" {
+		return nil, nil
+	}
+
+	expr := ExtractExpression(line, col)
+	if expr == "" {
+		return nil, nil
+	}
+
+	moduleRef, functionName := ExtractModuleAndFunction(expr)
+	token := functionName
+	if token == "" {
+		token = moduleLastSegment(moduleRef)
+	}
+	if token == "" {
+		return nil, nil
+	}
+
+	// Reuse the same parsed tree for token occurrences
+	occs := treesitter.FindTokenOccurrencesWithTree(root, src, token)
+	if len(occs) == 0 {
+		return nil, nil
+	}
+
+	var highlights []protocol.DocumentHighlight
+	for _, occ := range occs {
+		highlights = append(highlights, protocol.DocumentHighlight{
+			Range: protocol.Range{
+				Start: protocol.Position{Line: uint32(occ.Line), Character: uint32(occ.StartCol)},
+				End:   protocol.Position{Line: uint32(occ.Line), Character: uint32(occ.EndCol)},
+			},
+			Kind: protocol.DocumentHighlightKindText,
+		})
+	}
+	return highlights, nil
 }
 func (s *Server) DocumentLink(ctx context.Context, params *protocol.DocumentLinkParams) ([]protocol.DocumentLink, error) {
 	return nil, nil
@@ -1605,7 +1937,76 @@ func (s *Server) ExecuteCommand(ctx context.Context, params *protocol.ExecuteCom
 	return nil, nil
 }
 func (s *Server) FoldingRanges(ctx context.Context, params *protocol.FoldingRangeParams) ([]protocol.FoldingRange, error) {
-	return nil, nil
+	docURI := string(params.TextDocument.URI)
+	text, ok := s.docs.Get(docURI)
+	if !ok {
+		return nil, nil
+	}
+
+	lines := strings.Split(text, "\n")
+	var ranges []protocol.FoldingRange
+	inHeredoc := false
+	heredocStart := 0
+
+	type blockStart struct {
+		line   int
+		indent int
+	}
+	var stack []blockStart
+
+	for i, line := range lines {
+		// Track heredoc boundaries as foldable regions
+		if strings.Contains(line, `"""`) {
+			count := strings.Count(line, `"""`)
+			if count >= 2 {
+				continue
+			}
+			if !inHeredoc {
+				inHeredoc = true
+				heredocStart = i
+			} else {
+				inHeredoc = false
+				if i > heredocStart {
+					ranges = append(ranges, protocol.FoldingRange{
+						StartLine: uint32(heredocStart),
+						EndLine:   uint32(i),
+					})
+				}
+			}
+			continue
+		}
+		if inHeredoc {
+			continue
+		}
+
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		indent := len(line) - len(strings.TrimLeft(line, " \t"))
+
+		// Check for do blocks: "... do" at end of line
+		if strings.HasSuffix(trimmed, " do") || strings.HasSuffix(trimmed, "\tdo") || trimmed == "do" {
+			stack = append(stack, blockStart{line: i, indent: indent})
+			continue
+		}
+
+		// Pop on "end" at matching indent
+		if trimmed == "end" && len(stack) > 0 {
+			top := stack[len(stack)-1]
+			if indent == top.indent {
+				stack = stack[:len(stack)-1]
+				if i > top.line {
+					ranges = append(ranges, protocol.FoldingRange{
+						StartLine: uint32(top.line),
+						EndLine:   uint32(i),
+					})
+				}
+			}
+		}
+	}
+
+	return ranges, nil
 }
 func (s *Server) Formatting(ctx context.Context, params *protocol.DocumentFormattingParams) ([]protocol.TextEdit, error) {
 	return nil, nil
@@ -1794,19 +2195,21 @@ func (s *Server) PrepareRename(ctx context.Context, params *protocol.PrepareRena
 	}
 
 	// Not a known module/function — try variable rename via tree-sitter
-	if occs := treesitter.FindVariableOccurrences([]byte(text), uint(lineNum), uint(col)); len(occs) > 0 {
-		for _, occ := range occs {
-			if occ.Line == uint(lineNum) && uint(col) >= occ.StartCol && uint(col) < occ.EndCol {
-				return &protocol.Range{
-					Start: protocol.Position{Line: uint32(occ.Line), Character: uint32(occ.StartCol)},
-					End:   protocol.Position{Line: uint32(occ.Line), Character: uint32(occ.EndCol)},
-				}, nil
+	if tree, src, ok := s.docs.GetTree(docURI); ok {
+		if occs := treesitter.FindVariableOccurrencesWithTree(tree.RootNode(), src, uint(lineNum), uint(col)); len(occs) > 0 {
+			for _, occ := range occs {
+				if occ.Line == uint(lineNum) && uint(col) >= occ.StartCol && uint(col) < occ.EndCol {
+					return &protocol.Range{
+						Start: protocol.Position{Line: uint32(occ.Line), Character: uint32(occ.StartCol)},
+						End:   protocol.Position{Line: uint32(occ.Line), Character: uint32(occ.EndCol)},
+					}, nil
+				}
 			}
+			return &protocol.Range{
+				Start: protocol.Position{Line: uint32(occs[0].Line), Character: uint32(occs[0].StartCol)},
+				End:   protocol.Position{Line: uint32(occs[0].Line), Character: uint32(occs[0].EndCol)},
+			}, nil
 		}
-		return &protocol.Range{
-			Start: protocol.Position{Line: uint32(occs[0].Line), Character: uint32(occs[0].StartCol)},
-			End:   protocol.Position{Line: uint32(occs[0].Line), Character: uint32(occs[0].EndCol)},
-		}, nil
 	}
 
 	return nil, nil
@@ -1937,27 +2340,21 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 	}
 
 	// Also find refs attributed to modules whose __using__ transitively imports
-	// fullModule — following both direct imports and transitive use chains,
-	// matching the same logic as lookupInUsingEntry for go-to-definition.
+	// fullModule. Refs to use-injected functions are attributed to the injecting
+	// module (the one whose __using__ does the import), not the consuming module.
+	// Instead of scanning all modules with calls to functionName (can be thousands
+	// for common names), we find injector modules directly via import refs.
 	if functionName != "" {
 		tStep = s.debugNow()
-		callerModules, err := s.store.ListCallerModulesForFunction(functionName)
+		injectors := s.findModulesWhoseUsingImports(fullModule)
 		if s.debug {
-			s.debugf("References: ListCallerModulesForFunction: %d modules (%s)", len(callerModules), time.Since(tStep).Round(time.Microsecond))
+			s.debugf("References: use-chain injectors for %s: %v (%s)", fullModule, injectors, time.Since(tStep).Round(time.Microsecond))
 		}
-		if err == nil {
-			visited := make(map[string]bool)
-			for _, mod := range callerModules {
-				if mod == fullModule {
-					continue
-				}
-				if s.usingChainImports(mod, fullModule, visited) {
-					transitive, err := s.store.LookupReferences(mod, functionName)
-					if err == nil {
-						refResults = append(refResults, transitive...)
-						s.debugf("References: transitive via %s: +%d results", mod, len(transitive))
-					}
-				}
+		for _, mod := range injectors {
+			transitive, err := s.store.LookupReferences(mod, functionName)
+			if err == nil {
+				refResults = append(refResults, transitive...)
+				s.debugf("References: transitive via %s: +%d results", mod, len(transitive))
 			}
 		}
 	}
@@ -2087,18 +2484,20 @@ func (s *Server) Rename(ctx context.Context, params *protocol.RenameParams) (*pr
 	}
 
 	// Not a known module/function — try variable rename via tree-sitter
-	if occs := treesitter.FindVariableOccurrences([]byte(text), uint(lineNum), uint(col)); len(occs) > 0 {
-		changes := make(map[protocol.DocumentURI][]protocol.TextEdit)
-		for _, occ := range occs {
-			changes[protocol.DocumentURI(docURI)] = append(changes[protocol.DocumentURI(docURI)], protocol.TextEdit{
-				Range: protocol.Range{
-					Start: protocol.Position{Line: uint32(occ.Line), Character: uint32(occ.StartCol)},
-					End:   protocol.Position{Line: uint32(occ.Line), Character: uint32(occ.EndCol)},
-				},
-				NewText: params.NewName,
-			})
+	if tree, src, ok := s.docs.GetTree(docURI); ok {
+		if occs := treesitter.FindVariableOccurrencesWithTree(tree.RootNode(), src, uint(lineNum), uint(col)); len(occs) > 0 {
+			changes := make(map[protocol.DocumentURI][]protocol.TextEdit)
+			for _, occ := range occs {
+				changes[protocol.DocumentURI(docURI)] = append(changes[protocol.DocumentURI(docURI)], protocol.TextEdit{
+					Range: protocol.Range{
+						Start: protocol.Position{Line: uint32(occ.Line), Character: uint32(occ.StartCol)},
+						End:   protocol.Position{Line: uint32(occ.Line), Character: uint32(occ.EndCol)},
+					},
+					NewText: params.NewName,
+				})
+			}
+			return &protocol.WorkspaceEdit{Changes: changes}, nil
 		}
-		return &protocol.WorkspaceEdit{Changes: changes}, nil
 	}
 
 	return nil, nil
@@ -2147,23 +2546,14 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*pro
 	}
 
 	// Transitive refs via __using__ chains
-	callerModules, err := s.store.ListCallerModulesForFunction(functionName)
-	if err == nil {
-		visited := make(map[string]bool)
-		for _, mod := range callerModules {
-			if mod == module {
-				continue
-			}
-			if s.usingChainImports(mod, module, visited) {
-				transitive, err := s.store.LookupReferences(mod, functionName)
-				if err == nil {
-					for _, r := range transitive {
-						if r.Kind == "alias" || r.Kind == "use" {
-							continue
-						}
-						addSite(r.FilePath, r.Line)
-					}
+	for _, mod := range s.findModulesWhoseUsingImports(module) {
+		transitive, err := s.store.LookupReferences(mod, functionName)
+		if err == nil {
+			for _, r := range transitive {
+				if r.Kind == "alias" || r.Kind == "use" {
+					continue
 				}
+				addSite(r.FilePath, r.Line)
 			}
 		}
 	}
@@ -2234,39 +2624,50 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*pro
 				if s.isDepsFile(del.FilePath) {
 					continue
 				}
-				lineText, ok := s.getFileLine(del.FilePath, del.Line)
+				fileText, open, ok := s.readFileText(del.FilePath)
 				if !ok {
 					continue
 				}
-				updatedLine := updateDelegateAs(lineText, del.Function, newName)
-				if updatedLine == lineText {
+				fileLines := strings.Split(fileText, "\n")
+				startLine := del.Line - 1
+				if startLine >= len(fileLines) {
 					continue
 				}
-				lineIdx := uint32(del.Line - 1)
-				fileURI := protocol.DocumentURI(uri.File(del.FilePath))
 
-				if _, open := s.docs.Get(string(uri.File(del.FilePath))); open {
+				updatedSpan, spanStart, spanEnd := updateDelegateAs(fileLines, startLine, del.Function, newName)
+				// Check if anything actually changed
+				changed := len(updatedSpan) != spanEnd-spanStart
+				if !changed {
+					for i, line := range updatedSpan {
+						if line != fileLines[spanStart+i] {
+							changed = true
+							break
+						}
+					}
+				}
+				if !changed {
+					continue
+				}
+
+				fileURI := protocol.DocumentURI(uri.File(del.FilePath))
+				if open {
 					if edit.Changes == nil {
 						edit.Changes = make(map[protocol.DocumentURI][]protocol.TextEdit)
 					}
 					edit.Changes[fileURI] = append(edit.Changes[fileURI], protocol.TextEdit{
 						Range: protocol.Range{
-							Start: protocol.Position{Line: lineIdx, Character: 0},
-							End:   protocol.Position{Line: lineIdx, Character: uint32(len(lineText))},
+							Start: protocol.Position{Line: uint32(spanStart), Character: 0},
+							End:   protocol.Position{Line: uint32(spanEnd - 1), Character: uint32(len(fileLines[spanEnd-1]))},
 						},
-						NewText: updatedLine,
+						NewText: strings.Join(updatedSpan, "\n"),
 					})
 				} else {
-					// Closed file: read, replace the line, write back
-					fileText, _, ok := s.readFileText(del.FilePath)
-					if !ok {
-						continue
-					}
-					fileLines := strings.Split(fileText, "\n")
-					if del.Line-1 < len(fileLines) {
-						fileLines[del.Line-1] = updatedLine
-						_ = os.WriteFile(del.FilePath, []byte(strings.Join(fileLines, "\n")), 0644)
-					}
+					// Closed file: splice updated span into file lines and write back
+					newFileLines := make([]string, 0, len(fileLines)-spanEnd+spanStart+len(updatedSpan))
+					newFileLines = append(newFileLines, fileLines[:spanStart]...)
+					newFileLines = append(newFileLines, updatedSpan...)
+					newFileLines = append(newFileLines, fileLines[spanEnd:]...)
+					_ = os.WriteFile(del.FilePath, []byte(strings.Join(newFileLines, "\n")), 0644)
 				}
 			}
 		}
@@ -2912,7 +3313,131 @@ func (s *Server) findBareCallRefs(module, functionName string) []store.Reference
 	return refs
 }
 func (s *Server) SignatureHelp(ctx context.Context, params *protocol.SignatureHelpParams) (*protocol.SignatureHelp, error) {
-	return nil, nil
+	docURI := string(params.TextDocument.URI)
+	text, ok := s.docs.Get(docURI)
+	if !ok {
+		return nil, nil
+	}
+
+	lineNum := int(params.Position.Line)
+	col := int(params.Position.Character)
+
+	funcExpr, argIndex, found := ExtractCallContext(text, lineNum, col)
+	if !found {
+		return nil, nil
+	}
+
+	moduleRef, functionName := ExtractModuleAndFunction(funcExpr)
+	if functionName == "" {
+		return nil, nil
+	}
+
+	aliases := ExtractAliases(text)
+	lines := strings.Split(text, "\n")
+
+	// Resolve the function to a store lookup result
+	var result *store.LookupResult
+	if moduleRef != "" {
+		fullModule := resolveModule(moduleRef, aliases)
+		if results, err := s.store.LookupFunction(fullModule, functionName); err == nil && len(results) > 0 {
+			result = &results[0]
+		}
+	} else {
+		// Bare function — check buffer, imports, use chains, Kernel
+		if defLine, found := FindFunctionDefinition(text, functionName); found {
+			// Build signature from buffer
+			paramNames := extractParamNames(lines, defLine-1)
+			if paramNames == nil {
+				return nil, nil
+			}
+			sig := buildSignature(functionName, paramNames, lines, defLine-1)
+			return &protocol.SignatureHelp{
+				Signatures:      []protocol.SignatureInformation{sig},
+				ActiveSignature: 0,
+				ActiveParameter: uint32(argIndex),
+			}, nil
+		}
+
+		for _, mod := range ExtractImports(text) {
+			if results, err := s.store.LookupFunction(mod, functionName); err == nil && len(results) > 0 {
+				result = &results[0]
+				break
+			}
+		}
+
+		if result == nil {
+			if results := s.lookupThroughUse(text, functionName, aliases); len(results) > 0 {
+				result = &results[0]
+			}
+		}
+
+		if result == nil {
+			if results, err := s.store.LookupFollowDelegate("Kernel", functionName); err == nil && len(results) > 0 {
+				result = &results[0]
+			}
+		}
+	}
+
+	if result == nil {
+		return nil, nil
+	}
+
+	// Read the definition file, preferring the in-memory doc store
+	fileText, _, ok2 := s.readFileText(result.FilePath)
+	if !ok2 {
+		return nil, nil
+	}
+	fileLines := strings.Split(fileText, "\n")
+	defIdx := result.Line - 1
+	if defIdx < 0 || defIdx >= len(fileLines) {
+		return nil, nil
+	}
+
+	paramNames := extractParamNames(fileLines, defIdx)
+	if paramNames == nil {
+		return nil, nil
+	}
+
+	sig := buildSignature(functionName, paramNames, fileLines, defIdx)
+	return &protocol.SignatureHelp{
+		Signatures:      []protocol.SignatureInformation{sig},
+		ActiveSignature: 0,
+		ActiveParameter: uint32(argIndex),
+	}, nil
+}
+
+func buildSignature(functionName string, paramNames []string, lines []string, defIdx int) protocol.SignatureInformation {
+	label := functionName + "(" + strings.Join(paramNames, ", ") + ")"
+
+	var params []protocol.ParameterInformation
+	for _, name := range paramNames {
+		params = append(params, protocol.ParameterInformation{
+			Label: name,
+		})
+	}
+
+	sig := protocol.SignatureInformation{
+		Label:      label,
+		Parameters: params,
+	}
+
+	// Add @spec and @doc as documentation if present
+	doc, spec := extractDocAbove(lines, defIdx)
+	var docParts []string
+	if spec != "" {
+		docParts = append(docParts, "```elixir\n"+spec+"\n```")
+	}
+	if doc != "" {
+		docParts = append(docParts, doc)
+	}
+	if len(docParts) > 0 {
+		sig.Documentation = protocol.MarkupContent{
+			Kind:  protocol.Markdown,
+			Value: strings.Join(docParts, "\n\n"),
+		}
+	}
+
+	return sig
 }
 func (s *Server) Symbols(ctx context.Context, params *protocol.WorkspaceSymbolParams) ([]protocol.SymbolInformation, error) {
 	query := params.Query
@@ -2947,7 +3472,48 @@ func (s *Server) Symbols(ctx context.Context, params *protocol.WorkspaceSymbolPa
 	return symbols, nil
 }
 func (s *Server) TypeDefinition(ctx context.Context, params *protocol.TypeDefinitionParams) ([]protocol.Location, error) {
-	return nil, nil
+	docURI := string(params.TextDocument.URI)
+	text, ok := s.docs.Get(docURI)
+	if !ok {
+		return nil, nil
+	}
+
+	lines := strings.Split(text, "\n")
+	lineNum := int(params.Position.Line)
+	col := int(params.Position.Character)
+	if lineNum >= len(lines) {
+		return nil, nil
+	}
+
+	expr := ExtractExpression(lines[lineNum], col)
+	if expr == "" {
+		return nil, nil
+	}
+
+	moduleRef, typeName := ExtractModuleAndFunction(expr)
+	if typeName == "" {
+		return nil, nil
+	}
+
+	aliases := ExtractAliases(text)
+	fullModule := resolveModule(moduleRef, aliases)
+
+	results, err := s.store.LookupFunction(fullModule, typeName)
+	if err != nil {
+		return nil, nil
+	}
+
+	// Filter to only type definitions
+	var locations []protocol.Location
+	for _, r := range results {
+		if r.Kind == "type" || r.Kind == "typep" || r.Kind == "opaque" {
+			locations = append(locations, protocol.Location{
+				URI:   uri.File(r.FilePath),
+				Range: lineRange(r.Line - 1),
+			})
+		}
+	}
+	return locations, nil
 }
 func (s *Server) WillSave(ctx context.Context, params *protocol.WillSaveTextDocumentParams) error {
 	return nil
@@ -3040,13 +3606,22 @@ func (s *Server) PrepareCallHierarchy(ctx context.Context, params *protocol.Call
 	return []protocol.CallHierarchyItem{item}, nil
 }
 
-func (s *Server) IncomingCalls(ctx context.Context, params *protocol.CallHierarchyIncomingCallsParams) ([]protocol.CallHierarchyIncomingCall, error) {
-	data, ok := params.Item.Data.(map[string]interface{})
-	if !ok {
-		return nil, nil
+// extractCallHierarchyData extracts module and function from a CallHierarchyItem's
+// Data field. Handles both map[string]string (direct Go calls) and
+// map[string]interface{} (after JSON round-trip).
+func extractCallHierarchyData(data interface{}) (module, function string) {
+	if m, ok := data.(map[string]interface{}); ok {
+		module, _ = m["module"].(string)
+		function, _ = m["function"].(string)
+	} else if m, ok := data.(map[string]string); ok {
+		module = m["module"]
+		function = m["function"]
 	}
-	module, _ := data["module"].(string)
-	functionName, _ := data["function"].(string)
+	return
+}
+
+func (s *Server) IncomingCalls(ctx context.Context, params *protocol.CallHierarchyIncomingCallsParams) ([]protocol.CallHierarchyIncomingCall, error) {
+	module, functionName := extractCallHierarchyData(params.Item.Data)
 	if module == "" || functionName == "" {
 		return nil, nil
 	}
@@ -3058,17 +3633,9 @@ func (s *Server) IncomingCalls(ctx context.Context, params *protocol.CallHierarc
 	}
 
 	// Transitive refs via __using__ chains
-	if callerModules, err := s.store.ListCallerModulesForFunction(functionName); err == nil {
-		visited := make(map[string]bool)
-		for _, mod := range callerModules {
-			if mod == module {
-				continue
-			}
-			if s.usingChainImports(mod, module, visited) {
-				if transitive, err := s.store.LookupReferences(mod, functionName); err == nil {
-					refResults = append(refResults, transitive...)
-				}
-			}
+	for _, mod := range s.findModulesWhoseUsingImports(module) {
+		if transitive, err := s.store.LookupReferences(mod, functionName); err == nil {
+			refResults = append(refResults, transitive...)
 		}
 	}
 
@@ -3131,7 +3698,90 @@ func (s *Server) IncomingCalls(ctx context.Context, params *protocol.CallHierarc
 }
 
 func (s *Server) OutgoingCalls(ctx context.Context, params *protocol.CallHierarchyOutgoingCallsParams) ([]protocol.CallHierarchyOutgoingCall, error) {
-	return nil, nil
+	module, functionName := extractCallHierarchyData(params.Item.Data)
+	if module == "" || functionName == "" {
+		return nil, nil
+	}
+
+	// Find the definition location
+	defResults, err := s.store.LookupFunction(module, functionName)
+	if err != nil || len(defResults) == 0 {
+		return nil, nil
+	}
+	def := defResults[0]
+
+	// Determine the line range of the function body: from the def line to
+	// the next function definition (or a generous window if none found).
+	endLine := s.store.NextFunctionLine(def.FilePath, def.Line)
+	if endLine == 0 {
+		endLine = def.Line + 500
+	}
+
+	// Query indexed refs within that range
+	outRefs, err := s.store.LookupRefsInRange(def.FilePath, def.Line, endLine-1)
+	if err != nil {
+		return nil, nil
+	}
+
+	// Deduplicate by target (module, function) and collect call ranges
+	type callTarget struct {
+		module   string
+		function string
+	}
+	type targetInfo struct {
+		callRanges []protocol.Range
+	}
+	targets := make(map[callTarget]*targetInfo)
+	var targetOrder []callTarget
+	for _, ref := range outRefs {
+		key := callTarget{ref.Module, ref.Function}
+		if _, ok := targets[key]; !ok {
+			targets[key] = &targetInfo{}
+			targetOrder = append(targetOrder, key)
+		}
+		targets[key].callRanges = append(targets[key].callRanges, lineRange(ref.Line-1))
+	}
+
+	var calls []protocol.CallHierarchyOutgoingCall
+	for _, key := range targetOrder {
+		info := targets[key]
+
+		// Look up the target function's definition
+		targetDefs, err := s.store.LookupFunction(key.module, key.function)
+		if err != nil || len(targetDefs) == 0 {
+			continue
+		}
+		td := targetDefs[0]
+		if s.stdlibRoot != "" && strings.HasPrefix(td.FilePath, s.stdlibRoot) {
+			continue
+		}
+
+		nameCol := 0
+		if defLine, ok := s.getFileLine(td.FilePath, td.Line); ok {
+			if col := findTokenColumn(defLine, key.function); col >= 0 {
+				nameCol = col
+			}
+		}
+
+		toItem := protocol.CallHierarchyItem{
+			Name:  fmt.Sprintf("%s.%s", key.module, key.function),
+			Kind:  protocol.SymbolKindFunction,
+			URI:   protocol.DocumentURI(uri.File(td.FilePath)),
+			Range: lineRange(td.Line - 1),
+			SelectionRange: protocol.Range{
+				Start: protocol.Position{Line: uint32(td.Line - 1), Character: uint32(nameCol)},
+				End:   protocol.Position{Line: uint32(td.Line - 1), Character: uint32(nameCol + len(key.function))},
+			},
+			Data: map[string]string{"module": key.module, "function": key.function},
+		}
+
+		calls = append(calls, protocol.CallHierarchyOutgoingCall{
+			To:         toItem,
+			FromRanges: info.callRanges,
+		})
+	}
+
+	return calls, nil
 }
 func (s *Server) SemanticTokensFull(ctx context.Context, params *protocol.SemanticTokensParams) (*protocol.SemanticTokens, error) {
 	return nil, nil
