@@ -585,10 +585,8 @@ type ReferenceResult struct {
 func (s *Store) LookupReferences(module, function string) ([]ReferenceResult, error) {
 	query := "SELECT file_path, line, kind FROM refs WHERE module = ?"
 	args := []interface{}{module}
-	if function != "" {
-		query += " AND function = ?"
-		args = append(args, function)
-	}
+	query += " AND function = ?"
+	args = append(args, function)
 	query += " ORDER BY file_path, line"
 
 	rows, err := s.db.Query(query, args...)

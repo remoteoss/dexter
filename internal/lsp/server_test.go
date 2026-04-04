@@ -1732,6 +1732,42 @@ end`
 	}
 }
 
+func TestReferences_ModuleOnlyExcludesFunctionCalls(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	guardsSrc := `defmodule MyApp.Guards do
+  defguard is_positive(x) when x > 0
+  defguard is_negative(x) when x < 0
+end`
+
+	consumerSrc := `defmodule MyApp.Consumer do
+  import MyApp.Guards
+
+  def check(x) when is_positive(x), do: :pos
+  def check(x) when is_negative(x), do: :neg
+end`
+
+	indexFile(t, server.store, server.projectRoot, "lib/guards.ex", guardsSrc)
+	indexFile(t, server.store, server.projectRoot, "lib/consumer.ex", consumerSrc)
+
+	consumerURI := "file://" + filepath.Join(server.projectRoot, "lib/consumer.ex")
+	server.docs.Set(consumerURI, consumerSrc)
+
+	// References on the module name "MyApp.Guards" at the import line
+	// should return only the import, not the bare guard function calls.
+	locs := referencesAt(t, server, consumerURI, 1, 10)
+
+	for _, loc := range locs {
+		locURI := string(loc.URI)
+		line := loc.Range.Start.Line
+		// Lines 3 and 4 are bare guard calls — they should NOT appear.
+		if strings.Contains(locURI, "consumer.ex") && (line == 3 || line == 4) {
+			t.Errorf("module-only references should not include function call at line %d", line)
+		}
+	}
+}
+
 func TestServer_Formatting(t *testing.T) {
 	_, err := exec.LookPath("mix")
 	if err != nil {
