@@ -293,7 +293,7 @@ func completionAt(t *testing.T, server *Server, uri string, line, col uint32) []
 
 func hasCompletionItem(items []protocol.CompletionItem, label string) bool {
 	for _, item := range items {
-		if item.Label == label {
+		if item.Label == label || item.FilterText == label {
 			return true
 		}
 	}
@@ -455,12 +455,18 @@ end
 	items := completionAt(t, server, uri, 0, 17)
 	fetchCount := 0
 	for _, item := range items {
-		if item.Label == "fetch" {
+		if item.FilterText == "fetch" {
 			fetchCount++
 		}
 	}
 	if fetchCount != 2 {
 		t.Errorf("expected 2 fetch completions (arity 1 and 2), got %d", fetchCount)
+	}
+	if !hasCompletionItem(items, "fetch/1") {
+		t.Error("expected 'fetch/1' label in completions")
+	}
+	if !hasCompletionItem(items, "fetch/2") {
+		t.Error("expected 'fetch/2' label in completions")
 	}
 }
 
@@ -768,7 +774,7 @@ end
 
 	var statusItem *protocol.CompletionItem
 	for _, item := range items {
-		if item.Label == "status" {
+		if item.FilterText == "status" || item.Label == "status" {
 			item := item
 			statusItem = &item
 			break
@@ -900,7 +906,7 @@ end
 
 	var createItem protocol.CompletionItem
 	for _, item := range items {
-		if item.Label == "create" {
+		if item.FilterText == "create" {
 			createItem = item
 			break
 		}
@@ -2431,5 +2437,579 @@ func TestServer_Capabilities_DocumentSymbolAndWorkspaceSymbol(t *testing.T) {
 	}
 	if caps.WorkspaceSymbolProvider != true {
 		t.Error("WorkspaceSymbolProvider should be true")
+	}
+	if caps.DocumentHighlightProvider != true {
+		t.Error("DocumentHighlightProvider should be true")
+	}
+	if caps.TypeDefinitionProvider != true {
+		t.Error("TypeDefinitionProvider should be true")
+	}
+	if caps.SignatureHelpProvider == nil {
+		t.Error("SignatureHelpProvider should not be nil")
+	}
+}
+
+// === DocumentHighlight ===
+
+func TestDocumentHighlight_Variable(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyApp do
+  def process(data) do
+    result = transform(data)
+    result
+  end
+end`)
+
+	result, err := server.DocumentHighlight(context.Background(), &protocol.DocumentHighlightParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(uri)},
+			Position:     protocol.Position{Line: 2, Character: 4}, // cursor on "result"
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result) != 2 {
+		t.Fatalf("expected 2 highlights for 'result', got %d", len(result))
+	}
+}
+
+func TestDocumentHighlight_Function(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyApp do
+  def process(data) do
+    process(data)
+    # process comment
+    "process string"
+  end
+end`)
+
+	result, err := server.DocumentHighlight(context.Background(), &protocol.DocumentHighlightParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(uri)},
+			Position:     protocol.Position{Line: 2, Character: 4}, // cursor on process() call
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Should find def process and process() call, NOT comment or string
+	if len(result) != 2 {
+		t.Fatalf("expected 2 highlights for 'process', got %d", len(result))
+	}
+}
+
+// === TypeDefinition ===
+
+func TestTypeDefinition(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", `defmodule MyApp.Accounts do
+  @type status :: :active | :inactive
+  @opaque token :: String.t()
+
+  def create(attrs) do
+    :ok
+  end
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, "  MyApp.Accounts.status")
+
+	result, err := server.TypeDefinition(context.Background(), &protocol.TypeDefinitionParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(uri)},
+			Position:     protocol.Position{Line: 0, Character: 18}, // cursor on "status"
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result) == 0 {
+		t.Fatal("expected type definition result for 'status'")
+	}
+}
+
+func TestTypeDefinition_SkipsNonTypes(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", `defmodule MyApp.Accounts do
+  def create(attrs) do
+    :ok
+  end
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, "  MyApp.Accounts.create")
+
+	result, err := server.TypeDefinition(context.Background(), &protocol.TypeDefinitionParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(uri)},
+			Position:     protocol.Position{Line: 0, Character: 18}, // cursor on "create"
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result) != 0 {
+		t.Errorf("expected no type definition for regular function 'create', got %d", len(result))
+	}
+}
+
+// === SignatureHelp ===
+
+func TestSignatureHelp_QualifiedCall(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", `defmodule MyApp.Accounts do
+  @doc "Creates an account"
+  @spec create(map(), keyword()) :: {:ok, term()}
+  def create(attrs, opts) do
+    :ok
+  end
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyApp.Test do
+  alias MyApp.Accounts
+  def run do
+    Accounts.create(attrs, )
+  end
+end`)
+
+	// cursor on the space after the comma in "Accounts.create(attrs, )"
+	result, err := server.SignatureHelp(context.Background(), &protocol.SignatureHelpParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(uri)},
+			Position:     protocol.Position{Line: 3, Character: 27},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil {
+		t.Fatal("expected signature help result")
+	}
+	if len(result.Signatures) != 1 {
+		t.Fatalf("expected 1 signature, got %d", len(result.Signatures))
+	}
+	sig := result.Signatures[0]
+	if sig.Label != "create(attrs, opts)" {
+		t.Errorf("unexpected label: %s", sig.Label)
+	}
+	if len(sig.Parameters) != 2 {
+		t.Errorf("expected 2 parameters, got %d", len(sig.Parameters))
+	}
+	if result.ActiveParameter != 1 {
+		t.Errorf("expected active parameter 1, got %d", result.ActiveParameter)
+	}
+}
+
+func TestSignatureHelp_LocalFunction(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyApp.Test do
+  def process(data, opts) do
+    :ok
+  end
+
+  def run do
+    process(x, )
+  end
+end`)
+
+	// cursor after comma in process(x, )
+	result, err := server.SignatureHelp(context.Background(), &protocol.SignatureHelpParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(uri)},
+			Position:     protocol.Position{Line: 6, Character: 15},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil {
+		t.Fatal("expected signature help for local function")
+	}
+	if result.Signatures[0].Label != "process(data, opts)" {
+		t.Errorf("unexpected label: %s", result.Signatures[0].Label)
+	}
+}
+
+func TestSignatureHelp_Nested(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/string_helper.ex", `defmodule MyApp.StringHelper do
+  def upcase(text) do
+    String.upcase(text)
+  end
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyApp.Test do
+  alias MyApp.StringHelper
+  def run do
+    Enum.map(list, fn x -> StringHelper.upcase() end)
+  end
+end`)
+
+	// cursor between the parens of StringHelper.upcase()
+	// col 47 is the ) — cursor just before it, inside the empty args
+	result, err := server.SignatureHelp(context.Background(), &protocol.SignatureHelpParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(uri)},
+			Position:     protocol.Position{Line: 3, Character: 47},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil {
+		t.Fatal("expected signature help for nested call")
+	}
+	if result.Signatures[0].Label != "upcase(text)" {
+		t.Errorf("expected upcase(text), got: %s", result.Signatures[0].Label)
+	}
+	if result.ActiveParameter != 0 {
+		t.Errorf("expected active parameter 0, got %d", result.ActiveParameter)
+	}
+}
+
+// === OutgoingCalls ===
+
+func TestOutgoingCalls(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", `defmodule MyApp.Accounts do
+  def create(attrs) do
+    MyApp.Repo.insert(attrs)
+    MyApp.Mailer.send(attrs)
+  end
+
+  def list do
+    MyApp.Repo.all()
+  end
+end
+`)
+
+	indexFile(t, server.store, server.projectRoot, "lib/repo.ex", `defmodule MyApp.Repo do
+  def insert(attrs) do
+    :ok
+  end
+  def all do
+    :ok
+  end
+end
+`)
+
+	indexFile(t, server.store, server.projectRoot, "lib/mailer.ex", `defmodule MyApp.Mailer do
+  def send(attrs) do
+    :ok
+  end
+end
+`)
+
+	// Open the accounts file in the doc store so PrepareCallHierarchy can read it
+	accountsPath := filepath.Join(server.projectRoot, "lib/accounts.ex")
+	accountsContent, _ := os.ReadFile(accountsPath)
+	accountsURI := string(uri.File(accountsPath))
+	server.docs.Set(accountsURI, string(accountsContent))
+
+	// Prepare call hierarchy for create/1
+	items, err := server.PrepareCallHierarchy(context.Background(), &protocol.CallHierarchyPrepareParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{
+				URI: protocol.DocumentURI(accountsURI),
+			},
+			Position: protocol.Position{Line: 1, Character: 6}, // on "create"
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) == 0 {
+		t.Fatal("expected PrepareCallHierarchy to return an item")
+	}
+
+	calls, err := server.OutgoingCalls(context.Background(), &protocol.CallHierarchyOutgoingCallsParams{
+		Item: items[0],
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// create() calls Repo.insert and Mailer.send
+	if len(calls) < 2 {
+		t.Fatalf("expected at least 2 outgoing calls from create, got %d", len(calls))
+	}
+
+	names := make(map[string]bool)
+	for _, c := range calls {
+		names[c.To.Name] = true
+	}
+	if !names["MyApp.Repo.insert"] {
+		t.Error("expected outgoing call to MyApp.Repo.insert")
+	}
+	if !names["MyApp.Mailer.send"] {
+		t.Error("expected outgoing call to MyApp.Mailer.send")
+	}
+}
+
+// === FoldingRanges ===
+
+func TestFoldingRanges(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyApp.Accounts do
+  def create(attrs) do
+    :ok
+  end
+
+  def list do
+    :ok
+  end
+end`)
+
+	result, err := server.FoldingRanges(context.Background(), &protocol.FoldingRangeParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(uri)},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Should have 3 fold ranges: defmodule (0-8), create (1-3), list (5-7)
+	if len(result) != 3 {
+		t.Fatalf("expected 3 folding ranges, got %d: %+v", len(result), result)
+	}
+
+	// Verify the module-level fold
+	foundModule := false
+	for _, r := range result {
+		if r.StartLine == 0 && r.EndLine == 8 {
+			foundModule = true
+		}
+	}
+	if !foundModule {
+		t.Error("expected folding range for defmodule (lines 0-8)")
+	}
+}
+
+// === CodeAction ===
+
+func TestCodeAction_AddAlias(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", `defmodule MyApp.Accounts do
+  def create(attrs) do
+    :ok
+  end
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyApp.Test do
+  def run do
+    Accounts.create(attrs)
+  end
+end`)
+
+	actions, err := server.CodeAction(context.Background(), &protocol.CodeActionParams{
+		TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(uri)},
+		Range: protocol.Range{
+			Start: protocol.Position{Line: 2, Character: 4}, // on "Accounts"
+			End:   protocol.Position{Line: 2, Character: 12},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(actions) == 0 {
+		t.Fatal("expected at least one code action for unaliased Accounts")
+	}
+
+	found := false
+	for _, a := range actions {
+		if a.Title == "Add alias MyApp.Accounts" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		var titles []string
+		for _, a := range actions {
+			titles = append(titles, a.Title)
+		}
+		t.Errorf("expected 'Add alias MyApp.Accounts' action, got: %v", titles)
+	}
+}
+
+func TestCodeAction_NoActionWhenAliased(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", `defmodule MyApp.Accounts do
+  def create(attrs) do
+    :ok
+  end
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyApp.Test do
+  alias MyApp.Accounts
+  def run do
+    Accounts.create(attrs)
+  end
+end`)
+
+	actions, err := server.CodeAction(context.Background(), &protocol.CodeActionParams{
+		TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(uri)},
+		Range: protocol.Range{
+			Start: protocol.Position{Line: 3, Character: 4},
+			End:   protocol.Position{Line: 3, Character: 12},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(actions) != 0 {
+		t.Errorf("expected no code actions when module is already aliased, got %d", len(actions))
+	}
+}
+
+func TestCodeAction_DottedModuleRef(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/random_api/client.ex", `defmodule MyApp.RandomAPI.Client do
+  def request(url) do
+    :ok
+  end
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyApp.Test do
+  def run do
+    RandomAPI.Client.request("/api")
+  end
+end`)
+
+	actions, err := server.CodeAction(context.Background(), &protocol.CodeActionParams{
+		TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(uri)},
+		Range: protocol.Range{
+			Start: protocol.Position{Line: 2, Character: 4}, // on "RandomAPI"
+			End:   protocol.Position{Line: 2, Character: 12},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(actions) == 0 {
+		t.Fatal("expected code action for unaliased RandomAPI.Client")
+	}
+
+	found := false
+	for _, a := range actions {
+		if a.Title == "Add alias MyApp.RandomAPI" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		var titles []string
+		for _, a := range actions {
+			titles = append(titles, a.Title)
+		}
+		t.Errorf("expected 'Add alias MyApp.RandomAPI' action, got: %v", titles)
+	}
+}
+
+func TestCodeAction_FullyQualifiedModule(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/random_api/client.ex", `defmodule MyApp.RandomAPI.Client do
+  def new(opts) do
+    :ok
+  end
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyApp.Test do
+  def run do
+    MyApp.RandomAPI.Client.new(opts)
+  end
+end`)
+
+	// Cursor on "Client" within the fully qualified module name
+	actions, err := server.CodeAction(context.Background(), &protocol.CodeActionParams{
+		TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(uri)},
+		Range: protocol.Range{
+			Start: protocol.Position{Line: 2, Character: 19}, // on "Client"
+			End:   protocol.Position{Line: 2, Character: 25},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(actions) == 0 {
+		t.Fatal("expected code action for fully qualified MyApp.RandomAPI.Client")
+	}
+
+	// Check the action title
+	if actions[0].Title != "Add alias MyApp.RandomAPI.Client" {
+		t.Errorf("unexpected title: %s", actions[0].Title)
+	}
+
+	// Check that the edit includes both the alias insertion and the module replacement
+	edits := actions[0].Edit.Changes[protocol.DocumentURI(uri)]
+	if len(edits) != 2 {
+		t.Fatalf("expected 2 edits (alias + replacement), got %d", len(edits))
+	}
+
+	// One edit should insert the alias, the other should replace the module ref
+	hasAlias := false
+	hasReplacement := false
+	for _, e := range edits {
+		if strings.Contains(e.NewText, "alias MyApp.RandomAPI.Client") {
+			hasAlias = true
+		}
+		if e.NewText == "Client" {
+			hasReplacement = true
+		}
+	}
+	if !hasAlias {
+		t.Error("expected an edit inserting 'alias MyApp.RandomAPI.Client'")
+	}
+	if !hasReplacement {
+		t.Error("expected an edit replacing the module ref with 'Client'")
 	}
 }

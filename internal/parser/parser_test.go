@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -1282,6 +1283,91 @@ func TestExtractArity(t *testing.T) {
 				t.Errorf("ExtractArity(%q, %q) = %d, want %d", tt.line, tt.funcName, got, tt.expected)
 			}
 		})
+	}
+}
+
+func TestCountDefaultParams(t *testing.T) {
+	tests := []struct {
+		name     string
+		line     string
+		funcName string
+		expected int
+	}{
+		{"no defaults", "  def foo(a, b) do", "foo", 0},
+		{"one default", `  def foo(a, b \\ []) do`, "foo", 1},
+		{"two defaults", `  def foo(a, b \\ nil, c \\ []) do`, "foo", 2},
+		{"no parens", "  def foo, do: :ok", "foo", 0},
+		{"empty parens", "  def foo() do", "foo", 0},
+		{"default with keyword list", `  def foo(a, opts \\ [key: :val]) do`, "foo", 1},
+		{"default in nested not counted", `  def foo(%{a: b \\ c}, d) do`, "foo", 0},
+		{"defmacro default", `  defmacro from(expr, kw \\ []) do`, "from", 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := CountDefaultParams(tt.line, tt.funcName)
+			if got != tt.expected {
+				t.Errorf("CountDefaultParams(%q, %q) = %d, want %d", tt.line, tt.funcName, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestParseFile_DefaultParamExpansion(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.Companies do
+  def fetch_company_by_slug(slug, opts \\ []) do
+    :ok
+  end
+
+  def no_defaults(a, b) do
+    :ok
+  end
+
+  def multi_default(a, b \\ nil, c \\ []) do
+    :ok
+  end
+end
+`)
+
+	defs, _, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Collect all (function, arity) pairs
+	type funcArity struct {
+		name  string
+		arity int
+	}
+	var funcArities []funcArity
+	for _, d := range defs {
+		if d.Function != "" {
+			funcArities = append(funcArities, funcArity{d.Function, d.Arity})
+		}
+	}
+
+	// fetch_company_by_slug should have arity 1 and 2
+	found := map[string]bool{}
+	for _, fa := range funcArities {
+		found[fa.name+"/"+fmt.Sprintf("%d", fa.arity)] = true
+	}
+
+	for _, expected := range []string{
+		"fetch_company_by_slug/1",
+		"fetch_company_by_slug/2",
+		"no_defaults/2",
+		"multi_default/1",
+		"multi_default/2",
+		"multi_default/3",
+	} {
+		if !found[expected] {
+			t.Errorf("expected definition %s not found; got %v", expected, funcArities)
+		}
+	}
+
+	// no_defaults should NOT have arity 1
+	if found["no_defaults/1"] {
+		t.Errorf("no_defaults/1 should not exist")
 	}
 }
 

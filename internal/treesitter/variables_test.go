@@ -577,3 +577,57 @@ end`)
 		t.Errorf("expected nil for cursor outside function, got %v", vars)
 	}
 }
+
+func TestFindTokenOccurrences_Function(t *testing.T) {
+	src := []byte(`defmodule MyApp do
+  def process(data) do
+    result = process(data)
+    # process is called here
+    "process string"
+  end
+end`)
+
+	occs := FindTokenOccurrences(src, "process")
+	// Should find: def process (line 1) and process(data) call (line 2)
+	// Should NOT find: comment (line 3) or string (line 4)
+	if len(occs) != 2 {
+		t.Fatalf("expected 2 occurrences of 'process', got %d: %+v", len(occs), occs)
+	}
+	if occs[0].Line != 1 {
+		t.Errorf("first occurrence should be line 1 (def), got %d", occs[0].Line)
+	}
+	if occs[1].Line != 2 {
+		t.Errorf("second occurrence should be line 2 (call), got %d", occs[1].Line)
+	}
+}
+
+func TestFindTokenOccurrences_Module(t *testing.T) {
+	src := []byte(`defmodule MyApp.Accounts do
+  alias MyApp.Repo
+
+  def list do
+    Repo.all(User)
+  end
+end`)
+
+	occs := FindTokenOccurrences(src, "Repo")
+	// alias MyApp.Repo (line 1) and Repo.all (line 4)
+	if len(occs) != 2 {
+		t.Fatalf("expected 2 occurrences of 'Repo', got %d: %+v", len(occs), occs)
+	}
+}
+
+func TestFindTokenOccurrences_SkipsAtoms(t *testing.T) {
+	src := []byte(`defmodule MyApp do
+  def process(data) do
+    Keyword.get(data, :process, nil)
+  end
+end`)
+
+	occs := FindTokenOccurrences(src, "process")
+	// Should find: def process (line 1)
+	// Should NOT find: :process atom (line 2) — tree-sitter parses atoms differently
+	if len(occs) != 1 {
+		t.Fatalf("expected 1 occurrence of 'process' (not atom), got %d: %+v", len(occs), occs)
+	}
+}

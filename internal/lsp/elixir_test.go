@@ -581,7 +581,7 @@ func TestExtractCompletionContext(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			prefix, afterDot := ExtractCompletionContext(tt.line, tt.col)
+			prefix, afterDot, _ := ExtractCompletionContext(tt.line, tt.col)
 			if prefix != tt.wantPrefix {
 				t.Errorf("prefix: got %q, want %q", prefix, tt.wantPrefix)
 			}
@@ -897,4 +897,129 @@ end`
 			t.Errorf("expected 0 results for empty buffer, got %d", len(results))
 		}
 	})
+}
+
+func TestExtractCallContext(t *testing.T) {
+	tests := []struct {
+		name       string
+		text       string
+		line, col  int
+		wantExpr   string
+		wantArgIdx int
+		wantOK     bool
+	}{
+		{
+			name:       "simple call first arg",
+			text:       "foo(x, y)",
+			line:       0,
+			col:        4,
+			wantExpr:   "foo",
+			wantArgIdx: 0,
+			wantOK:     true,
+		},
+		{
+			name:       "simple call second arg",
+			text:       "foo(x, y)",
+			line:       0,
+			col:        7,
+			wantExpr:   "foo",
+			wantArgIdx: 1,
+			wantOK:     true,
+		},
+		{
+			name:       "qualified call",
+			text:       "Enum.map(list, fun)",
+			line:       0,
+			col:        15,
+			wantExpr:   "Enum.map",
+			wantArgIdx: 1,
+			wantOK:     true,
+		},
+		{
+			name:       "nested call finds inner",
+			text:       "Enum.map(list, fn x -> String.upcase(x) end)",
+			line:       0,
+			col:        37,
+			wantExpr:   "String.upcase",
+			wantArgIdx: 0,
+			wantOK:     true,
+		},
+		{
+			name:       "multi-line",
+			text:       "defmodule MyApp do\n  def run do\n    foo(x,\n      y)\n  end\nend",
+			line:       3,
+			col:        6,
+			wantExpr:   "foo",
+			wantArgIdx: 1,
+			wantOK:     true,
+		},
+		{
+			name:       "not in call",
+			text:       "x = 1",
+			line:       0,
+			col:        0,
+			wantExpr:   "",
+			wantArgIdx: 0,
+			wantOK:     false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			expr, argIdx, ok := ExtractCallContext(tt.text, tt.line, tt.col)
+			if ok != tt.wantOK {
+				t.Errorf("ok = %v, want %v", ok, tt.wantOK)
+			}
+			if expr != tt.wantExpr {
+				t.Errorf("expr = %q, want %q", expr, tt.wantExpr)
+			}
+			if argIdx != tt.wantArgIdx {
+				t.Errorf("argIdx = %d, want %d", argIdx, tt.wantArgIdx)
+			}
+		})
+	}
+}
+
+func TestExtractParamNames(t *testing.T) {
+	tests := []struct {
+		name     string
+		line     string
+		expected []string
+	}{
+		{
+			name:     "simple params",
+			line:     "  def create(attrs, opts) do",
+			expected: []string{"attrs", "opts"},
+		},
+		{
+			name:     "default param",
+			line:     `  def fetch(slug, opts \\ []) do`,
+			expected: []string{"slug", "opts"},
+		},
+		{
+			name:     "pattern match param",
+			line:     "  def process(%{name: name}, data) do",
+			expected: []string{"arg1", "data"},
+		},
+		{
+			name:     "no params",
+			line:     "  def run do",
+			expected: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lines := []string{tt.line}
+			got := extractParamNames(lines, 0)
+			if len(got) != len(tt.expected) {
+				t.Fatalf("got %v, want %v", got, tt.expected)
+			}
+			for i := range got {
+				if got[i] != tt.expected[i] {
+					t.Errorf("param %d: got %q, want %q", i, got[i], tt.expected[i])
+				}
+			}
+		})
+	}
 }

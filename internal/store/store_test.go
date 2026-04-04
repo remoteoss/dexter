@@ -1040,4 +1040,30 @@ end
 	if !foundModuleOnly {
 		t.Error("expected to find MyApp.Accounts module via dotted module query")
 	}
+
+	// Exact match ranking: "MyApp.Accounts" should be the first result
+	// when searching for that exact module name.
+	results, err = s.SearchSymbols("MyApp.Accounts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) == 0 {
+		t.Fatal("expected results for exact module query")
+	}
+	if results[0].Module != "MyApp.Accounts" || results[0].Function != "" {
+		t.Errorf("expected exact module match first, got %s.%s", results[0].Module, results[0].Function)
+	}
+
+	// Case-sensitive ranking: "Users" should rank MyApp.Users (exact case)
+	// before MyApp.Accounts.list_users/create_user (case-insensitive "users" substring).
+	results, err = s.SearchSymbols("Users")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) == 0 {
+		t.Fatal("expected results for 'Users' query")
+	}
+	if results[0].Module != "MyApp.Users" {
+		t.Errorf("expected case-sensitive match MyApp.Users first, got %s.%s", results[0].Module, results[0].Function)
+	}
 }

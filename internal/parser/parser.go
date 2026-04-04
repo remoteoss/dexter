@@ -332,18 +332,27 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 
 			if currentModule != "" {
 				if kind, funcName, ok := ScanFuncDef(rest); ok {
-					def := Definition{
-						Module:   currentModule,
-						Function: funcName,
-						Arity:    ExtractArity(line, funcName),
-						Line:     lineNum,
-						FilePath: path,
-						Kind:     kind,
-					}
+					maxArity := ExtractArity(line, funcName)
+					defaultCount := CountDefaultParams(line, funcName)
+					minArity := maxArity - defaultCount
+
+					var delegateTo, delegateAs string
 					if kind == "defdelegate" {
-						def.DelegateTo, def.DelegateAs = findDelegateToAndAs(lines, lineIdx, aliases, currentModule)
+						delegateTo, delegateAs = findDelegateToAndAs(lines, lineIdx, aliases, currentModule)
 					}
-					defs = append(defs, def)
+
+					for arity := minArity; arity <= maxArity; arity++ {
+						defs = append(defs, Definition{
+							Module:     currentModule,
+							Function:   funcName,
+							Arity:      arity,
+							Line:       lineNum,
+							FilePath:   path,
+							Kind:       kind,
+							DelegateTo: delegateTo,
+							DelegateAs: delegateAs,
+						})
+					}
 					// Don't continue — line may contain refs like: def foo, do: Repo.all()
 					goto extractCallRefs
 				}
@@ -670,6 +679,44 @@ func ExtractArity(line string, funcName string) int {
 		return commas + 1
 	}
 	return 0
+}
+
+// CountDefaultParams counts the number of parameters with default values (\\)
+// in a function definition line. Only counts defaults at the top-level param
+// depth, not inside nested structures.
+func CountDefaultParams(line string, funcName string) int {
+	idx := strings.Index(line, funcName)
+	if idx < 0 {
+		return 0
+	}
+	rest := line[idx+len(funcName):]
+
+	parenIdx := strings.IndexByte(rest, '(')
+	if parenIdx < 0 {
+		return 0
+	}
+
+	depth := 1
+	defaults := 0
+	inside := rest[parenIdx+1:]
+	for i := 0; i < len(inside); i++ {
+		ch := inside[i]
+		switch ch {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			depth--
+			if depth == 0 {
+				return defaults
+			}
+		case '\\':
+			if depth == 1 && i+1 < len(inside) && inside[i+1] == '\\' {
+				defaults++
+				i++ // skip the second backslash
+			}
+		}
+	}
+	return defaults
 }
 
 func resolveModule(s, currentModule string) string {

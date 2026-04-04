@@ -1,9 +1,27 @@
 package treesitter
 
 import (
+	"strings"
+
 	tree_sitter "github.com/tree-sitter/go-tree-sitter"
 	tree_sitter_elixir "github.com/tree-sitter/tree-sitter-elixir/bindings/go"
 )
+
+// parseElixir creates a parser, parses src, and returns the root node plus a
+// cleanup function that closes both tree and parser. Used by the standalone
+// (non-cached) entry points. Returns (nil, nil) on failure.
+func parseElixir(src []byte) (root *tree_sitter.Node, cleanup func()) {
+	p := tree_sitter.NewParser()
+	if err := p.SetLanguage(tree_sitter.NewLanguage(tree_sitter_elixir.Language())); err != nil {
+		p.Close()
+		return nil, nil
+	}
+	tree := p.Parse(src, nil)
+	return tree.RootNode(), func() {
+		tree.Close()
+		p.Close()
+	}
+}
 
 // VariableOccurrence is a position where a variable name appears.
 type VariableOccurrence struct {
@@ -16,18 +34,17 @@ type VariableOccurrence struct {
 // occurrences of the variable at the given cursor position within the
 // enclosing function scope. Returns nil if the cursor is not on a variable.
 func FindVariableOccurrences(src []byte, line, col uint) []VariableOccurrence {
-	parser := tree_sitter.NewParser()
-	defer parser.Close()
-	if err := parser.SetLanguage(tree_sitter.NewLanguage(tree_sitter_elixir.Language())); err != nil {
+	root, cleanup := parseElixir(src)
+	if root == nil {
 		return nil
 	}
+	defer cleanup()
+	return FindVariableOccurrencesWithTree(root, src, line, col)
+}
 
-	tree := parser.Parse(src, nil)
-	defer tree.Close()
-
-	root := tree.RootNode()
-
-	// Find the node at the cursor position
+// FindVariableOccurrencesWithTree is like FindVariableOccurrences but uses a
+// pre-parsed tree root, avoiding redundant parsing when a cached tree exists.
+func FindVariableOccurrencesWithTree(root *tree_sitter.Node, src []byte, line, col uint) []VariableOccurrence {
 	cursorNode := nodeAtPosition(root, line, col)
 	if cursorNode == nil {
 		return nil
@@ -303,22 +320,95 @@ func collectModuleAttributeOccurrences(node *tree_sitter.Node, src []byte, attrN
 	}
 }
 
+// FindTokenOccurrences parses src with tree-sitter and returns positions of
+// all identifier or alias nodes whose text matches token. Unlike a plain
+// string search, this naturally skips strings, comments, atoms, and other
+// non-code contexts.
+func FindTokenOccurrences(src []byte, token string) []VariableOccurrence {
+	root, cleanup := parseElixir(src)
+	if root == nil {
+		return nil
+	}
+	defer cleanup()
+	return FindTokenOccurrencesWithTree(root, src, token)
+}
+
+// FindTokenOccurrencesWithTree is like FindTokenOccurrences but uses a
+// pre-parsed tree root.
+func FindTokenOccurrencesWithTree(root *tree_sitter.Node, src []byte, token string) []VariableOccurrence {
+	var occurrences []VariableOccurrence
+	collectTokenOccurrences(root, src, token, &occurrences)
+	return occurrences
+}
+
+func collectTokenOccurrences(node *tree_sitter.Node, src []byte, token string, out *[]VariableOccurrence) {
+	if node == nil {
+		return
+	}
+
+	kind := node.Kind()
+
+	// Skip subtrees that can't contain meaningful identifier references
+	if kind == "string" || kind == "comment" || kind == "sigil" || kind == "charlist" {
+		return
+	}
+
+	if kind == "identifier" && node.Utf8Text(src) == token {
+		*out = append(*out, VariableOccurrence{
+			Line:     uint(node.StartPosition().Row),
+			StartCol: uint(node.StartPosition().Column),
+			EndCol:   uint(node.EndPosition().Column),
+		})
+	}
+
+	// Alias nodes may contain dotted names like "MyApp.Repo". Match if the
+	// full text equals token, or if a dot-separated segment matches. When a
+	// segment matches, report only that segment's column range.
+	if kind == "alias" {
+		text := node.Utf8Text(src)
+		if text == token {
+			*out = append(*out, VariableOccurrence{
+				Line:     uint(node.StartPosition().Row),
+				StartCol: uint(node.StartPosition().Column),
+				EndCol:   uint(node.EndPosition().Column),
+			})
+		} else {
+			startCol := uint(node.StartPosition().Column)
+			offset := uint(0)
+			for _, segment := range strings.Split(text, ".") {
+				if segment == token {
+					*out = append(*out, VariableOccurrence{
+						Line:     uint(node.StartPosition().Row),
+						StartCol: startCol + offset,
+						EndCol:   startCol + offset + uint(len(token)),
+					})
+				}
+				offset += uint(len(segment)) + 1 // +1 for the dot
+			}
+		}
+	}
+
+	for i := uint(0); i < uint(node.ChildCount()); i++ {
+		collectTokenOccurrences(node.Child(i), src, token, out)
+	}
+}
+
 // FindVariablesInScope parses src with tree-sitter and returns all unique
 // variable names visible at the given cursor position within the enclosing
 // function scope. Respects clause boundaries: variables from other case/fn
 // clauses are excluded. Returns nil if the cursor is not inside a function.
 func FindVariablesInScope(src []byte, line, col uint) []string {
-	parser := tree_sitter.NewParser()
-	defer parser.Close()
-	if err := parser.SetLanguage(tree_sitter.NewLanguage(tree_sitter_elixir.Language())); err != nil {
+	root, cleanup := parseElixir(src)
+	if root == nil {
 		return nil
 	}
+	defer cleanup()
+	return FindVariablesInScopeWithTree(root, src, line, col)
+}
 
-	tree := parser.Parse(src, nil)
-	defer tree.Close()
-
-	root := tree.RootNode()
-
+// FindVariablesInScopeWithTree is like FindVariablesInScope but uses a
+// pre-parsed tree root.
+func FindVariablesInScopeWithTree(root *tree_sitter.Node, src []byte, line, col uint) []string {
 	cursorNode := nodeAtPosition(root, line, col)
 	if cursorNode == nil && col > 0 {
 		cursorNode = nodeAtPosition(root, line, col-1)

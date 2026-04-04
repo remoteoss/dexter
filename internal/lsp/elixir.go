@@ -68,6 +68,30 @@ func extractExpressionBounds(line string, col int) (expr string, startCol int) {
 	return fullExpr[:searchFrom+nextDot], start
 }
 
+// ExtractFullExpression returns the complete dotted expression at the cursor
+// position without truncating at the cursor's segment. Unlike ExtractExpression
+// which returns "DocuSign" when the cursor is on "DocuSign.Client.request",
+// this returns the entire "DocuSign.Client.request".
+func ExtractFullExpression(line string, col int) string {
+	if len(line) == 0 || col < 0 {
+		return ""
+	}
+	if col >= len(line) {
+		col = len(line) - 1
+	}
+	if !isExprChar(line[col]) {
+		return ""
+	}
+	// Reuse the same boundary scan as extractExpressionBounds, but pass col
+	// at the end of the expression so no truncation occurs.
+	end := col
+	for end+1 < len(line) && isExprChar(line[end+1]) {
+		end++
+	}
+	expr, _ := extractExpressionBounds(line, end)
+	return expr
+}
+
 // ExtractModuleAndFunction splits a dotted expression into module reference and optional function name.
 // Uppercase-starting parts are module segments, the first lowercase part is the function.
 // Returns ("Foo.Bar", "baz") for "Foo.Bar.baz", ("Foo.Bar.Baz", "") for "Foo.Bar.Baz",
@@ -94,10 +118,11 @@ func ExtractModuleAndFunction(expr string) (moduleRef string, functionName strin
 // ExtractCompletionContext extracts the typing context for autocompletion.
 // Unlike ExtractExpression (which requires the cursor on an expression char),
 // this scans backward from col to handle incomplete expressions like "Foo.|".
-// Returns the prefix text and whether the cursor is immediately after a dot.
-func ExtractCompletionContext(line string, col int) (prefix string, afterDot bool) {
+// Returns the prefix text, whether the cursor is immediately after a dot,
+// and the start column of the prefix (for building textEdit ranges).
+func ExtractCompletionContext(line string, col int) (prefix string, afterDot bool, startCol int) {
 	if col <= 0 || len(line) == 0 {
-		return "", false
+		return "", false, 0
 	}
 	if col > len(line) {
 		col = len(line)
@@ -105,7 +130,7 @@ func ExtractCompletionContext(line string, col int) (prefix string, afterDot boo
 
 	end := col - 1
 	if end < 0 || !isExprChar(line[end]) {
-		return "", false
+		return "", false, 0
 	}
 
 	start := end
@@ -117,10 +142,10 @@ func ExtractCompletionContext(line string, col int) (prefix string, afterDot boo
 
 	// Trim trailing dots — "Foo." means afterDot=true, prefix="Foo"
 	if strings.HasSuffix(raw, ".") {
-		return strings.TrimSuffix(raw, "."), true
+		return strings.TrimSuffix(raw, "."), true, start
 	}
 
-	return raw, false
+	return raw, false, start
 }
 
 type BufferFunction struct {
@@ -131,6 +156,7 @@ type BufferFunction struct {
 
 // FindBufferFunctions scans document text for all function and type definitions.
 // Returns a deduplicated list (multi-clause functions with the same arity appear once).
+// Functions with default parameters emit one entry per callable arity.
 // Private types (@typep) are included since they are accessible within the same file.
 func FindBufferFunctions(text string) []BufferFunction {
 	seen := make(map[string]bool)
@@ -138,11 +164,14 @@ func FindBufferFunctions(text string) []BufferFunction {
 	for _, line := range strings.Split(text, "\n") {
 		if m := parser.FuncDefRe.FindStringSubmatch(line); m != nil {
 			name := m[2]
-			arity := parser.ExtractArity(line, name)
-			key := name + "/" + strconv.Itoa(arity)
-			if !seen[key] {
-				seen[key] = true
-				results = append(results, BufferFunction{Name: name, Arity: arity, Kind: m[1]})
+			maxArity := parser.ExtractArity(line, name)
+			minArity := maxArity - parser.CountDefaultParams(line, name)
+			for arity := minArity; arity <= maxArity; arity++ {
+				key := name + "/" + strconv.Itoa(arity)
+				if !seen[key] {
+					seen[key] = true
+					results = append(results, BufferFunction{Name: name, Arity: arity, Kind: m[1]})
+				}
 			}
 		} else if m := parser.TypeDefRe.FindStringSubmatch(line); m != nil {
 			name := m[2]
@@ -464,15 +493,20 @@ func FindBareFunctionCalls(text string, functionName string) []int {
 		if m := parser.FuncDefRe.FindStringSubmatch(trimmed); m != nil && m[2] == functionName {
 			continue
 		}
+		if strings.HasPrefix(trimmed, "@spec ") || strings.HasPrefix(trimmed, "@callback ") {
+			continue
+		}
 
 		found := false
 
-		// Direct bare call: functionName(
+		// Direct bare call: functionName( — but NOT Module.functionName(
 		if col := findTokenColumn(line, functionName); col >= 0 {
-			afterToken := line[col+len(functionName):]
-			afterTrimmed := strings.TrimLeft(afterToken, " \t")
-			if strings.HasPrefix(afterTrimmed, "(") {
-				found = true
+			if col == 0 || line[col-1] != '.' {
+				afterToken := line[col+len(functionName):]
+				afterTrimmed := strings.TrimLeft(afterToken, " \t")
+				if strings.HasPrefix(afterTrimmed, "(") {
+					found = true
+				}
 			}
 		}
 
@@ -497,4 +531,188 @@ func FindBareFunctionCalls(text string, functionName string) []int {
 		}
 	}
 	return lineNums
+}
+
+// ExtractCallContext scans backward from (lineNum, col) in text to find the
+// innermost open function call. Returns the function expression (e.g.
+// "Enum.map" or "my_func"), the 0-based argument index, and true if found.
+func ExtractCallContext(text string, lineNum, col int) (funcExpr string, argIndex int, ok bool) {
+	lines := strings.Split(text, "\n")
+	if lineNum >= len(lines) {
+		return "", 0, false
+	}
+	// Clamp col to line length
+	if col > len(lines[lineNum]) {
+		col = len(lines[lineNum])
+	}
+
+	// Convert (lineNum, col) to a flat byte offset
+	offset := 0
+	for i := 0; i < lineNum; i++ {
+		offset += len(lines[i]) + 1 // +1 for newline
+	}
+	offset += col
+
+	if offset > len(text) {
+		offset = len(text)
+	}
+
+	// Scan backward tracking nesting depth
+	depth := 0
+	commas := 0
+	inString := false
+
+	for i := offset - 1; i >= 0; i-- {
+		ch := text[i]
+
+		// String skip: when we hit a closing ", scan backward to find the opening "
+		if ch == '"' && !inString {
+			inString = true
+			continue
+		}
+		if inString {
+			if ch == '"' && (i == 0 || text[i-1] != '\\') {
+				inString = false
+			}
+			continue
+		}
+
+		switch ch {
+		case ')', ']', '}':
+			depth++
+		case '[', '{':
+			if depth > 0 {
+				depth--
+			} else {
+				// Inside a list/map/tuple, not a function call
+				return "", 0, false
+			}
+		case '(':
+			if depth > 0 {
+				depth--
+			} else {
+				// Found the opening paren of our call — extract the function name before it
+				// Scan backward from i-1 to find the expression
+				exprEnd := i - 1
+				// Skip whitespace between expression and paren
+				for exprEnd >= 0 && (text[exprEnd] == ' ' || text[exprEnd] == '\t' || text[exprEnd] == '\n' || text[exprEnd] == '\r') {
+					exprEnd--
+				}
+				if exprEnd < 0 {
+					return "", 0, false
+				}
+				// Find the start of the expression
+				exprStart := exprEnd
+				for exprStart > 0 && isExprChar(text[exprStart-1]) {
+					exprStart--
+				}
+				funcExpr = text[exprStart : exprEnd+1]
+				if funcExpr == "" {
+					return "", 0, false
+				}
+				// Skip Elixir keywords that take parens (if, case, etc.)
+				if parser.IsElixirKeyword(funcExpr) {
+					return "", 0, false
+				}
+				return funcExpr, commas, true
+			}
+		case ',':
+			if depth == 0 {
+				commas++
+			}
+		}
+	}
+	return "", 0, false
+}
+
+// extractParamNames reads the function definition line at defIdx and returns
+// the parameter names. Falls back to positional names (arg1, arg2, ...) for
+// complex patterns.
+func extractParamNames(lines []string, defIdx int) []string {
+	if defIdx < 0 || defIdx >= len(lines) {
+		return nil
+	}
+	line := lines[defIdx]
+
+	// Find the function name via FuncDefRe, then locate its param list
+	m := parser.FuncDefRe.FindStringSubmatch(line)
+	if m == nil {
+		return nil
+	}
+	funcName := m[2]
+
+	idx := strings.Index(line, funcName)
+	if idx < 0 {
+		return nil
+	}
+	rest := line[idx+len(funcName):]
+	parenIdx := strings.IndexByte(rest, '(')
+	if parenIdx < 0 {
+		return nil
+	}
+
+	// Extract the content inside the outermost parens
+	inside := rest[parenIdx+1:]
+	depth := 1
+	end := 0
+	for i := 0; i < len(inside); i++ {
+		switch inside[i] {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			depth--
+			if depth == 0 {
+				end = i
+				goto found
+			}
+		}
+	}
+	return nil
+
+found:
+	paramStr := inside[:end]
+	if strings.TrimSpace(paramStr) == "" {
+		return nil
+	}
+
+	// Split by commas at depth 0
+	var params []string
+	depth = 0
+	start := 0
+	for i := 0; i < len(paramStr); i++ {
+		switch paramStr[i] {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			depth--
+		case ',':
+			if depth == 0 {
+				params = append(params, strings.TrimSpace(paramStr[start:i]))
+				start = i + 1
+			}
+		}
+	}
+	params = append(params, strings.TrimSpace(paramStr[start:]))
+
+	// Extract a readable name from each param
+	var names []string
+	for i, p := range params {
+		// Strip default value (\\)
+		if bsIdx := strings.Index(p, "\\\\"); bsIdx >= 0 {
+			p = strings.TrimSpace(p[:bsIdx])
+		}
+		name := extractParamName(p, i)
+		names = append(names, name)
+	}
+	return names
+}
+
+// extractParamName tries to pull a clean variable name from a single parameter.
+// Returns a positional fallback for complex patterns.
+func extractParamName(param string, index int) string {
+	param = strings.TrimSpace(param)
+	if name := parser.ScanFuncName(param); name != "" && name != "_" {
+		return name
+	}
+	return "arg" + strconv.Itoa(index+1)
 }

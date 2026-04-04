@@ -1701,45 +1701,116 @@ end
 func TestUpdateDelegateAs(t *testing.T) {
 	tests := []struct {
 		name          string
-		line          string
+		lines         []string
+		startLine     int
 		facadeName    string
 		newTargetName string
-		expected      string
+		expectedLines []string
 	}{
 		{
-			name:          "add as: when none exists",
-			line:          "  defdelegate get_company_by_slug(slug), to: CRUD",
+			name:          "single line: add as: when none exists",
+			lines:         []string{"  defdelegate get_company_by_slug(slug), to: CRUD"},
+			startLine:     0,
 			facadeName:    "get_company_by_slug",
 			newTargetName: "get_company",
-			expected:      "  defdelegate get_company_by_slug(slug), to: CRUD, as: :get_company",
+			expectedLines: []string{"  defdelegate get_company_by_slug(slug), to: CRUD, as: :get_company"},
 		},
 		{
-			name:          "update existing as:",
-			line:          "  defdelegate list_users(), to: CRUD, as: :fetch_users",
+			name:          "single line: update existing as:",
+			lines:         []string{"  defdelegate list_users(), to: CRUD, as: :fetch_users"},
+			startLine:     0,
 			facadeName:    "list_users",
 			newTargetName: "get_users",
-			expected:      "  defdelegate list_users(), to: CRUD, as: :get_users",
+			expectedLines: []string{"  defdelegate list_users(), to: CRUD, as: :get_users"},
 		},
 		{
-			name:          "remove as: when names match",
-			line:          "  defdelegate list_users(), to: CRUD, as: :fetch_users",
+			name:          "single line: remove as: when names match",
+			lines:         []string{"  defdelegate list_users(), to: CRUD, as: :fetch_users"},
+			startLine:     0,
 			facadeName:    "list_users",
 			newTargetName: "list_users",
-			expected:      "  defdelegate list_users(), to: CRUD",
+			expectedLines: []string{"  defdelegate list_users(), to: CRUD"},
 		},
 		{
-			name:          "no-op when no as: and names already match",
-			line:          "  defdelegate list_users(), to: CRUD",
+			name:          "single line: no-op when no as: and names already match",
+			lines:         []string{"  defdelegate list_users(), to: CRUD"},
+			startLine:     0,
 			facadeName:    "list_users",
 			newTargetName: "list_users",
-			expected:      "  defdelegate list_users(), to: CRUD",
+			expectedLines: []string{"  defdelegate list_users(), to: CRUD"},
+		},
+		{
+			name: "multi-line: update as: on continuation line",
+			lines: []string{
+				"  defdelegate update_employee_payment_installment(installment, attrs, user),",
+				"    to: UpdateEmployeePaymentInstallment,",
+				"    as: :call",
+			},
+			startLine:     0,
+			facadeName:    "update_employee_payment_installment",
+			newTargetName: "update_installment",
+			expectedLines: []string{
+				"  defdelegate update_employee_payment_installment(installment, attrs, user),",
+				"    to: UpdateEmployeePaymentInstallment,",
+				"    as: :update_installment",
+			},
+		},
+		{
+			name: "multi-line: add as: when none exists",
+			lines: []string{
+				"  defdelegate list_users(params),",
+				"    to: MyApp.CRUD",
+			},
+			startLine:     0,
+			facadeName:    "list_users",
+			newTargetName: "all_users",
+			expectedLines: []string{
+				"  defdelegate list_users(params),",
+				"    to: MyApp.CRUD, as: :all_users",
+			},
+		},
+		{
+			name: "multi-line: remove as: when names match (removes entire as: line)",
+			lines: []string{
+				"  defdelegate list_users(params),",
+				"    to: MyApp.CRUD,",
+				"    as: :fetch_users",
+			},
+			startLine:     0,
+			facadeName:    "list_users",
+			newTargetName: "list_users",
+			expectedLines: []string{
+				"  defdelegate list_users(params),",
+				"    to: MyApp.CRUD,",
+			},
+		},
+		{
+			name: "multi-line: statement embedded in larger file",
+			lines: []string{
+				"defmodule MyApp do",
+				"  defdelegate foo(x),",
+				"    to: Impl,",
+				"    as: :old_foo",
+				"",
+				"  def bar, do: :ok",
+			},
+			startLine:     1,
+			facadeName:    "foo",
+			newTargetName: "new_foo",
+			expectedLines: []string{
+				"  defdelegate foo(x),",
+				"    to: Impl,",
+				"    as: :new_foo",
+			},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := updateDelegateAs(tt.line, tt.facadeName, tt.newTargetName)
-			if got != tt.expected {
-				t.Errorf("updateDelegateAs(%q, %q, %q)\n  got:  %q\n  want: %q", tt.line, tt.facadeName, tt.newTargetName, got, tt.expected)
+			gotLines, gotStart, gotEnd := updateDelegateAs(tt.lines, tt.startLine, tt.facadeName, tt.newTargetName)
+			got := strings.Join(gotLines, "\n")
+			expected := strings.Join(tt.expectedLines, "\n")
+			if got != expected {
+				t.Errorf("updateDelegateAs span [%d:%d]:\n  got:  %q\n  want: %q", gotStart, gotEnd, got, expected)
 			}
 		})
 	}
