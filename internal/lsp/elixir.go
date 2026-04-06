@@ -225,27 +225,26 @@ var (
 // ExtractAliases parses all alias declarations from document text.
 // Returns a map of short name -> full module name (not scope-aware).
 func ExtractAliases(text string) map[string]string {
-	return extractAliases(text, -1)
+	return extractAliasesFromLines(strings.Split(text, "\n"), -1)
 }
 
 // ExtractAliasesInScope parses alias declarations visible at the given 0-based
 // line. In Elixir, aliases are lexically scoped to the enclosing defmodule —
 // a nested module does NOT inherit its parent's aliases.
 func ExtractAliasesInScope(text string, targetLine int) map[string]string {
-	return extractAliases(text, targetLine)
+	return extractAliasesFromLines(strings.Split(text, "\n"), targetLine)
 }
 
-// extractAliases is the shared implementation. When targetLine >= 0, only
+// extractAliasesFromLines is the shared implementation. When targetLine >= 0, only
 // aliases from the module scope enclosing that line are returned.
 // Uses a single pass: collects all aliases keyed by their module scope, then
 // returns only those matching the target line's scope.
-func extractAliases(text string, targetLine int) map[string]string {
+func extractAliasesFromLines(lines []string, targetLine int) map[string]string {
 	type moduleFrame struct {
 		name  string
 		depth int // do..end nesting depth when this module was opened
 	}
 
-	lines := strings.Split(text, "\n")
 	var stack []moduleFrame
 	depth := 0
 
@@ -357,26 +356,27 @@ func ExtractImports(text string) []string {
 // nil slices if the function or its quote block can't be found.
 func parseHelperQuoteBlock(lines []string, helperName string, fileAliases map[string]string) (imported []string, inlineDefs map[string][]inlineDef, transUses []string, optBindings []optBinding) {
 	resolveAlias := func(modName string) string {
-		if resolved, ok := fileAliases[modName]; ok {
-			return resolved
-		}
-		if parts := strings.SplitN(modName, ".", 2); len(parts) == 2 {
-			if resolved, ok := fileAliases[parts[0]]; ok {
-				return resolved + "." + parts[1]
-			}
-		}
-		return modName
+		return parser.ResolveModuleRef(modName, fileAliases, "")
 	}
 
 	// Find the def/defp for helperName
-	funcDefPrefix := regexp.MustCompile(`^\s*defp?\s+` + regexp.QuoteMeta(helperName) + `\b`)
 	funcIdx := -1
 	funcIndent := 0
 	for i, line := range lines {
-		if funcDefPrefix.MatchString(line) {
-			funcIdx = i
-			funcIndent = len(line) - len(strings.TrimLeft(line, " \t"))
-			break
+		trimmed := strings.TrimSpace(line)
+		rest := ""
+		if strings.HasPrefix(trimmed, "defp ") {
+			rest = trimmed[5:]
+		} else if strings.HasPrefix(trimmed, "def ") {
+			rest = trimmed[4:]
+		}
+		if rest != "" && strings.HasPrefix(rest, helperName) {
+			after := rest[len(helperName):]
+			if after == "" || after[0] == '(' || after[0] == ' ' || after[0] == '\t' || after[0] == ',' {
+				funcIdx = i
+				funcIndent = len(line) - len(strings.TrimLeft(line, " \t"))
+				break
+			}
 		}
 	}
 	if funcIdx < 0 {
@@ -461,29 +461,16 @@ func ExtractUsesWithOpts(text string, aliases map[string]string) []UseCall {
 	for _, line := range strings.Split(text, "\n") {
 		// use Module, key: Val
 		if m := useWithOptsRe.FindStringSubmatch(line); m != nil {
-			module := resolveModuleRef(m[1], aliases)
+			module := parser.ResolveModuleRef(m[1], aliases, "")
 			calls = append(calls, UseCall{Module: module, Opts: ParseKeywordModuleOpts(m[2], aliases)})
 			continue
 		}
 		// plain use Module
 		if m := useRe.FindStringSubmatch(line); m != nil {
-			calls = append(calls, UseCall{Module: resolveModuleRef(m[1], aliases)})
+			calls = append(calls, UseCall{Module: parser.ResolveModuleRef(m[1], aliases, "")})
 		}
 	}
 	return calls
-}
-
-// resolveModuleRef resolves a module name through the alias map.
-func resolveModuleRef(name string, aliases map[string]string) string {
-	if resolved, ok := aliases[name]; ok {
-		return resolved
-	}
-	if parts := strings.SplitN(name, ".", 2); len(parts) == 2 {
-		if resolved, ok := aliases[parts[0]]; ok {
-			return resolved + "." + parts[1]
-		}
-	}
-	return name
 }
 
 // ParseKeywordModuleOpts parses an Elixir keyword list string (e.g. "mod: Hammox, repo: MyRepo")
@@ -492,7 +479,7 @@ func resolveModuleRef(name string, aliases map[string]string) string {
 func ParseKeywordModuleOpts(optsStr string, aliases map[string]string) map[string]string {
 	result := make(map[string]string)
 	for _, m := range optKeyModuleRe.FindAllStringSubmatch(optsStr, -1) {
-		result[m[1]] = resolveModuleRef(m[2], aliases)
+		result[m[1]] = parser.ResolveModuleRef(m[2], aliases, "")
 	}
 	return result
 }
@@ -512,7 +499,7 @@ type inlineDef struct {
 // a Keyword.get on opts).
 func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inlineDef, transUses []string, optBindings []optBinding) {
 	lines := strings.Split(text, "\n")
-	fileAliases := ExtractAliases(text)
+	fileAliases := extractAliasesFromLines(lines, -1)
 
 	// Check if this module uses ExUnit.CaseTemplate (which provides the `using` macro)
 	usesCaseTemplate := false
@@ -529,6 +516,14 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 	for i, line := range lines {
 		if strings.IndexByte(line, '"') >= 0 {
 			if count := strings.Count(line, `"""`); count > 0 {
+				if count < 2 {
+					inHeredoc = !inHeredoc
+				}
+				continue
+			}
+		}
+		if strings.IndexByte(line, '\'') >= 0 {
+			if count := strings.Count(line, `'''`); count > 0 {
 				if count < 2 {
 					inHeredoc = !inHeredoc
 				}
@@ -558,15 +553,7 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 	inlineDefs = make(map[string][]inlineDef)
 
 	resolveAlias := func(modName string) string {
-		if resolved, ok := fileAliases[modName]; ok {
-			return resolved
-		}
-		if parts := strings.SplitN(modName, ".", 2); len(parts) == 2 {
-			if resolved, ok := fileAliases[parts[0]]; ok {
-				return resolved + "." + parts[1]
-			}
-		}
-		return modName
+		return parser.ResolveModuleRef(modName, fileAliases, "")
 	}
 
 	// varToOpt tracks variables bound from opts: var_name → {optKey, defaultMod}
@@ -837,8 +824,15 @@ func ExtractCallContext(text string, lineNum, col int) (funcExpr string, argInde
 			continue
 		}
 		if inString {
-			if ch == '"' && (i == 0 || text[i-1] != '\\') {
-				inString = false
+			if ch == '"' {
+				// Count preceding backslashes — an odd number means the quote is escaped
+				backslashes := 0
+				for j := i - 1; j >= 0 && text[j] == '\\'; j-- {
+					backslashes++
+				}
+				if backslashes%2 == 0 {
+					inString = false
+				}
 			}
 			continue
 		}

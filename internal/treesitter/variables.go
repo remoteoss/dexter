@@ -45,12 +45,105 @@ func FindVariableOccurrences(src []byte, line, col uint) []VariableOccurrence {
 // FindVariableOccurrencesWithTree is like FindVariableOccurrences but uses a
 // pre-parsed tree root, avoiding redundant parsing when a cached tree exists.
 func FindVariableOccurrencesWithTree(root *tree_sitter.Node, src []byte, line, col uint) []VariableOccurrence {
-	cursorNode := nodeAtPosition(root, line, col)
-	if cursorNode == nil {
+	resolved := resolveVariableScope(root, src, line, col)
+	if resolved == nil {
 		return nil
 	}
 
-	if cursorNode.Kind() != "identifier" {
+	if resolved.moduleAttribute {
+		var occurrences []VariableOccurrence
+		collectModuleAttributeOccurrences(resolved.scope, src, resolved.varName, &occurrences)
+		return occurrences
+	}
+
+	var occurrences []VariableOccurrence
+
+	// When the scope is a stab_clause because the body rebinds the variable
+	// (not the args), only collect from the body — the args hold the outer
+	// variable's pin reference, which belongs to a different scope.
+	if resolved.scope.Kind() == "stab_clause" && stabBodyRebindsVariable(resolved.scope, src, resolved.varName) && !stabBindsVariable(resolved.scope, src, resolved.varName) {
+		for i := uint(0); i < uint(resolved.scope.ChildCount()); i++ {
+			child := resolved.scope.Child(i)
+			if child.Kind() != "arguments" {
+				collectVariableOccurrences(child, src, resolved.varName, &occurrences, false)
+			}
+		}
+		return occurrences
+	}
+
+	// with/for call scope: use cursor-aware collection to correctly handle
+	// multi-clause patterns where different clauses bind/reference the variable.
+	if resolved.scope.Kind() == "call" && callHasDoBlock(resolved.scope) && callArgumentPatternsBindVariable(resolved.scope, src, resolved.varName) {
+		collectWithOccurrences(resolved.scope, resolved.cursorNode, src, resolved.varName, &occurrences)
+		return occurrences
+	}
+
+	skipRoot := resolved.scope.Kind() == "stab_clause"
+	collectVariableOccurrences(resolved.scope, src, resolved.varName, &occurrences, skipRoot)
+	return occurrences
+}
+
+// NameExistsInScopeOf checks whether newName already exists as a variable or
+// module attribute in the same scope as the variable at (line, col). Uses the
+// same scope-finding rules as FindVariableOccurrencesWithTree so collision
+// detection matches the rename's reach.
+//
+// Bare identifiers that are zero-arity function calls (not bound as variables)
+// are NOT considered collisions — in Elixir, a variable simply shadows them.
+func NameExistsInScopeOf(root *tree_sitter.Node, src []byte, line, col uint, newName string) bool {
+	resolved := resolveVariableScope(root, src, line, col)
+	if resolved == nil {
+		return false
+	}
+
+	if resolved.moduleAttribute {
+		return moduleAttributeExists(resolved.scope, src, newName)
+	}
+
+	// Find the first non-call identifier matching newName in the scope.
+	target := findFirstNonCallIdentifier(resolved.scope, src, newName)
+	if target == nil {
+		return false
+	}
+
+	// Check if that identifier is actually a variable (bound in its scope)
+	// rather than a bare zero-arity function call. Reuses the full variable
+	// resolution logic so the same scoping rules apply.
+	pos := target.StartPosition()
+	return len(FindVariableOccurrencesWithTree(root, src, uint(pos.Row), uint(pos.Column))) > 0
+}
+
+// findFirstNonCallIdentifier returns the first identifier node in the subtree
+// matching name that is not a function name in a call expression.
+func findFirstNonCallIdentifier(node *tree_sitter.Node, src []byte, name string) *tree_sitter.Node {
+	if node == nil {
+		return nil
+	}
+	if node.Kind() == "identifier" && node.Utf8Text(src) == name && !isFunctionNameInCall(node, src) {
+		return node
+	}
+	for i := uint(0); i < uint(node.ChildCount()); i++ {
+		if found := findFirstNonCallIdentifier(node.Child(i), src, name); found != nil {
+			return found
+		}
+	}
+	return nil
+}
+
+// resolvedScope holds the result of locating a variable's scope.
+type resolvedScope struct {
+	cursorNode      *tree_sitter.Node
+	scope           *tree_sitter.Node
+	varName         string
+	moduleAttribute bool // true when the identifier is a module attribute (@foo)
+}
+
+// resolveVariableScope locates the cursor node at (line, col), validates it as
+// a variable or module attribute, and returns the enclosing scope. Returns nil
+// if the position is not on a renameable variable.
+func resolveVariableScope(root *tree_sitter.Node, src []byte, line, col uint) *resolvedScope {
+	cursorNode := nodeAtPosition(root, line, col)
+	if cursorNode == nil || cursorNode.Kind() != "identifier" {
 		return nil
 	}
 
@@ -66,9 +159,7 @@ func FindVariableOccurrencesWithTree(root *tree_sitter.Node, src []byte, line, c
 		if scope == nil {
 			return nil
 		}
-		var occurrences []VariableOccurrence
-		collectModuleAttributeOccurrences(scope, src, varName, &occurrences)
-		return occurrences
+		return &resolvedScope{cursorNode: cursorNode, scope: scope, varName: varName, moduleAttribute: true}
 	}
 
 	// Check it's actually a variable — not a function name in a call or def keyword
@@ -87,39 +178,29 @@ func FindVariableOccurrencesWithTree(root *tree_sitter.Node, src []byte, line, c
 	// Only treat it as a variable if the name is actually defined (bound)
 	// earlier in the scope — e.g. as a function parameter or via assignment.
 	// This ensures bare function calls fall through to function reference lookup.
-	if !variableDefinedInScope(scope, src, varName, line, col) {
+	// Exception: if the cursor is on an assignment target (LHS of =), it is
+	// unambiguously a variable binding regardless of other occurrences.
+	if !isAssignmentTarget(cursorNode, src) && !variableDefinedInScope(scope, src, varName, line, col) {
 		return nil
 	}
 
-	// Collect all identifier nodes with the same name in the scope.
-	// Skip the scope check for the root when the scope itself is a
-	// stab_clause or a call-with-do_block that rebinds this variable
-	// (we already determined it's our scope boundary).
-	var occurrences []VariableOccurrence
+	return &resolvedScope{cursorNode: cursorNode, scope: scope, varName: varName}
+}
 
-	// When the scope is a stab_clause because the body rebinds the variable
-	// (not the args), only collect from the body — the args hold the outer
-	// variable's pin reference, which belongs to a different scope.
-	if scope.Kind() == "stab_clause" && stabBodyRebindsVariable(scope, src, varName) && !stabBindsVariable(scope, src, varName) {
-		for i := uint(0); i < uint(scope.ChildCount()); i++ {
-			child := scope.Child(i)
-			if child.Kind() != "arguments" {
-				collectVariableOccurrences(child, src, varName, &occurrences, false)
-			}
+// moduleAttributeExists returns true if @name appears in the subtree.
+func moduleAttributeExists(node *tree_sitter.Node, src []byte, name string) bool {
+	if node == nil {
+		return false
+	}
+	if node.Kind() == "identifier" && node.Utf8Text(src) == name && isModuleAttributeIdent(node, src) {
+		return true
+	}
+	for i := uint(0); i < uint(node.ChildCount()); i++ {
+		if moduleAttributeExists(node.Child(i), src, name) {
+			return true
 		}
-		return occurrences
 	}
-
-	// with/for call scope: use cursor-aware collection to correctly handle
-	// multi-clause patterns where different clauses bind/reference the variable.
-	if scope.Kind() == "call" && callHasDoBlock(scope) && callArgumentPatternsBindVariable(scope, src, varName) {
-		collectWithOccurrences(scope, cursorNode, src, varName, &occurrences)
-		return occurrences
-	}
-
-	skipRoot := scope.Kind() == "stab_clause"
-	collectVariableOccurrences(scope, src, varName, &occurrences, skipRoot)
-	return occurrences
+	return false
 }
 
 // nodeAtPosition finds the deepest (most specific) node at the given position.
@@ -206,6 +287,20 @@ var functionKeywords = map[string]bool{
 
 func isDefinitionKeyword(name string) bool {
 	return defKeywords[name]
+}
+
+// isAssignmentTarget returns true if node is on the left-hand side of a `=`
+// binary operator, meaning it is unambiguously a variable binding.
+func isAssignmentTarget(node *tree_sitter.Node, src []byte) bool {
+	parent := node.Parent()
+	if parent == nil || parent.Kind() != "binary_operator" || parent.ChildCount() < 3 {
+		return false
+	}
+	if parent.Child(1).Utf8Text(src) != "=" {
+		return false
+	}
+	left := parent.Child(0)
+	return node.StartByte() >= left.StartByte() && node.EndByte() <= left.EndByte()
 }
 
 // variableDefinedInScope returns true if varName is bound (defined) in the
@@ -722,6 +817,11 @@ func collectWithOccurrences(callNode, cursor *tree_sitter.Node, src []byte, varN
 		}
 	}
 
+	// Cursor on operator/comma/whitespace between clauses — not on any lhs or rhs
+	if cursorIdx < 0 {
+		return
+	}
+
 	// Cursor in do_block (cursorIdx == len(clauses)): uses the last clause's binding
 	if cursorIdx >= len(clauses) {
 		lastBindingIdx := -1
@@ -794,7 +894,7 @@ func collectPatternExpressionOccurrences(callNode *tree_sitter.Node, src []byte,
 					collectVariableOccurrences(arg.Child(2), src, varName, out, false)
 					// If the left (pattern) side rebinds our variable,
 					// all subsequent clauses use the new binding — stop.
-					if subtreeContainsIdentifier(arg.Child(0), src, varName) {
+					if subtreeContainsUnpinnedIdentifier(arg.Child(0), src, varName) {
 						return
 					}
 					continue
@@ -864,23 +964,6 @@ func stabBindsVariable(stabClause *tree_sitter.Node, src []byte, varName string)
 		child := stabClause.Child(i)
 		if child.Kind() == "arguments" {
 			return subtreeContainsUnpinnedIdentifier(child, src, varName)
-		}
-	}
-	return false
-}
-
-// subtreeContainsIdentifier returns true if any identifier node in the subtree
-// has the given name.
-func subtreeContainsIdentifier(node *tree_sitter.Node, src []byte, name string) bool {
-	if node == nil {
-		return false
-	}
-	if node.Kind() == "identifier" && node.Utf8Text(src) == name {
-		return true
-	}
-	for i := uint(0); i < uint(node.ChildCount()); i++ {
-		if subtreeContainsIdentifier(node.Child(i), src, name) {
-			return true
 		}
 	}
 	return false

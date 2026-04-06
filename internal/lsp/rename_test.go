@@ -827,6 +827,48 @@ end
 	}
 }
 
+func TestRename_Variable_ShadowsFunctionOnlyCallOccurrences(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Regression: when a variable has the same name as a function and the
+	// variable is assigned but only the function is called (with args),
+	// renaming the variable must not rename the function call or definition.
+	content := `defmodule MyApp.Billing do
+  def call(user, payment) do
+    verify_payment = nil
+
+    with :ok <- verify_payment(user, payment) do
+      :done
+    end
+  end
+
+  defp verify_payment(_user, _payment), do: :ok
+end
+`
+	path := filepath.Join(server.projectRoot, "lib", "billing.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/billing.ex", content)
+	docURI := "file://" + path
+	server.docs.Set(docURI, content)
+
+	// Cursor on the variable assignment "verify_payment" at line 2, col 4
+	edit := renameAt(t, server, docURI, 2, 4, "check_payment")
+	edits := collectEdits(edit, path)
+
+	// Only the assignment line should be renamed
+	if !editsContainLine(edits, 2) {
+		t.Error("expected edit on variable assignment line")
+	}
+	// The function call inside with (line 4) should NOT be renamed
+	if editsContainLine(edits, 4) {
+		t.Error("variable rename should NOT touch the function call")
+	}
+	// The defp definition (line 9) should NOT be renamed
+	if editsContainLine(edits, 9) {
+		t.Error("variable rename should NOT touch the function definition")
+	}
+}
+
 func TestRename_Function_NestedModule(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
@@ -1477,7 +1519,9 @@ end
 		}
 	})
 
-	// Re-index with original content for test 2
+	// Clean up test 1's renamed file and re-index with original content for test 2
+	_ = os.Remove(filepath.Join(server.projectRoot, "lib", "docusigns.ex"))
+	_ = server.store.RemoveFile(filepath.Join(server.projectRoot, "lib", "docusigns.ex"))
 	indexFile(t, server.store, server.projectRoot, "lib/docusign.ex", defContent)
 
 	// Test 2: rename from a caller file via alias (def file is closed)
@@ -2433,5 +2477,253 @@ end
 	}
 	if !strings.Contains(facadeResult, "defdelegate list_users(), to: MyApp.Accounts.CRUD") {
 		t.Errorf("expected delegate line preserved without as:, got:\n%s", facadeResult)
+	}
+}
+
+// === Collision detection tests ===
+
+func renameExpectError(t *testing.T, server *Server, docURI string, line, col uint32, newName string) error {
+	t.Helper()
+	_, err := server.Rename(context.Background(), &protocol.RenameParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(docURI)},
+			Position:     protocol.Position{Line: line, Character: col},
+		},
+		NewName: newName,
+	})
+	if err == nil {
+		t.Fatalf("expected rename to %q to fail, but it succeeded", newName)
+	}
+	return err
+}
+
+func TestRename_Module_CollisionBlocked(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", `defmodule MyApp.Accounts do
+  def list, do: []
+end
+`)
+	indexFile(t, server.store, server.projectRoot, "lib/auth.ex", `defmodule MyApp.Auth do
+  def login, do: :ok
+end
+`)
+
+	defPath := filepath.Join(server.projectRoot, "lib", "accounts.ex")
+	defURI := "file://" + defPath
+	server.docs.Set(defURI, `defmodule MyApp.Accounts do
+  def list, do: []
+end
+`)
+
+	err := renameExpectError(t, server, defURI, 0, 16, "Auth")
+	if !strings.Contains(err.Error(), "already exists") {
+		t.Errorf("expected 'already exists' error, got: %v", err)
+	}
+}
+
+func TestRename_Module_SubmoduleCollisionBlocked(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// MyApp.Accounts has submodule MyApp.Accounts.User
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", `defmodule MyApp.Accounts do
+  def list, do: []
+end
+`)
+	indexFile(t, server.store, server.projectRoot, "lib/accounts/user.ex", `defmodule MyApp.Accounts.User do
+  defstruct [:name]
+end
+`)
+	// MyApp.Auth.User already exists — renaming Accounts → Auth would collide on the submodule
+	indexFile(t, server.store, server.projectRoot, "lib/auth/user.ex", `defmodule MyApp.Auth.User do
+  defstruct [:email]
+end
+`)
+
+	defPath := filepath.Join(server.projectRoot, "lib", "accounts.ex")
+	defURI := "file://" + defPath
+	server.docs.Set(defURI, `defmodule MyApp.Accounts do
+  def list, do: []
+end
+`)
+
+	err := renameExpectError(t, server, defURI, 0, 16, "Auth")
+	if !strings.Contains(err.Error(), "already exists") {
+		t.Errorf("expected 'already exists' error, got: %v", err)
+	}
+}
+
+func TestRename_Module_NoFalsePositiveForUnrelatedModule(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// MyApp.Auth.Session exists, but renaming MyApp.Accounts.User → MyApp.Accounts.Session
+	// should succeed (different parent namespace, no file path overlap)
+	indexFile(t, server.store, server.projectRoot, "lib/auth/session.ex", `defmodule MyApp.Auth.Session do
+  def foo, do: :ok
+end
+`)
+	indexFile(t, server.store, server.projectRoot, "lib/accounts/user.ex", `defmodule MyApp.Accounts.User do
+  def bar, do: :ok
+end
+`)
+	callerContent := `defmodule MyApp.Web do
+  alias MyApp.Accounts.User
+
+  def show, do: %User{}
+end
+`
+	callerPath := filepath.Join(server.projectRoot, "lib", "web.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/web.ex", callerContent)
+	callerURI := "file://" + callerPath
+	server.docs.Set(callerURI, callerContent)
+
+	// Rename User → Session from the caller file (cursor on "User" in alias line).
+	// MyApp.Auth.Session should not cause a collision with MyApp.Accounts.Session.
+	edit := renameAt(t, server, callerURI, 1, 24, "Session")
+	if edit == nil {
+		t.Fatal("expected non-nil edit — MyApp.Auth.Session should not block renaming MyApp.Accounts.User → MyApp.Accounts.Session")
+	}
+}
+
+func TestRename_Module_FileCollisionBlocked(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", `defmodule MyApp.Accounts do
+  def list, do: []
+end
+`)
+
+	defPath := filepath.Join(server.projectRoot, "lib", "accounts.ex")
+	defURI := "file://" + defPath
+	server.docs.Set(defURI, `defmodule MyApp.Accounts do
+  def list, do: []
+end
+`)
+
+	// Create the target file on disk (but not indexed as a module)
+	targetPath := filepath.Join(server.projectRoot, "lib", "billing.ex")
+	_ = os.WriteFile(targetPath, []byte("# placeholder"), 0644)
+
+	err := renameExpectError(t, server, defURI, 0, 16, "Billing")
+	if !strings.Contains(err.Error(), "already exists") {
+		t.Errorf("expected 'already exists' error for file collision, got: %v", err)
+	}
+}
+
+func TestRename_Function_CollisionBlocked(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule MyApp do
+  def list_users, do: []
+  def get_user, do: nil
+end
+`
+	path := filepath.Join(server.projectRoot, "lib", "my_app.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/my_app.ex", content)
+	docURI := "file://" + path
+	server.docs.Set(docURI, content)
+
+	// Renaming list_users → get_user should fail since get_user already exists
+	err := renameExpectError(t, server, docURI, 1, 6, "get_user")
+	if !strings.Contains(err.Error(), "already exists") {
+		t.Errorf("expected 'already exists' error, got: %v", err)
+	}
+}
+
+func TestRename_Variable_CollisionBlocked(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule MyApp do
+  def process(items) do
+    result = transform(items)
+    output = format(result)
+    output
+  end
+end
+`
+	path := filepath.Join(server.projectRoot, "lib", "my_app.ex")
+	docURI := "file://" + path
+	server.docs.Set(docURI, content)
+
+	// Renaming "result" → "output" should fail since output already exists in scope
+	err := renameExpectError(t, server, docURI, 2, 4, "output")
+	if !strings.Contains(err.Error(), "already exists") {
+		t.Errorf("expected 'already exists' error, got: %v", err)
+	}
+}
+
+func TestRename_Variable_ZeroArityFunctionAllowed(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule MyApp do
+  defp do_stuff, do: :ok
+
+  def process(items) do
+    result = transform(items)
+    do_stuff()
+    result
+  end
+end
+`
+	path := filepath.Join(server.projectRoot, "lib", "my_app.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/my_app.ex", content)
+	docURI := "file://" + path
+	server.docs.Set(docURI, content)
+
+	// Renaming "result" → "do_stuff" should succeed — variable shadows function
+	edit := renameAt(t, server, docURI, 4, 4, "do_stuff")
+	edits := collectEdits(edit, path)
+	if len(edits) == 0 {
+		t.Fatal("expected edits — variable rename should be allowed when target is only a function name")
+	}
+}
+
+func TestRename_Module_OpenSubmoduleFileGetsEdits(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	parentContent := `defmodule MyApp.ReviewRequests do
+  def list, do: []
+end
+`
+	childContent := `defmodule MyApp.ReviewRequests.ReviewRequest do
+  defstruct [:title]
+end
+`
+
+	indexFile(t, server.store, server.projectRoot, "lib/review_requests.ex", parentContent)
+	indexFile(t, server.store, server.projectRoot, "lib/review_requests/review_request.ex", childContent)
+
+	// Open the CHILD file (submodule) — this is the trigger file
+	childPath := filepath.Join(server.projectRoot, "lib", "review_requests", "review_request.ex")
+	childURI := "file://" + childPath
+	server.docs.Set(childURI, childContent)
+
+	// Rename parent module "ReviewRequests" → "Approvals" from the child file
+	// The cursor is on "ReviewRequests" at line 0, col 16
+	edit := renameAt(t, server, childURI, 0, 16, "Approvals")
+
+	// The open child buffer should get TextEdits (not be silently written to disk)
+	childEdits := collectEdits(edit, childPath)
+	if len(childEdits) == 0 {
+		t.Error("expected TextEdits for the open child file buffer")
+	}
+
+	hasCorrectEdit := false
+	for _, e := range childEdits {
+		if strings.Contains(e.NewText, "Approvals") {
+			hasCorrectEdit = true
+			break
+		}
+	}
+	if !hasCorrectEdit {
+		t.Errorf("expected edit containing 'Approvals' in child file, got: %v", childEdits)
 	}
 }

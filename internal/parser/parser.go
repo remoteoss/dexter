@@ -77,8 +77,10 @@ func ParseFile(path string) ([]Definition, []Reference, error) {
 // The path is used to populate FilePath fields but the text is not read from disk.
 func ParseText(path, text string) ([]Definition, []Reference, error) {
 	type moduleFrame struct {
-		name   string
-		indent int // leading whitespace count when defmodule was found
+		name           string
+		indent         int
+		savedAliases   map[string]string
+		savedInjectors map[string]bool
 	}
 
 	lines := strings.Split(text, "\n")
@@ -92,9 +94,19 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 	for lineIdx, line := range lines {
 		lineNum := lineIdx + 1
 
-		// Heredoc tracking — only scan for """ if line contains a double-quote
+		// Heredoc tracking — handle both """ and '''
 		if strings.IndexByte(line, '"') >= 0 {
 			quoteCount := strings.Count(line, `"""`)
+			if quoteCount > 0 {
+				if quoteCount >= 2 {
+					continue
+				}
+				inHeredoc = !inHeredoc
+				continue
+			}
+		}
+		if strings.IndexByte(line, '\'') >= 0 {
+			quoteCount := strings.Count(line, `'''`)
 			if quoteCount > 0 {
 				if quoteCount >= 2 {
 					continue
@@ -123,7 +135,10 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 		if first == 'e' {
 			if len(moduleStack) > 0 && strings.TrimRight(rest, " \t\r") == "end" {
 				if moduleStack[len(moduleStack)-1].indent == trimStart {
+					frame := moduleStack[len(moduleStack)-1]
 					moduleStack = moduleStack[:len(moduleStack)-1]
+					aliases = frame.savedAliases
+					injectors = frame.savedInjectors
 				}
 				continue
 			}
@@ -155,10 +170,14 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 							parentResolved := resolveModule(parent, currentModule)
 							for _, segment := range strings.Split(inner, ",") {
 								segment = strings.TrimSpace(segment)
-								childName := scanIdentifier(segment)
+								childName := ScanModuleName(segment)
 								if childName != "" {
 									fullChild := parentResolved + "." + childName
-									aliases[childName] = fullChild
+									aliasKey := childName
+									if dot := strings.LastIndexByte(childName, '.'); dot >= 0 {
+										aliasKey = childName[dot+1:]
+									}
+									aliases[aliasKey] = fullChild
 									if !strings.Contains(fullChild, "__MODULE__") {
 										refs = append(refs, Reference{Module: fullChild, Line: lineNum, FilePath: path, Kind: "alias"})
 									}
@@ -321,7 +340,7 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 					name = currentModule + "." + name
 				}
 				currentModule = name
-				moduleStack = append(moduleStack, moduleFrame{name: currentModule, indent: trimStart})
+				moduleStack = append(moduleStack, moduleFrame{name: currentModule, indent: trimStart, savedAliases: copyMap(aliases), savedInjectors: copyBoolMap(injectors)})
 				defs = append(defs, Definition{
 					Module:   currentModule,
 					Line:     lineNum,
@@ -332,8 +351,11 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 			}
 
 			if name, ok := scanDefKeyword(rest, "defprotocol"); ok {
+				if !strings.Contains(name, ".") && currentModule != "" {
+					name = currentModule + "." + name
+				}
 				currentModule = name
-				moduleStack = append(moduleStack, moduleFrame{name: currentModule, indent: trimStart})
+				moduleStack = append(moduleStack, moduleFrame{name: currentModule, indent: trimStart, savedAliases: copyMap(aliases), savedInjectors: copyBoolMap(injectors)})
 				defs = append(defs, Definition{
 					Module:   currentModule,
 					Line:     lineNum,
@@ -344,8 +366,11 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 			}
 
 			if name, ok := scanDefKeyword(rest, "defimpl"); ok {
+				if !strings.Contains(name, ".") && currentModule != "" {
+					name = currentModule + "." + name
+				}
 				currentModule = name
-				moduleStack = append(moduleStack, moduleFrame{name: currentModule, indent: trimStart})
+				moduleStack = append(moduleStack, moduleFrame{name: currentModule, indent: trimStart, savedAliases: copyMap(aliases), savedInjectors: copyBoolMap(injectors)})
 				defs = append(defs, Definition{
 					Module:   currentModule,
 					Line:     lineNum,
@@ -454,7 +479,7 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 				if elixirKeyword[funcName] {
 					continue
 				}
-				resolved := resolveModuleRef(modRef, aliases, currentModule)
+				resolved := ResolveModuleRef(modRef, aliases, currentModule)
 				if resolved != "" {
 					refs = append(refs, Reference{Module: resolved, Function: funcName, Line: lineNum, FilePath: path, Kind: "call"})
 				}
@@ -462,7 +487,7 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 
 			// %Module{} struct literals and pattern matches
 			for _, match := range structLiteralRe.FindAllStringSubmatch(codeLine, -1) {
-				resolved := resolveModuleRef(match[1], aliases, currentModule)
+				resolved := ResolveModuleRef(match[1], aliases, currentModule)
 				if resolved != "" {
 					refs = append(refs, Reference{Module: resolved, Line: lineNum, FilePath: path, Kind: "call"})
 				}
@@ -486,7 +511,7 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 				if modRef == currentModule {
 					continue
 				}
-				resolved := resolveModuleRef(modRef, aliases, currentModule)
+				resolved := ResolveModuleRef(modRef, aliases, currentModule)
 				if resolved != "" {
 					refs = append(refs, Reference{Module: resolved, Line: lineNum, FilePath: path, Kind: "call"})
 				}
@@ -684,7 +709,15 @@ func ExtractArity(line string, funcName string) int {
 	depth := 1
 	commas := 0
 	hasContent := false
-	for _, ch := range rest[parenIdx+1:] {
+	inside := rest[parenIdx+1:]
+	for i := 0; i < len(inside); i++ {
+		ch := inside[i]
+		// Skip string and charlist literals
+		if ch == '"' || ch == '\'' {
+			i = skipStringLiteral(inside, i)
+			hasContent = true
+			continue
+		}
 		switch ch {
 		case '(', '[', '{':
 			depth++
@@ -732,6 +765,11 @@ func CountDefaultParams(line string, funcName string) int {
 	inside := rest[parenIdx+1:]
 	for i := 0; i < len(inside); i++ {
 		ch := inside[i]
+		// Skip string and charlist literals
+		if ch == '"' || ch == '\'' {
+			i = skipStringLiteral(inside, i)
+			continue
+		}
 		switch ch {
 		case '(', '[', '{':
 			depth++
@@ -748,6 +786,23 @@ func CountDefaultParams(line string, funcName string) int {
 		}
 	}
 	return defaults
+}
+
+// skipStringLiteral advances past a string or charlist literal starting at
+// position i in s (where s[i] is '"' or '\”). Returns the index of the
+// closing quote character so that the outer for-loop's i++ lands past it.
+func skipStringLiteral(s string, i int) int {
+	quote := s[i]
+	for j := i + 1; j < len(s); j++ {
+		if s[j] == '\\' {
+			j++ // skip escaped character
+			continue
+		}
+		if s[j] == quote {
+			return j
+		}
+	}
+	return len(s) - 1
 }
 
 func resolveModule(s, currentModule string) string {
@@ -769,9 +824,9 @@ var structLiteralRe = regexp.MustCompile(`%([A-Z][A-Za-z0-9_]*(?:\.[A-Z][A-Za-z0
 // is_struct(x, User), etc. The negative lookahead for . and { is handled in code.
 var standaloneModuleRe = regexp.MustCompile(`(?:^|[^A-Za-z0-9_.%])([A-Z][A-Za-z0-9_]*(?:\.[A-Z][A-Za-z0-9_]*)*)`)
 
-// resolveModuleRef resolves a module reference through aliases and __MODULE__.
+// ResolveModuleRef resolves a module reference through aliases and __MODULE__.
 // Returns "" if the reference contains unresolvable __MODULE__.
-func resolveModuleRef(modRef string, aliases map[string]string, currentModule string) string {
+func ResolveModuleRef(modRef string, aliases map[string]string, currentModule string) string {
 	resolved := modRef
 	if full, ok := aliases[modRef]; ok {
 		resolved = full
@@ -797,9 +852,13 @@ func hasUppercase(s string) bool {
 }
 
 // stripCommentsAndStrings removes inline comments and replaces the content
-// of string literals with spaces so that regex-based extraction doesn't
-// produce false-positive references from comments or string values.
+// of string literals and sigils with spaces so that regex-based extraction
+// doesn't produce false-positive references from comments, strings, or sigils.
 func stripCommentsAndStrings(line string) string {
+	// Fast path: skip allocation if line has no strings, comments, or sigils
+	if !strings.ContainsAny(line, "\"'#~") {
+		return line
+	}
 	buf := []byte(line)
 	i := 0
 	for i < len(buf) {
@@ -809,56 +868,28 @@ func stripCommentsAndStrings(line string) string {
 			i += 2
 			continue
 		}
-		// String literal (double-quoted)
-		if ch == '"' {
-			j := i + 1
-			for j < len(buf) {
-				if buf[j] == '\\' && j+1 < len(buf) {
-					j += 2
+		// Sigil: ~s(...), ~r/.../,  etc.
+		if ch == '~' && i+1 < len(buf) {
+			next := buf[i+1]
+			sigilStart := i + 2
+			// Sigil letter (uppercase or lowercase)
+			if (next >= 'a' && next <= 'z') || (next >= 'A' && next <= 'Z') {
+				if sigilStart < len(buf) {
+					i = blankSigil(buf, sigilStart)
 					continue
 				}
-				if buf[j] == '"' {
-					// Blank out string contents (keep quotes for structure)
-					for k := i + 1; k < j; k++ {
-						buf[k] = ' '
-					}
-					i = j + 1
-					break
-				}
-				j++
 			}
-			if j >= len(buf) {
-				// Unterminated string — blank to end
-				for k := i + 1; k < len(buf); k++ {
-					buf[k] = ' '
-				}
-				break
-			}
+			i++
+			continue
+		}
+		// String literal (double-quoted)
+		if ch == '"' {
+			i = blankQuoted(buf, i, '"')
 			continue
 		}
 		// Single-quoted charlist
 		if ch == '\'' {
-			j := i + 1
-			for j < len(buf) {
-				if buf[j] == '\\' && j+1 < len(buf) {
-					j += 2
-					continue
-				}
-				if buf[j] == '\'' {
-					for k := i + 1; k < j; k++ {
-						buf[k] = ' '
-					}
-					i = j + 1
-					break
-				}
-				j++
-			}
-			if j >= len(buf) {
-				for k := i + 1; k < len(buf); k++ {
-					buf[k] = ' '
-				}
-				break
-			}
+			i = blankQuoted(buf, i, '\'')
 			continue
 		}
 		// Comment — blank everything from here to end of line
@@ -871,6 +902,97 @@ func stripCommentsAndStrings(line string) string {
 		i++
 	}
 	return string(buf)
+}
+
+// blankQuoted blanks the contents of a quoted literal (string or charlist)
+// starting at buf[i] (which is the opening quote). Returns the index after
+// the closing quote.
+func blankQuoted(buf []byte, i int, quote byte) int {
+	j := i + 1
+	for j < len(buf) {
+		if buf[j] == '\\' && j+1 < len(buf) {
+			buf[j] = ' '
+			buf[j+1] = ' '
+			j += 2
+			continue
+		}
+		if buf[j] == quote {
+			i = j + 1
+			return i
+		}
+		buf[j] = ' '
+		j++
+	}
+	// Unterminated — blank to end
+	for k := i + 1; k < len(buf); k++ {
+		buf[k] = ' '
+	}
+	return len(buf)
+}
+
+// blankSigil blanks the contents of a sigil starting at buf[i] (the opening
+// delimiter character, after the ~X). Returns the index after the closing
+// delimiter + modifiers.
+func blankSigil(buf []byte, i int) int {
+	opener := buf[i]
+	var closer byte
+	switch opener {
+	case '(':
+		closer = ')'
+	case '[':
+		closer = ']'
+	case '{':
+		closer = '}'
+	case '<':
+		closer = '>'
+	case '/', '|', '"', '\'':
+		closer = opener
+	default:
+		return i + 1
+	}
+	j := i + 1
+	depth := 1
+	for j < len(buf) {
+		if buf[j] == '\\' && j+1 < len(buf) {
+			buf[j] = ' '
+			buf[j+1] = ' '
+			j += 2
+			continue
+		}
+		if buf[j] == closer {
+			depth--
+			if depth == 0 {
+				j++
+				// Skip trailing sigil modifiers (letters)
+				for j < len(buf) && ((buf[j] >= 'a' && buf[j] <= 'z') || (buf[j] >= 'A' && buf[j] <= 'Z')) {
+					buf[j] = ' '
+					j++
+				}
+				return j
+			}
+		} else if closer != opener && buf[j] == opener {
+			depth++
+		}
+		buf[j] = ' '
+		j++
+	}
+	return len(buf)
+}
+
+func copyMap(m map[string]string) map[string]string {
+	cp := make(map[string]string, len(m))
+	for k, v := range m {
+		cp[k] = v
+	}
+	return cp
+}
+
+func copyBoolMap(m map[string]bool) map[string]bool {
+	cp := make(map[string]bool, len(m))
+	for k, v := range m {
+		cp[k] = v
+	}
+	return cp
 }
 
 func IsElixirFile(path string) bool {

@@ -1,8 +1,6 @@
 package lsp
 
 import (
-	"os"
-	"path/filepath"
 	"strings"
 
 	"go.lsp.dev/protocol"
@@ -12,14 +10,12 @@ import (
 )
 
 func (s *Server) hoverFromFile(function string, result store.LookupResult) (*protocol.Hover, error) {
-	cleaned := filepath.Clean(result.FilePath)
-
-	data, err := os.ReadFile(cleaned)
-	if err != nil {
+	text, _, ok := s.readFileText(result.FilePath)
+	if !ok {
 		return nil, nil
 	}
 
-	lines := strings.Split(string(data), "\n")
+	lines := strings.Split(text, "\n")
 	defIdx := result.Line - 1
 
 	if defIdx < 0 || defIdx >= len(lines) {
@@ -90,12 +86,12 @@ func extractDocAbove(lines []string, defIdx int) (doc, spec string) {
 	inHeredocBack := false
 	for i := defIdx - 1; i >= 0; i-- {
 		trimmed := strings.TrimSpace(lines[i])
-		if !inHeredocBack && trimmed == `"""` {
+		if !inHeredocBack && (trimmed == `"""` || trimmed == `'''`) {
 			inHeredocBack = true
 			continue
 		}
 		if inHeredocBack {
-			if strings.HasSuffix(trimmed, `"""`) {
+			if strings.HasSuffix(trimmed, `"""`) || strings.HasSuffix(trimmed, `'''`) {
 				inHeredocBack = false
 			}
 			continue

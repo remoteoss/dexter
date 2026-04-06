@@ -100,9 +100,8 @@ type dbExecer interface {
 
 func createIndexes(db dbExecer) error {
 	_, err := db.Exec(`
-		CREATE INDEX IF NOT EXISTS idx_definitions_module ON definitions(module);
 		CREATE INDEX IF NOT EXISTS idx_definitions_module_function ON definitions(module, function);
-		CREATE INDEX IF NOT EXISTS idx_definitions_file_path ON definitions(file_path);
+		CREATE INDEX IF NOT EXISTS idx_definitions_file_path_line ON definitions(file_path, line);
 		CREATE INDEX IF NOT EXISTS idx_refs_module_function ON refs(module, function);
 		CREATE INDEX IF NOT EXISTS idx_refs_file_path ON refs(file_path);
 		CREATE INDEX IF NOT EXISTS idx_refs_function_kind ON refs(function, kind);
@@ -116,6 +115,7 @@ func (s *Store) DropIndexes() error {
 		DROP INDEX IF EXISTS idx_definitions_module;
 		DROP INDEX IF EXISTS idx_definitions_module_function;
 		DROP INDEX IF EXISTS idx_definitions_file_path;
+		DROP INDEX IF EXISTS idx_definitions_file_path_line;
 		DROP INDEX IF EXISTS idx_refs_module_function;
 		DROP INDEX IF EXISTS idx_refs_file_path;
 		DROP INDEX IF EXISTS idx_refs_function_kind;
@@ -398,19 +398,29 @@ func (s *Store) ListFilePaths() ([]string, error) {
 }
 
 func (s *Store) RemoveFile(path string) error {
+	return s.RemoveFiles([]string{path})
+}
+
+func (s *Store) RemoveFiles(paths []string) error {
+	if len(paths) == 0 {
+		return nil
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	_, err = tx.Exec("DELETE FROM definitions WHERE file_path = ?", path)
-	if err != nil {
-		return err
-	}
-	_, err = tx.Exec("DELETE FROM files WHERE path = ?", path)
-	if err != nil {
-		return err
+	for _, path := range paths {
+		if _, err = tx.Exec("DELETE FROM definitions WHERE file_path = ?", path); err != nil {
+			return err
+		}
+		if _, err = tx.Exec("DELETE FROM refs WHERE file_path = ?", path); err != nil {
+			return err
+		}
+		if _, err = tx.Exec("DELETE FROM files WHERE path = ?", path); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }

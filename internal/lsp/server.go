@@ -73,6 +73,8 @@ type Server struct {
 
 	conn                  jsonrpc2.Conn // raw connection for server-initiated requests not on the Client interface
 	showDocumentSupported bool          // client supports window/showDocument (LSP 3.16+)
+
+	reindexing sync.Mutex // serializes concurrent backgroundReindex calls
 }
 
 func (s *Server) debugf(format string, args ...interface{}) {
@@ -129,6 +131,11 @@ func Serve(in io.Reader, out io.Writer, s *store.Store, projectRoot string) erro
 // full init, otherwise it does an incremental mtime-based update.
 func (s *Server) backgroundReindex() {
 	go func() {
+		if !s.reindexing.TryLock() {
+			return
+		}
+		defer s.reindexing.Unlock()
+
 		start := time.Now()
 		reindexed := 0
 		isEmpty := s.store.IsEmpty()
@@ -186,10 +193,14 @@ func (s *Server) backgroundReindex() {
 
 		// Prune store entries for files no longer on disk
 		if storedPaths, err := s.store.ListFilePaths(); err == nil {
+			var toRemove []string
 			for _, storedPath := range storedPaths {
 				if _, ok := seen[storedPath]; !ok {
-					_ = s.store.RemoveFile(storedPath)
+					toRemove = append(toRemove, storedPath)
 				}
+			}
+			if len(toRemove) > 0 {
+				_ = s.store.RemoveFiles(toRemove)
 			}
 		}
 
@@ -677,21 +688,21 @@ func lineRange(line int) protocol.Range {
 }
 
 // nthLine returns the n-th line (0-based) from text without splitting the
-// entire string. Returns "" if n is out of range.
-func nthLine(text string, n int) string {
+// entire string. The bool indicates whether the line was found.
+func nthLine(text string, n int) (string, bool) {
 	start := 0
 	for i := 0; i < n; i++ {
 		idx := strings.IndexByte(text[start:], '\n')
 		if idx < 0 {
-			return ""
+			return "", false
 		}
 		start += idx + 1
 	}
 	end := strings.IndexByte(text[start:], '\n')
 	if end < 0 {
-		return text[start:]
+		return text[start:], true
 	}
-	return text[start : start+end]
+	return text[start : start+end], true
 }
 
 // findDexterRoot walks up from the given path looking for .dexter.db first,
@@ -765,7 +776,7 @@ func (s *Server) CodeAction(ctx context.Context, params *protocol.CodeActionPara
 		return nil, nil
 	}
 
-	aliases := ExtractAliases(text)
+	aliases := ExtractAliasesInScope(text, lineNum)
 
 	// Check if the first segment is already aliased — if so, the reference
 	// already resolves and no code action is needed.
@@ -1160,11 +1171,17 @@ func (s *Server) cachedUsingWithPath(moduleName, knownPath string) *usingCacheEn
 }
 
 func (s *Server) parseUsingFile(filePath string) *usingCacheEntry {
-	fileData, err := os.ReadFile(filePath)
+	f, err := os.Open(filePath)
 	if err != nil {
 		return nil
 	}
-	info, err := os.Stat(filePath)
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil
+	}
+	fileData, err := io.ReadAll(f)
+	_ = f.Close()
 	if err != nil {
 		return nil
 	}
@@ -1923,8 +1940,8 @@ func (s *Server) DocumentHighlight(ctx context.Context, params *protocol.Documen
 	}
 
 	// Extract the cursor's line without splitting the entire document
-	line := nthLine(text, lineNum)
-	if line == "" {
+	line, ok := nthLine(text, lineNum)
+	if !ok || line == "" {
 		return nil, nil
 	}
 
@@ -2008,6 +2025,16 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 	for lineIdx, line := range lines {
 		if strings.IndexByte(line, '"') >= 0 {
 			quoteCount := strings.Count(line, `"""`)
+			if quoteCount > 0 {
+				if quoteCount >= 2 {
+					continue
+				}
+				inHeredoc = !inHeredoc
+				continue
+			}
+		}
+		if strings.IndexByte(line, '\'') >= 0 {
+			quoteCount := strings.Count(line, `'''`)
 			if quoteCount > 0 {
 				if quoteCount >= 2 {
 					continue
@@ -2381,12 +2408,18 @@ func (s *Server) FoldingRanges(ctx context.Context, params *protocol.FoldingRang
 	var stack []blockStart
 
 	for i, line := range lines {
-		// Track heredoc boundaries as foldable regions
+		// Track heredoc boundaries as foldable regions (""" and ''')
+		isHeredocDelimiter := false
 		if strings.Contains(line, `"""`) {
-			count := strings.Count(line, `"""`)
-			if count >= 2 {
-				continue
+			if strings.Count(line, `"""`) < 2 {
+				isHeredocDelimiter = true
 			}
+		} else if strings.Contains(line, `'''`) {
+			if strings.Count(line, `'''`) < 2 {
+				isHeredocDelimiter = true
+			}
+		}
+		if isHeredocDelimiter {
 			if !inHeredoc {
 				inHeredoc = true
 				heredocStart = i
@@ -2548,7 +2581,7 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 		return nil, nil
 	}
 
-	fullModule := resolveModule(moduleRef, aliases)
+	fullModule := s.resolveModuleWithNesting(moduleRef, aliases, uriToPath(protocol.DocumentURI(docURI)), lineNum)
 
 	if functionName != "" {
 		var results []store.LookupResult
@@ -3016,6 +3049,10 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 				if s.stdlibRoot != "" && strings.HasPrefix(r.FilePath, s.stdlibRoot) {
 					continue
 				}
+				k := refKey{r.FilePath, r.Line}
+				if _, ok := seen[k]; ok {
+					continue
+				}
 				locations = append(locations, protocol.Location{
 					URI:   uri.File(r.FilePath),
 					Range: lineRange(r.Line - 1),
@@ -3052,6 +3089,9 @@ func (s *Server) Rename(ctx context.Context, params *protocol.RenameParams) (*pr
 	if moduleRef == "" {
 		if tree, src, ok := s.docs.GetTree(docURI); ok {
 			if occs := treesitter.FindVariableOccurrencesWithTree(tree.RootNode(), src, uint(lineNum), uint(col)); len(occs) > 0 {
+				if treesitter.NameExistsInScopeOf(tree.RootNode(), src, uint(lineNum), uint(col), params.NewName) {
+					return nil, fmt.Errorf("variable %q already exists in this scope", params.NewName)
+				}
 				changes := make(map[protocol.DocumentURI][]protocol.TextEdit)
 				for _, occ := range occs {
 					changes[protocol.DocumentURI(docURI)] = append(changes[protocol.DocumentURI(docURI)], protocol.TextEdit{
@@ -3111,6 +3151,9 @@ func (s *Server) Rename(ctx context.Context, params *protocol.RenameParams) (*pr
 			if fullModule != "" {
 				if !isValidFunctionName(params.NewName) {
 					return nil, fmt.Errorf("invalid function name %q: must match [a-z_][a-z0-9_?!]*", params.NewName)
+				}
+				if existing, err := s.store.LookupFunction(fullModule, params.NewName); err == nil && len(existing) > 0 {
+					return nil, fmt.Errorf("function %s.%s already exists", fullModule, params.NewName)
 				}
 				return s.renameFunctionEdits(fullModule, functionName, params.NewName)
 			}
@@ -3335,23 +3378,45 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*pro
 // Files following the naming convention are also renamed/moved.
 func (s *Server) renameModuleEdits(ctx context.Context, oldModule, newModule, triggerFilePath string) (*protocol.WorkspaceEdit, error) {
 	mr := s.buildModuleRename(oldModule, newModule)
+
+	// Check for collisions: verify that none of the target module names
+	// (including submodules) already exist, and that no destination file
+	// paths are occupied.
+	if err := mr.checkCollisions(); err != nil {
+		return nil, err
+	}
+
 	mr.collectSites()
 
 	fileCache := mr.readFiles()
 
-	movedFiles, showDocumentPath := mr.moveConventionalFiles(fileCache, triggerFilePath)
+	movedFiles, openMovedFiles, showDocumentPath := mr.moveConventionalFiles(fileCache, triggerFilePath)
 	openChanges := mr.applyEdits(fileCache, movedFiles)
-	mr.reindex(fileCache, movedFiles)
+	mr.reindex(fileCache, movedFiles, openMovedFiles)
 
-	if showDocumentPath != "" && s.showDocumentSupported && s.conn != nil {
-		showURI := protocol.URI(string(uri.File(showDocumentPath)))
-		go func() {
-			var result protocol.ShowDocumentResult
-			_ = protocol.Call(context.Background(), s.conn, "window/showDocument", &protocol.ShowDocumentParams{
-				URI:       showURI,
-				TakeFocus: true,
-			}, &result)
-		}()
+	// For open files that were moved: send showDocument so the editor opens
+	// the new path, then delete the old file in the background.
+	if s.showDocumentSupported && s.conn != nil {
+		for oldPath, newPath := range openMovedFiles {
+			showURI := protocol.URI(string(uri.File(newPath)))
+			takeFocus := newPath == showDocumentPath
+			go func() {
+				var result protocol.ShowDocumentResult
+				_ = protocol.Call(context.Background(), s.conn, "window/showDocument", &protocol.ShowDocumentParams{
+					URI:       showURI,
+					TakeFocus: takeFocus,
+				}, &result)
+				// Delete old file after the editor has been redirected
+				_ = os.Remove(oldPath)
+				_ = s.store.RemoveFile(oldPath)
+			}()
+		}
+	} else if len(openMovedFiles) > 0 {
+		// Client doesn't support showDocument — still clean up old files
+		for oldPath := range openMovedFiles {
+			_ = os.Remove(oldPath)
+			_ = s.store.RemoveFile(oldPath)
+		}
 	}
 
 	return &protocol.WorkspaceEdit{Changes: openChanges}, nil
@@ -3404,6 +3469,47 @@ func (s *Server) buildModuleRename(oldModule, newModule string) *moduleRename {
 		tokenReplacements: tokenReplacements,
 		sitesByFile:       make(map[string][]moduleEditSite),
 	}
+}
+
+// checkCollisions verifies that none of the target module names (including
+// submodules) already exist at unrelated file paths, and that no conventional
+// destination file paths are already occupied on disk.
+func (mr *moduleRename) checkCollisions() error {
+	// Build the set of source file paths involved in this rename so we can
+	// ignore stale index entries at those paths.
+	oldDefs, _ := mr.server.store.LookupModulesByPrefix(mr.oldModule)
+	ignorePaths := make(map[string]bool, len(oldDefs)*2)
+	for _, r := range oldDefs {
+		ignorePaths[r.FilePath] = true
+	}
+
+	for oldMod, newMod := range mr.moduleRenames {
+		// Module name collision: check if newMod already exists outside our rename scope
+		if existing, err := mr.server.store.LookupModule(newMod); err == nil && len(existing) > 0 {
+			for _, r := range existing {
+				if !ignorePaths[r.FilePath] {
+					return fmt.Errorf("module %s already exists", newMod)
+				}
+			}
+		}
+
+		// File path collision: if the old module follows naming convention,
+		// check that the destination path isn't already taken.
+		oldDefs, _ := mr.server.store.LookupModule(oldMod)
+		for _, r := range oldDefs {
+			if fileMatchesModuleConvention(r.FilePath, oldMod) {
+				newPath := conventionalNewPath(r.FilePath, oldMod, newMod)
+				if _, err := os.Stat(newPath); err == nil {
+					// File exists — only a collision if it's not a source file
+					// we're moving as part of this rename
+					if !ignorePaths[newPath] {
+						return fmt.Errorf("file %s already exists", newPath)
+					}
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func (mr *moduleRename) isExcluded(filePath string) bool {
@@ -3574,10 +3680,13 @@ func (mr *moduleRename) conventionalNewPath(r store.LookupResult) (string, bool)
 }
 
 // moveConventionalFiles moves files that follow the naming convention to their
-// new paths, applying edits in the process. Returns moved files and the path
-// to show in the editor (if the trigger file was moved).
-func (mr *moduleRename) moveConventionalFiles(fileCache map[string]moduleFileInfo, triggerFilePath string) (movedFiles map[string]string, showDocumentPath string) {
+// new paths, applying edits in the process. Open files are NOT moved on disk —
+// they are left for applyEdits to handle via TextEdits so the editor buffer
+// stays in sync. Returns moved files, paths that need showDocument calls
+// (open files that were moved), and the path to show for the trigger file.
+func (mr *moduleRename) moveConventionalFiles(fileCache map[string]moduleFileInfo, triggerFilePath string) (movedFiles map[string]string, openMovedFiles map[string]string, showDocumentPath string) {
 	movedFiles = make(map[string]string)
+	openMovedFiles = make(map[string]string)
 	for _, r := range mr.allModuleDefs {
 		if _, ok := mr.moduleRenames[r.Module]; !ok {
 			continue
@@ -3590,6 +3699,30 @@ func (mr *moduleRename) moveConventionalFiles(fileCache map[string]moduleFileInf
 		if !hasContent {
 			continue
 		}
+
+		// Open files: write the new file to disk but DON'T delete the old one
+		// or mark it in movedFiles. Instead track it in openMovedFiles so that
+		// applyEdits still produces TextEdits for the editor buffer, and we
+		// send showDocument to redirect the editor to the new path.
+		if fi.open {
+			updatedLines := mr.applyEditsToLines(fi.lines, mr.sitesByFile[r.FilePath])
+			content := strings.Join(updatedLines, "\n")
+			if err := os.MkdirAll(filepath.Dir(newPath), 0755); err != nil {
+				log.Printf("Rename: cannot create dir for %s: %v", newPath, err)
+				continue
+			}
+			if err := os.WriteFile(newPath, []byte(content), 0644); err != nil {
+				log.Printf("Rename: cannot write %s: %v", newPath, err)
+				continue
+			}
+			mr.server.debugf("Rename: %s → %s (open, deferred delete)", r.FilePath, newPath)
+			openMovedFiles[r.FilePath] = newPath
+			if r.FilePath == triggerFilePath && showDocumentPath == "" {
+				showDocumentPath = newPath
+			}
+			continue
+		}
+
 		updatedLines := mr.applyEditsToLines(fi.lines, mr.sitesByFile[r.FilePath])
 		content := strings.Join(updatedLines, "\n")
 
@@ -3606,12 +3739,8 @@ func (mr *moduleRename) moveConventionalFiles(fileCache map[string]moduleFileInf
 		}
 		mr.server.debugf("Rename: %s → %s", r.FilePath, newPath)
 		movedFiles[r.FilePath] = newPath
-
-		if r.Module == mr.oldModule && r.FilePath == triggerFilePath && showDocumentPath == "" {
-			showDocumentPath = newPath
-		}
 	}
-	return movedFiles, showDocumentPath
+	return movedFiles, openMovedFiles, showDocumentPath
 }
 
 // applyEdits applies text edits to all non-moved files: open buffers get
@@ -3661,7 +3790,7 @@ func (mr *moduleRename) applyEdits(fileCache map[string]moduleFileInfo, movedFil
 }
 
 // reindex re-parses all touched files asynchronously after the rename.
-func (mr *moduleRename) reindex(fileCache map[string]moduleFileInfo, movedFiles map[string]string) {
+func (mr *moduleRename) reindex(fileCache map[string]moduleFileInfo, movedFiles map[string]string, openMovedFiles map[string]string) {
 	for oldPath := range movedFiles {
 		_ = mr.server.store.RemoveFile(oldPath)
 	}
@@ -3684,11 +3813,23 @@ func (mr *moduleRename) reindex(fileCache map[string]moduleFileInfo, movedFiles 
 		if !ok {
 			continue
 		}
-		if fi.open {
-			updatedLines := mr.applyEditsToLines(fi.lines, mr.sitesByFile[fp])
-			openReindexes = append(openReindexes, textReindex{fp, strings.Join(updatedLines, "\n")})
+		updatedLines := mr.applyEditsToLines(fi.lines, mr.sitesByFile[fp])
+		updatedText := strings.Join(updatedLines, "\n")
+		if newPath, moved := openMovedFiles[fp]; moved {
+			// Open file that was moved: reindex at the new path
+			openReindexes = append(openReindexes, textReindex{newPath, updatedText})
+		} else if fi.open {
+			openReindexes = append(openReindexes, textReindex{fp, updatedText})
 		} else {
 			reindexPaths = append(reindexPaths, fp)
+		}
+	}
+
+	// Also reindex open moved files that had no edit sites (e.g. the file
+	// only contained the defmodule line which is already in allModuleDefs)
+	for oldPath, newPath := range openMovedFiles {
+		if _, hasSites := mr.sitesByFile[oldPath]; !hasSites {
+			reindexPaths = append(reindexPaths, newPath)
 		}
 	}
 
@@ -3922,11 +4063,11 @@ func (s *Server) readFileText(filePath string) (text string, open bool, ok bool)
 // filePath, preferring the in-memory document store for open buffers.
 // For closed files, only reads up to the target line instead of the whole file.
 func (s *Server) getFileLine(filePath string, lineNum int) (string, bool) {
-	// Open buffer: split from in-memory text (already loaded, cheap)
+	// Open buffer: extract the single line without splitting the entire text
 	if text, ok := s.docs.Get(string(uri.File(filePath))); ok {
-		lines := strings.Split(text, "\n")
-		if lineNum-1 < len(lines) {
-			return lines[lineNum-1], true
+		line, found := nthLine(text, lineNum-1)
+		if found {
+			return line, true
 		}
 		return "", false
 	}
@@ -4158,7 +4299,7 @@ func (s *Server) TypeDefinition(ctx context.Context, params *protocol.TypeDefini
 	}
 
 	aliases := ExtractAliasesInScope(text, lineNum)
-	fullModule := resolveModule(moduleRef, aliases)
+	fullModule := s.resolveModuleWithNesting(moduleRef, aliases, uriToPath(protocol.DocumentURI(docURI)), lineNum)
 
 	results, err := s.store.LookupFunction(fullModule, typeName)
 	if err != nil {
