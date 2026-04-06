@@ -1,5 +1,7 @@
 # Dexter
 
+<img src="dexter-logo.png" width="200" height="200" alt="Dexter logo" />
+
 A fast, full-featured Elixir LSP that works on large codebases and won't eat all of your resources.
 
 ## Features
