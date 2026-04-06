@@ -1336,7 +1336,9 @@ func TestDefinition_BareTypeReference(t *testing.T) {
     required(:charge) => charge_type()
   }
 end`
-	fileURI := "file:///test.ex"
+	path := filepath.Join(server.projectRoot, "lib", "payment.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/payment.ex", src)
+	fileURI := "file://" + path
 	server.docs.Set(fileURI, src)
 
 	// col=26 is on 'charge_type' in the @type params line (line 4)
@@ -1362,7 +1364,9 @@ func TestDefinition_BareTypeReferenceInStructType(t *testing.T) {
     status: status()
   }
 end`
-	fileURI := "file:///order.ex"
+	path := filepath.Join(server.projectRoot, "lib", "order.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/order.ex", src)
+	fileURI := "file://" + path
 	server.docs.Set(fileURI, src)
 
 	// col=13 is on 'status' in the @type t definition (line 4)
@@ -1417,6 +1421,122 @@ end`)
 	// Should jump to line 1 where user is the function param
 	if locs[0].Range.Start.Line != 1 {
 		t.Errorf("expected definition on line 1, got line %d", locs[0].Range.Start.Line)
+	}
+}
+
+func TestDefinition_ImportedFunctionViaUseChain(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Regression: `import MyApp.Factory` where MyApp.Factory uses ExMachina
+	// (which injects `insert` via __using__). go-to-definition on `insert`
+	// was returning nil because the import lookup only checked direct
+	// definitions, not the imported module's use chain.
+	exMachinaSrc := `defmodule MyApp.ExMachina do
+  defmacro __using__(_opts) do
+    quote do
+      def insert(factory_name, attrs \\ []), do: :ok
+    end
+  end
+end`
+	factorySrc := `defmodule MyApp.Factory do
+  use MyApp.ExMachina
+end`
+	callerSrc := `defmodule MyApp.SomeTest do
+  import MyApp.Factory
+
+  def run do
+    insert(:user)
+  end
+end`
+
+	indexFile(t, server.store, server.projectRoot, "lib/ex_machina.ex", exMachinaSrc)
+	exMachinaURI := "file://" + filepath.Join(server.projectRoot, "lib/ex_machina.ex")
+	server.docs.Set(exMachinaURI, exMachinaSrc)
+
+	indexFile(t, server.store, server.projectRoot, "lib/factory.ex", factorySrc)
+	factoryURI := "file://" + filepath.Join(server.projectRoot, "lib/factory.ex")
+	server.docs.Set(factoryURI, factorySrc)
+
+	callerURI := "file://" + filepath.Join(server.projectRoot, "test/some_test.exs")
+	server.docs.Set(callerURI, callerSrc)
+
+	// col=4 is on `insert` (line 4, 0-indexed)
+	locs := definitionAt(t, server, callerURI, 4, 4)
+	if len(locs) == 0 {
+		t.Fatal("expected go-to-definition for `insert` imported from a module that uses ExMachina")
+	}
+}
+
+func TestReferences_UseWithOptOverride(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Remote.Mox: imports the `mod` opt (default Mox) via unquote
+	indexFile(t, server.store, server.projectRoot, "lib/mox.ex", `defmodule Remote.Mox do
+  defmacro __using__(opts \\ []) do
+    mod = Keyword.get(opts, :mod, Mox)
+    quote do
+      import unquote(mod)
+    end
+  end
+end
+`)
+	indexFile(t, server.store, server.projectRoot, "lib/mox_lib.ex", `defmodule Mox do
+  def expect(mock, name, fun), do: :ok
+end
+`)
+	indexFile(t, server.store, server.projectRoot, "lib/hammox_lib.ex", `defmodule Hammox do
+  def expect(mock, name, fun), do: :ok
+end
+`)
+
+	// Two consumers: one with default Mox, one with mod: Hammox override
+	defaultCallerSrc := `defmodule DefaultTest do
+  use Remote.Mox
+
+  def run do
+    expect(MyMock, :foo, fn -> :ok end)
+  end
+end
+`
+	overrideCallerSrc := `defmodule OverrideTest do
+  use Remote.Mox, mod: Hammox
+
+  def run do
+    expect(MyMock, :foo, fn -> :ok end)
+  end
+end
+`
+	overridePath := filepath.Join(server.projectRoot, "test", "override_test.ex")
+	indexFile(t, server.store, server.projectRoot, "test/default_test.ex", defaultCallerSrc)
+	indexFile(t, server.store, server.projectRoot, "test/override_test.ex", overrideCallerSrc)
+
+	// Go-to-references on `expect` from the override file (mod: Hammox)
+	overrideURI := "file://" + overridePath
+	server.docs.Set(overrideURI, overrideCallerSrc)
+
+	locs := referencesAt(t, server, overrideURI, 4, 4)
+	if len(locs) == 0 {
+		t.Fatal("expected references for expect with mod: Hammox override")
+	}
+
+	// Both files should be in the results (both use Remote.Mox to get expect)
+	foundDefault, foundOverride := false, false
+	for _, loc := range locs {
+		locStr := string(loc.URI)
+		if strings.Contains(locStr, "default_test.ex") {
+			foundDefault = true
+		}
+		if strings.Contains(locStr, "override_test.ex") {
+			foundOverride = true
+		}
+	}
+	if !foundDefault {
+		t.Error("expected reference in default_test.ex")
+	}
+	if !foundOverride {
+		t.Error("expected reference in override_test.ex")
 	}
 }
 
@@ -1777,6 +1897,207 @@ end`
 	}
 }
 
+func TestReferences_NestedModuleDefinition(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Nested module: defmodule MoneyResponse inside Money creates
+	// MyApp.Money.MoneyResponse, but the defmodule line says just "MoneyResponse"
+	defSrc := `defmodule MyApp.Money do
+  defmodule MoneyResponse do
+    def schema, do: %{}
+  end
+end
+`
+	callerSrc := `defmodule MyApp.Cards do
+  alias MyApp.Money.MoneyResponse
+
+  def show do
+    MoneyResponse.schema()
+  end
+end
+`
+	defPath := filepath.Join(server.projectRoot, "lib", "money.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/money.ex", defSrc)
+	indexFile(t, server.store, server.projectRoot, "lib/cards.ex", callerSrc)
+
+	defURI := "file://" + defPath
+	server.docs.Set(defURI, defSrc)
+
+	// Go-to-references on "MoneyResponse" in the defmodule line (line 1, col 13)
+	locs := referencesAt(t, server, defURI, 1, 13)
+	if len(locs) == 0 {
+		t.Fatal("expected references for nested module MoneyResponse")
+	}
+	// Should find the alias and/or usage in cards.ex
+	foundCallerRef := false
+	for _, loc := range locs {
+		if strings.Contains(string(loc.URI), "cards.ex") {
+			foundCallerRef = true
+			break
+		}
+	}
+	if !foundCallerRef {
+		t.Error("expected reference in cards.ex for nested module MoneyResponse")
+	}
+}
+
+func TestReferences_NestedDefmoduleWithConflictingAlias(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// The nested defmodule PaymentRecord creates MyApp.Payments.PaymentRecord,
+	// but inside it there's `alias MyApp.Billing.PaymentRecord` (a different module).
+	// Go-to-references on the defmodule line should find references to the API module,
+	// NOT the billing module.
+	defSrc := `defmodule MyApp.Payments do
+  defmodule PaymentRecord do
+    alias MyApp.Billing.PaymentRecord
+
+    def schema, do: %{}
+  end
+end
+`
+	callerSrc := `defmodule MyApp.Web do
+  alias MyApp.Payments.PaymentRecord
+
+  def show do
+    PaymentRecord.schema()
+  end
+end
+`
+	// Also index the billing module so the alias has a target
+	billingSrc := `defmodule MyApp.Billing.PaymentRecord do
+  def get(id), do: id
+end
+`
+	defPath := filepath.Join(server.projectRoot, "lib", "payments.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/payments.ex", defSrc)
+	indexFile(t, server.store, server.projectRoot, "lib/web.ex", callerSrc)
+	indexFile(t, server.store, server.projectRoot, "lib/billing.ex", billingSrc)
+
+	defURI := "file://" + defPath
+	server.docs.Set(defURI, defSrc)
+
+	// Go-to-references on "PaymentRecord" in the defmodule line (line 1, col 13)
+	locs := referencesAt(t, server, defURI, 1, 13)
+
+	// Should find references to MyApp.Payments.PaymentRecord (the API module),
+	// NOT MyApp.Billing.PaymentRecord
+	foundWebRef := false
+	foundBillingRef := false
+	for _, loc := range locs {
+		locStr := string(loc.URI)
+		if strings.Contains(locStr, "web.ex") {
+			foundWebRef = true
+		}
+		if strings.Contains(locStr, "billing.ex") {
+			foundBillingRef = true
+		}
+	}
+	if !foundWebRef {
+		t.Error("expected reference in web.ex for the API PaymentRecord module")
+	}
+	if foundBillingRef {
+		t.Error("should NOT return references to MyApp.Billing.PaymentRecord")
+	}
+}
+
+func TestDefinition_QualifiedCallOnNestedModule(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Inner.helper() called from parent Outer — "Inner" is an implicit alias
+	// for MyApp.Outer.Inner created by the nested defmodule.
+	content := `defmodule MyApp.Outer do
+  defmodule Inner do
+    def helper, do: :ok
+  end
+
+  def run do
+    Inner.helper()
+  end
+end
+`
+	path := filepath.Join(server.projectRoot, "lib", "outer.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/outer.ex", content)
+	docURI := "file://" + path
+	server.docs.Set(docURI, content)
+
+	// Go-to-definition on "helper" in Inner.helper() (line 6, col 10)
+	locs := definitionAt(t, server, docURI, 6, 10)
+	if len(locs) == 0 {
+		t.Fatal("expected go-to-definition for Inner.helper() via implicit alias")
+	}
+	// Should jump to def helper on line 2
+	if locs[0].Range.Start.Line != 2 {
+		t.Errorf("expected jump to line 2 (def helper), got line %d", locs[0].Range.Start.Line)
+	}
+}
+
+func TestDefinition_TripleNestedModule(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule MyApp.A do
+  defmodule B do
+    defmodule C do
+      def deep, do: :ok
+    end
+  end
+
+  def run do
+    B.C.deep()
+  end
+end
+`
+	path := filepath.Join(server.projectRoot, "lib", "a.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/a.ex", content)
+	docURI := "file://" + path
+	server.docs.Set(docURI, content)
+
+	// Go-to-definition on "deep" in B.C.deep() (line 8, col 8)
+	locs := definitionAt(t, server, docURI, 8, 8)
+	if len(locs) == 0 {
+		t.Fatal("expected go-to-definition for triple-nested B.C.deep()")
+	}
+	if locs[0].Range.Start.Line != 3 {
+		t.Errorf("expected jump to line 3 (def deep), got line %d", locs[0].Range.Start.Line)
+	}
+}
+
+func TestResolveBareFunctionModule_ParentScopeFunction(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Function defined in Outer, bare-called from inside Inner.
+	// The enclosing module at the call site is Inner (which doesn't define it),
+	// so the file-scan fallback should find it in Outer.
+	content := `defmodule MyApp.Outer do
+  def shared_helper, do: :ok
+
+  defmodule Inner do
+    def run do
+      shared_helper()
+    end
+  end
+end
+`
+	path := filepath.Join(server.projectRoot, "lib", "outer.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/outer.ex", content)
+	docURI := "file://" + path
+	server.docs.Set(docURI, content)
+
+	// Go-to-definition on shared_helper() inside Inner (line 5, col 6)
+	locs := definitionAt(t, server, docURI, 5, 6)
+	if len(locs) == 0 {
+		t.Fatal("expected go-to-definition for parent-scope function called from nested module")
+	}
+	if locs[0].Range.Start.Line != 1 {
+		t.Errorf("expected jump to line 1 (def shared_helper in Outer), got line %d", locs[0].Range.Start.Line)
+	}
+}
+
 func TestReferences_ModuleOnlyExcludesFunctionCalls(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
@@ -1810,6 +2131,145 @@ end`
 		if strings.Contains(locURI, "consumer.ex") && (line == 3 || line == 4) {
 			t.Errorf("module-only references should not include function call at line %d", line)
 		}
+	}
+}
+
+func TestReferences_Variable(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyApp do
+  def process(data) do
+    result = transform(data)
+    log(result)
+    result
+  end
+end`)
+
+	// Cursor on "result" at line 2 (0-based), col 4
+	locs := referencesAt(t, server, uri, 2, 4)
+	if len(locs) != 3 {
+		t.Fatalf("expected 3 occurrences of 'result', got %d", len(locs))
+	}
+	for _, loc := range locs {
+		if string(loc.URI) != uri {
+			t.Errorf("expected URI %q, got %q", uri, loc.URI)
+		}
+	}
+	lines := []uint32{locs[0].Range.Start.Line, locs[1].Range.Start.Line, locs[2].Range.Start.Line}
+	expected := []uint32{2, 3, 4}
+	for i, got := range lines {
+		if got != expected[i] {
+			t.Errorf("occurrence %d: expected line %d, got %d", i, expected[i], got)
+		}
+	}
+}
+
+func TestReferences_VariableScopedToFunction(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyApp do
+  def first(x) do
+    x + 1
+  end
+
+  def second(x) do
+    x * 2
+  end
+end`)
+
+	// Cursor on "x" in first/1 at line 1, col 12
+	locs := referencesAt(t, server, uri, 1, 12)
+	if len(locs) != 2 {
+		t.Fatalf("expected 2 occurrences of 'x' in first/1, got %d", len(locs))
+	}
+	for _, loc := range locs {
+		line := loc.Range.Start.Line
+		if line != 1 && line != 2 {
+			t.Errorf("unexpected line %d — should only see lines 1 and 2 (first/1 scope)", line)
+		}
+	}
+}
+
+func TestReferences_BareFunctionCallInsideWithBlock(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	src := `defmodule MyApp.Service do
+  def run(args) do
+    with {:ok, result} <- do_work(args) do
+      format(result)
+    end
+  end
+
+  defp do_work(args) do
+    {:ok, args}
+  end
+
+  defp format(result) do
+    result
+  end
+end`
+
+	indexFile(t, server.store, server.projectRoot, "lib/service.ex", src)
+	serviceURI := "file://" + filepath.Join(server.projectRoot, "lib/service.ex")
+	server.docs.Set(serviceURI, src)
+
+	// References for "do_work" from the call site inside with (line 2, col 30)
+	// "    with {:ok, result} <- do_work(args) do"
+	// do_work starts at col 27
+	locs := referencesAt(t, server, serviceURI, 2, 27)
+	if len(locs) == 0 {
+		t.Fatal("expected function references for 'do_work' inside with block, got none")
+	}
+
+	// References for "format" from inside with do block (line 3, col 6)
+	locs = referencesAt(t, server, serviceURI, 3, 6)
+	if len(locs) == 0 {
+		t.Fatal("expected function references for 'format' inside with do block, got none")
+	}
+}
+
+func TestReferences_BareFunctionCallInsideCaseBlock(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	src := `defmodule MyApp.Service do
+  def run(args) do
+    case do_work(args) do
+      {:ok, result} ->
+        format(result)
+      _ ->
+        :error
+    end
+  end
+
+  defp do_work(args) do
+    {:ok, args}
+  end
+
+  defp format(result) do
+    result
+  end
+end`
+
+	indexFile(t, server.store, server.projectRoot, "lib/service.ex", src)
+	serviceURI := "file://" + filepath.Join(server.projectRoot, "lib/service.ex")
+	server.docs.Set(serviceURI, src)
+
+	// References for "do_work" from the call site inside case (line 2)
+	locs := referencesAt(t, server, serviceURI, 2, 9)
+	if len(locs) == 0 {
+		t.Fatal("expected function references for 'do_work' inside case block, got none")
+	}
+
+	// References for "format" from inside case arm (line 4, col 8)
+	locs = referencesAt(t, server, serviceURI, 4, 8)
+	if len(locs) == 0 {
+		t.Fatal("expected function references for 'format' inside case arm, got none")
 	}
 }
 
@@ -3419,6 +3879,88 @@ end`)
 			titles = append(titles, a.Title)
 		}
 		t.Errorf("expected 'Add alias MyApp.RandomAPI' action, got: %v", titles)
+	}
+}
+
+func TestDeclaration_ImplTrueFallback(t *testing.T) {
+	// When the behaviour chain can't be statically resolved (e.g. dynamic
+	// `use unquote(mod)`), Declaration should fall back to a global @callback
+	// search when @impl true is present above the function definition.
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/my_behaviour.ex", `defmodule MyApp.MyBehaviour do
+  @callback process(job :: term()) :: :ok | {:error, term()}
+end
+`)
+
+	uri := "file:///test_worker.ex"
+	server.docs.Set(uri, `defmodule MyApp.Worker do
+  use MyApp.SomeWrapper
+
+  @impl true
+  def process(job) do
+    :ok
+  end
+end`)
+
+	// Cursor on "process" (line 4, 0-based — the def process line)
+	actions, err := server.Declaration(context.Background(), &protocol.DeclarationParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(uri)},
+			Position:     protocol.Position{Line: 4, Character: 6},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) == 0 {
+		t.Fatal("expected at least one declaration location via @impl true fallback, got none")
+	}
+	found := false
+	for _, loc := range actions {
+		if strings.Contains(string(loc.URI), "my_behaviour.ex") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a location in my_behaviour.ex, got: %v", actions)
+	}
+}
+
+func TestDeclaration_ImplModule(t *testing.T) {
+	// When @impl SomeModule is explicit, Declaration should use it directly
+	// without needing to resolve the behaviour chain.
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/my_behaviour.ex", `defmodule MyApp.MyBehaviour do
+  @callback process(job :: term()) :: :ok | {:error, term()}
+end
+`)
+
+	uri := "file:///test_worker2.ex"
+	server.docs.Set(uri, `defmodule MyApp.Worker2 do
+  @impl MyApp.MyBehaviour
+  def process(job) do
+    :ok
+  end
+end`)
+
+	actions, err := server.Declaration(context.Background(), &protocol.DeclarationParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(uri)},
+			Position:     protocol.Position{Line: 2, Character: 6},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(actions) == 0 {
+		t.Fatal("expected a declaration location via @impl MyApp.MyBehaviour, got none")
+	}
+	if !strings.Contains(string(actions[0].URI), "my_behaviour.ex") {
+		t.Errorf("expected location in my_behaviour.ex, got: %s", actions[0].URI)
 	}
 }
 

@@ -282,6 +282,31 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 					}
 				}
 
+				// @callback/@macrocallback — index as definitions for go-to-declaration and go-to-implementation.
+				// Check @macrocallback first since it shares a prefix with @callback.
+				var callbackKind string
+				var afterCallbackKw string
+				if strings.HasPrefix(rest, "@macrocallback") && len(rest) > 14 && (rest[14] == ' ' || rest[14] == '\t') {
+					callbackKind = "macrocallback"
+					afterCallbackKw = strings.TrimLeft(rest[14:], " \t")
+				} else if strings.HasPrefix(rest, "@callback") && len(rest) > 9 && (rest[9] == ' ' || rest[9] == '\t') {
+					callbackKind = "callback"
+					afterCallbackKw = strings.TrimLeft(rest[9:], " \t")
+				}
+				if callbackKind != "" {
+					name := ScanFuncName(afterCallbackKw)
+					if name != "" {
+						defs = append(defs, Definition{
+							Module:   currentModule,
+							Function: name,
+							Arity:    ExtractArity(line, name),
+							Line:     lineNum,
+							FilePath: path,
+							Kind:     callbackKind,
+						})
+					}
+				}
+
 			}
 			// Don't continue — fall through to extractCallRefs so that module
 			// references in @spec/@type/@callback annotations are captured
@@ -592,6 +617,12 @@ func ScanFuncDef(rest string) (string, string, bool) {
 		return kw, name, true
 	}
 	return "", "", false
+}
+
+// ContainsDo returns true if the trimmed line ends with a block-opening " do"
+// (not an inline "do:" keyword argument).
+func ContainsDo(trimmed string) bool {
+	return strings.HasSuffix(trimmed, " do") || strings.HasSuffix(trimmed, "\tdo")
 }
 
 // findDelegateTo searches the current line and up to 5 subsequent lines for a to: target,

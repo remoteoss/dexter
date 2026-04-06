@@ -46,9 +46,9 @@ func TestModuleToExpectedFilename(t *testing.T) {
 		{"MyApp", "my_app.ex"},
 	}
 	for _, tt := range tests {
-		got := moduleToExpectedFilename(tt.module)
+		got := moduleToExpectedBase(tt.module) + ".ex"
 		if got != tt.expected {
-			t.Errorf("moduleToExpectedFilename(%q) = %q, want %q", tt.module, got, tt.expected)
+			t.Errorf("moduleToExpectedBase(%q)+\".ex\" = %q, want %q", tt.module, got, tt.expected)
 		}
 	}
 }
@@ -103,6 +103,40 @@ func TestFindAllTokenColumns(t *testing.T) {
 		for i := range got {
 			if got[i] != tt.expected[i] {
 				t.Errorf("findAllTokenColumns(%q, %q)[%d] = %d, want %d", tt.line, tt.token, i, got[i], tt.expected[i])
+			}
+		}
+	}
+}
+
+func TestFindFunctionTokenColumns(t *testing.T) {
+	tests := []struct {
+		line     string
+		token    string
+		expected []int
+	}{
+		// Normal function call
+		{"  resource_type(x)", "resource_type", []int{2}},
+		// Keyword key followed by function call — only the call
+		{"  resource_type: resource_type(x)", "resource_type", []int{17}},
+		// Keyword key only — filtered out
+		{"  resource_type: :payroll", "resource_type", nil},
+		// Import only: line — keyword IS function name, but findFunctionTokenColumns
+		// filters it because it's a keyword. Import sites use findAllTokenColumns instead.
+		{"  import Mod, only: [resource_type: 1]", "resource_type", nil},
+		// def line (no colon after token)
+		{"  defp resource_type(%Foo{}), do: :bar", "resource_type", []int{7}},
+		// Type separator :: should NOT be treated as keyword
+		{"  @spec resource_type() :: atom()", "resource_type", []int{8}},
+	}
+	for _, tt := range tests {
+		got := findFunctionTokenColumns(tt.line, tt.token)
+		if len(got) != len(tt.expected) {
+			t.Errorf("findFunctionTokenColumns(%q, %q) = %v, want %v", tt.line, tt.token, got, tt.expected)
+			continue
+		}
+		for i := range got {
+			if got[i] != tt.expected[i] {
+				t.Errorf("findFunctionTokenColumns(%q, %q)[%d] = %d, want %d", tt.line, tt.token, i, got[i], tt.expected[i])
 			}
 		}
 	}
@@ -375,8 +409,9 @@ func TestPrepareRename_FunctionName(t *testing.T) {
   end
 end
 `
+	path := filepath.Join(server.projectRoot, "lib", "accounts.ex")
 	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", content)
-	docURI := "file:///test/accounts.ex"
+	docURI := "file://" + path
 	server.docs.Set(docURI, content)
 
 	// Cursor on "list_users" (line 1, col 6 — 0-based)
@@ -592,6 +627,460 @@ end
 	// import only: line should be updated (either in WorkspaceEdit or written to disk)
 	if !hasRename(edit, callerPath, "format_date_string") {
 		t.Error("expected 'format_date_string' in caller file (import only: line)")
+	}
+}
+
+func TestRename_Function_BareCallsInImportingFile(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	defContent := `defmodule MyApp.Config do
+  def repo, do: MyApp.Repo
+end
+`
+	callerContent := `defmodule MyApp.Service do
+  import MyApp.Config, only: [repo: 0]
+
+  def call do
+    repo().transaction(fn ->
+      with {:ok, result} <- repo().insert(%{}),
+           {:ok, _} <- repo().update(result) do
+        result
+      else
+        {:error, reason} -> repo().rollback(reason)
+      end
+    end)
+  end
+end
+`
+	defPath := filepath.Join(server.projectRoot, "lib", "config.ex")
+	callerPath := filepath.Join(server.projectRoot, "lib", "service.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/config.ex", defContent)
+	indexFile(t, server.store, server.projectRoot, "lib/service.ex", callerContent)
+
+	defURI := "file://" + defPath
+	server.docs.Set(defURI, defContent)
+
+	edit := renameAt(t, server, defURI, 1, 6, "repo_func")
+
+	// All bare calls in the importing file should be renamed
+	callerEdits := collectEdits(edit, callerPath)
+	// If not in WorkspaceEdit (closed file), check disk
+	if len(callerEdits) == 0 {
+		data, err := os.ReadFile(callerPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		content := string(data)
+		if strings.Contains(content, "repo()") {
+			t.Error("expected all bare repo() calls to be renamed to repo_func(), but found unrenamed repo()")
+		}
+		if !strings.Contains(content, "repo_func()") {
+			t.Error("expected repo_func() in caller file")
+		}
+	} else {
+		// Count edits — should have import line + 4 bare calls = 5
+		if len(callerEdits) < 5 {
+			t.Errorf("expected at least 5 edits in caller (1 import + 4 bare calls), got %d", len(callerEdits))
+		}
+	}
+}
+
+func TestRename_Function_KeywordKeySameName(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// resource_type appears as both a keyword key and a function call on the same line
+	content := `defmodule MyApp.Worker do
+  def enqueue(resource) do
+    %{
+      resource_type: resource_type(resource)
+    }
+  end
+
+  defp resource_type(%{type: t}), do: t
+end
+`
+	path := filepath.Join(server.projectRoot, "lib", "worker.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/worker.ex", content)
+	docURI := "file://" + path
+	server.docs.Set(docURI, content)
+
+	// Rename the private function from the definition (line 7, col 7 = "resource_type")
+	edit := renameAt(t, server, docURI, 7, 7, "get_type")
+	edits := collectEdits(edit, path)
+
+	// Definition line should be renamed
+	if !editsContainLine(edits, 7) {
+		t.Error("expected edit on defp line")
+	}
+	// Function call on line 3 should be renamed
+	if !editsContainLine(edits, 3) {
+		t.Error("expected edit on function call line")
+	}
+	// The keyword key "resource_type:" on line 3 should NOT be renamed.
+	// There should be exactly one edit on line 3 (the function call), not two.
+	line3Edits := 0
+	for _, e := range edits {
+		if e.Range.Start.Line == 3 {
+			line3Edits++
+		}
+	}
+	if line3Edits != 1 {
+		t.Errorf("expected 1 edit on line 3 (function call only), got %d", line3Edits)
+	}
+}
+
+func TestRename_Function_ImportOnlyKeywordRenamed(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	defContent := `defmodule MyApp.Helpers do
+  def resource_type(r), do: r.type
+end
+`
+	callerContent := `defmodule MyApp.Web do
+  import MyApp.Helpers, only: [resource_type: 1]
+
+  def show(r) do
+    resource_type(r)
+  end
+end
+`
+	defPath := filepath.Join(server.projectRoot, "lib", "helpers.ex")
+	callerPath := filepath.Join(server.projectRoot, "lib", "web.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/helpers.ex", defContent)
+	indexFile(t, server.store, server.projectRoot, "lib/web.ex", callerContent)
+
+	defURI := "file://" + defPath
+	server.docs.Set(defURI, defContent)
+
+	edit := renameAt(t, server, defURI, 1, 6, "get_type")
+
+	// The import only: keyword SHOULD be renamed (it references the function)
+	if !hasRename(edit, callerPath, "get_type") {
+		t.Error("expected import only: keyword to be renamed")
+	}
+}
+
+func TestRename_Variable_ShadowsFunction(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule MyApp.Worker do
+  def process(args) do
+    resource_type = args.type
+    fetch(resource_type)
+  end
+
+  defp resource_type(%{type: t}), do: t
+end
+`
+	path := filepath.Join(server.projectRoot, "lib", "worker.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/worker.ex", content)
+	docURI := "file://" + path
+	server.docs.Set(docURI, content)
+
+	// Cursor on "resource_type" variable at line 3, col 4 (the assignment)
+	edit := renameAt(t, server, docURI, 2, 4, "res_type")
+	edits := collectEdits(edit, path)
+
+	// Should rename the variable assignment and its usage, NOT the defp
+	if !editsContainLine(edits, 2) {
+		t.Error("expected edit on variable assignment line")
+	}
+	if !editsContainLine(edits, 3) {
+		t.Error("expected edit on variable usage line")
+	}
+	// The defp line (line 6) should NOT be touched
+	if editsContainLine(edits, 6) {
+		t.Error("variable rename should NOT touch the function definition")
+	}
+}
+
+func TestPrepareRename_VariableShadowsFunction(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule MyApp.Worker do
+  def process(args) do
+    resource_type = args.type
+    fetch(resource_type)
+  end
+
+  defp resource_type(%{type: t}), do: t
+end
+`
+	path := filepath.Join(server.projectRoot, "lib", "worker.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/worker.ex", content)
+	docURI := "file://" + path
+	server.docs.Set(docURI, content)
+
+	// PrepareRename on the variable usage at line 3 col 10 ("resource_type" in fetch call)
+	rng := prepareRenameAt(t, server, docURI, 3, 10)
+	if rng == nil {
+		t.Fatal("expected PrepareRename to return a range for the variable")
+	}
+	// The highlighted range should be on line 3 (the variable), not line 6 (the function)
+	if rng.Start.Line != 3 {
+		t.Errorf("expected PrepareRename to highlight line 3 (variable), got line %d", rng.Start.Line)
+	}
+}
+
+func TestRename_Function_NestedModule(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule MyApp.Outer do
+  defmodule Inner do
+    defp format(data), do: data
+
+    def run(data) do
+      format(data)
+    end
+  end
+end
+`
+	path := filepath.Join(server.projectRoot, "lib", "outer.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/outer.ex", content)
+	docURI := "file://" + path
+	server.docs.Set(docURI, content)
+
+	// Rename "format" from the defp line (line 2, col 9)
+	edit := renameAt(t, server, docURI, 2, 9, "transform")
+	edits := collectEdits(edit, path)
+
+	if !editsContainLine(edits, 2) {
+		t.Error("expected edit on defp line")
+	}
+	if !editsContainLine(edits, 5) {
+		t.Error("expected edit on bare call line")
+	}
+}
+
+func TestRename_Function_SiblingNestedModules(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule MyApp.Accounts do
+  defmodule Admin do
+    def fetch_user(id), do: {:admin, id}
+  end
+
+  defmodule Regular do
+    def fetch_user(id), do: {:regular, id}
+
+    def run(id) do
+      fetch_user(id)
+    end
+  end
+end
+`
+	path := filepath.Join(server.projectRoot, "lib", "accounts.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", content)
+	docURI := "file://" + path
+	server.docs.Set(docURI, content)
+
+	// Rename "fetch_user" from Regular's def (line 6, col 8)
+	edit := renameAt(t, server, docURI, 6, 8, "get_user")
+	edits := collectEdits(edit, path)
+
+	// Regular.fetch_user def and call should be renamed
+	if !editsContainLine(edits, 6) {
+		t.Error("expected edit on Regular.fetch_user def (line 6)")
+	}
+	if !editsContainLine(edits, 9) {
+		t.Error("expected edit on bare call in Regular.run (line 9)")
+	}
+	// Admin.fetch_user should NOT be renamed (it's a different module)
+	if editsContainLine(edits, 2) {
+		t.Error("Admin.fetch_user should NOT be renamed")
+	}
+}
+
+func TestDefinition_NestedModuleFunction(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule MyApp.Outer do
+  def other, do: nil
+
+  defmodule Inner do
+    defp helper(x), do: x * 2
+
+    def run(x) do
+      helper(x)
+    end
+  end
+end
+`
+	path := filepath.Join(server.projectRoot, "lib", "outer.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/outer.ex", content)
+	docURI := "file://" + path
+	server.docs.Set(docURI, content)
+
+	// Go-to-definition on "helper" in Inner.run (line 7, col 6)
+	locs := definitionAt(t, server, docURI, 7, 6)
+	if len(locs) == 0 {
+		t.Fatal("expected go-to-definition for nested module function")
+	}
+	// Should jump to defp helper on line 4 (0-indexed)
+	if locs[0].Range.Start.Line != 4 {
+		t.Errorf("expected jump to line 4 (defp helper), got line %d", locs[0].Range.Start.Line)
+	}
+}
+
+func TestRename_AsAlias_FileLocal(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule MyApp.Web do
+  alias MyApp.Billing.TransactionReceipt, as: ReceiptSchema
+
+  def show do
+    ReceiptSchema.get()
+  end
+
+  def list do
+    ReceiptSchema.all()
+  end
+end
+`
+	path := filepath.Join(server.projectRoot, "lib", "web.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/web.ex", content)
+
+	// Also index the target module so the alias has a real target
+	indexFile(t, server.store, server.projectRoot, "lib/receipt.ex",
+		"defmodule MyApp.Billing.TransactionReceipt do\n  def get, do: nil\n  def all, do: nil\nend\n")
+
+	docURI := "file://" + path
+	server.docs.Set(docURI, content)
+
+	// Rename "ReceiptSchema" from a usage site (line 4, col 4)
+	edit := renameAt(t, server, docURI, 4, 4, "Receipt")
+	edits := collectEdits(edit, path)
+
+	// Should rename the as: declaration and both usage sites — all in this file
+	if len(edits) < 3 {
+		t.Errorf("expected at least 3 edits (as: decl + 2 usages), got %d", len(edits))
+	}
+	// All edits should be "Receipt"
+	for _, e := range edits {
+		if e.NewText != "Receipt" {
+			t.Errorf("expected NewText 'Receipt', got %q", e.NewText)
+		}
+	}
+	// Should NOT have renamed anything in the receipt.ex file (that would mean
+	// it did a module rename instead of an alias rename)
+	receiptPath := filepath.Join(server.projectRoot, "lib", "receipt.ex")
+	receiptEdits := collectEdits(edit, receiptPath)
+	if len(receiptEdits) > 0 {
+		t.Error("as: alias rename should NOT modify the target module's file")
+	}
+	if fileContains(receiptPath, "Receipt") && !fileContains(receiptPath, "TransactionReceipt") {
+		t.Error("as: alias rename should NOT modify the target module's file")
+	}
+}
+
+func TestRename_AsAlias_NestedModuleWithParentName(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// The as: alias "Payments" matches the parent module name MyApp.Payments.
+	// Rename should only affect the alias, not the parent module.
+	content := `defmodule MyApp.Payments do
+  defmodule Processor do
+    alias MyApp.External.PaymentGateway, as: Payments
+
+    def charge(amount) do
+      Payments.process(amount)
+    end
+  end
+end
+`
+	path := filepath.Join(server.projectRoot, "lib", "payments.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/payments.ex", content)
+	indexFile(t, server.store, server.projectRoot, "lib/gateway.ex",
+		"defmodule MyApp.External.PaymentGateway do\n  def process(x), do: x\nend\n")
+
+	docURI := "file://" + path
+	server.docs.Set(docURI, content)
+
+	// Rename "Payments" from usage inside Processor (line 5, col 6)
+	edit := renameAt(t, server, docURI, 5, 6, "Gateway")
+	edits := collectEdits(edit, path)
+
+	// Should rename as: declaration and usage — both on lines inside Processor
+	if len(edits) < 2 {
+		t.Errorf("expected at least 2 edits (as: decl + usage), got %d", len(edits))
+	}
+	for _, e := range edits {
+		if e.NewText != "Gateway" {
+			t.Errorf("expected NewText 'Gateway', got %q", e.NewText)
+		}
+	}
+	// The defmodule MyApp.Payments line should NOT be touched
+	if editsContainLine(edits, 0) {
+		t.Error("as: alias rename should NOT rename the parent defmodule line")
+	}
+}
+
+func TestPrepareRename_AsAlias(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule MyApp.Web do
+  alias MyApp.Billing.TransactionReceipt, as: ReceiptSchema
+
+  def show do
+    ReceiptSchema.get()
+  end
+end
+`
+	path := filepath.Join(server.projectRoot, "lib", "web.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/web.ex", content)
+	indexFile(t, server.store, server.projectRoot, "lib/receipt.ex",
+		"defmodule MyApp.Billing.TransactionReceipt do\nend\n")
+
+	docURI := "file://" + path
+	server.docs.Set(docURI, content)
+
+	// PrepareRename on "ReceiptSchema" usage (line 4, col 4)
+	r := prepareRenameAt(t, server, docURI, 4, 4)
+	if r == nil {
+		t.Fatal("expected PrepareRename to succeed for as: alias")
+	}
+	if r.Start.Line != 4 {
+		t.Errorf("expected highlight on line 4, got line %d", r.Start.Line)
+	}
+}
+
+func TestPrepareRename_NestedModuleFunction(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule MyApp.Outer do
+  defmodule Inner do
+    defp helper(x), do: x * 2
+
+    def run(x) do
+      helper(x)
+    end
+  end
+end
+`
+	path := filepath.Join(server.projectRoot, "lib", "outer.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/outer.ex", content)
+	docURI := "file://" + path
+	server.docs.Set(docURI, content)
+
+	// PrepareRename on "helper" call (line 5, col 6)
+	r := prepareRenameAt(t, server, docURI, 5, 6)
+	if r == nil {
+		t.Fatal("expected PrepareRename to succeed for nested module function")
+	}
+	if r.Start.Line != 5 {
+		t.Errorf("expected highlight on line 5, got line %d", r.Start.Line)
 	}
 }
 

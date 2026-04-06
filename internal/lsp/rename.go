@@ -47,6 +47,24 @@ func findAllTokenColumns(lineText, token string) []int {
 	return cols
 }
 
+// findFunctionTokenColumns returns columns for token occurrences that are
+// function references (calls, definitions, specs), filtering out keyword-syntax
+// occurrences like `resource_type: value` where the token is an atom key.
+// A keyword occurrence is one where ':' immediately follows the token (but not
+// '::' which is a type separator).
+func findFunctionTokenColumns(lineText, token string) []int {
+	cols := findAllTokenColumns(lineText, token)
+	var result []int
+	for _, col := range cols {
+		end := col + len(token)
+		if end < len(lineText) && lineText[end] == ':' && (end+1 >= len(lineText) || lineText[end+1] != ':') {
+			continue
+		}
+		result = append(result, col)
+	}
+	return result
+}
+
 // isTokenBoundary returns true when the substring [pos, pos+length) in s is
 // not immediately preceded or followed by an identifier character.
 func isTokenBoundary(s string, pos, length int) bool {
@@ -120,11 +138,6 @@ func moduleLastSegment(module string) string {
 // "MyApp.SomeUser" → "some_user"
 func moduleToExpectedBase(module string) string {
 	return camelToSnake(moduleLastSegment(module))
-}
-
-// moduleToExpectedFilename returns the conventional filename for .ex files.
-func moduleToExpectedFilename(module string) string {
-	return moduleToExpectedBase(module) + ".ex"
 }
 
 // fileMatchesModuleConvention returns true if the file's base name (ignoring

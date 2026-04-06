@@ -29,15 +29,25 @@ import (
 	"gitlab.com/remote-com/employ-starbase/dexter/internal/version"
 )
 
+// optBinding represents a dynamic import/use in __using__ driven by opts.
+// For example: `mod = Keyword.get(opts, :mod, Mox)` followed by `import unquote(mod)`
+// produces: {optKey: "mod", defaultMod: "Mox", kind: "import"}.
+type optBinding struct {
+	optKey     string // keyword key in opts (e.g. "mod")
+	defaultMod string // default module if opt not provided (e.g. "Mox"); empty if none
+	kind       string // "import" or "use"
+}
+
 // usingCacheEntry holds the full parsed result of a module's defmacro __using__
 // body, keyed by module name. Storing filePath avoids a LookupModule query on
 // cache hits; mtime invalidates the entry when the source file changes.
 type usingCacheEntry struct {
-	mtime      int64
-	filePath   string
-	imports    []string               // modules imported in __using__, source order
-	inlineDefs map[string][]inlineDef // function name → inline defs in quote do block
-	transUses  []string               // modules used inside __using__ body (double-use chains)
+	mtime       int64
+	filePath    string
+	imports     []string               // modules imported in __using__, source order
+	inlineDefs  map[string][]inlineDef // function name → inline defs in quote do block
+	transUses   []string               // modules used inside __using__ body (double-use chains)
+	optBindings []optBinding           // dynamic imports/uses resolved from opts
 }
 
 type Server struct {
@@ -331,6 +341,8 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 			},
 			DefinitionProvider:         true,
 			TypeDefinitionProvider:     true,
+			DeclarationProvider:        true,
+			ImplementationProvider:     true,
 			ReferencesProvider:         true,
 			DocumentFormattingProvider: true,
 			HoverProvider:              true,
@@ -518,7 +530,8 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 	}
 
 	moduleRef, functionName := ExtractModuleAndFunction(expr)
-	aliases := ExtractAliases(text)
+	aliases := ExtractAliasesInScope(text, lineNum)
+	s.debugf("Definition: expr=%q module=%q function=%q", expr, moduleRef, functionName)
 
 	// Bare identifier — check variable first (cheap tree-sitter lookup), then functions
 	if moduleRef == "" {
@@ -530,6 +543,7 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		// The first occurrence in scope is the definition (pattern/assignment).
 		if tree, src, ok := s.docs.GetTree(docURI); ok {
 			if occs := treesitter.FindVariableOccurrencesWithTree(tree.RootNode(), src, uint(lineNum), uint(col)); len(occs) > 0 {
+				s.debugf("Definition: returning variable definition at line %d", occs[0].Line)
 				return []protocol.Location{{
 					URI:   params.TextDocument.URI,
 					Range: lineRange(int(occs[0].Line)),
@@ -537,62 +551,58 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 			}
 		}
 
-		// Check current buffer first
-		if line, found := FindFunctionDefinition(text, functionName); found {
-			return []protocol.Location{{
-				URI:   params.TextDocument.URI,
-				Range: lineRange(line - 1),
-			}}, nil
+		currentModule := firstDefmodule(lines)
+		fullModule := s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, lines, lineNum, functionName, aliases)
+		s.debugf("Definition: resolved bare %q -> %q", functionName, fullModule)
+		if fullModule == "" {
+			s.debugf("Definition: could not resolve bare function %q", functionName)
+			return nil, nil
 		}
 
-		// Check imports
-		imports := ExtractImports(text)
-		for _, mod := range imports {
-			results, err := s.store.LookupFollowDelegate(mod, functionName)
-			if err != nil {
-				continue
-			}
-			if len(results) > 0 {
-				return storeResultsToLocations(filterOutTypes(results)), nil
+		// Current module — return buffer location directly (works before indexing)
+		if fullModule == currentModule {
+			if line, found := FindFunctionDefinition(text, functionName); found {
+				return []protocol.Location{{
+					URI:   params.TextDocument.URI,
+					Range: lineRange(line - 1),
+				}}, nil
 			}
 		}
 
-		// Check use-injected imports and inline defs
+		// Look up via store
+		var results []store.LookupResult
+		var err error
+		if s.followDelegates {
+			results, err = s.store.LookupFollowDelegate(fullModule, functionName)
+		} else {
+			results, err = s.store.LookupFunction(fullModule, functionName)
+		}
+		if err == nil && len(results) > 0 {
+			s.debugf("Definition: found %d result(s) in store for %s.%s", len(results), fullModule, functionName)
+			return storeResultsToLocations(filterOutTypes(results)), nil
+		}
+
+		// fullModule may not directly define the function — try its use chain
+		// (e.g. `import MyApp.Factory` where MyApp.Factory uses ExMachina).
+		if results := s.lookupThroughUseOf(fullModule, functionName); len(results) > 0 {
+			s.debugf("Definition: found %d result(s) via use chain of %s for %s", len(results), fullModule, functionName)
+			return storeResultsToLocations(filterOutTypes(results)), nil
+		}
+
+		// Fallback for use-chain inline defs (not stored as module definitions)
 		if results := s.lookupThroughUse(text, functionName, aliases); len(results) > 0 {
+			s.debugf("Definition: found %d result(s) via current file use chain for %s", len(results), functionName)
 			return storeResultsToLocations(filterOutTypes(results)), nil
 		}
 
-		// Fallback: try the use'd modules themselves directly. Handles DSL macros
-		// (e.g. Ecto.Schema.field) that are available inside macro-injected blocks
-		// but not explicitly listed in the module's __using__ imports.
-		for _, usedMod := range ExtractUses(text) {
-			resolved := resolveModule(usedMod, aliases)
-			if results, err := s.store.LookupFollowDelegate(resolved, functionName); err == nil && len(results) > 0 {
-				return storeResultsToLocations(results), nil
-			}
-		}
-
-		// Kernel is always imported — fall back to it last
-		if results, err := s.store.LookupFollowDelegate("Kernel", functionName); err == nil && len(results) > 0 {
-			return storeResultsToLocations(filterOutTypes(results)), nil
-		}
+		s.debugf("Definition: no result found for bare function %q in module %q", functionName, fullModule)
 
 		return nil, nil
 	}
 
-	// Module.function call — resolve aliases, then look up
-	fullModule := moduleRef
-	if resolved, ok := aliases[moduleRef]; ok {
-		// Exact alias: "Foo" -> "MyApp.Handlers.Foo"
-		fullModule = resolved
-	} else if parts := strings.SplitN(moduleRef, ".", 2); len(parts) == 2 {
-		// Partial alias: "Services.AssociateWithTeamV2" where the file has
-		// "alias __MODULE__.Services". Only resolves if the first segment is
-		// explicitly aliased — otherwise falls through to a direct lookup.
-		if resolved, ok := aliases[parts[0]]; ok {
-			fullModule = resolved + "." + parts[1]
-		}
-	}
+	// Module.function call — resolve aliases (including implicit nested-module aliases)
+	fullModule := s.resolveModuleWithNesting(moduleRef, aliases, uriToPath(params.TextDocument.URI), lineNum)
+	s.debugf("Definition: qualified call resolved %q -> %q", moduleRef, fullModule)
 
 	if functionName != "" {
 		var results []store.LookupResult
@@ -603,18 +613,21 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 			results, err = s.store.LookupFunction(fullModule, functionName)
 		}
 		if err == nil && len(results) > 0 {
+			s.debugf("Definition: found %d result(s) in store for %s.%s", len(results), fullModule, functionName)
 			return storeResultsToLocations(filterOutTypes(results)), nil
 		}
 		// Not directly defined — the function may have been injected by a
 		// `use` macro in fullModule's source (e.g. Oban.Worker injects `new`).
 		if results := s.lookupThroughUseOf(fullModule, functionName); len(results) > 0 {
+			s.debugf("Definition: found %d result(s) via use chain of %s for %s", len(results), fullModule, functionName)
 			return storeResultsToLocations(results), nil
 		}
+		s.debugf("Definition: no result for %s.%s", fullModule, functionName)
 	}
 
-	// Fall back to module
+	// Fall back to module (fullModule already resolved via nesting above)
 	results, err := s.store.LookupModule(fullModule)
-	if err != nil {
+	if err != nil || len(results) == 0 {
 		return nil, nil
 	}
 	return storeResultsToLocations(results), nil
@@ -776,35 +789,35 @@ func (s *Server) CodeAction(ctx context.Context, params *protocol.CodeActionPara
 
 			// Replace the module part of the expression on the current line
 			// with just the last segment (e.g. "MyApp.RandomAPI.Client" → "Client").
-			exprStart := strings.Index(lines[lineNum], moduleRef)
-			if exprStart >= 0 {
-				var edits []protocol.TextEdit
-				// Insert the alias line
-				edits = append(edits, protocol.TextEdit{
-					Range: protocol.Range{
-						Start: protocol.Position{Line: uint32(insertLine), Character: 0},
-						End:   protocol.Position{Line: uint32(insertLine), Character: 0},
+			// Use the expression start column rather than strings.Index so that
+			// duplicate module references on the same line are not misidentified.
+			_, exprStart := extractExpressionBounds(lines[lineNum], col)
+			var edits []protocol.TextEdit
+			// Insert the alias line
+			edits = append(edits, protocol.TextEdit{
+				Range: protocol.Range{
+					Start: protocol.Position{Line: uint32(insertLine), Character: 0},
+					End:   protocol.Position{Line: uint32(insertLine), Character: 0},
+				},
+				NewText: aliasText,
+			})
+			// Replace the qualified module reference with the short name
+			edits = append(edits, protocol.TextEdit{
+				Range: protocol.Range{
+					Start: protocol.Position{Line: uint32(lineNum), Character: uint32(exprStart)},
+					End:   protocol.Position{Line: uint32(lineNum), Character: uint32(exprStart + len(moduleRef))},
+				},
+				NewText: lastSegment,
+			})
+			actions = append(actions, protocol.CodeAction{
+				Title: "Add alias " + moduleRef,
+				Kind:  protocol.QuickFix,
+				Edit: &protocol.WorkspaceEdit{
+					Changes: map[protocol.DocumentURI][]protocol.TextEdit{
+						protocol.DocumentURI(docURI): edits,
 					},
-					NewText: aliasText,
-				})
-				// Replace the qualified module reference with the short name
-				edits = append(edits, protocol.TextEdit{
-					Range: protocol.Range{
-						Start: protocol.Position{Line: uint32(lineNum), Character: uint32(exprStart)},
-						End:   protocol.Position{Line: uint32(lineNum), Character: uint32(exprStart + len(moduleRef))},
-					},
-					NewText: lastSegment,
-				})
-				actions = append(actions, protocol.CodeAction{
-					Title: "Add alias " + moduleRef,
-					Kind:  protocol.QuickFix,
-					Edit: &protocol.WorkspaceEdit{
-						Changes: map[protocol.DocumentURI][]protocol.TextEdit{
-							protocol.DocumentURI(docURI): edits,
-						},
-					},
-				})
-			}
+				},
+			})
 		}
 	}
 
@@ -1155,13 +1168,14 @@ func (s *Server) parseUsingFile(filePath string) *usingCacheEntry {
 	if err != nil {
 		return nil
 	}
-	imported, inlineDefs, transUses := parseUsingBody(string(fileData))
+	imported, inlineDefs, transUses, optBindings := parseUsingBody(string(fileData))
 	return &usingCacheEntry{
-		mtime:      info.ModTime().UnixNano(),
-		filePath:   filePath,
-		imports:    imported,
-		inlineDefs: inlineDefs,
-		transUses:  transUses,
+		mtime:       info.ModTime().UnixNano(),
+		filePath:    filePath,
+		imports:     imported,
+		inlineDefs:  inlineDefs,
+		transUses:   transUses,
+		optBindings: optBindings,
 	}
 }
 
@@ -1185,12 +1199,11 @@ func (s *Server) lookupThroughUseOf(fullModule, functionName string) []store.Loo
 // priority over imported ones. Later `use` declarations shadow earlier ones.
 // Transitive use chains (use inside __using__ body) are followed recursively.
 func (s *Server) lookupThroughUse(text, functionName string, aliases map[string]string) []store.LookupResult {
-	uses := ExtractUses(text)
+	useCalls := ExtractUsesWithOpts(text, aliases)
 	visited := make(map[string]bool)
 
-	for i := len(uses) - 1; i >= 0; i-- {
-		moduleName := resolveModule(uses[i], aliases)
-		if result := s.lookupInUsingEntry(moduleName, functionName, visited); result != nil {
+	for i := len(useCalls) - 1; i >= 0; i-- {
+		if result := s.lookupInUsingEntry(useCalls[i].Module, functionName, useCalls[i].Opts, visited); result != nil {
 			return result
 		}
 	}
@@ -1199,7 +1212,9 @@ func (s *Server) lookupThroughUse(text, functionName string, aliases map[string]
 
 // lookupInUsingEntry resolves functionName through a single module's __using__
 // body, then recurses into any transitive uses. The visited set prevents cycles.
-func (s *Server) lookupInUsingEntry(moduleName, functionName string, visited map[string]bool) []store.LookupResult {
+// consumerOpts are the keyword args from the `use Module, key: Val` call and
+// are used to resolve dynamic imports like `import unquote(mod)`.
+func (s *Server) lookupInUsingEntry(moduleName, functionName string, consumerOpts map[string]string, visited map[string]bool) []store.LookupResult {
 	if visited[moduleName] {
 		return nil
 	}
@@ -1219,7 +1234,7 @@ func (s *Server) lookupInUsingEntry(moduleName, functionName string, visited map
 		return results
 	}
 
-	// Imported modules (last import in __using__ wins → iterate in reverse)
+	// Static imports
 	for j := len(entry.imports) - 1; j >= 0; j-- {
 		var results []store.LookupResult
 		var err error
@@ -1234,9 +1249,37 @@ func (s *Server) lookupInUsingEntry(moduleName, functionName string, visited map
 		return results
 	}
 
+	// Dynamic imports/uses driven by opts (e.g. `import unquote(mod)`)
+	for _, b := range entry.optBindings {
+		mod := consumerOpts[b.optKey]
+		if mod == "" {
+			mod = b.defaultMod
+		}
+		if mod == "" {
+			continue
+		}
+		switch b.kind {
+		case "import":
+			var results []store.LookupResult
+			var err error
+			if s.followDelegates {
+				results, err = s.store.LookupFollowDelegate(mod, functionName)
+			} else {
+				results, err = s.store.LookupFunction(mod, functionName)
+			}
+			if err == nil && len(results) > 0 {
+				return results
+			}
+		case "use":
+			if result := s.lookupInUsingEntry(mod, functionName, nil, visited); result != nil {
+				return result
+			}
+		}
+	}
+
 	// Transitive uses: use Module inside the __using__ body (double-use chains)
 	for k := len(entry.transUses) - 1; k >= 0; k-- {
-		if result := s.lookupInUsingEntry(entry.transUses[k], functionName, visited); result != nil {
+		if result := s.lookupInUsingEntry(entry.transUses[k], functionName, nil, visited); result != nil {
 			return result
 		}
 	}
@@ -1245,9 +1288,9 @@ func (s *Server) lookupInUsingEntry(moduleName, functionName string, visited map
 }
 
 // resolveModuleViaUseChain returns the module name that provides functionName
-// through moduleName's __using__ chain (imports and transitive uses), or "" if
-// not found. Mirrors lookupInUsingEntry but returns the module rather than locations.
-func (s *Server) resolveModuleViaUseChain(moduleName, functionName string, visited map[string]bool) string {
+// resolveModuleViaUseChainWithOpts is like resolveModuleViaUseChain but uses
+// consumer-provided opts to resolve dynamic imports (e.g. `import unquote(mod)`).
+func (s *Server) resolveModuleViaUseChainWithOpts(moduleName, functionName string, consumerOpts map[string]string, visited map[string]bool) string {
 	if visited[moduleName] {
 		return ""
 	}
@@ -1259,14 +1302,33 @@ func (s *Server) resolveModuleViaUseChain(moduleName, functionName string, visit
 	}
 
 	for j := len(entry.imports) - 1; j >= 0; j-- {
-		results, err := s.store.LookupFunction(entry.imports[j], functionName)
-		if err == nil && len(results) > 0 {
+		if results, err := s.store.LookupFunction(entry.imports[j], functionName); err == nil && len(results) > 0 {
 			return entry.imports[j]
 		}
 	}
 
+	for _, b := range entry.optBindings {
+		mod := consumerOpts[b.optKey]
+		if mod == "" {
+			mod = b.defaultMod
+		}
+		if mod == "" {
+			continue
+		}
+		switch b.kind {
+		case "import":
+			if results, err := s.store.LookupFunction(mod, functionName); err == nil && len(results) > 0 {
+				return mod
+			}
+		case "use":
+			if m := s.resolveModuleViaUseChainWithOpts(mod, functionName, nil, visited); m != "" {
+				return m
+			}
+		}
+	}
+
 	for k := len(entry.transUses) - 1; k >= 0; k-- {
-		if mod := s.resolveModuleViaUseChain(entry.transUses[k], functionName, visited); mod != "" {
+		if mod := s.resolveModuleViaUseChainWithOpts(entry.transUses[k], functionName, nil, visited); mod != "" {
 			return mod
 		}
 	}
@@ -1428,22 +1490,55 @@ func (s *Server) addCompletionsFromUsing(moduleName, funcPrefix string, seen map
 	}
 }
 
-// resolveBareFunctionModule finds the module that defines a bare function name
-// by checking imports, use chains, the current module, and Kernel (in order).
-func (s *Server) resolveBareFunctionModule(text string, lines []string, functionName string) string {
+// firstDefmodule returns the first defmodule name found in the file, or "".
+func firstDefmodule(lines []string) string {
+	for _, l := range lines {
+		if m := parser.DefmoduleRe.FindStringSubmatch(l); m != nil {
+			return m[1]
+		}
+	}
+	return ""
+}
+
+// resolveBareFunctionModule finds the module that defines a bare function name.
+// Mirrors the go-to-definition priority: current file modules → imports → use chains → Kernel.
+// Callers should pass pre-computed aliases to avoid redundant ExtractAliases scans.
+func (s *Server) resolveBareFunctionModule(filePath, text string, lines []string, lineNum int, functionName string, aliases map[string]string) string {
+	// Check all modules in the current file with a single query, preferring
+	// the one closest to the cursor line (handles sibling nested modules).
+	if mod, ok := s.store.LookupFunctionInFile(filePath, functionName, lineNum+1); ok {
+		return mod
+	}
+
+	// Explicit imports (direct definitions only — fast store lookup)
 	imports := ExtractImports(text)
 	for _, mod := range imports {
 		if results, err := s.store.LookupFunction(mod, functionName); err == nil && len(results) > 0 {
 			return mod
 		}
 	}
-	for _, l := range lines {
-		if m := parser.DefmoduleRe.FindStringSubmatch(l); m != nil {
-			if results, err := s.store.LookupFunction(m[1], functionName); err == nil && len(results) > 0 {
-				return m[1]
-			}
+
+	// Use chains — use opts-aware resolution so `import unquote(mod)` patterns
+	// resolve to the consumer-provided module rather than always using the default.
+	for _, uc := range ExtractUsesWithOpts(text, aliases) {
+		if mod := s.resolveModuleViaUseChainWithOpts(uc.Module, functionName, uc.Opts, map[string]bool{}); mod != "" {
+			return mod
 		}
 	}
+
+	// Kernel is always in scope
+	if results, err := s.store.LookupFunction("Kernel", functionName); err == nil && len(results) > 0 {
+		return "Kernel"
+	}
+
+	// Slow fallback: function may be injected into an imported module via its
+	// own use chain (e.g. MyApp.Factory uses ExMachina, which injects `insert`).
+	for _, mod := range imports {
+		if results := s.lookupThroughUseOf(mod, functionName); len(results) > 0 {
+			return mod
+		}
+	}
+
 	return ""
 }
 
@@ -1457,6 +1552,40 @@ func resolveModule(moduleRef string, aliases map[string]string) string {
 		}
 	}
 	return moduleRef
+}
+
+// resolveModuleWithNesting resolves a module reference, falling back to the
+// implicit alias created by nested defmodule declarations. In Elixir,
+// `defmodule Inner do` inside `defmodule Outer do` creates an implicit alias
+// Inner → Outer.Inner within Outer's scope.
+func (s *Server) resolveModuleWithNesting(moduleRef string, aliases map[string]string, filePath string, lineNum int) string {
+	resolved := resolveModule(moduleRef, aliases)
+
+	// If the alias map resolved it, or it already looks fully qualified, use it
+	if resolved != moduleRef {
+		return resolved
+	}
+	if results, err := s.store.LookupModule(resolved); err == nil && len(results) > 0 {
+		return resolved
+	}
+
+	// Try implicit alias: prepend enclosing parent module(s).
+	// Walk up the nesting until we find a match.
+	enclosing := s.store.LookupEnclosingModule(filePath, lineNum+1)
+	for enclosing != "" {
+		candidate := enclosing + "." + moduleRef
+		if results, err := s.store.LookupModule(candidate); err == nil && len(results) > 0 {
+			return candidate
+		}
+		// Move up one level: "A.B.C" → "A.B"
+		if dot := strings.LastIndex(enclosing, "."); dot >= 0 {
+			enclosing = enclosing[:dot]
+		} else {
+			break
+		}
+	}
+
+	return resolved
 }
 
 func funcKey(name string, arity int) string {
@@ -1542,8 +1671,188 @@ func (s *Server) CompletionResolve(ctx context.Context, params *protocol.Complet
 	return params, nil
 }
 func (s *Server) Declaration(ctx context.Context, params *protocol.DeclarationParams) ([]protocol.Location, error) {
-	return nil, nil
+	docURI := string(params.TextDocument.URI)
+	if s.debug {
+		t0 := time.Now()
+		s.debugf("Declaration request: uri=%s line=%d col=%d", docURI, params.Position.Line, params.Position.Character)
+		defer func() { s.debugf("Declaration: total %s", time.Since(t0).Round(time.Microsecond)) }()
+	}
+
+	text, ok := s.docs.Get(docURI)
+	if !ok {
+		s.debugf("Declaration: document not open")
+		return nil, nil
+	}
+
+	path := uriToPath(params.TextDocument.URI)
+	lines := strings.Split(text, "\n")
+	lineNum := int(params.Position.Line)
+	col := int(params.Position.Character)
+
+	if lineNum >= len(lines) {
+		return nil, nil
+	}
+
+	// Use the enclosing function to get both name, arity, and module for precise matching.
+	// Fall back to expression extraction if the cursor is not inside a function body.
+	currentModule := ""
+	functionName := ""
+	arity := -1
+	if mod, fn, ar, _, found := s.store.LookupEnclosingFunction(path, lineNum+1); found {
+		currentModule = mod
+		functionName = fn
+		arity = ar
+	}
+	if functionName == "" {
+		expr := ExtractExpression(lines[lineNum], col)
+		if expr == "" {
+			s.debugf("Declaration: no expression at cursor")
+			return nil, nil
+		}
+		_, functionName = ExtractModuleAndFunction(expr)
+		if functionName == "" {
+			s.debugf("Declaration: no function name in expression")
+			return nil, nil
+		}
+	}
+
+	s.debugf("Declaration: module=%s function=%s arity=%d", currentModule, functionName, arity)
+
+	appendCallbackLocations := func(locations []protocol.Location, behaviourModule string) []protocol.Location {
+		callbacks, err := s.store.LookupCallbackDef(behaviourModule, functionName)
+		if err != nil {
+			return locations
+		}
+		s.debugf("Declaration: found %d callbacks in %s for %s", len(callbacks), behaviourModule, functionName)
+		for _, cb := range callbacks {
+			if arity >= 0 && cb.Arity != arity {
+				continue
+			}
+			locations = append(locations, protocol.Location{
+				URI:   uri.File(cb.FilePath),
+				Range: lineRange(cb.Line - 1),
+			})
+		}
+		return locations
+	}
+
+	var locations []protocol.Location
+
+	// Check for callbacks defined in the current module itself (common pattern where
+	// a module defines @callback and @impl def in the same file).
+	if currentModule != "" {
+		locations = appendCallbackLocations(locations, currentModule)
+	}
+
+	// Also check declared @behaviour and `use` modules for callbacks defined elsewhere.
+	behaviours, err := s.store.LookupBehavioursForFile(path)
+	s.debugf("Declaration: behaviours for file: %v (err=%v)", behaviours, err)
+	if err == nil {
+		for _, behaviour := range behaviours {
+			if behaviour == currentModule {
+				continue // already checked above
+			}
+			locations = appendCallbackLocations(locations, behaviour)
+		}
+	}
+
+	// Fallback: walk the transitive use-chain (including modules surfaced via
+	// keywordModuleRe from `Keyword.put_new/pop`) looking for @callback definitions.
+	// This handles dynamic `use unquote(mod)` patterns where the concrete module
+	// is specified as a keyword opt (e.g. oban_module: Oban.Pro.Worker).
+	if len(locations) == 0 && functionName != "" {
+		aliases := ExtractAliasesInScope(text, lineNum)
+		if callbacks := s.findCallbacksViaUseChain(text, functionName, arity, aliases); len(callbacks) > 0 {
+			s.debugf("Declaration: found %d callbacks via use-chain for %s/%d", len(callbacks), functionName, arity)
+			for _, cb := range callbacks {
+				locations = append(locations, protocol.Location{
+					URI:   uri.File(cb.FilePath),
+					Range: lineRange(cb.Line - 1),
+				})
+			}
+		}
+	}
+
+	// Last resort: if an @impl annotation is present but the chain still yielded
+	// nothing, do a project-wide callback search by name/arity.
+	if len(locations) == 0 && functionName != "" {
+		implModule := extractImplAnnotation(lines, lineNum)
+		if implModule == "true" {
+			s.debugf("Declaration: @impl true global fallback for %s/%d", functionName, arity)
+			if callbacks, err := s.store.LookupCallbackDefGlobal(functionName, arity); err == nil {
+				for _, cb := range callbacks {
+					locations = append(locations, protocol.Location{
+						URI:   uri.File(cb.FilePath),
+						Range: lineRange(cb.Line - 1),
+					})
+				}
+			}
+		} else if implModule != "" {
+			s.debugf("Declaration: @impl %s fallback for %s/%d", implModule, functionName, arity)
+			locations = appendCallbackLocations(locations, implModule)
+		}
+	}
+
+	s.debugf("Declaration: returning %d locations", len(locations))
+	return locations, nil
 }
+
+// extractImplAnnotation scans backward from lineNum for an @impl annotation
+// on the preceding non-blank lines. Returns the module name ("true" for @impl true,
+// the module string for @impl SomeModule, or "" if none found).
+func extractImplAnnotation(lines []string, lineNum int) string {
+	for i := lineNum - 1; i >= 0 && i >= lineNum-3; i-- {
+		trimmed := strings.TrimSpace(lines[i])
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "@impl ") {
+			return strings.TrimSpace(trimmed[len("@impl "):])
+		}
+		// Stop at the first non-blank, non-@impl line
+		break
+	}
+	return ""
+}
+
+// findCallbacksViaUseChain walks the transitive use-chain of the file (using
+// the same cached __using__ entries as go-to-definition) and collects @callback
+// definitions matching functionName/arity. This resolves dynamic `use unquote(mod)`
+// patterns where the concrete module appears as a keyword opt in the chain.
+func (s *Server) findCallbacksViaUseChain(text, functionName string, arity int, aliases map[string]string) []store.CallbackResult {
+	uses := ExtractUses(text)
+	visited := make(map[string]bool)
+	var results []store.CallbackResult
+	for _, moduleName := range uses {
+		moduleName = resolveModule(moduleName, aliases)
+		s.collectCallbacksInChain(moduleName, functionName, arity, visited, &results)
+	}
+	return results
+}
+
+func (s *Server) collectCallbacksInChain(moduleName, functionName string, arity int, visited map[string]bool, results *[]store.CallbackResult) {
+	if visited[moduleName] {
+		return
+	}
+	visited[moduleName] = true
+
+	if callbacks, err := s.store.LookupCallbackDef(moduleName, functionName); err == nil {
+		for _, cb := range callbacks {
+			if arity < 0 || cb.Arity == arity {
+				*results = append(*results, cb)
+			}
+		}
+	}
+
+	entry := s.cachedUsing(moduleName)
+	if entry == nil {
+		return
+	}
+	for _, transModule := range entry.transUses {
+		s.collectCallbacksInChain(transModule, functionName, arity, visited, results)
+	}
+}
+
 func (s *Server) DidChangeConfiguration(ctx context.Context, params *protocol.DidChangeConfigurationParams) error {
 	return nil
 }
@@ -1910,6 +2219,12 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 			} else if strings.HasPrefix(rest, "@opaque") && len(rest) > 7 && (rest[7] == ' ' || rest[7] == '\t') {
 				kind = "opaque"
 				afterKw = strings.TrimLeft(rest[7:], " \t")
+			} else if strings.HasPrefix(rest, "@macrocallback") && len(rest) > 14 && (rest[14] == ' ' || rest[14] == '\t') {
+				kind = "macrocallback"
+				afterKw = strings.TrimLeft(rest[14:], " \t")
+			} else if strings.HasPrefix(rest, "@callback") && len(rest) > 9 && (rest[9] == ' ' || rest[9] == '\t') {
+				kind = "callback"
+				afterKw = strings.TrimLeft(rest[9:], " \t")
 			}
 			if kind != "" {
 				name := parser.ScanFuncName(afterKw)
@@ -2036,6 +2351,8 @@ func defKindToSymbolKind(kind string) protocol.SymbolKind {
 		return protocol.SymbolKindFunction
 	case "type", "typep", "opaque":
 		return protocol.SymbolKindTypeParameter
+	case "callback", "macrocallback":
+		return protocol.SymbolKindEvent
 	case "defstruct", "defexception":
 		return protocol.SymbolKindStruct
 	default:
@@ -2192,38 +2509,39 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 	}
 
 	moduleRef, functionName := ExtractModuleAndFunction(expr)
-	aliases := ExtractAliases(text)
+	aliases := ExtractAliasesInScope(text, lineNum)
 
 	if moduleRef == "" {
 		if functionName == "" {
 			return nil, nil
 		}
 
-		if line, found := FindFunctionDefinition(text, functionName); found {
-			return s.hoverFromBuffer(text, line-1)
-		}
+		currentModule := firstDefmodule(lines)
+		fullModule := s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, lines, lineNum, functionName, aliases)
 
-		for _, mod := range ExtractImports(text) {
+		if fullModule != "" {
+			// Current module — hover from the buffer directly
+			if fullModule == currentModule {
+				if line, found := FindFunctionDefinition(text, functionName); found {
+					return s.hoverFromBuffer(text, line-1)
+				}
+			}
+
+			// Look up via store
 			var results []store.LookupResult
 			var err error
 			if s.followDelegates {
-				results, err = s.store.LookupFollowDelegate(mod, functionName)
+				results, err = s.store.LookupFollowDelegate(fullModule, functionName)
 			} else {
-				results, err = s.store.LookupFunction(mod, functionName)
+				results, err = s.store.LookupFunction(fullModule, functionName)
 			}
-			if err != nil || len(results) == 0 {
-				continue
+			if err == nil && len(results) > 0 {
+				return s.hoverFromFile(functionName, results[0])
 			}
-			return s.hoverFromFile(functionName, results[0])
 		}
 
-		// Check use-injected imports and inline defs
+		// Fallback for use-chain inline defs (not stored as module definitions)
 		if results := s.lookupThroughUse(text, functionName, aliases); len(results) > 0 {
-			return s.hoverFromFile(functionName, results[0])
-		}
-
-		// Kernel is always imported — fall back to it last
-		if results, err := s.store.LookupFollowDelegate("Kernel", functionName); err == nil && len(results) > 0 {
 			return s.hoverFromFile(functionName, results[0])
 		}
 
@@ -2252,7 +2570,73 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 	return s.hoverFromFile("", results[0])
 }
 func (s *Server) Implementation(ctx context.Context, params *protocol.ImplementationParams) ([]protocol.Location, error) {
-	return nil, nil
+	docURI := string(params.TextDocument.URI)
+	if s.debug {
+		t0 := time.Now()
+		s.debugf("Implementation request: uri=%s line=%d col=%d", docURI, params.Position.Line, params.Position.Character)
+		defer func() { s.debugf("Implementation: total %s", time.Since(t0).Round(time.Microsecond)) }()
+	}
+
+	text, ok := s.docs.Get(docURI)
+	if !ok {
+		return nil, nil
+	}
+
+	lines := strings.Split(text, "\n")
+	lineNum := int(params.Position.Line)
+	col := int(params.Position.Character)
+
+	if lineNum >= len(lines) {
+		return nil, nil
+	}
+
+	expr := ExtractExpression(lines[lineNum], col)
+	if expr == "" {
+		return nil, nil
+	}
+	_, functionName := ExtractModuleAndFunction(expr)
+	if functionName == "" {
+		return nil, nil
+	}
+
+	// Find the module enclosing the cursor via the store — this correctly handles
+	// files with defmodule lines inside heredocs/doc examples.
+	path := uriToPath(params.TextDocument.URI)
+	currentModule := s.store.LookupEnclosingModule(path, lineNum+1)
+	if currentModule == "" {
+		s.debugf("Implementation: no enclosing module for %s:%d", path, lineNum+1)
+		return nil, nil
+	}
+
+	s.debugf("Implementation: module=%s function=%s", currentModule, functionName)
+
+	// Only proceed if this function is a declared callback in the current module.
+	callbacks, err := s.store.LookupCallbackDef(currentModule, functionName)
+	if err != nil || len(callbacks) == 0 {
+		return nil, nil
+	}
+	callbackArity := callbacks[0].Arity
+
+	// Always include the current module as a candidate — handles the common pattern
+	// where @callback and def live in the same module. LookupFunctionInModules will
+	// simply return nothing for it if no matching def exists.
+	modules := []string{currentModule}
+	implementors, err := s.store.LookupBehaviourImplementors(currentModule)
+	if err == nil {
+		for _, impl := range implementors {
+			if impl.Module != currentModule {
+				modules = append(modules, impl.Module)
+			}
+		}
+	}
+
+	s.debugf("Implementation: %d implementor modules, arity=%d", len(modules), callbackArity)
+
+	results, err := s.store.LookupFunctionInModules(modules, functionName, callbackArity)
+	if err != nil {
+		return nil, nil
+	}
+	return storeResultsToLocations(results), nil
 }
 func (s *Server) OnTypeFormatting(ctx context.Context, params *protocol.DocumentOnTypeFormattingParams) ([]protocol.TextEdit, error) {
 	return nil, nil
@@ -2271,11 +2655,49 @@ func (s *Server) PrepareRename(ctx context.Context, params *protocol.PrepareRena
 		return nil, nil
 	}
 
-	// Try module/function rename first via the index
 	expr, exprStart := extractExpressionBounds(lines[lineNum], col)
+	moduleRef, functionName := "", ""
 	if expr != "" {
-		moduleRef, functionName := ExtractModuleAndFunction(expr)
-		aliases := ExtractAliases(text)
+		moduleRef, functionName = ExtractModuleAndFunction(expr)
+	}
+
+	// For bare identifiers (no module qualifier), check tree-sitter variables
+	// first — a local variable shadows a same-named function in Elixir.
+	if moduleRef == "" {
+		if tree, src, ok := s.docs.GetTree(docURI); ok {
+			if occs := treesitter.FindVariableOccurrencesWithTree(tree.RootNode(), src, uint(lineNum), uint(col)); len(occs) > 0 {
+				for _, occ := range occs {
+					if occ.Line == uint(lineNum) && uint(col) >= occ.StartCol && uint(col) < occ.EndCol {
+						return &protocol.Range{
+							Start: protocol.Position{Line: uint32(occ.Line), Character: uint32(occ.StartCol)},
+							End:   protocol.Position{Line: uint32(occ.Line), Character: uint32(occ.EndCol)},
+						}, nil
+					}
+				}
+				return &protocol.Range{
+					Start: protocol.Position{Line: uint32(occs[0].Line), Character: uint32(occs[0].StartCol)},
+					End:   protocol.Position{Line: uint32(occs[0].Line), Character: uint32(occs[0].EndCol)},
+				}, nil
+			}
+		}
+	}
+
+	// Try module/function rename via the index
+	if expr != "" {
+		aliases := ExtractAliasesInScope(text, lineNum)
+
+		// Detect `as:` aliases — these are file-local renames, not module renames.
+		// An `as:` alias has a short name that differs from the last segment of
+		// the resolved module (e.g. TransactionReceiptSchema → MyApp.Billing.TransactionReceipt).
+		if moduleRef != "" && functionName == "" {
+			if resolved, ok := aliases[moduleRef]; ok && moduleLastSegment(resolved) != moduleRef {
+				// File-local alias rename: find all occurrences in this file
+				return &protocol.Range{
+					Start: protocol.Position{Line: uint32(lineNum), Character: uint32(exprStart)},
+					End:   protocol.Position{Line: uint32(lineNum), Character: uint32(exprStart + len(moduleRef))},
+				}, nil
+			}
+		}
 
 		var tokenName string
 		var fullModule string
@@ -2286,7 +2708,7 @@ func (s *Server) PrepareRename(ctx context.Context, params *protocol.PrepareRena
 			if moduleRef != "" {
 				fullModule = resolveModule(moduleRef, aliases)
 			} else {
-				fullModule = s.resolveBareFunctionModule(text, lines, functionName)
+				fullModule = s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, lines, lineNum, functionName, aliases)
 			}
 			found = fullModule != ""
 		} else if moduleRef != "" {
@@ -2341,24 +2763,6 @@ func (s *Server) PrepareRename(ctx context.Context, params *protocol.PrepareRena
 					End:   protocol.Position{Line: uint32(lineNum), Character: uint32(tokenStart + len(tokenName))},
 				}, nil
 			}
-		}
-	}
-
-	// Not a known module/function — try variable rename via tree-sitter
-	if tree, src, ok := s.docs.GetTree(docURI); ok {
-		if occs := treesitter.FindVariableOccurrencesWithTree(tree.RootNode(), src, uint(lineNum), uint(col)); len(occs) > 0 {
-			for _, occ := range occs {
-				if occ.Line == uint(lineNum) && uint(col) >= occ.StartCol && uint(col) < occ.EndCol {
-					return &protocol.Range{
-						Start: protocol.Position{Line: uint32(occ.Line), Character: uint32(occ.StartCol)},
-						End:   protocol.Position{Line: uint32(occ.Line), Character: uint32(occ.EndCol)},
-					}, nil
-				}
-			}
-			return &protocol.Range{
-				Start: protocol.Position{Line: uint32(occs[0].Line), Character: uint32(occs[0].StartCol)},
-				End:   protocol.Position{Line: uint32(occs[0].Line), Character: uint32(occs[0].EndCol)},
-			}, nil
 		}
 	}
 
@@ -2431,7 +2835,7 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 	}
 
 	moduleRef, functionName := ExtractModuleAndFunction(expr)
-	aliases := ExtractAliases(text)
+	aliases := ExtractAliasesInScope(text, lineNum)
 	s.debugf("References: expr=%q module=%q function=%q", expr, moduleRef, functionName)
 
 	var fullModule string
@@ -2442,77 +2846,79 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 			return nil, nil
 		}
 
-		// Bare function — resolve to its defining module via imports/use
-		imports := ExtractImports(text)
-		for _, mod := range imports {
-			results, err := s.store.LookupFunction(mod, functionName)
-			if err == nil && len(results) > 0 {
-				fullModule = mod
-				s.debugf("References: resolved bare %q via import %q", functionName, mod)
-				break
-			}
-		}
-
-		if fullModule == "" {
-			// Check use-injected modules — use the same recursive chain resolution
-			// as go-to-definition (follows transUses, not just direct imports).
-			if defResults := s.lookupThroughUse(text, functionName, aliases); len(defResults) > 0 {
-				// lookupThroughUse returns definition locations; recover the module
-				// by looking up which module owns this definition.
-				for _, usedMod := range ExtractUses(text) {
-					resolved := resolveModule(usedMod, aliases)
-					visited := make(map[string]bool)
-					if mod := s.resolveModuleViaUseChain(resolved, functionName, visited); mod != "" {
-						fullModule = mod
-						s.debugf("References: resolved bare %q via use chain -> %q", functionName, mod)
-						break
-					}
+		// Variable references via tree-sitter (scoped to the current file).
+		// When a variable is defined in the enclosing scope, it shadows any
+		// function with the same name, so variable references take priority.
+		// Bare identifiers that aren't defined as variables fall through to
+		// function reference lookup.
+		if tree, src, ok := s.docs.GetTree(docURI); ok {
+			if occs := treesitter.FindVariableOccurrencesWithTree(tree.RootNode(), src, uint(lineNum), uint(col)); len(occs) > 0 {
+				var locations []protocol.Location
+				for _, occ := range occs {
+					locations = append(locations, protocol.Location{
+						URI: params.TextDocument.URI,
+						Range: protocol.Range{
+							Start: protocol.Position{Line: uint32(occ.Line), Character: uint32(occ.StartCol)},
+							End:   protocol.Position{Line: uint32(occ.Line), Character: uint32(occ.EndCol)},
+						},
+					})
 				}
+				s.debugf("References: returning %d variable occurrences", len(locations))
+				return locations, nil
 			}
 		}
 
-		if fullModule == "" {
-			// Check current module — cursor may be on a definition
-			for _, l := range lines {
-				if m := parser.DefmoduleRe.FindStringSubmatch(l); m != nil {
-					results, err := s.store.LookupFunction(m[1], functionName)
-					if err == nil && len(results) > 0 {
-						fullModule = m[1]
-						s.debugf("References: resolved bare %q via current module %q", functionName, fullModule)
-						break
-					}
-				}
-			}
-		}
-
-		if fullModule == "" {
-			// Kernel fallback
-			results, err := s.store.LookupFunction("Kernel", functionName)
-			if err == nil && len(results) > 0 {
-				fullModule = "Kernel"
-				s.debugf("References: resolved bare %q via Kernel", functionName)
-			}
-		}
-
+		// Bare function — resolve to its defining module
+		fullModule = s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, lines, lineNum, functionName, aliases)
+		s.debugf("References: resolved bare %q -> %q", functionName, fullModule)
 		if fullModule == "" {
 			s.debugf("References: could not resolve bare function %q", functionName)
 			return nil, nil
 		}
 	} else {
-		fullModule = resolveModule(moduleRef, aliases)
+		// When cursor is on a defmodule line, use the store's fully-qualified
+		// name directly — the user is asking about the module being defined,
+		// not a reference that might be shadowed by an alias with the same name.
+		if m := parser.DefmoduleRe.FindStringSubmatch(lines[lineNum]); m != nil {
+			if enclosing := s.store.LookupEnclosingModule(uriToPath(params.TextDocument.URI), lineNum+1); enclosing != "" {
+				fullModule = enclosing
+			} else {
+				fullModule = resolveModule(moduleRef, aliases)
+			}
+		} else {
+			fullModule = s.resolveModuleWithNesting(moduleRef, aliases, uriToPath(params.TextDocument.URI), lineNum)
+		}
 		s.debugf("References: resolved module %q -> %q", moduleRef, fullModule)
 	}
 
 	s.debugf("References: looking up refs for %s.%s", fullModule, functionName)
 
-	// Run direct lookup and use-chain injector scan concurrently — they
-	// are independent and together dominate the total request time.
+	// Check the cursor file's own use chains with consumer opts first — this is
+	// fast (cache reads only) and catches dynamic opt-binding injectors like
+	// `import unquote(mod)`. If we find injectors here we can skip the expensive
+	// findModulesWhoseUsingImports scan entirely.
+	var injectors []string
+	if functionName != "" && moduleRef == "" {
+		useCalls := ExtractUsesWithOpts(text, aliases)
+		visited := make(map[string]bool)
+		for _, uc := range useCalls {
+			if s.lookupInUsingEntry(uc.Module, functionName, uc.Opts, visited) != nil {
+				injectors = append(injectors, uc.Module)
+				s.debugf("References: opt-binding injector for %s: %s", functionName, uc.Module)
+			}
+		}
+	}
+
+	// Run direct lookup and (if needed) the static use-chain injector scan.
+	// The static scan is expensive but necessary when the function comes from
+	// a static __using__ import rather than a dynamic opt binding.
 	type injectorResult struct {
 		injectors []string
 		elapsed   time.Duration
 	}
 	var injectorCh chan injectorResult
-	if functionName != "" {
+	if functionName != "" && len(injectors) == 0 {
+		// Only run the expensive scan if the fast opt-binding check found nothing
 		injectorCh = make(chan injectorResult, 1)
 		go func() {
 			tInj := s.debugNow()
@@ -2531,20 +2937,19 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 		s.debugf("References: direct lookup: %d results (%s)", len(refResults), time.Since(tStep).Round(time.Microsecond))
 	}
 
-	// Also find refs attributed to modules whose __using__ transitively imports
-	// fullModule. Refs to use-injected functions are attributed to the injecting
-	// module (the one whose __using__ does the import), not the consuming module.
 	if injectorCh != nil {
 		ir := <-injectorCh
 		if s.debug {
 			s.debugf("References: use-chain injectors for %s: %v (%s)", fullModule, ir.injectors, ir.elapsed.Round(time.Microsecond))
 		}
-		for _, mod := range ir.injectors {
-			transitive, err := s.store.LookupReferences(mod, functionName)
-			if err == nil {
-				refResults = append(refResults, transitive...)
-				s.debugf("References: transitive via %s: +%d results", mod, len(transitive))
-			}
+		injectors = append(injectors, ir.injectors...)
+	}
+
+	for _, mod := range injectors {
+		transitive, err := s.store.LookupReferences(mod, functionName)
+		if err == nil {
+			refResults = append(refResults, transitive...)
+			s.debugf("References: transitive via %s: +%d results", mod, len(transitive))
 		}
 	}
 
@@ -2636,18 +3041,72 @@ func (s *Server) Rename(ctx context.Context, params *protocol.RenameParams) (*pr
 		return nil, nil
 	}
 
-	// Try module/function rename first via the index
 	expr, _ := extractExpressionBounds(lines[lineNum], col)
+	moduleRef, functionName := "", ""
 	if expr != "" {
-		moduleRef, functionName := ExtractModuleAndFunction(expr)
-		aliases := ExtractAliases(text)
+		moduleRef, functionName = ExtractModuleAndFunction(expr)
+	}
+
+	// For bare identifiers, check tree-sitter variables first — a local
+	// variable shadows a same-named function in Elixir.
+	if moduleRef == "" {
+		if tree, src, ok := s.docs.GetTree(docURI); ok {
+			if occs := treesitter.FindVariableOccurrencesWithTree(tree.RootNode(), src, uint(lineNum), uint(col)); len(occs) > 0 {
+				changes := make(map[protocol.DocumentURI][]protocol.TextEdit)
+				for _, occ := range occs {
+					changes[protocol.DocumentURI(docURI)] = append(changes[protocol.DocumentURI(docURI)], protocol.TextEdit{
+						Range: protocol.Range{
+							Start: protocol.Position{Line: uint32(occ.Line), Character: uint32(occ.StartCol)},
+							End:   protocol.Position{Line: uint32(occ.Line), Character: uint32(occ.EndCol)},
+						},
+						NewText: params.NewName,
+					})
+				}
+				return &protocol.WorkspaceEdit{Changes: changes}, nil
+			}
+		}
+	}
+
+	// Try module/function rename via the index
+	if expr != "" {
+		aliases := ExtractAliasesInScope(text, lineNum)
+
+		// Detect `as:` aliases — file-local rename of the alias name, not
+		// the underlying module.
+		if moduleRef != "" && functionName == "" {
+			if resolved, ok := aliases[moduleRef]; ok && moduleLastSegment(resolved) != moduleRef {
+				if !isValidModuleName(params.NewName) {
+					return nil, fmt.Errorf("invalid alias name %q: must start with an uppercase letter", params.NewName)
+				}
+				// Replace all standalone occurrences of the alias in this file
+				// (skip occurrences preceded by '.' — those are part of a
+				// qualified module name, not the alias).
+				changes := make(map[protocol.DocumentURI][]protocol.TextEdit)
+				fileURI := protocol.DocumentURI(docURI)
+				for i, line := range lines {
+					for _, col := range findAllTokenColumns(line, moduleRef) {
+						if col > 0 && line[col-1] == '.' {
+							continue
+						}
+						changes[fileURI] = append(changes[fileURI], protocol.TextEdit{
+							Range: protocol.Range{
+								Start: protocol.Position{Line: uint32(i), Character: uint32(col)},
+								End:   protocol.Position{Line: uint32(i), Character: uint32(col + len(moduleRef))},
+							},
+							NewText: params.NewName,
+						})
+					}
+				}
+				return &protocol.WorkspaceEdit{Changes: changes}, nil
+			}
+		}
 
 		if functionName != "" {
 			var fullModule string
 			if moduleRef != "" {
 				fullModule = resolveModule(moduleRef, aliases)
 			} else {
-				fullModule = s.resolveBareFunctionModule(text, lines, functionName)
+				fullModule = s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, lines, lineNum, functionName, aliases)
 			}
 			if fullModule != "" {
 				if !isValidFunctionName(params.NewName) {
@@ -2672,23 +3131,6 @@ func (s *Server) Rename(ctx context.Context, params *protocol.RenameParams) (*pr
 		}
 	}
 
-	// Not a known module/function — try variable rename via tree-sitter
-	if tree, src, ok := s.docs.GetTree(docURI); ok {
-		if occs := treesitter.FindVariableOccurrencesWithTree(tree.RootNode(), src, uint(lineNum), uint(col)); len(occs) > 0 {
-			changes := make(map[protocol.DocumentURI][]protocol.TextEdit)
-			for _, occ := range occs {
-				changes[protocol.DocumentURI(docURI)] = append(changes[protocol.DocumentURI(docURI)], protocol.TextEdit{
-					Range: protocol.Range{
-						Start: protocol.Position{Line: uint32(occ.Line), Character: uint32(occ.StartCol)},
-						End:   protocol.Position{Line: uint32(occ.Line), Character: uint32(occ.EndCol)},
-					},
-					NewText: params.NewName,
-				})
-			}
-			return &protocol.WorkspaceEdit{Changes: changes}, nil
-		}
-	}
-
 	return nil, nil
 }
 
@@ -2696,21 +3138,28 @@ func (s *Server) Rename(ctx context.Context, params *protocol.RenameParams) (*pr
 // module.functionName to newName across the codebase.
 func (s *Server) renameFunctionEdits(module, functionName, newName string) (*protocol.WorkspaceEdit, error) {
 	// Collect all (filePath, lineNumber) pairs — definitions + references
-	seen := make(map[renameSite]bool)
+	type siteKey struct {
+		filePath string
+		line     int
+	}
+	seen := make(map[siteKey]bool)
 	var sites []renameSite
 
-	addSite := func(filePath string, line int) {
+	addSiteOpts := func(filePath string, line int, includeKeyword bool) {
 		if s.stdlibRoot != "" && strings.HasPrefix(filePath, s.stdlibRoot) {
 			return
 		}
 		if s.isDepsFile(filePath) {
 			return
 		}
-		k := renameSite{filePath, line}
+		k := siteKey{filePath, line}
 		if !seen[k] {
 			seen[k] = true
-			sites = append(sites, k)
+			sites = append(sites, renameSite{filePath, line, includeKeyword})
 		}
+	}
+	addSite := func(filePath string, line int) {
+		addSiteOpts(filePath, line, false)
 	}
 
 	// Definition sites
@@ -2784,8 +3233,10 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*pro
 		}
 	}
 
-	// Scan all files that import the module for `import Module, only: [functionName: N]` lines
+	// Scan all files that import the module for `import Module, only: [functionName: N]` lines,
+	// then also scan those files for bare calls (which aren't indexed as references).
 	importRefs, _ := s.store.LookupReferences(module, "")
+	importFilePaths := make(map[string]bool)
 	for _, r := range importRefs {
 		if r.Kind != "import" {
 			continue
@@ -2795,7 +3246,17 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*pro
 			continue
 		}
 		if findTokenColumn(lineText, functionName) >= 0 {
-			addSite(r.FilePath, r.Line)
+			addSiteOpts(r.FilePath, r.Line, true)
+			importFilePaths[r.FilePath] = true
+		}
+	}
+	for filePath := range importFilePaths {
+		fileText, _, ok := s.readFileText(filePath)
+		if !ok {
+			continue
+		}
+		for _, lineNum := range FindBareFunctionCalls(fileText, functionName) {
+			addSite(filePath, lineNum)
 		}
 	}
 
@@ -3244,8 +3705,9 @@ func (mr *moduleRename) reindex(fileCache map[string]moduleFileInfo, movedFiles 
 }
 
 type renameSite struct {
-	filePath string
-	line     int
+	filePath       string
+	line           int
+	includeKeyword bool // true for import-only lines where keyword keys ARE function names
 }
 
 // buildTextEdits creates a WorkspaceEdit replacing all whole-token occurrences
@@ -3297,7 +3759,12 @@ func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string) *
 				continue
 			}
 			lineText := lines[site.line-1]
-			cols := findAllTokenColumns(lineText, oldToken)
+			var cols []int
+			if site.includeKeyword {
+				cols = findAllTokenColumns(lineText, oldToken)
+			} else {
+				cols = findFunctionTokenColumns(lineText, oldToken)
+			}
 			for i := len(cols) - 1; i >= 0; i-- {
 				lineText = lineText[:cols[i]] + newToken + lineText[cols[i]+len(oldToken):]
 			}
@@ -3333,7 +3800,13 @@ func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string) *
 					continue
 				}
 				lineText := fi.lines[site.line-1]
-				for _, col := range findAllTokenColumns(lineText, oldToken) {
+				var cols []int
+				if site.includeKeyword {
+					cols = findAllTokenColumns(lineText, oldToken)
+				} else {
+					cols = findFunctionTokenColumns(lineText, oldToken)
+				}
+				for _, col := range cols {
 					openChanges[fileURI] = append(openChanges[fileURI], protocol.TextEdit{
 						Range: protocol.Range{
 							Start: protocol.Position{Line: uint32(site.line - 1), Character: uint32(col)},
@@ -3521,7 +3994,7 @@ func (s *Server) SignatureHelp(ctx context.Context, params *protocol.SignatureHe
 		return nil, nil
 	}
 
-	aliases := ExtractAliases(text)
+	aliases := ExtractAliasesInScope(text, lineNum)
 	lines := strings.Split(text, "\n")
 
 	// Resolve the function to a store lookup result
@@ -3684,7 +4157,7 @@ func (s *Server) TypeDefinition(ctx context.Context, params *protocol.TypeDefini
 		return nil, nil
 	}
 
-	aliases := ExtractAliases(text)
+	aliases := ExtractAliasesInScope(text, lineNum)
 	fullModule := resolveModule(moduleRef, aliases)
 
 	results, err := s.store.LookupFunction(fullModule, typeName)
@@ -3758,12 +4231,12 @@ func (s *Server) PrepareCallHierarchy(ctx context.Context, params *protocol.Call
 		return nil, nil
 	}
 
-	aliases := ExtractAliases(text)
+	aliases := ExtractAliasesInScope(text, lineNum)
 	var fullModule string
 	if moduleRef != "" {
 		fullModule = resolveModule(moduleRef, aliases)
 	} else {
-		fullModule = s.resolveBareFunctionModule(text, lines, functionName)
+		fullModule = s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, lines, lineNum, functionName, aliases)
 	}
 	if fullModule == "" {
 		return nil, nil

@@ -1,6 +1,7 @@
 package treesitter
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -578,6 +579,132 @@ end`)
 	}
 }
 
+func TestFindVariableOccurrences_FullWorkerFile(t *testing.T) {
+	// Full file structure matching the real worker pattern that fails
+	src := []byte(`defmodule MyApp.Workers.SendEmailWorker do
+  @moduledoc """
+  Worker to send an email.
+  """
+
+  use MyApp.Worker,
+    owner: :payments,
+    queue: :default,
+    max_attempts: 4,
+    unique: [
+      period: {1, :minutes},
+      keys: [:resource_slug, :resource_type],
+      states: [:available, :scheduled, :executing, :retryable]
+    ]
+
+  alias MyApp.Mailer.PaymentEmail
+  alias MyApp.Resources
+  alias MyApp.Resources.Resource
+  alias MyApp.Remittances
+  alias MyApp.Remittances.Schemas.Remittance
+
+  args_schema do
+    field :resource_slug, :uuid, required: true
+    field :resource_type, :string, required: true
+    field :payment_intent_id, :string, required: true
+    field :transfer_amount, :map, required: true
+  end
+
+  @spec enqueue!(Resource.t() | Remittance.t(), String.t(), Money.t()) :: :ok
+  def enqueue!(resource, payment_intent_id, transfer_amount) do
+    %{
+      resource_slug: resource.slug,
+      resource_type: resource_type(resource),
+      payment_intent_id: payment_intent_id,
+      transfer_amount: %{amount: transfer_amount.amount, currency: transfer_amount.currency}
+    }
+    |> __MODULE__.new()
+    |> MyApp.Oban.safe_insert()
+
+    :ok
+  end
+
+  defp resource_type(%Resource{}), do: "resource"
+  defp resource_type(%Remittance{}), do: "remittance"
+
+  @impl true
+  def process(%Job{
+        args: %__MODULE__{
+          resource_slug: resource_slug,
+          resource_type: resource_type,
+          payment_intent_id: payment_intent_id,
+          transfer_amount: transfer_amount
+        }
+      }) do
+    with {:ok, resource} <- fetch_resource_by_slug(resource_slug, resource_type) do
+      transfer_amount = Money.new(transfer_amount["currency"], transfer_amount["amount"])
+      {:ok, _} = PaymentEmail.deliver(resource, payment_intent_id, transfer_amount)
+
+      :ok
+    end
+  end
+
+  defp fetch_resource_by_slug(slug, "resource") do
+    Resources.get_resource_by_slug(slug)
+  end
+
+  defp fetch_resource_by_slug(slug, "remittance") do
+    Remittances.get_remittance_by(%{slug: slug})
+  end
+
+  @impl true
+  defdelegate backoff(job), to: MyApp.Oban.EmailWorker
+end`)
+
+	root, cleanup := parseElixir(src)
+	if root == nil {
+		t.Fatal("failed to parse")
+	}
+	defer cleanup()
+
+	// Find the actual line for "transfer_amount = Money.new" in this test source
+	lines := strings.Split(string(src), "\n")
+	transferLine := -1
+	for i, line := range lines {
+		if strings.Contains(line, "transfer_amount = Money.new") {
+			transferLine = i
+			break
+		}
+	}
+	if transferLine < 0 {
+		t.Fatal("could not find transfer_amount = Money.new line")
+	}
+	t.Logf("transfer_amount rebind is at line %d: %q", transferLine, lines[transferLine])
+
+	occs := FindVariableOccurrences(src, uint(transferLine), 6)
+	t.Logf("transfer_amount from line %d col 6: %d occs: %+v", transferLine, len(occs), occs)
+	if occs == nil {
+		t.Fatal("expected variable occurrences for 'transfer_amount', got nil")
+	}
+	if len(occs) < 2 {
+		t.Fatalf("expected multiple occurrences of 'transfer_amount', got %d: %+v", len(occs), occs)
+	}
+}
+
+func TestFindVariableOccurrences_BareZeroArityCallNotVariable(t *testing.T) {
+	src := []byte(`defmodule MyApp do
+  def run() do
+    result = do_work()
+    validate
+  end
+
+  defp do_work, do: :ok
+  defp validate, do: :ok
+end`)
+
+	// Cursor on "validate" (line 3) — a zero-arity function call without parens.
+	// Not defined as a variable anywhere in the scope, so returns nil to let
+	// function reference lookup handle it.
+	occs := FindVariableOccurrences(src, 3, 4)
+	if occs != nil {
+		t.Errorf("expected nil for bare function call 'validate', got %d: %+v", len(occs), occs)
+	}
+}
+
 func TestFindTokenOccurrences_Function(t *testing.T) {
 	src := []byte(`defmodule MyApp do
   def process(data) do
@@ -614,6 +741,606 @@ end`)
 	// alias MyApp.Repo (line 1) and Repo.all (line 4)
 	if len(occs) != 2 {
 		t.Fatalf("expected 2 occurrences of 'Repo', got %d: %+v", len(occs), occs)
+	}
+}
+
+func TestFindVariableOccurrences_DestructuredStructParams(t *testing.T) {
+	// Mirrors the pattern from a real Oban worker with %Job{args: %__MODULE__{...}} destructuring
+	src := []byte(`defmodule MyApp.Workers.EmailWorker do
+  use MyApp.Worker
+
+  def process(%Job{
+        args: %__MODULE__{
+          resource_slug: resource_slug,
+          resource_type: resource_type,
+          payment_intent_id: payment_intent_id,
+          transfer_amount: transfer_amount
+        }
+      }) do
+    with {:ok, resource} <- fetch_resource(resource_slug, resource_type) do
+      transfer_amount = Money.new(transfer_amount["currency"], transfer_amount["amount"])
+      {:ok, _} = deliver(resource, payment_intent_id, transfer_amount)
+      :ok
+    end
+  end
+
+  defp fetch_resource(slug, type) do
+    {:ok, %{slug: slug, type: type}}
+  end
+end`)
+
+	// Cursor on "resource_slug" in the with expression (line 11)
+	// "    with {:ok, resource} <- fetch_resource(resource_slug, resource_type) do"
+	occs := FindVariableOccurrences(src, 11, 45)
+	if len(occs) != 2 {
+		t.Fatalf("expected 2 occurrences of 'resource_slug', got %d: %+v", len(occs), occs)
+	}
+	if occs[0].Line != 5 {
+		t.Errorf("occ[0]: expected line 5 (struct pattern), got line %d", occs[0].Line)
+	}
+	if occs[1].Line != 11 {
+		t.Errorf("occ[1]: expected line 11 (with expression), got line %d", occs[1].Line)
+	}
+
+	// Cursor on "resource" in the with pattern (line 11)
+	// Should be scoped to the with block only
+	occs = FindVariableOccurrences(src, 11, 17)
+	if len(occs) != 2 {
+		t.Fatalf("expected 2 occurrences of 'resource' (pattern + usage), got %d: %+v", len(occs), occs)
+	}
+	if occs[0].Line != 11 {
+		t.Errorf("occ[0]: expected line 11 ({:ok, resource}), got line %d", occs[0].Line)
+	}
+	if occs[1].Line != 13 {
+		t.Errorf("occ[1]: expected line 13 (deliver(resource, ...)), got line %d", occs[1].Line)
+	}
+
+	// Cursor on "transfer_amount" inside the with do block (line 12)
+	// Should find ALL occurrences in the process function since with doesn't rebind it
+	occs = FindVariableOccurrences(src, 12, 6)
+	if len(occs) != 5 {
+		t.Fatalf("expected 5 occurrences of 'transfer_amount', got %d: %+v", len(occs), occs)
+	}
+
+	// Cursor on "fetch_resource" (a function call, NOT a variable)
+	occs = FindVariableOccurrences(src, 11, 30)
+	if occs != nil {
+		t.Errorf("expected nil for function call 'fetch_resource', got %d: %+v", len(occs), occs)
+	}
+
+	// Cursor on "deliver" inside with do block (a function call, NOT a variable)
+	occs = FindVariableOccurrences(src, 13, 19)
+	if occs != nil {
+		t.Errorf("expected nil for function call 'deliver', got %d: %+v", len(occs), occs)
+	}
+}
+
+func TestFindVariableOccurrences_PinnedVariable(t *testing.T) {
+	src := []byte(`defmodule MyApp do
+  def run do
+    slug = "test_slug"
+    expect(Repo, :get_by_slug, fn ^slug -> {:ok, %{}} end)
+    slug
+  end
+end`)
+
+	// Cursor on "slug" at line 2, col 4 (the assignment)
+	occs := FindVariableOccurrences(src, 2, 4)
+	if len(occs) == 0 {
+		t.Fatal("expected occurrences of 'slug'")
+	}
+
+	// Should find: assignment (line 2), pinned reference (line 3), usage (line 4)
+	lines := make(map[uint]bool)
+	for _, occ := range occs {
+		lines[occ.Line] = true
+	}
+	if !lines[2] {
+		t.Error("expected occurrence on line 2 (assignment)")
+	}
+	if !lines[3] {
+		t.Error("expected occurrence on line 3 (pinned ^slug in fn)")
+	}
+	if !lines[4] {
+		t.Error("expected occurrence on line 4 (usage)")
+	}
+}
+
+func TestFindVariableOccurrences_PinnedDoesNotCreateNewBinding(t *testing.T) {
+	src := []byte(`defmodule MyApp do
+  def run do
+    x = 1
+    Enum.find([1, 2, 3], fn ^x -> true; _ -> false end)
+    x + 1
+  end
+end`)
+
+	// Cursor on "x" at line 2, col 4 (the assignment)
+	occs := FindVariableOccurrences(src, 2, 4)
+
+	// The fn ^x -> ... clause uses pin, so x is NOT rebound.
+	// All three lines should be included.
+	if len(occs) < 3 {
+		t.Errorf("expected at least 3 occurrences (assign + pin + usage), got %d", len(occs))
+	}
+}
+
+func TestFindVariableOccurrences_PinnedThenReboundInBody(t *testing.T) {
+	src := []byte(`defmodule MyApp do
+  def run do
+    slug = "outer"
+    expect(Mock, :fn, fn ^slug, %{}, ^user ->
+      slug = nil
+      {:ok, slug}
+    end)
+    slug
+  end
+end`)
+
+	// Cursor on outer "slug" at line 2, col 4
+	occs := FindVariableOccurrences(src, 2, 4)
+
+	lines := make(map[uint]bool)
+	for _, occ := range occs {
+		lines[occ.Line] = true
+	}
+
+	// Outer assignment and pin reference should be collected
+	if !lines[2] {
+		t.Error("expected occurrence on line 2 (outer assignment)")
+	}
+	if !lines[3] {
+		t.Error("expected occurrence on line 3 (pinned ^slug in fn params)")
+	}
+	// Final usage after the expect should be collected
+	if !lines[7] {
+		t.Error("expected occurrence on line 7 (usage after expect)")
+	}
+	// Inside the fn body: slug = nil and {:ok, slug} should NOT be collected
+	// (they refer to the local rebinding, not the outer variable)
+	if lines[4] {
+		t.Error("slug = nil (line 4) is a body rebind — should NOT be collected")
+	}
+	if lines[5] {
+		t.Error("{:ok, slug} (line 5) follows a body rebind — should NOT be collected")
+	}
+}
+
+func TestFindVariableOccurrences_RenameInsideStabBodyRebind(t *testing.T) {
+	// Cursor on inner `slug` (the rebind inside fn body) should NOT rename outer slug.
+	src := []byte(`defmodule MyApp do
+  test "example", %{user: user} do
+    slug = Ecto.UUID.generate()
+
+    expect(Mock, :fn, fn ^slug, %{}, ^user ->
+      slug = nil
+      {:ok, slug}
+    end)
+
+    slug
+  end
+end`)
+
+	// Cursor on the inner `slug = nil` at line 5, col 6
+	occs := FindVariableOccurrences(src, 5, 6)
+
+	lines := make(map[uint]bool)
+	for _, occ := range occs {
+		lines[occ.Line] = true
+	}
+
+	// Should find: the rebind (line 5) and usage after it (line 6)
+	if !lines[5] {
+		t.Error("expected occurrence on line 5 (inner rebind)")
+	}
+	if !lines[6] {
+		t.Error("expected occurrence on line 6 (usage after rebind)")
+	}
+	// Should NOT rename the outer slug or the pin reference
+	if lines[2] {
+		t.Error("outer slug assignment (line 2) should NOT be renamed")
+	}
+	if lines[4] {
+		t.Error("^slug pin (line 4) should NOT be renamed")
+	}
+	if lines[9] {
+		t.Error("outer slug usage (line 9) should NOT be renamed")
+	}
+}
+
+func TestFindVariableOccurrences_MixedPinnedAndUnpinnedArgs(t *testing.T) {
+	// fn with mixed args: `^pinned` (outer ref) and `other` (new binding).
+	// Renaming `other` from inside the fn should be scoped to the fn.
+	// Renaming `pinned` from outside should include the ^pinned pin reference.
+	src := []byte(`defmodule MyApp do
+  def run do
+    pinned = "value"
+    other = "outer"
+
+    Enum.each(list, fn ^pinned, other ->
+      IO.puts(other)
+    end)
+
+    other
+  end
+end`)
+
+	// Renaming `other` from the usage inside the fn (line 6, col 14 — on `other` in `IO.puts(other)`)
+	innerOccs := FindVariableOccurrences(src, 6, 14)
+	innerLines := make(map[uint]bool)
+	for _, occ := range innerOccs {
+		innerLines[occ.Line] = true
+	}
+	// Should find the fn param `other` (line 5) and usage (line 6)
+	if !innerLines[5] && !innerLines[6] {
+		t.Errorf("expected inner `other` in fn scope, got lines %v", innerLines)
+	}
+	// Should NOT find the outer `other`
+	if innerLines[3] {
+		t.Error("outer `other` assignment (line 3) should NOT be included")
+	}
+	if innerLines[9] {
+		t.Error("outer `other` usage (line 9) should NOT be included")
+	}
+
+	// Renaming `pinned` from outside (line 2, col 4) — should include ^pinned pin
+	outerOccs := FindVariableOccurrences(src, 2, 4)
+	outerLines := make(map[uint]bool)
+	for _, occ := range outerOccs {
+		outerLines[occ.Line] = true
+	}
+	if !outerLines[2] {
+		t.Error("expected outer `pinned` assignment (line 2)")
+	}
+	if !outerLines[5] {
+		t.Error("expected ^pinned pin reference (line 5) to be included")
+	}
+}
+
+func TestFindVariableOccurrences_WithRightSideIsOuterScope(t *testing.T) {
+	// Right side of <- in `with` is evaluated in the outer scope.
+	// Renaming `slug` on the right side should NOT rename the left-side binding.
+	src := []byte(`defmodule MyApp do
+  def run do
+    slug = nil
+    with {:ok, slug} <- fetch_something(slug) do
+      use(slug)
+    end
+  end
+end`)
+
+	// Cursor on right-side `slug` in `fetch_something(slug)` (line 3, col 40)
+	// "    with {:ok, slug} <- fetch_something(slug) do"
+	//      0              15                  40
+	occs := FindVariableOccurrences(src, 3, 40)
+	lines := make(map[uint]bool)
+	for _, occ := range occs {
+		lines[occ.Line] = true
+	}
+	// Right-side slug and the outer assignment should be included
+	if !lines[2] {
+		t.Error("expected outer slug assignment (line 2)")
+	}
+	if !lines[3] {
+		t.Error("expected right-side slug in with (line 3)")
+	}
+	// Left-side slug (new binding) should NOT be included
+	for _, occ := range occs {
+		if occ.Line == 3 && occ.StartCol == 11 { // col 11 = left-side slug position
+			t.Error("left-side slug (new binding) should NOT be renamed with outer slug")
+		}
+	}
+	// do_block slug (new binding's scope) should NOT be included
+	if lines[4] {
+		t.Error("do_block slug (line 4) uses new binding — should NOT be included")
+	}
+}
+
+func TestFindVariableOccurrences_WithLeftSideDoesNotIncludeRightSide(t *testing.T) {
+	// Cursor on left-side `slug` in `{:ok, slug} <- fetch_something(slug)`.
+	// Renaming should include the new binding (left side) and do_block usages,
+	// but NOT the right-side slug which comes from the outer scope.
+	src := []byte(`defmodule MyApp do
+  def run do
+    slug = nil
+    with {:ok, slug} <- fetch_something(slug) do
+      slug = :ok
+      {:ok, slug}
+    end
+  end
+end`)
+
+	// Cursor on left-side `slug` in `{:ok, slug}` (line 3, col 15)
+	// "    with {:ok, slug} <- fetch_something(slug) do"
+	//      0             15
+	occs := FindVariableOccurrences(src, 3, 15)
+	lines := make(map[uint]bool)
+	for _, occ := range occs {
+		lines[occ.Line] = true
+	}
+	// Left-side binding and do_block usages should be included
+	if !lines[3] {
+		t.Error("expected left-side slug occurrence (line 3)")
+	}
+	if !lines[4] {
+		t.Error("expected do_block slug rebind (line 4)")
+	}
+	if !lines[5] {
+		t.Error("expected do_block slug usage (line 5)")
+	}
+	// Right-side slug and outer slug should NOT be included
+	if lines[2] {
+		t.Error("outer slug assignment (line 2) should NOT be renamed")
+	}
+	// Verify there's only one occurrence on line 3 (the left-side, not the right-side)
+	line3count := 0
+	for _, occ := range occs {
+		if occ.Line == 3 {
+			line3count++
+		}
+	}
+	if line3count != 1 {
+		t.Errorf("expected exactly 1 occurrence on line 3 (left side only), got %d", line3count)
+	}
+}
+
+func TestFindVariableOccurrences_WithRightSideOfEquals(t *testing.T) {
+	// Right side of `=` in `with x = expr do` is outer scope;
+	// left side is the new binding.
+	src := []byte(`defmodule MyApp do
+  def run do
+    x = 1
+    with y = x * 2 do
+      use(x)
+      use(y)
+    end
+    x
+  end
+end`)
+
+	// Cursor on `x` in the right side `x * 2` (line 3, col 13)
+	// "    with y = x * 2 do"
+	//      0        9 13
+	occs := FindVariableOccurrences(src, 3, 13)
+	lines := make(map[uint]bool)
+	for _, occ := range occs {
+		lines[occ.Line] = true
+	}
+	if !lines[2] {
+		t.Error("expected outer x assignment (line 2)")
+	}
+	if !lines[3] {
+		t.Error("expected x in with right side (line 3)")
+	}
+	// do_block x should NOT be renamed (it references the outer x, true, but
+	// the scope boundary prevents conflating with the with-expression x)
+	// NOTE: the outer x IS visible in the do_block, but this test mainly checks
+	// the left-side y is not mistakenly included
+	if lines[6] {
+		t.Error("y (line 6) should NOT be included in x rename")
+	}
+}
+
+func TestFindVariableOccurrences_WithMultiClause(t *testing.T) {
+	src := []byte(`defmodule MyApp do
+  def run do
+    slug = nil
+    with {:ok, slug} <- fetch_slug(slug),
+         {:ok, slug} <- transform_slug(slug) do
+      use(slug)
+    end
+  end
+end`)
+
+	// "    slug = nil"                             → line 2
+	// "    with {:ok, slug} <- fetch_slug(slug),"  → line 3
+	// "         {:ok, slug} <- transform_slug(slug) do" → line 4
+	// "      use(slug)"                            → line 5
+
+	// Case 1: outer slug (line 2, col 4)
+	// Should include: outer slug + clause 0 rhs (fetch_slug(slug))
+	// Should NOT include: clause 0 lhs, clause 1 rhs, clause 1 lhs, do_block
+	t.Run("outer slug", func(t *testing.T) {
+		occs := FindVariableOccurrences(src, 2, 4)
+		lines := make(map[uint]bool)
+		for _, occ := range occs {
+			lines[occ.Line] = true
+		}
+		if !lines[2] {
+			t.Error("expected outer slug (line 2)")
+		}
+		if !lines[3] {
+			t.Error("expected clause 0 rhs fetch_slug(slug) (line 3)")
+		}
+		if lines[4] {
+			t.Error("clause 1 rhs should NOT be included (uses clause 0 binding)")
+		}
+		if lines[5] {
+			t.Error("do_block should NOT be included")
+		}
+	})
+
+	// Case 2: clause 0 lhs slug (line 3, col 15)
+	// "    with {:ok, slug} <- fetch_slug(slug),"
+	//           at col 15 = left-side slug
+	// Should include: clause 0 lhs + clause 1 rhs (transform_slug(slug))
+	// Should NOT include: outer slug, clause 0 rhs, clause 1 lhs, do_block
+	t.Run("clause 0 lhs", func(t *testing.T) {
+		occs := FindVariableOccurrences(src, 3, 15)
+		lines := make(map[uint]bool)
+		for _, occ := range occs {
+			lines[occ.Line] = true
+		}
+		if !lines[3] {
+			t.Error("expected clause 0 lhs (line 3)")
+		}
+		if !lines[4] {
+			t.Error("expected clause 1 rhs transform_slug(slug) (line 4)")
+		}
+		if lines[2] {
+			t.Error("outer slug (line 2) should NOT be included")
+		}
+		if lines[5] {
+			t.Error("do_block should NOT be included (clause 1 lhs rebinds)")
+		}
+		// Ensure only one occurrence on line 3 (lhs only, not rhs)
+		line3count := 0
+		for _, occ := range occs {
+			if occ.Line == 3 {
+				line3count++
+			}
+		}
+		if line3count != 1 {
+			t.Errorf("expected 1 occurrence on line 3 (lhs only), got %d", line3count)
+		}
+	})
+
+	// Case 3: clause 1 lhs slug (line 4, col 15)
+	// "         {:ok, slug} <- transform_slug(slug) do"
+	//                at col 15 = left-side slug (with 9 spaces indent)
+	// Should include: clause 1 lhs + do_block use(slug)
+	// Should NOT include: outer slug, clause 0 anything, clause 1 rhs
+	t.Run("clause 1 lhs", func(t *testing.T) {
+		occs := FindVariableOccurrences(src, 4, 15)
+		lines := make(map[uint]bool)
+		for _, occ := range occs {
+			lines[occ.Line] = true
+		}
+		if !lines[4] {
+			t.Error("expected clause 1 lhs (line 4)")
+		}
+		if !lines[5] {
+			t.Error("expected do_block use(slug) (line 5)")
+		}
+		if lines[2] || lines[3] {
+			t.Error("outer slug and clause 0 should NOT be included")
+		}
+		// Only the lhs occurrence on line 4, not the rhs
+		line4count := 0
+		for _, occ := range occs {
+			if occ.Line == 4 {
+				line4count++
+			}
+		}
+		if line4count != 1 {
+			t.Errorf("expected 1 occurrence on line 4 (lhs only), got %d", line4count)
+		}
+	})
+
+	// Case 4: do_block slug (line 5, col 10)
+	// Should include: clause 1 lhs + do_block
+	// Same as Case 3 (both reference clause 1's binding)
+	t.Run("do_block slug", func(t *testing.T) {
+		occs := FindVariableOccurrences(src, 5, 10)
+		lines := make(map[uint]bool)
+		for _, occ := range occs {
+			lines[occ.Line] = true
+		}
+		if !lines[4] {
+			t.Error("expected clause 1 lhs (line 4)")
+		}
+		if !lines[5] {
+			t.Error("expected do_block slug (line 5)")
+		}
+		if lines[2] || lines[3] {
+			t.Error("outer slug and clause 0 should NOT be included")
+		}
+	})
+}
+
+func TestFindVariableOccurrences_PinnedWithNoBodyRebind(t *testing.T) {
+	// fn ^x -> use(x) end — no rebind in body, x is a closure reference.
+	// Renaming outer x should include both the pin and the closure reference.
+	src := []byte(`defmodule MyApp do
+  def run do
+    x = 1
+    Enum.each(list, fn ^x ->
+      IO.puts(x)
+    end)
+    x
+  end
+end`)
+
+	// Cursor on outer x at line 2
+	occs := FindVariableOccurrences(src, 2, 4)
+	lines := make(map[uint]bool)
+	for _, occ := range occs {
+		lines[occ.Line] = true
+	}
+	if !lines[2] {
+		t.Error("expected outer x assignment (line 2)")
+	}
+	if !lines[3] {
+		t.Error("expected ^x pin (line 3)")
+	}
+	if !lines[4] {
+		t.Error("expected x closure reference in fn body (line 4)")
+	}
+	if !lines[6] {
+		t.Error("expected x usage after fn (line 6)")
+	}
+}
+
+func TestFindVariableOccurrences_MultipleClausesWithPins(t *testing.T) {
+	// case with pinned and non-pinned clauses
+	src := []byte(`defmodule MyApp do
+  def run(expected) do
+    result = fetch()
+    case result do
+      ^expected -> :matched
+      other -> :no_match
+    end
+  end
+end`)
+
+	// Cursor on `expected` at line 1, col 11 (the param name: `  def run(expected)`)
+	occs := FindVariableOccurrences(src, 1, 11)
+	lines := make(map[uint]bool)
+	for _, occ := range occs {
+		lines[occ.Line] = true
+	}
+	if !lines[1] {
+		t.Error("expected param `expected` (line 1)")
+	}
+	if !lines[4] {
+		t.Error("expected ^expected pin in case (line 4)")
+	}
+}
+
+func TestFindVariableOccurrences_BodyRebindMidFunction(t *testing.T) {
+	// fn ^slug -> first_use(slug); slug = new_val; second_use(slug) end
+	// Cursor on inner slug (after rebind) should scope to fn body only.
+	// Cursor on first_use(slug) — before the rebind — is ambiguous but
+	// in practice treated as outer scope (no rebind before cursor).
+	src := []byte(`defmodule MyApp do
+  def run do
+    slug = "outer"
+    expect(Mock, :call, fn ^slug ->
+      result = do_thing(slug)
+      slug = "inner"
+      other(slug)
+    end)
+    slug
+  end
+end`)
+
+	// Cursor on `slug = "inner"` (line 5, col 6) — inner rebind
+	innerOccs := FindVariableOccurrences(src, 5, 6)
+	innerLines := make(map[uint]bool)
+	for _, occ := range innerOccs {
+		innerLines[occ.Line] = true
+	}
+	if !innerLines[5] {
+		t.Error("expected inner rebind (line 5)")
+	}
+	if !innerLines[6] {
+		t.Error("expected inner usage after rebind (line 6)")
+	}
+	if innerLines[2] {
+		t.Error("outer slug (line 2) should NOT be included")
+	}
+	if innerLines[3] {
+		t.Error("^slug pin (line 3) should NOT be included")
 	}
 }
 

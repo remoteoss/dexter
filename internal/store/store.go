@@ -512,7 +512,7 @@ func (s *Store) SearchSubmoduleSegments(parentModule string, segmentPrefix strin
 }
 
 func (s *Store) ListModuleFunctions(module string, publicOnly bool) ([]CompletionResult, error) {
-	query := "SELECT module, function, arity, kind, file_path, line FROM definitions WHERE module = ? AND function != ''"
+	query := "SELECT module, function, arity, kind, file_path, line FROM definitions WHERE module = ? AND function != '' AND kind NOT IN ('callback', 'macrocallback')"
 	if publicOnly {
 		query += " AND kind IN ('def', 'defmacro', 'defguard', 'defdelegate', 'type', 'opaque')"
 	}
@@ -551,11 +551,223 @@ func (s *Store) LookupModule(module string) ([]LookupResult, error) {
 	)
 }
 
+// LookupModulesInFile returns all module names defined in the given file, in line order.
+func (s *Store) LookupModulesInFile(filePath string) ([]string, error) {
+	rows, err := s.db.Query(
+		"SELECT module FROM definitions WHERE file_path = ? AND function = '' AND kind IN ('module', 'defprotocol') ORDER BY line",
+		filePath,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var modules []string
+	for rows.Next() {
+		var mod string
+		if err := rows.Scan(&mod); err != nil {
+			return nil, err
+		}
+		modules = append(modules, mod)
+	}
+	return modules, rows.Err()
+}
+
+// LookupFunctionInFile returns the module that defines the given function in the
+// specified file. Checks the enclosing module at nearLine first (respecting module
+// boundaries), then falls back to any other module in the file.
+func (s *Store) LookupFunctionInFile(filePath, function string, nearLine int) (string, bool) {
+	// Try the enclosing module first — this is the correct scope for bare calls
+	enclosing := s.LookupEnclosingModule(filePath, nearLine)
+	if enclosing != "" {
+		var count int
+		if err := s.db.QueryRow(
+			"SELECT COUNT(*) FROM definitions WHERE module = ? AND function = ? AND kind NOT IN ('module', 'defprotocol', 'defimpl', 'callback', 'macrocallback')",
+			enclosing, function,
+		).Scan(&count); err == nil && count > 0 {
+			return enclosing, true
+		}
+	}
+
+	// Fall back to any module in this file that defines the function (handles
+	// calls to parent-scope functions from nested modules)
+	var module string
+	err := s.db.QueryRow(
+		"SELECT d.module FROM definitions d "+
+			"WHERE d.file_path = ? AND d.function = ? AND d.kind NOT IN ('module', 'defprotocol', 'defimpl', 'callback', 'macrocallback') "+
+			"LIMIT 1",
+		filePath, function,
+	).Scan(&module)
+	if err != nil {
+		return "", false
+	}
+	return module, true
+}
+
 func (s *Store) LookupFunction(module, function string) ([]LookupResult, error) {
 	return s.queryLookup(
-		"SELECT file_path, line, kind, delegate_to, delegate_as FROM definitions WHERE module = ? AND function = ? AND kind NOT IN ('module', 'defprotocol', 'defimpl') ORDER BY CASE WHEN kind IN ('type', 'opaque') THEN 1 ELSE 0 END, line",
+		"SELECT file_path, line, kind, delegate_to, delegate_as FROM definitions WHERE module = ? AND function = ? AND kind NOT IN ('module', 'defprotocol', 'defimpl', 'callback', 'macrocallback') ORDER BY CASE WHEN kind IN ('type', 'opaque') THEN 1 ELSE 0 END, line",
 		module, function,
 	)
+}
+
+// CallbackResult holds a @callback or @macrocallback definition with its arity.
+type CallbackResult struct {
+	FilePath string
+	Line     int
+	Kind     string
+	Arity    int
+}
+
+// LookupCallbackDef returns @callback and @macrocallback definitions for a given behaviour module and function name.
+func (s *Store) LookupCallbackDef(behaviourModule, function string) ([]CallbackResult, error) {
+	rows, err := s.db.Query(
+		"SELECT file_path, line, kind, arity FROM definitions WHERE module = ? AND function = ? AND kind IN ('callback', 'macrocallback') ORDER BY line",
+		behaviourModule, function,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var results []CallbackResult
+	for rows.Next() {
+		var r CallbackResult
+		if err := rows.Scan(&r.FilePath, &r.Line, &r.Kind, &r.Arity); err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	return results, rows.Err()
+}
+
+// LookupCallbackDefGlobal returns all @callback/@macrocallback definitions with the
+// given function name across all indexed modules. When arity >= 0 it filters by
+// arity; pass -1 to return all arities. Used as a fallback when the behaviour chain
+// can't be resolved statically (e.g. dynamic `use unquote(mod)`).
+func (s *Store) LookupCallbackDefGlobal(function string, arity int) ([]CallbackResult, error) {
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if arity >= 0 {
+		rows, err = s.db.Query(
+			"SELECT file_path, line, kind, arity FROM definitions WHERE function = ? AND arity = ? AND kind IN ('callback', 'macrocallback') ORDER BY module, line",
+			function, arity,
+		)
+	} else {
+		rows, err = s.db.Query(
+			"SELECT file_path, line, kind, arity FROM definitions WHERE function = ? AND kind IN ('callback', 'macrocallback') ORDER BY module, line",
+			function,
+		)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var results []CallbackResult
+	for rows.Next() {
+		var r CallbackResult
+		if err := rows.Scan(&r.FilePath, &r.Line, &r.Kind, &r.Arity); err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	return results, rows.Err()
+}
+
+// LookupBehavioursForFile returns the fully-qualified names of all behaviour modules
+// referenced by the given file. Includes explicit @behaviour declarations and `use`d
+// modules that define at least one @callback (since `use` commonly injects @behaviour).
+func (s *Store) LookupBehavioursForFile(filePath string) ([]string, error) {
+	rows, err := s.db.Query(`
+		SELECT module FROM refs WHERE file_path = ? AND kind = 'behaviour'
+		UNION
+		SELECT r.module FROM refs r
+		WHERE r.file_path = ? AND r.kind = 'use'
+			AND EXISTS (SELECT 1 FROM definitions d WHERE d.module = r.module AND d.kind IN ('callback', 'macrocallback'))
+		ORDER BY 1`,
+		filePath, filePath,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var modules []string
+	for rows.Next() {
+		var module string
+		if err := rows.Scan(&module); err != nil {
+			return nil, err
+		}
+		modules = append(modules, module)
+	}
+	return modules, rows.Err()
+}
+
+// BehaviourImplementorResult holds an implementing module and its source file.
+type BehaviourImplementorResult struct {
+	Module   string
+	FilePath string
+}
+
+// LookupBehaviourImplementors returns all modules that declare @behaviour or `use` the given module.
+// Uses a correlated subquery to find the nearest enclosing defmodule for each ref,
+// avoiding a cross-product when a file defines multiple modules.
+func (s *Store) LookupBehaviourImplementors(behaviourModule string) ([]BehaviourImplementorResult, error) {
+	rows, err := s.db.Query(`
+		SELECT DISTINCT d.module, r.file_path
+		FROM refs r
+		JOIN definitions d ON d.file_path = r.file_path AND d.function = '' AND d.kind IN ('module', 'defprotocol')
+			AND d.line = (
+				SELECT MAX(d2.line) FROM definitions d2
+				WHERE d2.file_path = r.file_path AND d2.function = '' AND d2.kind IN ('module', 'defprotocol') AND d2.line <= r.line
+			)
+		WHERE r.module = ? AND r.kind IN ('behaviour', 'use')
+		ORDER BY d.module`,
+		behaviourModule,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var results []BehaviourImplementorResult
+	for rows.Next() {
+		var r BehaviourImplementorResult
+		if err := rows.Scan(&r.Module, &r.FilePath); err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	return results, rows.Err()
+}
+
+// LookupFunctionInModules returns definitions of a function across multiple modules in a single query.
+// If arity >= 0, filters by exact arity match.
+func (s *Store) LookupFunctionInModules(modules []string, function string, arity int) ([]LookupResult, error) {
+	if len(modules) == 0 {
+		return nil, nil
+	}
+	placeholders := make([]string, len(modules))
+	args := make([]interface{}, 0, len(modules)+2)
+	for i, mod := range modules {
+		placeholders[i] = "?"
+		args = append(args, mod)
+	}
+	args = append(args, function)
+
+	query := "SELECT file_path, line, kind, delegate_to, delegate_as FROM definitions WHERE module IN (" +
+		strings.Join(placeholders, ",") +
+		") AND function = ? AND kind NOT IN ('module', 'defprotocol', 'defimpl', 'callback', 'macrocallback')"
+
+	if arity >= 0 {
+		query += " AND arity = ?"
+		args = append(args, arity)
+	}
+
+	query += " ORDER BY line"
+	return s.queryLookup(query, args...)
 }
 
 func (s *Store) queryLookup(query string, args ...interface{}) ([]LookupResult, error) {
@@ -805,6 +1017,20 @@ func (s *Store) LookupUsingModules() ([]UsingModule, error) {
 		modules = append(modules, m)
 	}
 	return modules, rows.Err()
+}
+
+// LookupEnclosingModule returns the module name for the nearest defmodule at or before
+// lineNum in the given file. Returns "" if none is found.
+func (s *Store) LookupEnclosingModule(filePath string, lineNum int) string {
+	var module string
+	err := s.db.QueryRow(
+		"SELECT module FROM definitions WHERE file_path = ? AND function = '' AND kind IN ('module', 'defprotocol') AND line <= ? ORDER BY line DESC LIMIT 1",
+		filePath, lineNum,
+	).Scan(&module)
+	if err != nil {
+		return ""
+	}
+	return module
 }
 
 // LookupEnclosingFunction returns the function definition that encloses the

@@ -140,6 +140,64 @@ end
 	}
 }
 
+func TestLookupEnclosingFunction_MultiLineSig(t *testing.T) {
+	s, dir := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	// Reproduces a real bug: multi-clause function followed by a function with a
+	// multi-line signature. LookupEnclosingFunction must return the latter when
+	// the cursor is anywhere on its definition line or within its body, not the
+	// preceding multi-clause function.
+	path := writeElixirFile(t, dir, "lib/worker.ex", `defmodule MyApp.Worker do
+  defp resource_type(%PayrollRun{}), do: "payroll_run"
+  defp resource_type(%StatutoryRemittance{}), do: "statutory_remittance"
+
+  @impl true
+  def process(%Job{
+        args: %__MODULE__{
+          resource_slug: resource_slug,
+          resource_type: resource_type
+        }
+      }) do
+    :ok
+  end
+end
+`)
+
+	defs, _, err := parser.ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IndexFile(path, defs); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		desc   string
+		line   int // 1-based, as passed to LookupEnclosingFunction
+		wantFn string
+	}{
+		{"on def process line", 6, "process"},
+		{"inside multi-line args", 8, "process"},
+		{"on closing paren line", 10, "process"},
+		{"inside body", 11, "process"},
+		{"on resource_type clause 1", 2, "resource_type"},
+		{"on resource_type clause 2", 3, "resource_type"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.desc, func(t *testing.T) {
+			_, fn, _, _, found := s.LookupEnclosingFunction(path, tt.line)
+			if !found {
+				t.Fatalf("expected to find enclosing function at line %d, got none", tt.line)
+			}
+			if fn != tt.wantFn {
+				t.Errorf("line %d: got %q, want %q", tt.line, fn, tt.wantFn)
+			}
+		})
+	}
+}
+
 func TestReindexUpdatesDefinitions(t *testing.T) {
 	s, dir := setupTestStore(t)
 	defer func() { _ = s.Close() }()

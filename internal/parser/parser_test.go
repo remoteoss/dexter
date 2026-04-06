@@ -1814,3 +1814,107 @@ func filterRefs(refs []Reference, kind string) []Reference {
 	}
 	return out
 }
+
+func TestParseFile_CallbackDefinitions(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.Worker do
+  @callback init(args :: term) :: {:ok, state :: term} | {:error, reason :: term}
+  @callback handle_call(request, from, state) :: {:reply, term, term}
+  @callback name :: String.t()
+  @macrocallback before_compile(env :: Macro.Env.t) :: Macro.t
+end
+`)
+
+	defs, _, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type callbackExpectation struct {
+		function string
+		kind     string
+		arity    int
+	}
+
+	expected := []callbackExpectation{
+		{"init", "callback", 1},
+		{"handle_call", "callback", 3},
+		{"name", "callback", 0},
+		{"before_compile", "macrocallback", 1},
+	}
+
+	var callbacks []Definition
+	for _, d := range defs {
+		if d.Kind == "callback" || d.Kind == "macrocallback" {
+			callbacks = append(callbacks, d)
+		}
+	}
+
+	if len(callbacks) != len(expected) {
+		t.Fatalf("expected %d callbacks, got %d: %+v", len(expected), len(callbacks), callbacks)
+	}
+
+	for i, exp := range expected {
+		cb := callbacks[i]
+		if cb.Function != exp.function || cb.Kind != exp.kind || cb.Arity != exp.arity {
+			t.Errorf("callback[%d]: expected {%s, %s, arity=%d}, got {%s, %s, arity=%d}",
+				i, exp.function, exp.kind, exp.arity, cb.Function, cb.Kind, cb.Arity)
+		}
+		if cb.Module != "MyApp.Worker" {
+			t.Errorf("callback[%d]: expected module MyApp.Worker, got %s", i, cb.Module)
+		}
+	}
+}
+
+func TestParseFile_CallbackOutsideModuleIgnored(t *testing.T) {
+	path := writeTempFile(t, `@callback orphan(arg) :: term
+defmodule MyApp.Worker do
+  @callback valid(arg) :: term
+end
+`)
+
+	defs, _, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var callbacks []Definition
+	for _, d := range defs {
+		if d.Kind == "callback" || d.Kind == "macrocallback" {
+			callbacks = append(callbacks, d)
+		}
+	}
+
+	if len(callbacks) != 1 {
+		t.Fatalf("expected 1 callback (only the one inside the module), got %d: %+v", len(callbacks), callbacks)
+	}
+	if callbacks[0].Function != "valid" {
+		t.Errorf("expected callback 'valid', got %q", callbacks[0].Function)
+	}
+}
+
+func TestParseFile_CallbackModuleRefsExtracted(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.Behaviour do
+  @callback fetch(id :: integer) :: {:ok, User.t()} | {:error, String.t()}
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Module refs in the callback type annotation should be extracted as call refs.
+	refModules := map[string]bool{}
+	for _, r := range refs {
+		if r.Kind == "call" {
+			refModules[r.Module+"."+r.Function] = true
+		}
+	}
+
+	if !refModules["User.t"] {
+		t.Errorf("expected User.t ref from callback type annotation, refs: %v", refs)
+	}
+	if !refModules["String.t"] {
+		t.Errorf("expected String.t ref from callback type annotation, refs: %v", refs)
+	}
+}

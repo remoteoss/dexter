@@ -273,6 +273,68 @@ func TestExtractAliases(t *testing.T) {
 	})
 }
 
+func TestExtractAliasesInScope(t *testing.T) {
+	src := `defmodule MyApp.Outer do
+  alias MyApp.Repo
+  alias MyApp.Config
+
+  defmodule Inner do
+    alias MyApp.Billing.Invoice
+
+    def run do
+      Invoice.get()
+    end
+  end
+
+  def call do
+    Repo.all()
+  end
+end
+`
+	t.Run("outer scope sees outer aliases only", func(t *testing.T) {
+		// Line 13 = "def call do" inside Outer
+		aliases := ExtractAliasesInScope(src, 13)
+		if aliases["Repo"] != "MyApp.Repo" {
+			t.Errorf("expected Repo alias in outer scope, got %q", aliases["Repo"])
+		}
+		if _, ok := aliases["Invoice"]; ok {
+			t.Error("Invoice alias should NOT be visible in outer scope")
+		}
+	})
+
+	t.Run("inner scope sees inner aliases only", func(t *testing.T) {
+		// Line 8 = "Invoice.get()" inside Inner
+		aliases := ExtractAliasesInScope(src, 8)
+		if aliases["Invoice"] != "MyApp.Billing.Invoice" {
+			t.Errorf("expected Invoice alias in inner scope, got %q", aliases["Invoice"])
+		}
+		if _, ok := aliases["Repo"]; ok {
+			t.Error("Repo alias should NOT be visible in inner scope")
+		}
+	})
+
+	t.Run("nested module with conflicting alias", func(t *testing.T) {
+		conflictSrc := `defmodule MyApp.Payments do
+  defmodule PaymentRecord do
+    alias MyApp.Billing.PaymentRecord
+    def schema, do: %{}
+  end
+end
+`
+		// Line 3 = "def schema" inside the nested PaymentRecord
+		aliases := ExtractAliasesInScope(conflictSrc, 3)
+		if aliases["PaymentRecord"] != "MyApp.Billing.PaymentRecord" {
+			t.Errorf("expected Billing alias inside nested module, got %q", aliases["PaymentRecord"])
+		}
+
+		// Line 0 = "defmodule MyApp.Payments do" — outer scope has no aliases
+		aliases = ExtractAliasesInScope(conflictSrc, 0)
+		if _, ok := aliases["PaymentRecord"]; ok {
+			t.Error("PaymentRecord alias should NOT be visible in outer scope")
+		}
+	})
+}
+
 func TestExtractImports(t *testing.T) {
 	t.Run("parses imports", func(t *testing.T) {
 		text := "  import MyApp.Helpers.Formatting\n  import Ecto.Query"
@@ -644,7 +706,7 @@ func TestExtractUsingImports(t *testing.T) {
     :ok
   end
 end`
-		imports := extractUsingImports(text)
+		imports, _, _, _ := parseUsingBody(text)
 		if len(imports) != 2 {
 			t.Fatalf("expected 2 imports, got %d: %v", len(imports), imports)
 		}
@@ -667,7 +729,7 @@ end`
 
   def other_func, do: :ok
 end`
-		imports := extractUsingImports(text)
+		imports, _, _, _ := parseUsingBody(text)
 		if len(imports) != 1 || imports[0] != "Foo" {
 			t.Errorf("expected [Foo], got %v", imports)
 		}
@@ -675,7 +737,7 @@ end`
 
 	t.Run("no __using__ returns nil", func(t *testing.T) {
 		text := "defmodule Lib do\n  def foo, do: :ok\nend"
-		imports := extractUsingImports(text)
+		imports, _, _, _ := parseUsingBody(text)
 		if len(imports) != 0 {
 			t.Errorf("expected no imports, got %v", imports)
 		}
@@ -694,22 +756,31 @@ func TestExtractUsingInlineDefs(t *testing.T) {
   def module_level, do: :ok
 end`
 
+	inlineDefsOf := func(name string) []int {
+		_, defs, _, _ := parseUsingBody(text)
+		var lines []int
+		for _, d := range defs[name] {
+			lines = append(lines, d.line)
+		}
+		return lines
+	}
+
 	t.Run("finds inline def", func(t *testing.T) {
-		lineNums := extractUsingInlineDefs(text, "helper")
+		lineNums := inlineDefsOf("helper")
 		if len(lineNums) != 1 || lineNums[0] != 4 {
 			t.Errorf("expected [4], got %v", lineNums)
 		}
 	})
 
 	t.Run("does not find module-level def", func(t *testing.T) {
-		lineNums := extractUsingInlineDefs(text, "module_level")
+		lineNums := inlineDefsOf("module_level")
 		if len(lineNums) != 0 {
 			t.Errorf("expected empty, got %v", lineNums)
 		}
 	})
 
 	t.Run("returns empty for missing function", func(t *testing.T) {
-		lineNums := extractUsingInlineDefs(text, "nonexistent")
+		lineNums := inlineDefsOf("nonexistent")
 		if len(lineNums) != 0 {
 			t.Errorf("expected empty, got %v", lineNums)
 		}
@@ -727,7 +798,7 @@ func TestParseUsingBody_InlineDefArity(t *testing.T) {
     end
   end
 end`
-	_, inlineDefs, _ := parseUsingBody(text)
+	_, inlineDefs, _, _ := parseUsingBody(text)
 
 	check := func(name string, wantArity int, wantKind string) {
 		t.Helper()
@@ -760,7 +831,7 @@ func TestParseUsingBody_SkipsUnquoteUse(t *testing.T) {
     end
   end
 end`
-	_, _, transUses := parseUsingBody(text)
+	_, _, transUses, _ := parseUsingBody(text)
 	for _, u := range transUses {
 		if u == "unquote" {
 			t.Error("transUses should not contain 'unquote'")
@@ -779,7 +850,7 @@ func TestParseUsingBody_KeywordModuleHints(t *testing.T) {
     end
   end
 end`
-		_, _, transUses := parseUsingBody(text)
+		_, _, transUses, _ := parseUsingBody(text)
 		found := false
 		for _, u := range transUses {
 			if u == "Oban.Pro.Worker" {
@@ -791,7 +862,7 @@ end`
 		}
 	})
 
-	t.Run("Keyword.pop default adds module as transitive use", func(t *testing.T) {
+	t.Run("Keyword.pop default adds module as opt binding", func(t *testing.T) {
 		text := `defmodule MyLib do
   defmacro __using__(opts) do
     {mod, opts} = Keyword.pop(opts, :base_module, MyLib.DefaultBase)
@@ -801,15 +872,15 @@ end`
     end
   end
 end`
-		_, _, transUses := parseUsingBody(text)
+		_, _, _, optBindings := parseUsingBody(text)
 		found := false
-		for _, u := range transUses {
-			if u == "MyLib.DefaultBase" {
+		for _, b := range optBindings {
+			if b.optKey == "base_module" && b.defaultMod == "MyLib.DefaultBase" && b.kind == "use" {
 				found = true
 			}
 		}
 		if !found {
-			t.Errorf("expected MyLib.DefaultBase in transUses, got %v", transUses)
+			t.Errorf("expected base_module opt binding with MyLib.DefaultBase, got %v", optBindings)
 		}
 	})
 
@@ -823,11 +894,289 @@ end`
     end
   end
 end`
-		_, _, transUses := parseUsingBody(text)
+		_, _, transUses, _ := parseUsingBody(text)
 		for _, u := range transUses {
 			if u == "false" {
 				t.Error("transUses should not contain 'false'")
 			}
+		}
+	})
+}
+
+func TestParseUsingBody_CaseTemplateUsing(t *testing.T) {
+	t.Run("using do form with inline imports", func(t *testing.T) {
+		text := `defmodule MyApp.ConnCase do
+  use ExUnit.CaseTemplate
+
+  using do
+    quote do
+      import Phoenix.ConnTest
+      import MyApp.Helpers
+    end
+  end
+end
+`
+		imported, _, _, _ := parseUsingBody(text)
+		foundConn, foundHelpers := false, false
+		for _, imp := range imported {
+			if imp == "Phoenix.ConnTest" {
+				foundConn = true
+			}
+			if imp == "MyApp.Helpers" {
+				foundHelpers = true
+			}
+		}
+		if !foundConn {
+			t.Error("expected Phoenix.ConnTest in imports")
+		}
+		if !foundHelpers {
+			t.Error("expected MyApp.Helpers in imports")
+		}
+	})
+
+	t.Run("using opts do form delegating to helper function", func(t *testing.T) {
+		// Mirrors MyAppWeb.ConnCase: using opts do / using_block(opts) / end
+		// with using_block defined as a separate def that returns a quote do block
+		text := `defmodule MyAppWeb.ConnCase do
+  use ExUnit.CaseTemplate
+
+  def using_block(_opts) do
+    quote do
+      import Phoenix.ConnTest
+      import Plug.Conn
+      use MyAppWeb.VerifiedRoutes
+    end
+  end
+
+  using opts do
+    using_block(opts)
+  end
+end`
+		imported, _, transUses, _ := parseUsingBody(text)
+
+		foundConn, foundPlug := false, false
+		for _, imp := range imported {
+			if imp == "Phoenix.ConnTest" {
+				foundConn = true
+			}
+			if imp == "Plug.Conn" {
+				foundPlug = true
+			}
+		}
+		if !foundConn {
+			t.Errorf("expected Phoenix.ConnTest in imports (via helper), got %v", imported)
+		}
+		if !foundPlug {
+			t.Errorf("expected Plug.Conn in imports (via helper), got %v", imported)
+		}
+
+		foundRoutes := false
+		for _, u := range transUses {
+			if u == "MyAppWeb.VerifiedRoutes" {
+				foundRoutes = true
+			}
+		}
+		if !foundRoutes {
+			t.Errorf("expected MyAppWeb.VerifiedRoutes in transUses (via helper), got %v", transUses)
+		}
+	})
+
+	t.Run("using without ExUnit.CaseTemplate does not trigger", func(t *testing.T) {
+		// `using` is a common Elixir keyword/macro — should not be treated as
+		// __using__ unless the module explicitly uses ExUnit.CaseTemplate
+		text := `defmodule MyApp.Schema do
+  using MyField do
+    :ok
+  end
+end`
+		imported, _, _, _ := parseUsingBody(text)
+		if len(imported) != 0 {
+			t.Errorf("expected no imports for non-CaseTemplate using, got %v", imported)
+		}
+	})
+}
+
+func TestParseUsingBody_UnquoteImport(t *testing.T) {
+	t.Run("import unquote(mod) with Keyword.get default", func(t *testing.T) {
+		// Remote.Mox pattern: `mod = Keyword.get(opts, :mod, Mox)` + `import unquote(mod)`
+		text := `defmodule Remote.Mox do
+  defmacro __using__(opts \\ []) do
+    mod = Keyword.get(opts, :mod, Mox)
+    quote do
+      import unquote(mod)
+    end
+  end
+end`
+		imported, _, _, optBindings := parseUsingBody(text)
+		// Dynamic unquote imports should NOT be in static imports
+		for _, imp := range imported {
+			if imp == "Mox" {
+				t.Errorf("Mox should not be in static imports (it's a dynamic opt binding)")
+			}
+		}
+		_ = imported
+		// Should have an opt binding for override
+		if len(optBindings) == 0 {
+			t.Fatal("expected at least one opt binding")
+		}
+		b := optBindings[0]
+		if b.optKey != "mod" {
+			t.Errorf("optKey: want 'mod', got %q", b.optKey)
+		}
+		if b.defaultMod != "Mox" {
+			t.Errorf("defaultMod: want 'Mox', got %q", b.defaultMod)
+		}
+		if b.kind != "import" {
+			t.Errorf("kind: want 'import', got %q", b.kind)
+		}
+	})
+
+	t.Run("consumer opts override used in lookup", func(t *testing.T) {
+		// When consumer passes `use Remote.Mox, mod: Hammox`, the import should be Hammox
+		text := `defmodule Remote.Mox do
+  defmacro __using__(opts \\ []) do
+    mod = Keyword.get(opts, :mod, Mox)
+    quote do
+      import unquote(mod)
+    end
+  end
+end`
+		_, _, _, optBindings := parseUsingBody(text)
+		if len(optBindings) == 0 {
+			t.Fatal("expected opt binding")
+		}
+		// With consumer opts {mod: Hammox}, the effective import should be Hammox
+		consumerOpts := map[string]string{"mod": "Hammox"}
+		effectiveMod := consumerOpts[optBindings[0].optKey]
+		if effectiveMod != "Hammox" {
+			t.Errorf("consumer override: want 'Hammox', got %q", effectiveMod)
+		}
+		// Without consumer opts, should fall back to default
+		if optBindings[0].defaultMod != "Mox" {
+			t.Errorf("default: want 'Mox', got %q", optBindings[0].defaultMod)
+		}
+	})
+
+	t.Run("use unquote(mod) with Keyword.get default", func(t *testing.T) {
+		text := `defmodule MyLib do
+  defmacro __using__(opts \\ []) do
+    base = Keyword.get(opts, :base, MyLib.Base)
+    quote do
+      use unquote(base)
+    end
+  end
+end`
+		_, _, transUses, optBindings := parseUsingBody(text)
+		// Dynamic unquote uses should NOT be in static transUses
+		for _, u := range transUses {
+			if u == "MyLib.Base" {
+				t.Errorf("MyLib.Base should not be in static transUses (it's a dynamic opt binding)")
+			}
+		}
+		_ = transUses
+		if len(optBindings) == 0 || optBindings[0].kind != "use" {
+			t.Errorf("expected a 'use' opt binding, got %v", optBindings)
+		}
+	})
+}
+
+func TestParseKeywordModuleOpts(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		aliases  map[string]string
+		expected map[string]string
+	}{
+		{
+			name:     "single module opt",
+			input:    "mod: Hammox",
+			expected: map[string]string{"mod": "Hammox"},
+		},
+		{
+			name:     "multiple module opts",
+			input:    "mod: Hammox, repo: MyRepo",
+			expected: map[string]string{"mod": "Hammox", "repo": "MyRepo"},
+		},
+		{
+			name:     "alias resolved",
+			input:    "mod: Hammox",
+			aliases:  map[string]string{"Hammox": "MyApp.Hammox"},
+			expected: map[string]string{"mod": "MyApp.Hammox"},
+		},
+		{
+			name:     "non-module values ignored",
+			input:    "mod: Hammox, async: true, queue: :default",
+			expected: map[string]string{"mod": "Hammox"},
+		},
+		{
+			name:     "empty string",
+			input:    "",
+			expected: map[string]string{},
+		},
+		{
+			name:     "dotted module name",
+			input:    "repo: MyApp.Oban.Repo",
+			expected: map[string]string{"repo": "MyApp.Oban.Repo"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ParseKeywordModuleOpts(tt.input, tt.aliases)
+			if len(got) != len(tt.expected) {
+				t.Fatalf("ParseKeywordModuleOpts(%q) = %v, want %v", tt.input, got, tt.expected)
+			}
+			for k, v := range tt.expected {
+				if got[k] != v {
+					t.Errorf("key %q: got %q, want %q", k, got[k], v)
+				}
+			}
+		})
+	}
+}
+
+func TestExtractUsesWithOpts(t *testing.T) {
+	t.Run("no opts", func(t *testing.T) {
+		text := "defmodule Foo do\n  use Remote.Mox\nend"
+		calls := ExtractUsesWithOpts(text, nil)
+		if len(calls) != 1 || calls[0].Module != "Remote.Mox" {
+			t.Errorf("expected [Remote.Mox], got %v", calls)
+		}
+		if len(calls[0].Opts) != 0 {
+			t.Errorf("expected no opts, got %v", calls[0].Opts)
+		}
+	})
+
+	t.Run("with module opt", func(t *testing.T) {
+		text := "defmodule Foo do\n  use Remote.Mox, mod: Hammox\nend"
+		calls := ExtractUsesWithOpts(text, nil)
+		if len(calls) != 1 {
+			t.Fatalf("expected 1 use call, got %d", len(calls))
+		}
+		if calls[0].Opts["mod"] != "Hammox" {
+			t.Errorf("mod opt: want 'Hammox', got %q", calls[0].Opts["mod"])
+		}
+	})
+
+	t.Run("multiple opts", func(t *testing.T) {
+		text := "defmodule Foo do\n  use MyLib, mod: Hammox, repo: MyRepo\nend"
+		calls := ExtractUsesWithOpts(text, nil)
+		if len(calls) != 1 {
+			t.Fatalf("expected 1 use call, got %d", len(calls))
+		}
+		if calls[0].Opts["mod"] != "Hammox" {
+			t.Errorf("mod: want Hammox, got %q", calls[0].Opts["mod"])
+		}
+		if calls[0].Opts["repo"] != "MyRepo" {
+			t.Errorf("repo: want MyRepo, got %q", calls[0].Opts["repo"])
+		}
+	})
+
+	t.Run("aliases resolved for module opts", func(t *testing.T) {
+		aliases := map[string]string{"Hammox": "MyApp.Hammox"}
+		text := "defmodule Foo do\n  use Remote.Mox, mod: Hammox\nend"
+		calls := ExtractUsesWithOpts(text, aliases)
+		if calls[0].Opts["mod"] != "MyApp.Hammox" {
+			t.Errorf("alias not resolved: got %q", calls[0].Opts["mod"])
 		}
 	})
 }
@@ -975,6 +1324,59 @@ func TestExtractCallContext(t *testing.T) {
 			}
 			if argIdx != tt.wantArgIdx {
 				t.Errorf("argIdx = %d, want %d", argIdx, tt.wantArgIdx)
+			}
+		})
+	}
+}
+
+func TestFindBareFunctionCalls(t *testing.T) {
+	tests := []struct {
+		name     string
+		text     string
+		funcName string
+		want     []int
+	}{
+		{
+			name:     "simple call",
+			text:     "def foo do\n  bar(x)\nend",
+			funcName: "bar",
+			want:     []int{2},
+		},
+		{
+			name:     "keyword key shadows call on same line",
+			text:     "def foo do\n  %{resource_type: resource_type(x)}\nend",
+			funcName: "resource_type",
+			want:     []int{2},
+		},
+		{
+			name:     "keyword key only, no call",
+			text:     "def foo do\n  %{resource_type: :payroll}\nend",
+			funcName: "resource_type",
+			want:     nil,
+		},
+		{
+			name:     "pipe call",
+			text:     "def foo(x) do\n  x |> bar()\nend",
+			funcName: "bar",
+			want:     []int{2},
+		},
+		{
+			name:     "definition line excluded",
+			text:     "defp resource_type(%Foo{}), do: \"foo\"\ndefp resource_type(%Bar{}), do: \"bar\"",
+			funcName: "resource_type",
+			want:     nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := FindBareFunctionCalls(tt.text, tt.funcName)
+			if len(got) != len(tt.want) {
+				t.Fatalf("FindBareFunctionCalls(%q) = %v, want %v", tt.funcName, got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("FindBareFunctionCalls(%q)[%d] = %d, want %d", tt.funcName, i, got[i], tt.want[i])
+				}
 			}
 		})
 	}

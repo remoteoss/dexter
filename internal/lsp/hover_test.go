@@ -2,6 +2,7 @@ package lsp
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -445,8 +446,7 @@ func TestHover_LocalFunction(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
 
-	uri := "file:///test.ex"
-	server.docs.Set(uri, `defmodule MyModule do
+	src := `defmodule MyModule do
   @doc "Helper function."
   @spec helper(integer()) :: :ok
   def helper(x) do
@@ -456,7 +456,11 @@ func TestHover_LocalFunction(t *testing.T) {
   def caller do
     helper(1)
   end
-end`)
+end`
+	path := filepath.Join(server.projectRoot, "lib", "my_module.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/my_module.ex", src)
+	uri := "file://" + path
+	server.docs.Set(uri, src)
 
 	hover := hoverAt(t, server, uri, 8, 6)
 	if hover == nil {
@@ -762,6 +766,113 @@ end`)
 	}
 	if !strings.Contains(hover.Contents.Value, "Defines the argument schema") {
 		t.Errorf("expected doc content in hover, got %q", hover.Contents.Value)
+	}
+}
+
+func TestHover_CaseTemplateUsingWithHelperFunction(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Phoenix.ConnTest defines build_conn
+	indexFile(t, server.store, server.projectRoot, "lib/conn_test.ex", `defmodule Phoenix.ConnTest do
+  @doc "Builds a test connection."
+  def build_conn, do: %Plug.Conn{}
+end
+`)
+	// ConnCase uses ExUnit.CaseTemplate, delegates to using_block/1
+	indexFile(t, server.store, server.projectRoot, "lib/conn_case.ex", `defmodule MyAppWeb.ConnCase do
+  use ExUnit.CaseTemplate
+
+  def using_block(_opts) do
+    quote do
+      import Phoenix.ConnTest
+    end
+  end
+
+  using opts do
+    using_block(opts)
+  end
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyTest do
+  use MyAppWeb.ConnCase
+
+  def test do
+    build_conn()
+  end
+end`)
+
+	// col=4 is on 'b' of "build_conn"
+	hover := hoverAt(t, server, uri, 4, 4)
+	if hover == nil {
+		t.Fatal("expected hover for build_conn injected via CaseTemplate using_block delegation")
+	}
+	if !strings.Contains(hover.Contents.Value, "build_conn") {
+		t.Errorf("expected build_conn in hover, got %q", hover.Contents.Value)
+	}
+}
+
+func TestHover_UseWithOptOverride(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Remote.Mox pattern: `import unquote(mod)` where mod comes from opts
+	indexFile(t, server.store, server.projectRoot, "lib/mox.ex", `defmodule Remote.Mox do
+  defmacro __using__(opts \\ []) do
+    mod = Keyword.get(opts, :mod, Mox)
+    quote do
+      import unquote(mod)
+    end
+  end
+end
+`)
+	// Mox defines `expect`
+	indexFile(t, server.store, server.projectRoot, "lib/mox_lib.ex", `defmodule Mox do
+  @doc "Sets up an expectation on a mock."
+  def expect(mock, name, n \\ 1, fun), do: :ok
+end
+`)
+	// Hammox also defines `expect` (with different doc)
+	indexFile(t, server.store, server.projectRoot, "lib/hammox_lib.ex", `defmodule Hammox do
+  @doc "Sets up a type-checked expectation."
+  def expect(mock, name, n \\ 1, fun), do: :ok
+end
+`)
+
+	// Without opts: uses default Mox
+	uri1 := "file:///test1.ex"
+	server.docs.Set(uri1, `defmodule MyTest do
+  use Remote.Mox
+
+  def run do
+    expect(MyMock, :foo, fn -> :ok end)
+  end
+end`)
+	hover1 := hoverAt(t, server, uri1, 4, 4)
+	if hover1 == nil {
+		t.Fatal("expected hover for expect (default Mox)")
+	}
+	if !strings.Contains(hover1.Contents.Value, "Sets up an expectation") {
+		t.Errorf("expected Mox doc, got %q", hover1.Contents.Value)
+	}
+
+	// With `mod: Hammox`: should use Hammox instead
+	uri2 := "file:///test2.ex"
+	server.docs.Set(uri2, `defmodule MyTest do
+  use Remote.Mox, mod: Hammox
+
+  def run do
+    expect(MyMock, :foo, fn -> :ok end)
+  end
+end`)
+	hover2 := hoverAt(t, server, uri2, 4, 4)
+	if hover2 == nil {
+		t.Fatal("expected hover for expect (Hammox override)")
+	}
+	if !strings.Contains(hover2.Contents.Value, "type-checked") {
+		t.Errorf("expected Hammox doc, got %q", hover2.Contents.Value)
 	}
 }
 
