@@ -43,6 +43,7 @@ type formatterProcess struct {
 	startedAt      time.Time     // when the process was launched
 	ready          chan struct{} // closed when the BEAM has sent the ready signal
 	startErr       error         // non-nil if startup failed; set before ready is closed
+	closed         chan struct{} // closed by Close(); makes alive() return false immediately
 }
 
 // commandHandle wraps the process so we can check liveness.
@@ -54,6 +55,8 @@ type commandHandle struct {
 func (fp *formatterProcess) alive() bool {
 	select {
 	case <-fp.cmd.done:
+		return false
+	case <-fp.closed:
 		return false
 	default:
 		return true
@@ -138,6 +141,11 @@ func (e *FormatError) Error() string {
 }
 
 func (fp *formatterProcess) Close() {
+	select {
+	case <-fp.closed:
+	default:
+		close(fp.closed)
+	}
 	_ = fp.stdin.Close()
 	_ = fp.cmd.process.Kill()
 }
@@ -196,6 +204,7 @@ func (s *Server) startFormatterProcess(mixRoot, formatterExs string) (*formatter
 		formatterMtime: mtime,
 		startedAt:      time.Now(),
 		ready:          make(chan struct{}),
+		closed:         make(chan struct{}),
 	}
 
 	// Wait for the BEAM's ready signal asynchronously. Callers use fp.Ready()

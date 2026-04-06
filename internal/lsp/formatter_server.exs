@@ -12,6 +12,11 @@
 #                      4-byte result length (big-endian) + result
 #
 # Sends a ready response (status=0, length=0) once initialization is complete.
+#
+# Force raw byte mode on stdin/stdout — without this, the Erlang IO server
+# applies Unicode encoding, expanding bytes > 127 to multi-byte UTF-8 and
+# corrupting our binary protocol framing.
+:io.setopts(:standard_io, encoding: :latin1)
 
 [mix_root | rest] = System.argv()
 formatter_exs_path = List.first(rest)
@@ -87,11 +92,11 @@ else
   IO.puts(:stderr, "Formatter: no plugins")
 end
 
-# Signal ready: status=0, length=0
-IO.binwrite(:stdio, <<0, 0, 0, 0, 0>>)
-
 defmodule Formatter.Loop do
-  def run(format_opts, plugins) do
+  def run(format_opts, plugins, first_call?) do
+    # Signal ready if first call: status=0, length=0
+    if first_call?, do: IO.binwrite(:stdio, <<0, 0, 0, 0, 0>>)
+
     case IO.binread(:stdio, 2) do
       <<filename_len::unsigned-big-16>> ->
         filename = if filename_len > 0, do: IO.binread(:stdio, filename_len), else: ""
@@ -101,7 +106,7 @@ defmodule Formatter.Loop do
         {status, result} = format(content, filename, format_opts, plugins)
         size = byte_size(result)
         IO.binwrite(:stdio, <<status::8, size::unsigned-big-32, result::binary>>)
-        run(format_opts, plugins)
+        run(format_opts, plugins, false)
 
       _ ->
         :ok
@@ -158,7 +163,7 @@ defmodule Formatter.Loop do
 end
 
 try do
-  Formatter.Loop.run(format_opts, active_plugins)
+  Formatter.Loop.run(format_opts, active_plugins, true)
 rescue
   e ->
     IO.puts(:stderr, "Formatter: crash in loop: #{Exception.message(e)}")
