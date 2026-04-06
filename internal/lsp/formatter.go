@@ -331,16 +331,19 @@ func (s *Server) formatContent(ctx context.Context, mixRoot, path, content strin
 
 		default:
 			// Recently started — wait for it
-			readyErr := fp.Ready(ctx)
-			if readyErr != nil {
+			if err := fp.Ready(ctx); err != nil {
 				if ctx.Err() != nil {
-					return "", ctx.Err()
+					return "", err
 				}
 				s.evictFormatter(formatterExs, fp)
-				log.Printf("Formatting: persistent formatter failed to start, falling back to mix format: %v", readyErr)
+				log.Printf("Formatting: persistent formatter failed to start, falling back to mix format: %v", err)
 				return s.formatWithMixFormat(ctx, mixRoot, path, content)
 			}
 		}
+	}
+
+	if ctx.Err() != nil {
+		return "", ctx.Err()
 	}
 
 	start := time.Now()
@@ -349,14 +352,11 @@ func (s *Server) formatContent(ctx context.Context, mixRoot, path, content strin
 		var formatErr *FormatError
 		if errors.As(err, &formatErr) {
 			log.Printf("Formatting: %s failed: %s", path, formatErr.Message)
-			return "", err
+		} else {
+			s.evictFormatter(formatterExs, fp)
+			log.Printf("Formatting: persistent formatter crashed: %v", err)
 		}
-		s.evictFormatter(formatterExs, fp)
-		if ctx.Err() != nil {
-			return "", ctx.Err()
-		}
-		log.Printf("Formatting: persistent formatter failed, falling back to mix format: %v", err)
-		return s.formatWithMixFormat(ctx, mixRoot, path, content)
+		return "", err
 	}
 
 	log.Printf("Formatting: %s (%s, persistent)", path, time.Since(start))

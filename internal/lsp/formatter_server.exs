@@ -26,27 +26,51 @@ mix_root
 # Read .formatter.exs
 raw_opts =
   if formatter_exs_path && File.regular?(formatter_exs_path) do
-    try do
-      {result, _} = Code.eval_file(formatter_exs_path)
-      if is_list(result), do: result, else: []
-    rescue
-      _ -> []
-    end
+    {result, _} = Code.eval_file(formatter_exs_path)
+    if is_list(result), do: result, else: []
   else
     []
   end
 
 plugins = Keyword.get(raw_opts, :plugins, [])
 
+# Resolve locals_without_parens from import_deps by reading each dep's exported
+# formatter config. Mix does this automatically in mix format, but we must
+# replicate it here since we eval .formatter.exs directly.
+import_deps_locals =
+  raw_opts
+  |> Keyword.get(:import_deps, [])
+  |> Enum.flat_map(fn dep ->
+    dep_formatter = Path.join([mix_root, "deps", to_string(dep), ".formatter.exs"])
+
+    if File.regular?(dep_formatter) do
+      {dep_opts, _} = Code.eval_file(dep_formatter)
+
+      if is_list(dep_opts) do
+        dep_opts
+        |> Keyword.get(:export, [])
+        |> Keyword.get(:locals_without_parens, [])
+      else
+        []
+      end
+    else
+      []
+    end
+  end)
+
+explicit_locals = Keyword.get(raw_opts, :locals_without_parens, [])
+all_locals_without_parens = Enum.uniq(import_deps_locals ++ explicit_locals)
+
 # Extract formatting options
 format_opts =
-  Keyword.take(raw_opts, [
-    :locals_without_parens,
+  raw_opts
+  |> Keyword.take([
     :line_length,
     :normalize_bitstring_modifiers,
     :normalize_charlists_as_sigils,
     :force_do_end_blocks
   ])
+  |> Keyword.put(:locals_without_parens, all_locals_without_parens)
 
 # Resolve which plugins are actually loaded
 active_plugins = Enum.filter(plugins, &Code.ensure_loaded?/1)

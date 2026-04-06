@@ -2499,6 +2499,13 @@ func (s *Server) Formatting(ctx context.Context, params *protocol.DocumentFormat
 
 	s.clearFormatDiagnostics(params.TextDocument.URI)
 
+	// If the document changed while we were formatting, the edits would be
+	// against stale content and corrupt the buffer.
+	currentText, _ := s.docs.Get(string(params.TextDocument.URI))
+	if currentText != text {
+		return nil, nil
+	}
+
 	return computeMinimalEdits(text, formatted), nil
 }
 func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*protocol.Hover, error) {

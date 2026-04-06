@@ -216,6 +216,58 @@ func TestFormatterServer_DifferentProjectsDifferentResults(t *testing.T) {
 	}
 }
 
+func TestFormatterServer_MigrationDSL(t *testing.T) {
+	if _, err := exec.LookPath("mix"); err != nil {
+		t.Skip("mix not available in PATH")
+	}
+
+	monorepo := fixtureMonorepoPath(t)
+	mixRoot := filepath.Join(monorepo, "apps", "app_with_ecto_migration")
+	ensureFixtureDeps(t, mixRoot)
+
+	server, cleanup := setupTestServerForFixture(t, mixRoot)
+	defer cleanup()
+
+	// Migration DSL functions (add, create) are in locals_without_parens via
+	// import_deps: [:fake_ecto_sql]. The formatter must not add parens to them.
+	input := `defmodule MyApp.Migrations.CreateWidgets do
+  def change do
+    create table(:widgets) do
+      add :name, :string
+      add :count, :integer, default: 0
+      timestamps()
+    end
+
+    create unique_index(:widgets, [:name])
+    create index(:widgets, [:count])
+  end
+end
+`
+	filePath := filepath.Join(mixRoot, "priv", "repo", "migrations", "20000101000000_create_widgets.exs")
+	docURI := string(uri.File(filePath))
+	server.docs.Set(docURI, input)
+
+	edits, err := server.Formatting(context.Background(), &protocol.DocumentFormattingParams{
+		TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(docURI)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var result string
+	if edits != nil {
+		result = edits[0].NewText
+	} else {
+		result = input
+	}
+
+	for _, unwanted := range []string{"add(", "create("} {
+		if strings.Contains(result, unwanted) {
+			t.Errorf("formatter added parens to migration DSL call %q (import_deps locals_without_parens not applied):\n%s", unwanted, result)
+		}
+	}
+}
+
 func TestComputeMinimalEdits(t *testing.T) {
 	t.Run("identical text returns nil", func(t *testing.T) {
 		edits := computeMinimalEdits("hello\nworld\n", "hello\nworld\n")

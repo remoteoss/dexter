@@ -29,17 +29,23 @@ test:integration:
     MIX_HOME: "$CI_PROJECT_DIR/.mix"
     HEX_HOME: "$CI_PROJECT_DIR/.hex"
   cache:
-    key:
-      files:
-        - go.sum
-        - internal/lsp/testdata/monorepo/apps/app_with_styler/mix.lock
-    paths:
-      - /go/pkg/mod/
-      - .go/
-      - .mix/
-      - .hex/
-      - internal/lsp/testdata/monorepo/apps/app_with_styler/deps/
-      - internal/lsp/testdata/monorepo/apps/app_with_styler/_build/
+    - key:
+        files:
+          - go.sum
+      paths:
+        - /go/pkg/mod/
+        - .go/
+    - key:
+        files:
+          - internal/lsp/testdata/monorepo/apps/app_with_styler/mix.lock
+          - internal/lsp/testdata/monorepo/apps/app_with_ecto_migration/mix.lock
+      paths:
+        - .mix/
+        - .hex/
+        - internal/lsp/testdata/monorepo/apps/app_with_styler/deps/
+        - internal/lsp/testdata/monorepo/apps/app_with_styler/_build/
+        - internal/lsp/testdata/monorepo/apps/app_with_ecto_migration/deps/
+        - internal/lsp/testdata/monorepo/apps/app_with_ecto_migration/_build/
   before_script:
     - |
       if [ ! -f .go/bin/go ]; then
@@ -49,10 +55,11 @@ test:integration:
     - export PATH=$CI_PROJECT_DIR/.go/bin:$PATH
     - mix local.hex --force && mix local.rebar --force
     - cd internal/lsp/testdata/monorepo/apps/app_with_styler && mix deps.get && mix deps.compile && cd -
+    - cd internal/lsp/testdata/monorepo/apps/app_with_ecto_migration && mix deps.get && mix deps.compile && cd -
     - cd internal/lsp/testdata/monorepo/apps/app_basic && mix deps.get && cd -
   script:
     - export PATH=$CI_PROJECT_DIR/.go/bin:$PATH
-    - go test ./internal/lsp/ -run 'TestFormatterServer_(WithStyler|BasicProject|BadIndentation|CacheInvalidation|DifferentProjects)' -v -timeout 120s
+    - go test ./internal/lsp/ -run 'TestFormatterServer_(WithStyler|BasicProject|BadIndentation|CacheInvalidation|DifferentProjects|MigrationDSL)' -v -timeout 120s
   tags:
     - size-m
   rules:
