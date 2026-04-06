@@ -1,6 +1,13 @@
 # Changelog
 
-## [0.5.0] - 2026-04-04
+## [0.5.1] - 2026-04-06
+
+### Fixed
+
+- **Formatter `import_deps` resolution** — the persistent formatter now resolves `import_deps` from `.formatter.exs`, reading each dependency's exported `locals_without_parens` so formatting matches `mix format` output
+- **Formatter binary protocol corruption** — the Erlang IO server's default Unicode encoding was expanding bytes > 127 in the binary protocol framing to multi-byte UTF-8, silently corrupting formatted file content on the first format request if the server wasn't yet ready; fixed by forcing raw byte mode on stdin/stdout
+
+## [0.5.0] - 2026-04-06
 
 ### Added
 
