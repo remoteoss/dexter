@@ -77,6 +77,8 @@ type Server struct {
 
 	reindexing          sync.Mutex // serializes concurrent backgroundReindex calls
 	notifiedOTPMismatch sync.Once  // prevents repeated OTP mismatch warnings
+
+	backgroundWork sync.WaitGroup // tracks in-flight background goroutines for graceful shutdown
 }
 
 func (s *Server) debugf(format string, args ...interface{}) {
@@ -3899,7 +3901,9 @@ func (mr *moduleRename) reindex(fileCache map[string]moduleFileInfo, movedFiles 
 		}
 	}
 
+	mr.server.backgroundWork.Add(1)
 	go func() {
+		defer mr.server.backgroundWork.Done()
 		mr.server.reindexPaths(reindexPaths)
 		for _, r := range openReindexes {
 			defs, refs, err := parser.ParseText(r.path, r.text)
@@ -4038,7 +4042,9 @@ func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string) *
 	}
 	wg.Wait()
 
+	s.backgroundWork.Add(1)
 	go func() {
+		defer s.backgroundWork.Done()
 		s.reindexPaths(reindexPaths)
 		for _, r := range openReindexes {
 			defs, refs, err := parser.ParseText(r.path, r.text)

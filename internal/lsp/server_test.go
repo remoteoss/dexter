@@ -36,6 +36,7 @@ func setupTestServer(t *testing.T) (*Server, func()) {
 	}
 
 	return server, func() {
+		server.backgroundWork.Wait()
 		if err := s.Close(); err != nil {
 			t.Errorf("failed to close store: %v", err)
 		}
