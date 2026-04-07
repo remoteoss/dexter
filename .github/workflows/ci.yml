@@ -24,14 +24,22 @@ jobs:
   test-integration:
     runs-on: ubuntu-latest
     container: elixir:1.19
+    env:
+      GOMODCACHE: ${{ github.workspace }}/.gomod
+      MIX_HOME: ${{ github.workspace }}/.mix
+      HEX_HOME: ${{ github.workspace }}/.hex
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache@v4
         with:
-          path: |
-            .go/
+          path: .go/
           key: go-install-${{ hashFiles('go.sum') }}
           restore-keys: go-install-
+      - uses: actions/cache@v4
+        with:
+          path: .gomod/
+          key: go-mod-integration-${{ hashFiles('go.sum') }}
+          restore-keys: go-mod-integration-
       - uses: actions/cache@v4
         with:
           path: |
@@ -50,23 +58,14 @@ jobs:
             curl -fsSL https://go.dev/dl/go1.26.1.linux-amd64.tar.gz | tar -C .go --strip-components=1 -xz
           fi
           echo "$GITHUB_WORKSPACE/.go/bin" >> "$GITHUB_PATH"
-        env:
-          MIX_HOME: ${{ github.workspace }}/.mix
-          HEX_HOME: ${{ github.workspace }}/.hex
       - name: Install Elixir dependencies
         run: |
           mix local.hex --force && mix local.rebar --force
           cd internal/lsp/testdata/monorepo/apps/app_with_styler && mix deps.get && mix deps.compile && cd -
           cd internal/lsp/testdata/monorepo/apps/app_with_ecto_migration && mix deps.get && mix deps.compile && cd -
           cd internal/lsp/testdata/monorepo/apps/app_basic && mix deps.get && cd -
-        env:
-          MIX_HOME: ${{ github.workspace }}/.mix
-          HEX_HOME: ${{ github.workspace }}/.hex
       - name: Run integration tests
         run: go test ./internal/lsp/ -run 'TestFormatterServer_(WithStyler|BasicProject|BadIndentation|CacheInvalidation|DifferentProjects|MigrationDSL)' -v -timeout 120s
-        env:
-          MIX_HOME: ${{ github.workspace }}/.mix
-          HEX_HOME: ${{ github.workspace }}/.hex
 
   lint:
     runs-on: ubuntu-latest
