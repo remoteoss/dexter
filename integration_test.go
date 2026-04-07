@@ -12,7 +12,7 @@ import (
 func buildDexter(t *testing.T) string {
 	t.Helper()
 	binary := filepath.Join(t.TempDir(), "dexter")
-	cmd := exec.Command("go", "build", "-o", binary, "./cmd/")
+	cmd := exec.Command("go", "build", "-buildvcs=false", "-o", binary, "./cmd/")
 	cmd.Dir = filepath.Dir(mustAbs(t, "go.mod"))
 	out, err := cmd.CombinedOutput()
 	if err != nil {

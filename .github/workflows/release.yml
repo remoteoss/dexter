@@ -50,7 +50,7 @@ jobs:
       - name: Build
         run: |
           GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
-            go build -o dexter ./cmd/
+            go build -buildvcs=false -o dexter ./cmd/
       - name: Package
         run: |
           name="dexter_${{ matrix.platform }}"
