@@ -11,12 +11,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/spf13/cobra"
 	dexter_lsp "github.com/remoteoss/dexterdexter/internal/lsp"
 	"github.com/remoteoss/dexterdexter/internal/parser"
 	"github.com/remoteoss/dexterdexter/internal/stdlib"
 	"github.com/remoteoss/dexterdexter/internal/store"
 	"github.com/remoteoss/dexterdexter/internal/version"
+	"github.com/spf13/cobra"
 )
 
 func main() {
