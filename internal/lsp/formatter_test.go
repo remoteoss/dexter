@@ -268,6 +268,84 @@ end
 	}
 }
 
+func TestFormatterServer_UmbrellaStylerPlugin(t *testing.T) {
+	if _, err := exec.LookPath("mix"); err != nil {
+		t.Skip("mix not available in PATH")
+	}
+
+	// Ensure the Styler fixture is compiled so we have beam files to reuse
+	monorepo := fixtureMonorepoPath(t)
+	stylerFixture := filepath.Join(monorepo, "apps", "app_with_styler")
+	ensureFixtureDeps(t, stylerFixture)
+
+	// Create an umbrella-like temp directory where _build is only at the
+	// root, not in the child app — this is how real umbrella apps work.
+	umbrellaRoot := t.TempDir()
+	childApp := filepath.Join(umbrellaRoot, "apps", "child_app")
+	if err := os.MkdirAll(filepath.Join(childApp, "lib"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Symlink _build from the existing fixture to the umbrella root
+	if err := os.Symlink(
+		filepath.Join(stylerFixture, "_build"),
+		filepath.Join(umbrellaRoot, "_build"),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write a minimal mix.exs so findMixRoot stops at the child app
+	if err := os.WriteFile(
+		filepath.Join(childApp, "mix.exs"),
+		[]byte("defmodule ChildApp.MixProject do\n  use Mix.Project\n  def project, do: [app: :child_app, version: \"0.1.0\"]\nend\n"),
+		0644,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write .formatter.exs with Styler plugin
+	if err := os.WriteFile(
+		filepath.Join(childApp, ".formatter.exs"),
+		[]byte("[plugins: [Styler], inputs: [\"{lib,test}/**/*.{ex,exs}\"]]\n"),
+		0644,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// Set up server with the umbrella root as projectRoot
+	storeDir := t.TempDir()
+	s, err := store.Open(storeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	server := NewServer(s, umbrellaRoot)
+	if p, err := exec.LookPath("mix"); err == nil {
+		server.mixBin = p
+	}
+
+	unformatted := "defmodule Test do\n  def hello(x) do\n    x |> to_string()\n  end\nend\n"
+	filePath := filepath.Join(childApp, "lib", "test.ex")
+	docURI := string(uri.File(filePath))
+	server.docs.Set(docURI, unformatted)
+
+	edits, err := server.Formatting(context.Background(), &protocol.DocumentFormattingParams{
+		TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(docURI)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if edits == nil {
+		t.Fatal("expected formatting edits from Styler in umbrella child app, got nil")
+	}
+	if !strings.Contains(edits[0].NewText, "to_string(x)") {
+		t.Errorf("expected Styler to rewrite pipe in umbrella child app, got:\n%s", edits[0].NewText)
+	}
+	if strings.Contains(edits[0].NewText, "|>") {
+		t.Errorf("expected Styler to remove single pipe in umbrella child app, got:\n%s", edits[0].NewText)
+	}
+}
+
 func TestComputeMinimalEdits(t *testing.T) {
 	t.Run("identical text returns nil", func(t *testing.T) {
 		edits := computeMinimalEdits("hello\nworld\n", "hello\nworld\n")

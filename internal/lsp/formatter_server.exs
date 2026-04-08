@@ -18,19 +18,45 @@
 # corrupting our binary protocol framing.
 :io.setopts(:standard_io, encoding: :latin1)
 
-[mix_root | rest] = System.argv()
-formatter_exs_path = List.first(rest)
+[mix_root, formatter_exs_path, project_root_arg] = System.argv()
+
+# In umbrella apps, _build and deps live at the umbrella root, not in
+# individual app directories. Walk up from mix_root (bounded by the project
+# root) to find the nearest ancestor that contains a _build directory.
+expanded_mix_root = Path.expand(mix_root)
+expanded_boundary = Path.expand(project_root_arg)
+
+# If there are really umbrella apps with a distance greater than 20 to the root
+# we can update this (or maybe make it configurable), but 20 seems like a sane
+# limit.
+project_root =
+  Enum.reduce_while(1..20, expanded_mix_root, fn _, dir ->
+    cond do
+      File.dir?(Path.join(dir, "_build")) ->
+        {:halt, dir}
+      dir == expanded_boundary ->
+        {:halt, expanded_mix_root}
+      true ->
+        parent = Path.dirname(dir)
+
+        if parent == dir do
+          {:halt, expanded_mix_root}
+        else
+          {:cont, parent}
+        end
+    end
+  end)
 
 # Add the project's compiled deps to the code path so plugins are available
 # without needing Mix.install
-mix_root
+project_root
 |> Path.join("_build/dev/lib/*/ebin")
 |> Path.wildcard()
 |> Enum.each(&Code.prepend_path/1)
 
 # Read .formatter.exs
 raw_opts =
-  if formatter_exs_path && File.regular?(formatter_exs_path) do
+  if File.regular?(formatter_exs_path) do
     {result, _} = Code.eval_file(formatter_exs_path)
     if is_list(result), do: result, else: []
   else
@@ -46,7 +72,7 @@ import_deps_locals =
   raw_opts
   |> Keyword.get(:import_deps, [])
   |> Enum.flat_map(fn dep ->
-    dep_formatter = Path.join([mix_root, "deps", to_string(dep), ".formatter.exs"])
+    dep_formatter = Path.join([project_root, "deps", to_string(dep), ".formatter.exs"])
 
     if File.regular?(dep_formatter) do
       {dep_opts, _} = Code.eval_file(dep_formatter)
