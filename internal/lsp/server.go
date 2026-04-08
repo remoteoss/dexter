@@ -368,7 +368,7 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 			TextDocumentSync: protocol.TextDocumentSyncOptions{
 				OpenClose:         true,
 				Change:            protocol.TextDocumentSyncKindFull,
-				WillSaveWaitUntil: true,
+				WillSaveWaitUntil: false,
 				Save: &protocol.SaveOptions{
 					IncludeText: false,
 				},
@@ -2515,14 +2515,17 @@ func (s *Server) FoldingRanges(ctx context.Context, params *protocol.FoldingRang
 		}
 		indent := len(line) - len(strings.TrimLeft(line, " \t"))
 
-		// Check for do blocks: "... do" at end of line
-		if strings.HasSuffix(trimmed, " do") || strings.HasSuffix(trimmed, "\tdo") || trimmed == "do" {
+		// Strip strings/comments for block detection so content like
+		// `x = "foo do"` doesn't create a false folding range.
+		stripped := strings.TrimSpace(parser.StripCommentsAndStrings(trimmed))
+
+		if parser.OpensBlock(stripped) {
 			stack = append(stack, blockStart{line: i, indent: indent})
 			continue
 		}
 
 		// Pop on "end" at matching indent
-		if trimmed == "end" && len(stack) > 0 {
+		if parser.IsEnd(stripped) && len(stack) > 0 {
 			top := stack[len(stack)-1]
 			if indent == top.indent {
 				stack = stack[:len(stack)-1]
@@ -4394,9 +4397,7 @@ func (s *Server) WillSave(ctx context.Context, params *protocol.WillSaveTextDocu
 	return nil
 }
 func (s *Server) WillSaveWaitUntil(ctx context.Context, params *protocol.WillSaveTextDocumentParams) ([]protocol.TextEdit, error) {
-	return s.Formatting(ctx, &protocol.DocumentFormattingParams{
-		TextDocument: protocol.TextDocumentIdentifier{URI: params.TextDocument.URI},
-	})
+	return nil, nil
 }
 func (s *Server) ShowDocument(ctx context.Context, params *protocol.ShowDocumentParams) (*protocol.ShowDocumentResult, error) {
 	return nil, nil

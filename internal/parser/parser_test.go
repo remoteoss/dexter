@@ -1220,6 +1220,41 @@ end
 	}
 }
 
+func TestParseFile_FnEndMisindentedDoesNotPopModule(t *testing.T) {
+	// Regression: when fn...end is misformatted so the end aligns with defmodule,
+	// indent-matching would incorrectly pop the module. Depth-counting handles this.
+	path := writeTempFile(t, `defmodule MyModule do
+  def build(items) do
+    handler = fn item ->
+      item
+end
+  end
+
+  def next(x) do
+    x + 1
+  end
+end
+`)
+
+	defs, _, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	funcs := map[string]string{}
+	for _, d := range defs {
+		if d.Function != "" {
+			funcs[d.Function] = d.Module
+		}
+	}
+
+	for _, name := range []string{"build", "next"} {
+		if funcs[name] != "MyModule" {
+			t.Errorf("%s should belong to MyModule, got %q (all funcs: %v)", name, funcs[name], funcs)
+		}
+	}
+}
+
 func TestParseFile_FnEndWithTrailingParen(t *testing.T) {
 	path := writeTempFile(t, `defmodule MyModule do
   def process(enumerable) do

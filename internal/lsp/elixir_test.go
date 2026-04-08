@@ -333,6 +333,97 @@ end
 			t.Error("TransactionRecord alias should NOT be visible in outer scope")
 		}
 	})
+
+	t.Run("fn...end block does not break scope tracking", func(t *testing.T) {
+		// Regression: fn...end has an "end" without a corresponding "do",
+		// which caused the depth counter to go out of sync and pop the
+		// module scope prematurely.
+		fnSrc := `defmodule MyApp.Aggregator do
+  alias MyApp.Filters
+
+  defp build_filter(:active, items) do
+    codes =
+      Filters.get_codes(items) ++
+        Filters.get_extra_codes(items)
+
+    fn item ->
+      item.code in codes
+    end
+  end
+
+  def run(items) do
+    Filters.all(items)
+  end
+end
+`
+		// Line 14 = "def run" — should still see aliases from the module scope
+		aliases := ExtractAliasesInScope(fnSrc, 14)
+		if aliases["Filters"] != "MyApp.Filters" {
+			t.Errorf("expected Filters alias after fn...end block, got %q", aliases["Filters"])
+		}
+	})
+
+	t.Run("fn with end in comment does not confuse depth", func(t *testing.T) {
+		commentSrc := `defmodule MyApp.Worker do
+  alias MyApp.Processor
+
+  defp make_handler(items) do
+    fn -> # this is something in the end
+      Processor.run(items)
+    end
+  end
+
+  def execute(items) do
+    Processor.start(items)
+  end
+end
+`
+		// Line 10 = "def execute" — should still see aliases
+		aliases := ExtractAliasesInScope(commentSrc, 10)
+		if aliases["Processor"] != "MyApp.Processor" {
+			t.Errorf("expected Processor alias after fn with end-in-comment, got %q", aliases["Processor"])
+		}
+	})
+
+	t.Run("heredoc containing end does not break scope", func(t *testing.T) {
+		heredocSrc := `defmodule MyApp.Docs do
+  alias MyApp.Formatter
+
+  @moduledoc """
+  end
+  some text
+  end
+  """
+
+  def render(text) do
+    Formatter.run(text)
+  end
+end
+`
+		// Line 10 = "def render" — should still see aliases despite "end" lines in heredoc
+		aliases := ExtractAliasesInScope(heredocSrc, 10)
+		if aliases["Formatter"] != "MyApp.Formatter" {
+			t.Errorf("expected Formatter alias after heredoc with end lines, got %q", aliases["Formatter"])
+		}
+	})
+
+	t.Run("string containing do or end does not affect depth", func(t *testing.T) {
+		stringSrc := `defmodule MyApp.Config do
+  alias MyApp.Settings
+
+  def label do
+    x = "something do"
+    y = "end"
+    Settings.get(x, y)
+  end
+end
+`
+		// Line 7 = "Settings.get(x, y)" — aliases should still resolve
+		aliases := ExtractAliasesInScope(stringSrc, 7)
+		if aliases["Settings"] != "MyApp.Settings" {
+			t.Errorf("expected Settings alias with do/end in strings, got %q", aliases["Settings"])
+		}
+	})
 }
 
 func TestExtractImports(t *testing.T) {

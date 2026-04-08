@@ -272,12 +272,26 @@ func extractAliasesFromLines(lines []string, targetLine int) map[string]string {
 	}
 	var targetModule string
 	unscoped := targetLine < 0
+	inHeredoc := false
 
 	for i, line := range lines {
+		var skip bool
+		inHeredoc, skip = parser.CheckHeredoc(line, inHeredoc)
+		if skip {
+			// Still track targetLine so scope is correct for lines inside heredocs
+			if i == targetLine {
+				if len(stack) > 0 {
+					targetModule = stack[len(stack)-1].name
+				}
+			}
+			continue
+		}
+
 		trimmed := strings.TrimSpace(line)
+		stripped := strings.TrimSpace(parser.StripCommentsAndStrings(trimmed))
 
 		// Track do..end nesting
-		if trimmed == "end" {
+		if parser.IsEnd(stripped) {
 			if len(stack) > 0 && stack[len(stack)-1].depth == depth {
 				stack = stack[:len(stack)-1]
 			}
@@ -287,15 +301,16 @@ func extractAliasesFromLines(lines []string, targetLine int) map[string]string {
 			}
 		}
 
-		if m := parser.DefmoduleRe.FindStringSubmatch(line); m != nil {
+		if parser.OpensBlock(stripped) {
+			depth++
+		}
+
+		if m := parser.DefmoduleRe.FindStringSubmatch(trimmed); m != nil {
 			name := m[1]
 			if !strings.Contains(name, ".") && len(stack) > 0 {
 				name = stack[len(stack)-1].name + "." + name
 			}
-			depth++
 			stack = append(stack, moduleFrame{name, depth})
-		} else if parser.ContainsDo(trimmed) {
-			depth++
 		}
 
 		currentModule := ""

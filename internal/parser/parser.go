@@ -80,7 +80,7 @@ func ParseFile(path string) ([]Definition, []Reference, error) {
 func ParseText(path, text string) ([]Definition, []Reference, error) {
 	type moduleFrame struct {
 		name           string
-		indent         int
+		depth          int // do..end/fn..end nesting depth when this module was opened
 		savedAliases   map[string]string
 		savedInjectors map[string]bool
 	}
@@ -89,6 +89,7 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 	var defs []Definition
 	var refs []Reference
 	var moduleStack []moduleFrame
+	depth := 0
 	aliases := map[string]string{} // short name -> full module
 	injectors := map[string]bool{} // modules from use/import that inject bare functions
 	inHeredoc := false
@@ -96,29 +97,9 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 	for lineIdx, line := range lines {
 		lineNum := lineIdx + 1
 
-		// Heredoc tracking — handle both """ and '''
-		if strings.IndexByte(line, '"') >= 0 {
-			quoteCount := strings.Count(line, `"""`)
-			if quoteCount > 0 {
-				if quoteCount >= 2 {
-					continue
-				}
-				inHeredoc = !inHeredoc
-				continue
-			}
-		}
-		if strings.IndexByte(line, '\'') >= 0 {
-			quoteCount := strings.Count(line, `'''`)
-			if quoteCount > 0 {
-				if quoteCount >= 2 {
-					continue
-				}
-				inHeredoc = !inHeredoc
-				continue
-			}
-		}
-
-		if inHeredoc {
+		var skip bool
+		inHeredoc, skip = CheckHeredoc(line, inHeredoc)
+		if skip {
 			continue
 		}
 
@@ -133,18 +114,30 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 		first := line[trimStart]
 		rest := line[trimStart:] // line content from first non-whitespace char
 
+		strippedRest := strings.TrimRight(StripCommentsAndStrings(rest), " \t\r")
+
 		// 'e' — check for "end" to pop module stack; otherwise fall through
 		if first == 'e' {
-			if len(moduleStack) > 0 && strings.TrimRight(rest, " \t\r") == "end" {
-				if moduleStack[len(moduleStack)-1].indent == trimStart {
+			if IsEnd(strippedRest) {
+				if len(moduleStack) > 0 && moduleStack[len(moduleStack)-1].depth == depth {
 					frame := moduleStack[len(moduleStack)-1]
 					moduleStack = moduleStack[:len(moduleStack)-1]
 					aliases = frame.savedAliases
 					injectors = frame.savedInjectors
 				}
+				depth--
+				if depth < 0 {
+					depth = 0
+				}
 				continue
 			}
 			// Not "end" — may be a bare macro call like "embedded_schema do"
+		}
+
+		// Track block-opening keywords (do..end and fn..end) for depth counting.
+		// This covers defmodule/def/defp/case/cond/fn/etc. — any construct closed by "end".
+		if OpensBlock(strippedRest) {
+			depth++
 		}
 
 		currentModule := ""
@@ -342,7 +335,7 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 					name = currentModule + "." + name
 				}
 				currentModule = name
-				moduleStack = append(moduleStack, moduleFrame{name: currentModule, indent: trimStart, savedAliases: copyMap(aliases), savedInjectors: copyBoolMap(injectors)})
+				moduleStack = append(moduleStack, moduleFrame{name: currentModule, depth: depth, savedAliases: copyMap(aliases), savedInjectors: copyBoolMap(injectors)})
 				defs = append(defs, Definition{
 					Module:   currentModule,
 					Line:     lineNum,
@@ -357,7 +350,7 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 					name = currentModule + "." + name
 				}
 				currentModule = name
-				moduleStack = append(moduleStack, moduleFrame{name: currentModule, indent: trimStart, savedAliases: copyMap(aliases), savedInjectors: copyBoolMap(injectors)})
+				moduleStack = append(moduleStack, moduleFrame{name: currentModule, depth: depth, savedAliases: copyMap(aliases), savedInjectors: copyBoolMap(injectors)})
 				defs = append(defs, Definition{
 					Module:   currentModule,
 					Line:     lineNum,
@@ -372,7 +365,7 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 					name = currentModule + "." + name
 				}
 				currentModule = name
-				moduleStack = append(moduleStack, moduleFrame{name: currentModule, indent: trimStart, savedAliases: copyMap(aliases), savedInjectors: copyBoolMap(injectors)})
+				moduleStack = append(moduleStack, moduleFrame{name: currentModule, depth: depth, savedAliases: copyMap(aliases), savedInjectors: copyBoolMap(injectors)})
 				defs = append(defs, Definition{
 					Module:   currentModule,
 					Line:     lineNum,
@@ -477,7 +470,7 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 			continue
 		}
 		{
-			codeLine := stripCommentsAndStrings(line)
+			codeLine := StripCommentsAndStrings(line)
 
 			// Module.function calls (including type refs like User.t())
 			for _, match := range moduleCallRe.FindAllStringSubmatch(codeLine, -1) {
@@ -650,10 +643,91 @@ func ScanFuncDef(rest string) (string, string, bool) {
 	return "", "", false
 }
 
+// CheckHeredoc updates the inHeredoc state for a given line. Returns the new
+// inHeredoc state and whether this line is a heredoc boundary or content that
+// should be skipped by callers doing line-by-line analysis.
+func CheckHeredoc(line string, inHeredoc bool) (newState bool, skip bool) {
+	if strings.IndexByte(line, '"') >= 0 {
+		if c := strings.Count(line, `"""`); c > 0 {
+			if c < 2 {
+				inHeredoc = !inHeredoc
+			}
+			return inHeredoc, true
+		}
+	}
+	if strings.IndexByte(line, '\'') >= 0 {
+		if c := strings.Count(line, `'''`); c > 0 {
+			if c < 2 {
+				inHeredoc = !inHeredoc
+			}
+			return inHeredoc, true
+		}
+	}
+	return inHeredoc, inHeredoc
+}
+
 // ContainsDo returns true if the trimmed line ends with a block-opening " do"
 // (not an inline "do:" keyword argument).
 func ContainsDo(trimmed string) bool {
-	return strings.HasSuffix(trimmed, " do") || strings.HasSuffix(trimmed, "\tdo")
+	return trimmed == "do" || strings.HasSuffix(trimmed, " do") || strings.HasSuffix(trimmed, "\tdo")
+}
+
+// IsEnd returns true if the trimmed line is a block-closing "end", possibly
+// followed by closing punctuation like ")" or ",". This handles both standalone
+// "end" and "end)" as seen when fn...end is passed as an argument.
+func IsEnd(trimmed string) bool {
+	if trimmed == "end" {
+		return true
+	}
+	if !strings.HasPrefix(trimmed, "end") {
+		return false
+	}
+	// "end" followed only by closing punctuation/delimiters
+	for i := 3; i < len(trimmed); i++ {
+		switch trimmed[i] {
+		case ')', ']', '}', ',', ' ', '\t':
+			// valid trailing chars after end
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// OpensBlock returns true if the trimmed line opens a block that will be closed
+// by a matching "end". This covers both do..end blocks and fn..end blocks.
+func OpensBlock(trimmed string) bool {
+	return ContainsDo(trimmed) || ContainsFn(trimmed)
+}
+
+// ContainsFn returns true if the line opens an anonymous function block
+// (fn ... -> on its own line) that will be closed by a matching "end".
+// It returns false when the fn...end is entirely on one line.
+// Callers should pass input through StripCommentsAndStrings first.
+func ContainsFn(code string) bool {
+	if !strings.HasPrefix(code, "fn ") && code != "fn" {
+		// Also handle fn appearing mid-expression, e.g. "x = fn arg ->"
+		idx := strings.Index(code, " fn ")
+		if idx < 0 {
+			// Check for patterns like "Enum.map(list, fn arg ->" or "(fn arg ->"
+			for _, prefix := range []string{"(fn ", ",fn ", ", fn "} {
+				if i := strings.Index(code, prefix); i >= 0 {
+					idx = i + len(prefix) - len("fn ")
+					break
+				}
+			}
+		}
+		if idx < 0 {
+			return false
+		}
+	}
+	// Must not have a matching end on the same line (inline fn...end).
+	if idx := strings.LastIndex(code, " end"); idx >= 0 {
+		if IsEnd(strings.TrimSpace(code[idx:])) {
+			return false
+		}
+	}
+	return true
 }
 
 // findDelegateTo searches the current line and up to 5 subsequent lines for a to: target,
@@ -958,10 +1032,10 @@ func hasUppercase(s string) bool {
 	return false
 }
 
-// stripCommentsAndStrings removes inline comments and replaces the content
+// StripCommentsAndStrings removes inline comments and replaces the content
 // of string literals and sigils with spaces so that regex-based extraction
 // doesn't produce false-positive references from comments, strings, or sigils.
-func stripCommentsAndStrings(line string) string {
+func StripCommentsAndStrings(line string) string {
 	// Fast path: skip allocation if line has no strings, comments, or sigils
 	if !strings.ContainsAny(line, "\"'#~") {
 		return line

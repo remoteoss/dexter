@@ -2655,11 +2655,6 @@ func TestFormatter_RestartAfterCrash(t *testing.T) {
 }
 
 func TestFormatter_WillSaveWaitUntil(t *testing.T) {
-	_, err := exec.LookPath("mix")
-	if err != nil {
-		t.Skip("mix not available in PATH")
-	}
-
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
 
@@ -2679,11 +2674,8 @@ func TestFormatter_WillSaveWaitUntil(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if edits == nil {
-		t.Fatal("expected WillSaveWaitUntil to return formatting edits")
-	}
-	if !strings.Contains(edits[0].NewText, "defmodule Test do") {
-		t.Errorf("expected formatted output, got: %s", edits[0].NewText)
+	if edits != nil {
+		t.Fatal("expected WillSaveWaitUntil to return no edits, formatting should only happen via textDocument/formatting")
 	}
 }
 
