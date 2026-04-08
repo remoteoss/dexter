@@ -48,6 +48,7 @@ type usingCacheEntry struct {
 	inlineDefs  map[string][]inlineDef // function name → inline defs in quote do block
 	transUses   []string               // modules used inside __using__ body (double-use chains)
 	optBindings []optBinding           // dynamic imports/uses resolved from opts
+	aliases     map[string]string      // alias short name → full module injected by __using__
 }
 
 type Server struct {
@@ -565,6 +566,7 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 
 	moduleRef, functionName := ExtractModuleAndFunction(expr)
 	aliases := ExtractAliasesInScope(text, lineNum)
+	s.mergeAliasesFromUse(text, aliases)
 	s.debugf("Definition: expr=%q module=%q function=%q", expr, moduleRef, functionName)
 
 	// Bare identifier — check variable first (cheap tree-sitter lookup), then functions
@@ -800,6 +802,7 @@ func (s *Server) CodeAction(ctx context.Context, params *protocol.CodeActionPara
 	}
 
 	aliases := ExtractAliasesInScope(text, lineNum)
+	s.mergeAliasesFromUse(text, aliases)
 
 	// Check if the first segment is already aliased — if so, the reference
 	// already resolves and no code action is needed.
@@ -976,6 +979,7 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 
 	if moduleRef != "" && (afterDot || funcPrefix != "") {
 		aliases := ExtractAliases(text)
+		s.mergeAliasesFromUse(text, aliases)
 		resolved := resolveModule(moduleRef, aliases)
 		results, err := s.store.ListModuleFunctions(resolved, true)
 		if err != nil {
@@ -1012,6 +1016,7 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 		}
 	} else if moduleRef != "" {
 		aliases := ExtractAliases(text)
+		s.mergeAliasesFromUse(text, aliases)
 		seenModules := make(map[string]bool)
 
 		addModuleItem := func(label, detail string) {
@@ -1112,6 +1117,7 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 
 		// Check use-injected imports and inline defs (including transitive use chains)
 		aliases := ExtractAliases(text)
+		s.mergeAliasesFromUse(text, aliases)
 		visitedCompletion := make(map[string]bool)
 		for _, usedModule := range ExtractUses(text) {
 			s.addCompletionsFromUsing(resolveModule(usedModule, aliases), funcPrefix, seen, &items, visitedCompletion, inPipe, s.snippetSupport)
@@ -1209,7 +1215,7 @@ func (s *Server) parseUsingFile(filePath string) *usingCacheEntry {
 	if err != nil {
 		return nil
 	}
-	imported, inlineDefs, transUses, optBindings := parseUsingBody(string(fileData))
+	imported, inlineDefs, transUses, optBindings, aliases := parseUsingBody(string(fileData))
 	return &usingCacheEntry{
 		mtime:       info.ModTime().UnixNano(),
 		filePath:    filePath,
@@ -1217,6 +1223,7 @@ func (s *Server) parseUsingFile(filePath string) *usingCacheEntry {
 		inlineDefs:  inlineDefs,
 		transUses:   transUses,
 		optBindings: optBindings,
+		aliases:     aliases,
 	}
 }
 
@@ -1595,6 +1602,40 @@ func resolveModule(moduleRef string, aliases map[string]string) string {
 	return moduleRef
 }
 
+// mergeAliasesFromUse augments the alias map with aliases injected by `use`
+// declarations in the file. For example, if the file has `use MyApp.Schema`
+// and MyApp.Schema.__using__ contains `alias MyApp.Repo`, then Repo is added.
+func (s *Server) mergeAliasesFromUse(text string, aliases map[string]string) {
+	useCalls := ExtractUsesWithOpts(text, aliases)
+	visited := make(map[string]bool)
+	for _, uc := range useCalls {
+		s.mergeAliasesFromUsingEntry(uc.Module, aliases, visited)
+	}
+}
+
+func (s *Server) mergeAliasesFromUsingEntry(moduleName string, aliases map[string]string, visited map[string]bool) {
+	if visited[moduleName] {
+		return
+	}
+	visited[moduleName] = true
+
+	entry := s.cachedUsing(moduleName)
+	if entry == nil {
+		return
+	}
+
+	for short, full := range entry.aliases {
+		if _, exists := aliases[short]; !exists {
+			aliases[short] = full
+		}
+	}
+
+	// Follow transitive uses
+	for _, transModule := range entry.transUses {
+		s.mergeAliasesFromUsingEntry(transModule, aliases, visited)
+	}
+}
+
 // resolveModuleWithNesting resolves a module reference, falling back to the
 // implicit alias created by nested defmodule declarations. In Elixir,
 // `defmodule Inner do` inside `defmodule Outer do` creates an implicit alias
@@ -1850,6 +1891,7 @@ func (s *Server) Declaration(ctx context.Context, params *protocol.DeclarationPa
 	// is specified as a keyword opt (e.g. oban_module: Oban.Pro.Worker).
 	if len(locations) == 0 && functionName != "" {
 		aliases := ExtractAliasesInScope(text, lineNum)
+		s.mergeAliasesFromUse(text, aliases)
 		if callbacks := s.findCallbacksViaUseChain(text, functionName, arity, aliases); len(callbacks) > 0 {
 			s.debugf("Declaration: found %d callbacks via use-chain for %s/%d", len(callbacks), functionName, arity)
 			for _, cb := range callbacks {
@@ -2611,6 +2653,7 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 
 	moduleRef, functionName := ExtractModuleAndFunction(expr)
 	aliases := ExtractAliasesInScope(text, lineNum)
+	s.mergeAliasesFromUse(text, aliases)
 
 	if moduleRef == "" {
 		if functionName == "" {
@@ -2786,6 +2829,7 @@ func (s *Server) PrepareRename(ctx context.Context, params *protocol.PrepareRena
 	// Try module/function rename via the index
 	if expr != "" {
 		aliases := ExtractAliasesInScope(text, lineNum)
+		s.mergeAliasesFromUse(text, aliases)
 
 		// Detect `as:` aliases — these are file-local renames, not module renames.
 		// An `as:` alias has a short name that differs from the last segment of
@@ -2937,6 +2981,7 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 
 	moduleRef, functionName := ExtractModuleAndFunction(expr)
 	aliases := ExtractAliasesInScope(text, lineNum)
+	s.mergeAliasesFromUse(text, aliases)
 	s.debugf("References: expr=%q module=%q function=%q", expr, moduleRef, functionName)
 
 	var fullModule string
@@ -3178,6 +3223,7 @@ func (s *Server) Rename(ctx context.Context, params *protocol.RenameParams) (*pr
 	// Try module/function rename via the index
 	if expr != "" {
 		aliases := ExtractAliasesInScope(text, lineNum)
+		s.mergeAliasesFromUse(text, aliases)
 
 		// Detect `as:` aliases — file-local rename of the alias name, not
 		// the underlying module.
@@ -4208,6 +4254,7 @@ func (s *Server) SignatureHelp(ctx context.Context, params *protocol.SignatureHe
 	}
 
 	aliases := ExtractAliasesInScope(text, lineNum)
+	s.mergeAliasesFromUse(text, aliases)
 	lines := strings.Split(text, "\n")
 
 	// Resolve the function to a store lookup result
@@ -4371,6 +4418,7 @@ func (s *Server) TypeDefinition(ctx context.Context, params *protocol.TypeDefini
 	}
 
 	aliases := ExtractAliasesInScope(text, lineNum)
+	s.mergeAliasesFromUse(text, aliases)
 	fullModule := s.resolveModuleWithNesting(moduleRef, aliases, uriToPath(protocol.DocumentURI(docURI)), lineNum)
 
 	results, err := s.store.LookupFunction(fullModule, typeName)
@@ -4445,6 +4493,7 @@ func (s *Server) PrepareCallHierarchy(ctx context.Context, params *protocol.Call
 	}
 
 	aliases := ExtractAliasesInScope(text, lineNum)
+	s.mergeAliasesFromUse(text, aliases)
 	var fullModule string
 	if moduleRef != "" {
 		fullModule = resolveModule(moduleRef, aliases)

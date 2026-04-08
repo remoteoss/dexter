@@ -1528,6 +1528,106 @@ end`
 	}
 }
 
+func TestDefinition_AliasInjectedByUse(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// MyApp.Schema.__using__ injects `alias MyApp.Meta` into consumer modules.
+	// Go-to-definition on `Meta.source(x)` should resolve Meta → MyApp.Meta
+	// via the use-injected alias.
+	schemaSrc := `defmodule MyApp.Schema do
+  defmacro __using__(_opts) do
+    quote do
+      alias MyApp.Meta
+      alias MyApp.Config
+    end
+  end
+end`
+	metaSrc := `defmodule MyApp.Meta do
+  def source(x), do: x
+end`
+	callerSrc := `defmodule MyApp.MyCheck do
+  use MyApp.Schema
+
+  def run do
+    Meta.source(:foo)
+  end
+end`
+
+	indexFile(t, server.store, server.projectRoot, "lib/schema.ex", schemaSrc)
+	schemaURI := "file://" + filepath.Join(server.projectRoot, "lib/schema.ex")
+	server.docs.Set(schemaURI, schemaSrc)
+
+	indexFile(t, server.store, server.projectRoot, "lib/meta.ex", metaSrc)
+
+	callerURI := "file://" + filepath.Join(server.projectRoot, "lib/my_check.ex")
+	server.docs.Set(callerURI, callerSrc)
+
+	// line 4 (0-indexed): `    Meta.source(:foo)` — col 4 is on `Meta`
+	locs := definitionAt(t, server, callerURI, 4, 4)
+	if len(locs) == 0 {
+		t.Fatal("expected go-to-definition for `Meta` resolved via alias injected by `use MyApp.Schema`")
+	}
+
+	// Should resolve to the MyApp.Meta module definition
+	found := false
+	for _, loc := range locs {
+		if strings.Contains(string(loc.URI), "meta.ex") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected definition location in meta.ex, got %v", locs)
+	}
+}
+
+func TestHover_AliasInjectedByUse(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	schemaSrc := `defmodule MyApp.Schema do
+  defmacro __using__(_opts) do
+    quote do
+      alias MyApp.Meta
+    end
+  end
+end`
+	metaSrc := `defmodule MyApp.Meta do
+  @doc "Returns the source from meta"
+  def source(x), do: x
+end`
+	callerSrc := `defmodule MyApp.MyCheck do
+  use MyApp.Schema
+
+  def run do
+    Meta.source(:foo)
+  end
+end`
+
+	indexFile(t, server.store, server.projectRoot, "lib/schema.ex", schemaSrc)
+	schemaURI := "file://" + filepath.Join(server.projectRoot, "lib/schema.ex")
+	server.docs.Set(schemaURI, schemaSrc)
+
+	indexFile(t, server.store, server.projectRoot, "lib/meta.ex", metaSrc)
+
+	callerURI := "file://" + filepath.Join(server.projectRoot, "lib/my_check.ex")
+	server.docs.Set(callerURI, callerSrc)
+
+	// line 4 (0-indexed): `    Meta.source(:foo)` — col 9 is on `source`
+	hover, err := server.Hover(context.Background(), &protocol.HoverParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(callerURI)},
+			Position:     protocol.Position{Line: 4, Character: 9},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hover == nil {
+		t.Fatal("expected hover result for Meta.source resolved via use-injected alias, got nil")
+	}
+}
+
 func TestReferences_UseWithOptOverride(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()

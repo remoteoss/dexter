@@ -706,7 +706,7 @@ func TestExtractUsingImports(t *testing.T) {
     :ok
   end
 end`
-		imports, _, _, _ := parseUsingBody(text)
+		imports, _, _, _, _ := parseUsingBody(text)
 		if len(imports) != 2 {
 			t.Fatalf("expected 2 imports, got %d: %v", len(imports), imports)
 		}
@@ -729,7 +729,7 @@ end`
 
   def other_func, do: :ok
 end`
-		imports, _, _, _ := parseUsingBody(text)
+		imports, _, _, _, _ := parseUsingBody(text)
 		if len(imports) != 1 || imports[0] != "Foo" {
 			t.Errorf("expected [Foo], got %v", imports)
 		}
@@ -737,7 +737,7 @@ end`
 
 	t.Run("no __using__ returns nil", func(t *testing.T) {
 		text := "defmodule Lib do\n  def foo, do: :ok\nend"
-		imports, _, _, _ := parseUsingBody(text)
+		imports, _, _, _, _ := parseUsingBody(text)
 		if len(imports) != 0 {
 			t.Errorf("expected no imports, got %v", imports)
 		}
@@ -757,7 +757,7 @@ func TestExtractUsingInlineDefs(t *testing.T) {
 end`
 
 	inlineDefsOf := func(name string) []int {
-		_, defs, _, _ := parseUsingBody(text)
+		_, defs, _, _, _ := parseUsingBody(text)
 		var lines []int
 		for _, d := range defs[name] {
 			lines = append(lines, d.line)
@@ -798,7 +798,7 @@ func TestParseUsingBody_InlineDefArity(t *testing.T) {
     end
   end
 end`
-	_, inlineDefs, _, _ := parseUsingBody(text)
+	_, inlineDefs, _, _, _ := parseUsingBody(text)
 
 	check := func(name string, wantArity int, wantKind string) {
 		t.Helper()
@@ -831,7 +831,7 @@ func TestParseUsingBody_SkipsUnquoteUse(t *testing.T) {
     end
   end
 end`
-	_, _, transUses, _ := parseUsingBody(text)
+	_, _, transUses, _, _ := parseUsingBody(text)
 	for _, u := range transUses {
 		if u == "unquote" {
 			t.Error("transUses should not contain 'unquote'")
@@ -850,7 +850,7 @@ func TestParseUsingBody_KeywordModuleHints(t *testing.T) {
     end
   end
 end`
-		_, _, transUses, _ := parseUsingBody(text)
+		_, _, transUses, _, _ := parseUsingBody(text)
 		found := false
 		for _, u := range transUses {
 			if u == "Oban.Pro.Worker" {
@@ -872,7 +872,7 @@ end`
     end
   end
 end`
-		_, _, _, optBindings := parseUsingBody(text)
+		_, _, _, optBindings, _ := parseUsingBody(text)
 		found := false
 		for _, b := range optBindings {
 			if b.optKey == "base_module" && b.defaultMod == "MyLib.DefaultBase" && b.kind == "use" {
@@ -894,7 +894,7 @@ end`
     end
   end
 end`
-		_, _, transUses, _ := parseUsingBody(text)
+		_, _, transUses, _, _ := parseUsingBody(text)
 		for _, u := range transUses {
 			if u == "false" {
 				t.Error("transUses should not contain 'false'")
@@ -916,7 +916,7 @@ func TestParseUsingBody_CaseTemplateUsing(t *testing.T) {
   end
 end
 `
-		imported, _, _, _ := parseUsingBody(text)
+		imported, _, _, _, _ := parseUsingBody(text)
 		foundConn, foundHelpers := false, false
 		for _, imp := range imported {
 			if imp == "Phoenix.ConnTest" {
@@ -952,7 +952,7 @@ end
     using_block(opts)
   end
 end`
-		imported, _, transUses, _ := parseUsingBody(text)
+		imported, _, transUses, _, _ := parseUsingBody(text)
 
 		foundConn, foundPlug := false, false
 		for _, imp := range imported {
@@ -989,7 +989,7 @@ end`
     :ok
   end
 end`
-		imported, _, _, _ := parseUsingBody(text)
+		imported, _, _, _, _ := parseUsingBody(text)
 		if len(imported) != 0 {
 			t.Errorf("expected no imports for non-CaseTemplate using, got %v", imported)
 		}
@@ -1007,7 +1007,7 @@ func TestParseUsingBody_UnquoteImport(t *testing.T) {
     end
   end
 end`
-		imported, _, _, optBindings := parseUsingBody(text)
+		imported, _, _, optBindings, _ := parseUsingBody(text)
 		// Dynamic unquote imports should NOT be in static imports
 		for _, imp := range imported {
 			if imp == "Mox" {
@@ -1041,7 +1041,7 @@ end`
     end
   end
 end`
-		_, _, _, optBindings := parseUsingBody(text)
+		_, _, _, optBindings, _ := parseUsingBody(text)
 		if len(optBindings) == 0 {
 			t.Fatal("expected opt binding")
 		}
@@ -1066,7 +1066,7 @@ end`
     end
   end
 end`
-		_, _, transUses, optBindings := parseUsingBody(text)
+		_, _, transUses, optBindings, _ := parseUsingBody(text)
 		// Dynamic unquote uses should NOT be in static transUses
 		for _, u := range transUses {
 			if u == "MyLib.Base" {
@@ -1076,6 +1076,97 @@ end`
 		_ = transUses
 		if len(optBindings) == 0 || optBindings[0].kind != "use" {
 			t.Errorf("expected a 'use' opt binding, got %v", optBindings)
+		}
+	})
+}
+
+func TestParseUsingBody_Aliases(t *testing.T) {
+	t.Run("simple alias", func(t *testing.T) {
+		text := `defmodule MyApp.Schema do
+  defmacro __using__(_opts) do
+    quote do
+      alias MyApp.Repo
+      alias MyApp.Accounts.User
+      import Ecto.Query
+    end
+  end
+end`
+		_, _, _, _, aliases := parseUsingBody(text)
+		if aliases == nil {
+			t.Fatal("expected aliases, got nil")
+		}
+		if aliases["Repo"] != "MyApp.Repo" {
+			t.Errorf("Repo: got %q, want MyApp.Repo", aliases["Repo"])
+		}
+		if aliases["User"] != "MyApp.Accounts.User" {
+			t.Errorf("User: got %q, want MyApp.Accounts.User", aliases["User"])
+		}
+	})
+
+	t.Run("alias with as:", func(t *testing.T) {
+		text := `defmodule MyApp.Schema do
+  defmacro __using__(_opts) do
+    quote do
+      alias MyApp.Accounts.UserProfile, as: Profile
+    end
+  end
+end`
+		_, _, _, _, aliases := parseUsingBody(text)
+		if aliases == nil {
+			t.Fatal("expected aliases, got nil")
+		}
+		if aliases["Profile"] != "MyApp.Accounts.UserProfile" {
+			t.Errorf("Profile: got %q, want MyApp.Accounts.UserProfile", aliases["Profile"])
+		}
+	})
+
+	t.Run("multi alias", func(t *testing.T) {
+		text := `defmodule MyApp.Schema do
+  defmacro __using__(_opts) do
+    quote do
+      alias MyApp.{Repo, Config, Helper}
+    end
+  end
+end`
+		_, _, _, _, aliases := parseUsingBody(text)
+		if aliases == nil {
+			t.Fatal("expected aliases, got nil")
+		}
+		if aliases["Repo"] != "MyApp.Repo" {
+			t.Errorf("Repo: got %q, want MyApp.Repo", aliases["Repo"])
+		}
+		if aliases["Config"] != "MyApp.Config" {
+			t.Errorf("Config: got %q, want MyApp.Config", aliases["Config"])
+		}
+		if aliases["Helper"] != "MyApp.Helper" {
+			t.Errorf("Helper: got %q, want MyApp.Helper", aliases["Helper"])
+		}
+	})
+
+	t.Run("alias resolved through file-level alias", func(t *testing.T) {
+		text := `defmodule MyApp.Schema do
+  alias Remote.Ecto.Schema, as: EctoSchema
+
+  defmacro __using__(_opts) do
+    quote do
+      alias EctoSchema.Fields
+    end
+  end
+end`
+		_, _, _, _, aliases := parseUsingBody(text)
+		if aliases == nil {
+			t.Fatal("expected aliases, got nil")
+		}
+		if aliases["Fields"] != "Remote.Ecto.Schema.Fields" {
+			t.Errorf("Fields: got %q, want Remote.Ecto.Schema.Fields", aliases["Fields"])
+		}
+	})
+
+	t.Run("no __using__ returns nil aliases", func(t *testing.T) {
+		text := "defmodule Lib do\n  def foo, do: :ok\nend"
+		_, _, _, _, aliases := parseUsingBody(text)
+		if aliases != nil {
+			t.Errorf("expected nil aliases, got %v", aliases)
 		}
 	})
 }
