@@ -1,10 +1,13 @@
-.PHONY: build test release
+.PHONY: build test test-race release
 
 build:
 	go build -o dexter ./cmd/
 
 test:
 	go test ./...
+
+test-race:
+	go test -race ./...
 
 lint:
 	golangci-lint run ./...
