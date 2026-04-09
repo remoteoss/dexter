@@ -980,15 +980,91 @@ func TestStdlibRoot(t *testing.T) {
 
 func TestOpenCorruptedDB(t *testing.T) {
 	dir := t.TempDir()
-	dbPath := filepath.Join(dir, ".dexter.db")
 
-	if err := os.WriteFile(dbPath, []byte("this is not a sqlite database"), 0644); err != nil {
+	// Pre-create the .dexter/ folder and plant a garbage DB file in the
+	// new location so Open's migration path doesn't touch it.
+	if err := os.MkdirAll(DBDir(dir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := DBPath(dir)
+
+	if err := os.WriteFile(dbPath, []byte("this is not a sqlite database"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	_, err := Open(dir)
 	if err == nil {
 		t.Fatal("expected Open to fail on a corrupted DB file, got nil")
+	}
+}
+
+func TestOpen_CreatesDexterFolder(t *testing.T) {
+	dir := t.TempDir()
+
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+
+	if info, err := os.Stat(filepath.Join(dir, ".dexter")); err != nil || !info.IsDir() {
+		t.Errorf(".dexter/ directory was not created: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".dexter", "dexter.db")); err != nil {
+		t.Errorf(".dexter/dexter.db was not created: %v", err)
+	}
+}
+
+func TestOpen_MigratesLegacyLayout(t *testing.T) {
+	dir := t.TempDir()
+
+	// Seed a fake legacy database and its WAL siblings.
+	legacy := filepath.Join(dir, ".dexter.db")
+	legacyShm := legacy + "-shm"
+	legacyWal := legacy + "-wal"
+	for _, f := range []string{legacy, legacyShm, legacyWal} {
+		if err := os.WriteFile(f, []byte("legacy placeholder"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+
+	for _, f := range []string{legacy, legacyShm, legacyWal} {
+		if _, err := os.Stat(f); !os.IsNotExist(err) {
+			t.Errorf("legacy file %s still exists (err=%v)", f, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".dexter", "dexter.db")); err != nil {
+		t.Errorf("new DB was not created: %v", err)
+	}
+
+	// Smoke test: the store should be functional after migration.
+	if _, err := s.db.Exec("INSERT INTO files (path, mtime) VALUES (?, ?)", "/fake.ex", 1); err != nil {
+		t.Errorf("store not functional after migration: %v", err)
+	}
+}
+
+func TestOpen_MigrationWithPartialLegacyFiles(t *testing.T) {
+	// Legacy DB present but no WAL siblings — should still migrate cleanly.
+	dir := t.TempDir()
+	legacy := filepath.Join(dir, ".dexter.db")
+	if err := os.WriteFile(legacy, []byte("legacy"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+
+	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
+		t.Errorf("legacy .dexter.db still exists: %v", err)
 	}
 }
 

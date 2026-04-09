@@ -70,7 +70,14 @@ func FindProjectRoot(path string, extraMarkers ...string) string {
 }
 
 func Open(projectRoot string) (*Store, error) {
-	dbPath := filepath.Join(projectRoot, ".dexter.db")
+	if err := migrateLegacyLayout(projectRoot); err != nil {
+		return nil, fmt.Errorf("migrate legacy layout: %w", err)
+	}
+	if err := os.MkdirAll(DBDir(projectRoot), 0o755); err != nil {
+		return nil, fmt.Errorf("create dexter dir: %w", err)
+	}
+
+	dbPath := DBPath(projectRoot)
 	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=5000&_foreign_keys=ON")
 	if err != nil {
 		return nil, err
@@ -83,6 +90,28 @@ func Open(projectRoot string) (*Store, error) {
 	}
 
 	return &Store{db: db}, nil
+}
+
+// migrateLegacyLayout deletes any pre-.dexter/ folder artifacts so that a
+// fresh database will be built at the new location on the next Open. The
+// index is a derived cache, so deletion (rather than move) is safe and
+// avoids WAL/SHM consistency edge cases.
+//
+// Returns nil when there is nothing to migrate.
+func migrateLegacyLayout(projectRoot string) error {
+	legacy := LegacyDBPath(projectRoot)
+	if _, err := os.Stat(legacy); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("stat legacy db %s: %w", legacy, err)
+	}
+	for _, f := range []string{legacy, legacy + "-shm", legacy + "-wal"} {
+		if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove %s: %w", f, err)
+		}
+	}
+	return nil
 }
 
 func (s *Store) Close() error {
