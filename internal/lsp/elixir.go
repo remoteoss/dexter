@@ -97,7 +97,7 @@ func ExtractFullExpression(line string, col int) string {
 // Returns ("Foo.Bar", "baz") for "Foo.Bar.baz", ("Foo.Bar.Baz", "") for "Foo.Bar.Baz",
 // ("", "do_something") for "do_something".
 func ExtractModuleAndFunction(expr string) (moduleRef string, functionName string) {
-	var moduleParts []string
+	moduleParts := make([]string, 0, 4)
 	for _, part := range strings.Split(expr, ".") {
 		if len(part) == 0 {
 			continue
@@ -175,7 +175,7 @@ type BufferFunction struct {
 // Private types (@typep) are included since they are accessible within the same file.
 func FindBufferFunctions(text string) []BufferFunction {
 	seen := make(map[string]bool)
-	var results []BufferFunction
+	results := make([]BufferFunction, 0, 16)
 	for _, line := range strings.Split(text, "\n") {
 		if m := parser.FuncDefRe.FindStringSubmatch(line); m != nil {
 			name := m[2]
@@ -261,15 +261,15 @@ func extractAliasesFromLines(lines []string, targetLine int) map[string]string {
 		depth int // do..end nesting depth when this module was opened
 	}
 
-	var stack []moduleFrame
+	stack := make([]moduleFrame, 0, 4)
 	depth := 0
 
 	// Per-scope alias collection: module name → alias map
-	var allAliases []struct {
+	allAliases := make([]struct {
 		scope string
 		short string
 		full  string
-	}
+	}, 0, 8)
 	var targetModule string
 	unscoped := targetLine < 0
 	inHeredoc := false
@@ -829,7 +829,7 @@ func FindFunctionDefinition(text string, functionName string) (int, bool) {
 // including direct calls like functionName(...) and pipe calls like |> functionName.
 // Returns 1-based line numbers. Definition lines are excluded.
 func FindBareFunctionCalls(text string, functionName string) []int {
-	var lineNums []int
+	lineNums := make([]int, 0, 8)
 	for i, line := range strings.Split(text, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if m := parser.FuncDefRe.FindStringSubmatch(trimmed); m != nil && m[2] == functionName {

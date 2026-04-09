@@ -86,9 +86,9 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 	}
 
 	lines := strings.Split(text, "\n")
-	var defs []Definition
-	var refs []Reference
-	var moduleStack []moduleFrame
+	defs := make([]Definition, 0, 32)
+	refs := make([]Reference, 0, 64)
+	moduleStack := make([]moduleFrame, 0, 4)
 	depth := 0
 	aliases := map[string]string{} // short name -> full module
 	injectors := map[string]bool{} // modules from use/import that inject bare functions

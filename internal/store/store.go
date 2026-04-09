@@ -387,7 +387,7 @@ func (s *Store) ListFilePaths() ([]string, error) {
 	}
 	defer func() { _ = rows.Close() }()
 
-	var paths []string
+	paths := make([]string, 0, 256)
 	for rows.Next() {
 		var path string
 		if err := rows.Scan(&path); err != nil {
@@ -449,7 +449,7 @@ func (s *Store) SearchModulesBySuffix(segment string) ([]CompletionResult, error
 	}
 	defer func() { _ = rows.Close() }()
 
-	var results []CompletionResult
+	results := make([]CompletionResult, 0, 20)
 	for rows.Next() {
 		var r CompletionResult
 		if err := rows.Scan(&r.Module); err != nil {
@@ -471,7 +471,7 @@ func (s *Store) SearchModules(prefix string) ([]CompletionResult, error) {
 	}
 	defer func() { _ = rows.Close() }()
 
-	var results []CompletionResult
+	results := make([]CompletionResult, 0, 32)
 	for rows.Next() {
 		var r CompletionResult
 		if err := rows.Scan(&r.Module); err != nil {
@@ -502,7 +502,7 @@ func (s *Store) SearchSubmoduleSegments(parentModule string, segmentPrefix strin
 
 	parentDot := parentModule + "."
 	seen := make(map[string]bool)
-	var segments []string
+	segments := make([]string, 0, 16)
 	for rows.Next() {
 		var module string
 		if err := rows.Scan(&module); err != nil {
@@ -536,7 +536,7 @@ func (s *Store) ListModuleFunctions(module string, publicOnly bool) ([]Completio
 	}
 	defer func() { _ = rows.Close() }()
 
-	var results []CompletionResult
+	results := make([]CompletionResult, 0, 16)
 	for rows.Next() {
 		var r CompletionResult
 		if err := rows.Scan(&r.Module, &r.Function, &r.Arity, &r.Kind, &r.FilePath, &r.Line, &r.Params); err != nil {
@@ -573,7 +573,7 @@ func (s *Store) LookupModulesInFile(filePath string) ([]string, error) {
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
-	var modules []string
+	modules := make([]string, 0, 4)
 	for rows.Next() {
 		var mod string
 		if err := rows.Scan(&mod); err != nil {
@@ -641,7 +641,7 @@ func (s *Store) LookupCallbackDef(behaviourModule, function string) ([]CallbackR
 	}
 	defer func() { _ = rows.Close() }()
 
-	var results []CallbackResult
+	results := make([]CallbackResult, 0, 4)
 	for rows.Next() {
 		var r CallbackResult
 		if err := rows.Scan(&r.FilePath, &r.Line, &r.Kind, &r.Arity); err != nil {
@@ -677,7 +677,7 @@ func (s *Store) LookupCallbackDefGlobal(function string, arity int) ([]CallbackR
 	}
 	defer func() { _ = rows.Close() }()
 
-	var results []CallbackResult
+	results := make([]CallbackResult, 0, 4)
 	for rows.Next() {
 		var r CallbackResult
 		if err := rows.Scan(&r.FilePath, &r.Line, &r.Kind, &r.Arity); err != nil {
@@ -706,7 +706,7 @@ func (s *Store) LookupBehavioursForFile(filePath string) ([]string, error) {
 	}
 	defer func() { _ = rows.Close() }()
 
-	var modules []string
+	modules := make([]string, 0, 4)
 	for rows.Next() {
 		var module string
 		if err := rows.Scan(&module); err != nil {
@@ -744,7 +744,7 @@ func (s *Store) LookupBehaviourImplementors(behaviourModule string) ([]Behaviour
 	}
 	defer func() { _ = rows.Close() }()
 
-	var results []BehaviourImplementorResult
+	results := make([]BehaviourImplementorResult, 0, 8)
 	for rows.Next() {
 		var r BehaviourImplementorResult
 		if err := rows.Scan(&r.Module, &r.FilePath); err != nil {
@@ -789,7 +789,7 @@ func (s *Store) queryLookup(query string, args ...interface{}) ([]LookupResult, 
 	}
 	defer func() { _ = rows.Close() }()
 
-	var results []LookupResult
+	results := make([]LookupResult, 0, 4)
 	for rows.Next() {
 		var r LookupResult
 		if err := rows.Scan(&r.FilePath, &r.Line, &r.Kind, &r.DelegateTo, &r.DelegateAs); err != nil {
@@ -819,7 +819,7 @@ func (s *Store) LookupReferences(module, function string) ([]ReferenceResult, er
 	}
 	defer func() { _ = rows.Close() }()
 
-	var results []ReferenceResult
+	results := make([]ReferenceResult, 0, 16)
 	for rows.Next() {
 		var r ReferenceResult
 		if err := rows.Scan(&r.FilePath, &r.Line, &r.Kind); err != nil {
@@ -851,7 +851,7 @@ func (s *Store) LookupReferencesByPrefix(prefix string) ([]ModuleReferenceResult
 	}
 	defer func() { _ = rows.Close() }()
 
-	var results []ModuleReferenceResult
+	results := make([]ModuleReferenceResult, 0, 16)
 	for rows.Next() {
 		var r ModuleReferenceResult
 		if err := rows.Scan(&r.Module, &r.FilePath, &r.Line, &r.Kind); err != nil {
@@ -875,7 +875,7 @@ func (s *Store) LookupModulesByPrefix(prefix string) ([]LookupResult, error) {
 	}
 	defer func() { _ = rows.Close() }()
 
-	var results []LookupResult
+	results := make([]LookupResult, 0, 8)
 	for rows.Next() {
 		var r LookupResult
 		if err := rows.Scan(&r.Module, &r.FilePath, &r.Line, &r.Kind, &r.DelegateTo, &r.DelegateAs); err != nil {
@@ -912,7 +912,7 @@ func (s *Store) LookupDelegatesTo(targetModule, targetFunction string) ([]Delega
 	}
 	defer func() { _ = rows.Close() }()
 
-	var results []DelegateEntry
+	results := make([]DelegateEntry, 0, 4)
 	for rows.Next() {
 		var r DelegateEntry
 		if err := rows.Scan(&r.Module, &r.Function, &r.DelegateAs, &r.FilePath, &r.Line); err != nil {
@@ -971,7 +971,7 @@ func (s *Store) SearchSymbols(query string, excludePathPrefix ...string) ([]Comp
 	}
 	defer func() { _ = rows.Close() }()
 
-	var results []CompletionResult
+	results := make([]CompletionResult, 0, 16)
 	for rows.Next() {
 		var r CompletionResult
 		if err := rows.Scan(&r.Module, &r.Function, &r.Arity, &r.Kind, &r.FilePath, &r.Line); err != nil {
@@ -994,7 +994,7 @@ func (s *Store) ListSubmodules(prefix string) ([]string, error) {
 	}
 	defer func() { _ = rows.Close() }()
 
-	var modules []string
+	modules := make([]string, 0, 8)
 	for rows.Next() {
 		var mod string
 		if err := rows.Scan(&mod); err != nil {
@@ -1020,7 +1020,7 @@ func (s *Store) LookupUsingModules() ([]UsingModule, error) {
 	}
 	defer func() { _ = rows.Close() }()
 
-	var modules []UsingModule
+	modules := make([]UsingModule, 0, 8)
 	for rows.Next() {
 		var m UsingModule
 		if err := rows.Scan(&m.Module, &m.FilePath); err != nil {
@@ -1077,7 +1077,7 @@ func (s *Store) LookupRefsInRange(filePath string, startLine, endLine int) ([]Ou
 	}
 	defer func() { _ = rows.Close() }()
 
-	var results []OutgoingRef
+	results := make([]OutgoingRef, 0, 8)
 	for rows.Next() {
 		var r OutgoingRef
 		if err := rows.Scan(&r.Module, &r.Function, &r.Line); err != nil {
