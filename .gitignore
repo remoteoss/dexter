@@ -3,6 +3,7 @@ dexter
 
 # Database
 *.db
+.dexter/
 
 # OS
 .DS_Store
