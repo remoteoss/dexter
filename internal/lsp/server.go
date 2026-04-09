@@ -286,16 +286,20 @@ func (s *Server) notifyOTPMismatch(stderr string) {
 // === LSP Lifecycle ===
 
 func (s *Server) Initialize(ctx context.Context, params *protocol.InitializeParams) (*protocol.InitializeResult, error) {
+	// Note: unlike cmd/main.go, the LSP deliberately does NOT pass "mix.exs"
+	// to store.FindProjectRoot. In a monorepo we want to anchor on
+	// .dexter/dexter.db or .git so the whole repo is indexed, not the first
+	// nested Mix app we encounter.
 	if !s.explicitRoot {
 		if len(params.WorkspaceFolders) > 0 {
 			root := uriToPath(protocol.DocumentURI(params.WorkspaceFolders[0].URI))
 			if root != "" {
-				s.projectRoot = findDexterRoot(root)
+				s.projectRoot = store.FindProjectRoot(root)
 			}
 		} else if params.RootURI != "" { //nolint:staticcheck // RootURI is deprecated but Neovim still sends it
 			root := uriToPath(params.RootURI) //nolint:staticcheck
 			if root != "" {
-				s.projectRoot = findDexterRoot(root)
+				s.projectRoot = store.FindProjectRoot(root)
 			}
 		}
 	}
@@ -730,25 +734,6 @@ func nthLine(text string, n int) (string, bool) {
 		return text[start:], true
 	}
 	return text[start : start+end], true
-}
-
-// findDexterRoot walks up from the given path looking for .dexter.db first,
-// then .git (monorepo root), falling back to the original path.
-func findDexterRoot(path string) string {
-	for _, marker := range []string{".dexter.db", ".git"} {
-		dir := path
-		for {
-			if _, err := os.Stat(filepath.Join(dir, marker)); err == nil {
-				return dir
-			}
-			parent := filepath.Dir(dir)
-			if parent == dir {
-				break
-			}
-			dir = parent
-		}
-	}
-	return path
 }
 
 // findMixRoot walks up from dir looking for the nearest mix.exs.
