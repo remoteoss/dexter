@@ -1255,6 +1255,44 @@ end
 	}
 }
 
+func TestParseFile_TrailingFnDoesNotPopModule(t *testing.T) {
+	// Regression: "handler = fn" at end of line was not detected as a block
+	// opener because ContainsFn required a space after "fn".
+	path := writeTempFile(t, `defmodule MyModule do
+  def build do
+    handler = fn
+      :ok -> true
+      :error -> false
+    end
+
+    handler
+  end
+
+  def next(x) do
+    x + 1
+  end
+end
+`)
+
+	defs, _, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	funcs := map[string]string{}
+	for _, d := range defs {
+		if d.Function != "" {
+			funcs[d.Function] = d.Module
+		}
+	}
+
+	for _, name := range []string{"build", "next"} {
+		if funcs[name] != "MyModule" {
+			t.Errorf("%s should belong to MyModule, got %q (all funcs: %v)", name, funcs[name], funcs)
+		}
+	}
+}
+
 func TestParseFile_FnEndWithTrailingParen(t *testing.T) {
 	path := writeTempFile(t, `defmodule MyModule do
   def process(enumerable) do

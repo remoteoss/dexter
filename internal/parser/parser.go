@@ -672,26 +672,15 @@ func ContainsDo(trimmed string) bool {
 	return trimmed == "do" || strings.HasSuffix(trimmed, " do") || strings.HasSuffix(trimmed, "\tdo")
 }
 
-// IsEnd returns true if the trimmed line is a block-closing "end", possibly
-// followed by closing punctuation like ")" or ",". This handles both standalone
-// "end" and "end)" as seen when fn...end is passed as an argument.
+// IsEnd returns true if the trimmed line starts with the block-closing "end"
+// keyword. It distinguishes "end" from identifiers like "endpoint" by checking
+// that the character after "end" is not an identifier character.
 func IsEnd(trimmed string) bool {
-	if trimmed == "end" {
-		return true
-	}
 	if !strings.HasPrefix(trimmed, "end") {
 		return false
 	}
-	// "end" followed only by closing punctuation/delimiters
-	for i := 3; i < len(trimmed); i++ {
-		switch trimmed[i] {
-		case ')', ']', '}', ',', ' ', '\t':
-			// valid trailing chars after end
-		default:
-			return false
-		}
-	}
-	return true
+	// "end" at end of string, or followed by a non-identifier char
+	return len(trimmed) == 3 || !isIdentChar(trimmed[3])
 }
 
 // OpensBlock returns true if the trimmed line opens a block that will be closed
@@ -705,21 +694,8 @@ func OpensBlock(trimmed string) bool {
 // It returns false when the fn...end is entirely on one line.
 // Callers should pass input through StripCommentsAndStrings first.
 func ContainsFn(code string) bool {
-	if !strings.HasPrefix(code, "fn ") && code != "fn" {
-		// Also handle fn appearing mid-expression, e.g. "x = fn arg ->"
-		idx := strings.Index(code, " fn ")
-		if idx < 0 {
-			// Check for patterns like "Enum.map(list, fn arg ->" or "(fn arg ->"
-			for _, prefix := range []string{"(fn ", ",fn ", ", fn "} {
-				if i := strings.Index(code, prefix); i >= 0 {
-					idx = i + len(prefix) - len("fn ")
-					break
-				}
-			}
-		}
-		if idx < 0 {
-			return false
-		}
+	if !containsFnKeyword(code) {
+		return false
 	}
 	// Must not have a matching end on the same line (inline fn...end).
 	if idx := strings.LastIndex(code, " end"); idx >= 0 {
@@ -728,6 +704,34 @@ func ContainsFn(code string) bool {
 		}
 	}
 	return true
+}
+
+// containsFnKeyword returns true if code contains "fn" as a standalone keyword,
+// not part of a longer identifier. The character before "fn" must be a
+// non-identifier char (or start of string), and the character after must also
+// be a non-identifier char (or end of string).
+func containsFnKeyword(code string) bool {
+	for i := 0; i <= len(code)-2; i++ {
+		if code[i] != 'f' || code[i+1] != 'n' {
+			continue
+		}
+		// Check character before: must be start of string or non-identifier.
+		// ':' before means it's an atom (:fn), not the keyword.
+		if i > 0 && (isIdentChar(code[i-1]) || code[i-1] == ':') {
+			continue
+		}
+		// Check character after: must be end of string or non-identifier.
+		// ':' after means it's a keyword key (fn: value), not the keyword.
+		if i+2 < len(code) && (isIdentChar(code[i+2]) || code[i+2] == ':') {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func isIdentChar(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_'
 }
 
 // findDelegateTo searches the current line and up to 5 subsequent lines for a to: target,

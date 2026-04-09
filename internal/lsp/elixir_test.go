@@ -424,6 +424,29 @@ end
 			t.Errorf("expected Settings alias with do/end in strings, got %q", aliases["Settings"])
 		}
 	})
+
+	t.Run("trailing fn with no args does not break scope", func(t *testing.T) {
+		// Regression: "handler = fn" at end of line was not detected by ContainsFn
+		// because all patterns required a space after "fn".
+		trailingFnSrc := `defmodule MyApp.Builder do
+  alias MyApp.Validator
+
+  def build do
+    handler = fn
+      :ok -> true
+      :error -> false
+    end
+
+    Validator.run(handler)
+  end
+end
+`
+		// Line 10 = "Validator.run(handler)" — should still see aliases
+		aliases := ExtractAliasesInScope(trailingFnSrc, 10)
+		if aliases["Validator"] != "MyApp.Validator" {
+			t.Errorf("expected Validator alias after trailing fn, got %q", aliases["Validator"])
+		}
+	})
 }
 
 func TestExtractImports(t *testing.T) {
