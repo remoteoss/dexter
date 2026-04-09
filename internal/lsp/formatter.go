@@ -172,7 +172,7 @@ func (s *Server) startFormatterProcess(mixRoot, formatterExs string) (*formatter
 	}
 
 	elixirBin := filepath.Join(filepath.Dir(s.mixBin), "elixir")
-	cmd := exec.Command(elixirBin, scriptPath, mixRoot, formatterExs)
+	cmd := exec.Command(elixirBin, scriptPath, mixRoot, formatterExs, s.projectRoot)
 	cmd.Dir = mixRoot
 
 	stdin, err := cmd.StdinPipe()
