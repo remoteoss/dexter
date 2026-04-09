@@ -3,6 +3,7 @@ package store
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/remoteoss/dexter/internal/parser"
@@ -1148,4 +1149,84 @@ end
 	if results[0].Module != "MyApp.Users" {
 		t.Errorf("expected case-sensitive match MyApp.Users first, got %s.%s", results[0].Module, results[0].Function)
 	}
+}
+
+func TestFindProjectRoot(t *testing.T) {
+	// Helper: create a directory tree inside t.TempDir() and return the root.
+	mktree := func(t *testing.T, files []string) string {
+		t.Helper()
+		root := t.TempDir()
+		for _, rel := range files {
+			full := filepath.Join(root, rel)
+			if strings.HasSuffix(rel, "/") {
+				if err := os.MkdirAll(full, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				continue
+			}
+			if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(full, []byte(""), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return root
+	}
+
+	t.Run("new layout at root", func(t *testing.T) {
+		root := mktree(t, []string{".dexter/dexter.db", "apps/app/lib/foo.ex"})
+		got := FindProjectRoot(filepath.Join(root, "apps", "app"))
+		if got != root {
+			t.Errorf("got %q, want %q", got, root)
+		}
+	})
+
+	t.Run("legacy file at root", func(t *testing.T) {
+		root := mktree(t, []string{".dexter.db", "apps/app/lib/foo.ex"})
+		got := FindProjectRoot(filepath.Join(root, "apps", "app"))
+		if got != root {
+			t.Errorf("got %q, want %q", got, root)
+		}
+	})
+
+	t.Run("git fallback", func(t *testing.T) {
+		root := mktree(t, []string{".git/", "apps/app/lib/foo.ex"})
+		got := FindProjectRoot(filepath.Join(root, "apps", "app"))
+		if got != root {
+			t.Errorf("got %q, want %q", got, root)
+		}
+	})
+
+	t.Run("mix.exs extra marker", func(t *testing.T) {
+		root := mktree(t, []string{"apps/app/mix.exs", "apps/app/lib/foo.ex"})
+		start := filepath.Join(root, "apps", "app", "lib")
+		got := FindProjectRoot(start, "mix.exs")
+		want := filepath.Join(root, "apps", "app")
+		if got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	})
+
+	t.Run("no marker returns input", func(t *testing.T) {
+		root := mktree(t, []string{"lib/foo.ex"})
+		start := filepath.Join(root, "lib")
+		got := FindProjectRoot(start)
+		if got != start {
+			t.Errorf("got %q, want %q", got, start)
+		}
+	})
+
+	t.Run("new layout preferred over legacy", func(t *testing.T) {
+		// New layout at the repo root, legacy file inside a nested subdir.
+		// Walking up from the subdir must return the repo root (matching
+		// .dexter/dexter.db first), not the subdir — a reversed priority
+		// would incorrectly match the closer .dexter.db.
+		root := mktree(t, []string{".dexter/dexter.db", "apps/app/.dexter.db"})
+		cwd := filepath.Join(root, "apps", "app")
+		got := FindProjectRoot(cwd)
+		if got != root {
+			t.Errorf("got %q, want %q", got, root)
+		}
+	})
 }

@@ -34,6 +34,41 @@ func LegacyDBPath(projectRoot string) string {
 	return filepath.Join(projectRoot, ".dexter.db")
 }
 
+// FindProjectRoot walks up from path looking for known dexter/project
+// markers. The default markers (in priority order) are:
+//
+//  1. .dexter/dexter.db — the current database layout
+//  2. .dexter.db         — the legacy layout (pre-.dexter/ folder)
+//  3. .git               — repository root fallback
+//
+// Additional markers can be passed via extraMarkers; they are tried after
+// the defaults, in the order given. The CLI passes "mix.exs" to fall back
+// to the nearest Mix project when no dexter/git marker is found.
+//
+// Returns the original path if no marker is found.
+func FindProjectRoot(path string, extraMarkers ...string) string {
+	markers := append([]string{
+		filepath.Join(".dexter", "dexter.db"),
+		".dexter.db",
+		".git",
+	}, extraMarkers...)
+
+	for _, marker := range markers {
+		dir := path
+		for {
+			if _, err := os.Stat(filepath.Join(dir, marker)); err == nil {
+				return dir
+			}
+			parent := filepath.Dir(dir)
+			if parent == dir {
+				break
+			}
+			dir = parent
+		}
+	}
+	return path
+}
+
 func Open(projectRoot string) (*Store, error) {
 	dbPath := filepath.Join(projectRoot, ".dexter.db")
 	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=5000&_foreign_keys=ON")
