@@ -377,8 +377,9 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 
 			if currentModule != "" {
 				if kind, funcName, ok := ScanFuncDef(rest); ok {
-					maxArity := ExtractArity(line, funcName)
-					defaultCount := CountDefaultParams(line, funcName)
+					paramContent := FindParamContent(line, funcName)
+					maxArity := ArityFromParams(paramContent)
+					defaultCount := DefaultsFromParams(paramContent)
 					minArity := maxArity - defaultCount
 
 					var delegateTo, delegateAs string
@@ -775,25 +776,34 @@ func findDelegateToAndAs(lines []string, startIdx int, aliases map[string]string
 	return targetModule, targetFunc
 }
 
-// ExtractArity counts the number of arguments in a function definition line.
-// It finds the first parenthesized argument list after the function name and
-// counts top-level commas, respecting nested parens/brackets/braces.
-func ExtractArity(line string, funcName string) int {
+// FindParamContent locates funcName in line, finds the opening parenthesis
+// after it, and returns the substring starting after that '('. Returns ""
+// if funcName is not found or has no parenthesized arguments.
+// This allows callers that need both arity and default counts to avoid
+// repeating the Index + IndexByte lookup.
+func FindParamContent(line, funcName string) string {
 	idx := strings.Index(line, funcName)
 	if idx < 0 {
-		return 0
+		return ""
 	}
 	rest := line[idx+len(funcName):]
-
 	parenIdx := strings.IndexByte(rest, '(')
 	if parenIdx < 0 {
+		return ""
+	}
+	return rest[parenIdx+1:]
+}
+
+// ArityFromParams counts the number of top-level arguments in the parameter
+// content string (as returned by FindParamContent). Respects nested
+// parens/brackets/braces and skips string literals.
+func ArityFromParams(inside string) int {
+	if inside == "" {
 		return 0
 	}
-
 	depth := 1
 	commas := 0
 	hasContent := false
-	inside := rest[parenIdx+1:]
 	for i := 0; i < len(inside); i++ {
 		ch := inside[i]
 		// Skip string and charlist literals
@@ -822,31 +832,21 @@ func ExtractArity(line string, funcName string) int {
 			hasContent = true
 		}
 	}
-
 	if hasContent {
 		return commas + 1
 	}
 	return 0
 }
 
-// CountDefaultParams counts the number of parameters with default values (\\)
-// in a function definition line. Only counts defaults at the top-level param
-// depth, not inside nested structures.
-func CountDefaultParams(line string, funcName string) int {
-	idx := strings.Index(line, funcName)
-	if idx < 0 {
+// DefaultsFromParams counts parameters with default values (\\) in the
+// parameter content string (as returned by FindParamContent). Only counts
+// defaults at the top-level param depth, not inside nested structures.
+func DefaultsFromParams(inside string) int {
+	if inside == "" {
 		return 0
 	}
-	rest := line[idx+len(funcName):]
-
-	parenIdx := strings.IndexByte(rest, '(')
-	if parenIdx < 0 {
-		return 0
-	}
-
 	depth := 1
 	defaults := 0
-	inside := rest[parenIdx+1:]
 	for i := 0; i < len(inside); i++ {
 		ch := inside[i]
 		// Skip string and charlist literals
@@ -870,6 +870,20 @@ func CountDefaultParams(line string, funcName string) int {
 		}
 	}
 	return defaults
+}
+
+// ExtractArity counts the number of arguments in a function definition line.
+// It finds the first parenthesized argument list after the function name and
+// counts top-level commas, respecting nested parens/brackets/braces.
+func ExtractArity(line string, funcName string) int {
+	return ArityFromParams(FindParamContent(line, funcName))
+}
+
+// CountDefaultParams counts the number of parameters with default values (\\)
+// in a function definition line. Only counts defaults at the top-level param
+// depth, not inside nested structures.
+func CountDefaultParams(line string, funcName string) int {
+	return DefaultsFromParams(FindParamContent(line, funcName))
 }
 
 // ExtractParamNames extracts readable parameter names from a function
