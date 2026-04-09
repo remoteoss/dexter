@@ -6,34 +6,38 @@ A fast, full-featured Elixir LSP optimized for large Elixir codebases.
 
 ## Table of contents
 
-- [Features](#features)
-- [Quick start](#quick-start)
-- [Editor setup](#editor-setup)
-  - [VS Code / Cursor](#vs-code--cursor)
-  - [Neovim (0.11+)](#neovim-011)
-  - [Neovim (with nvim-lspconfig — \< 0.11)](#neovim-with-nvim-lspconfig---011)
-  - [Zed](#zed)
-- [Why build another LSP?](#why-build-another-lsp)
-- [Performance](#performance)
-- [CLI usage](#cli-usage)
-  - [Index a project](#index-a-project)
-  - [Look up definitions](#look-up-definitions)
-  - [Find references](#find-references)
-  - [Reindexing files manually](#reindexing-files-manually)
-- [Hover documentation](#hover-documentation)
-  - [Cursor-position-aware resolution](#cursor-position-aware-resolution)
-- [Rename](#rename)
-  - [Modules](#modules)
-  - [Functions](#functions)
-  - [Variables](#variables)
-- [Lightning-fast formatting](#lightning-fast-formatting)
-- [LSP options](#lsp-options)
-- [Index database location (.dexter.db)](#index-database-location-dexterdb)
-- [Debugging](#debugging)
-- [Development (building from source)](#development-building-from-source)
-- [Releasing](#releasing)
-- [Contributing](#contributing)
-- [License](#license)
+- [Dexter](#dexter)
+  - [Table of contents](#table-of-contents)
+  - [Features](#features)
+  - [Quick start](#quick-start)
+    - [Install via mise or asdf](#install-via-mise-or-asdf)
+  - [Editor setup](#editor-setup)
+    - [VS Code / Cursor](#vs-code--cursor)
+      - [Configuration](#configuration)
+    - [Neovim (0.11+)](#neovim-011)
+    - [Neovim (with nvim-lspconfig — \< 0.11)](#neovim-with-nvim-lspconfig---011)
+    - [Zed](#zed)
+  - [Why build another LSP?](#why-build-another-lsp)
+  - [Performance](#performance)
+  - [CLI usage](#cli-usage)
+    - [Index a project](#index-a-project)
+    - [Look up definitions](#look-up-definitions)
+    - [Find references](#find-references)
+    - [Reindexing files manually](#reindexing-files-manually)
+  - [Hover documentation](#hover-documentation)
+    - [Cursor-position-aware resolution](#cursor-position-aware-resolution)
+  - [Rename](#rename)
+    - [Modules](#modules)
+    - [Functions](#functions)
+    - [Variables](#variables)
+  - [Lightning-fast formatting](#lightning-fast-formatting)
+  - [LSP options](#lsp-options)
+  - [Index database location (.dexter.db)](#index-database-location-dexterdb)
+  - [Debugging](#debugging)
+  - [Development (building from source)](#development-building-from-source)
+  - [Releasing](#releasing)
+  - [Contributing](#contributing)
+  - [License](#license)
 
 ## Features
 
@@ -215,7 +219,7 @@ Measured on a 57k-file Elixir monorepo (330k definitions, 2.7M references) on a 
 
 | Operation | Time |
 |-----------|------|
-| Full cold reindex | ~11s |
+| Cold first-time index | ~11s |
 | Lookup (LSP or CLI) | ~10ms |
 | Single file reindex (on save) | ~10ms |
 | Full reindex (no changes) | ~2s |
