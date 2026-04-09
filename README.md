@@ -117,15 +117,11 @@ Dexter works with any editor that supports the Language Server Protocol. Below a
 
 ### VS Code / Cursor
 
-Install the [dexter-vscode](https://github.com/remoteoss/dexter-vscode) extension:
+Install the [Dexter VS Code Extension](https://marketplace.visualstudio.com/items?itemName=remoteoss.dexter-lsp).
 
-```sh
-git clone https://github.com/remoteoss/dexter-vscode.git
-cd dexter-vscode
-make install   # for Cursor, or make install-vscode for VS Code
-```
+Or, if you prefer to install from source: [dexter-vscode](https://github.com/remoteoss/dexter-vscode?tab=readme-ov-file#development).
 
-You'll need to restart your editor after installing.
+#### Configuration
 
 If you installed via Mise or ASDF, you're all done!
 
