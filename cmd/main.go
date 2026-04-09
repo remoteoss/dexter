@@ -146,25 +146,11 @@ func findProjectRoot(path string) string {
 	if !info.IsDir() {
 		path = filepath.Dir(path)
 	}
-
-	for _, marker := range []string{".dexter.db", ".git", "mix.exs"} {
-		dir := path
-		for {
-			if _, err := os.Stat(filepath.Join(dir, marker)); err == nil {
-				return dir
-			}
-			parent := filepath.Dir(dir)
-			if parent == dir {
-				break
-			}
-			dir = parent
-		}
-	}
-	return path
+	return store.FindProjectRoot(path, "mix.exs")
 }
 
 func cmdInit(projectRoot string, force bool, profile bool) {
-	dbPath := filepath.Join(projectRoot, ".dexter.db")
+	dbPath := store.DBPath(projectRoot)
 	if _, err := os.Stat(dbPath); err == nil {
 		if !force {
 			fmt.Fprintf(os.Stderr, "Index already exists at %s\n", dbPath)
