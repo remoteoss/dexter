@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/remoteoss/dexter/internal/store"
 )
 
 // buildDexter builds the binary once for all integration tests
@@ -459,8 +461,8 @@ end`,
 		t.Errorf("expected lookup to find Foo via .git root db, got: %s", out)
 	}
 
-	if _, err := os.Stat(filepath.Join(subapp, ".dexter.db")); err == nil {
-		t.Error("should not have created a second .dexter.db in the subapp")
+	if _, err := os.Stat(filepath.Join(subapp, ".dexter", "dexter.db")); err == nil {
+		t.Error("should not have created a second .dexter/dexter.db in the subapp")
 	}
 }
 
@@ -505,7 +507,7 @@ func TestIntegration_CorruptDBRecovery(t *testing.T) {
 	runDexter(t, binary, root, "init", root)
 
 	// Corrupt the DB with garbage bytes
-	dbPath := filepath.Join(root, ".dexter.db")
+	dbPath := store.DBPath(root)
 	if err := os.WriteFile(dbPath, []byte("not a sqlite database"), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -520,5 +522,45 @@ func TestIntegration_CorruptDBRecovery(t *testing.T) {
 	out2 := runDexter(t, binary, root, "lookup", "MyApp.Repo", "get")
 	if !strings.Contains(out2, "repo.ex:2") {
 		t.Errorf("expected lookup to work after corrupt DB recovery, got: %s", out2)
+	}
+}
+
+// TestIntegration_LegacyMigration simulates an upgrade path: a project with
+// the pre-.dexter/ folder layout (legacy .dexter.db file and its WAL
+// siblings at the root) is migrated automatically on the next dexter
+// invocation. The legacy files should be deleted and a fresh index built
+// at .dexter/dexter.db.
+func TestIntegration_LegacyMigration(t *testing.T) {
+	binary := buildDexter(t)
+	root := scaffoldProject(t)
+
+	// Seed the legacy layout.
+	legacy := filepath.Join(root, ".dexter.db")
+	for _, f := range []string{legacy, legacy + "-shm", legacy + "-wal"} {
+		if err := os.WriteFile(f, []byte("legacy placeholder"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Run init — migration runs inside store.Open.
+	runDexter(t, binary, root, "init", root)
+
+	// Legacy files should be gone.
+	for _, f := range []string{legacy, legacy + "-shm", legacy + "-wal"} {
+		if _, err := os.Stat(f); !os.IsNotExist(err) {
+			t.Errorf("legacy file %s still exists after migration", f)
+		}
+	}
+
+	// New DB should exist and be functional.
+	newDB := filepath.Join(root, ".dexter", "dexter.db")
+	if _, err := os.Stat(newDB); err != nil {
+		t.Errorf("new DB not created: %v", err)
+	}
+
+	// Lookups should work against the migrated index.
+	out := runDexter(t, binary, root, "lookup", "MyApp.Repo")
+	if !strings.Contains(out, "repo.ex:1") {
+		t.Errorf("expected lookup to work after migration, got: %s", out)
 	}
 }
