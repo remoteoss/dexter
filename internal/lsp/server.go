@@ -2829,11 +2829,13 @@ func (s *Server) PrepareRename(ctx context.Context, params *protocol.PrepareRena
 	// Try module/function rename via the index
 	if expr != "" {
 		aliases := ExtractAliasesInScope(text, lineNum)
-		s.mergeAliasesFromUse(text, aliases)
 
 		// Detect `as:` aliases — these are file-local renames, not module renames.
 		// An `as:` alias has a short name that differs from the last segment of
 		// the resolved module (e.g. TransactionReceiptSchema → MyApp.Billing.TransactionReceipt).
+		// This check runs before merging use-injected aliases because those
+		// declarations live in another file's __using__ macro and must not be
+		// treated as file-local renames.
 		if moduleRef != "" && functionName == "" {
 			if resolved, ok := aliases[moduleRef]; ok && moduleLastSegment(resolved) != moduleRef {
 				// File-local alias rename: find all occurrences in this file
@@ -2843,6 +2845,8 @@ func (s *Server) PrepareRename(ctx context.Context, params *protocol.PrepareRena
 				}, nil
 			}
 		}
+
+		s.mergeAliasesFromUse(text, aliases)
 
 		var tokenName string
 		var fullModule string
@@ -3223,10 +3227,11 @@ func (s *Server) Rename(ctx context.Context, params *protocol.RenameParams) (*pr
 	// Try module/function rename via the index
 	if expr != "" {
 		aliases := ExtractAliasesInScope(text, lineNum)
-		s.mergeAliasesFromUse(text, aliases)
 
 		// Detect `as:` aliases — file-local rename of the alias name, not
-		// the underlying module.
+		// the underlying module. This check runs before merging use-injected
+		// aliases because those declarations live in another file's __using__
+		// macro and must not be treated as file-local renames.
 		if moduleRef != "" && functionName == "" {
 			if resolved, ok := aliases[moduleRef]; ok && moduleLastSegment(resolved) != moduleRef {
 				if !isValidModuleName(params.NewName) {
@@ -3254,6 +3259,8 @@ func (s *Server) Rename(ctx context.Context, params *protocol.RenameParams) (*pr
 				return &protocol.WorkspaceEdit{Changes: changes}, nil
 			}
 		}
+
+		s.mergeAliasesFromUse(text, aliases)
 
 		if functionName != "" {
 			var fullModule string
