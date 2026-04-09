@@ -16,6 +16,24 @@ type Store struct {
 	db *sql.DB
 }
 
+// DBPath returns the canonical database path for a project root:
+// <root>/.dexter/dexter.db
+func DBPath(projectRoot string) string {
+	return filepath.Join(projectRoot, ".dexter", "dexter.db")
+}
+
+// DBDir returns the directory that holds the database: <root>/.dexter
+func DBDir(projectRoot string) string {
+	return filepath.Join(projectRoot, ".dexter")
+}
+
+// LegacyDBPath returns the pre-migration database path: <root>/.dexter.db
+// Used only for detecting and deleting databases created before the
+// .dexter/ folder layout.
+func LegacyDBPath(projectRoot string) string {
+	return filepath.Join(projectRoot, ".dexter.db")
+}
+
 func Open(projectRoot string) (*Store, error) {
 	dbPath := filepath.Join(projectRoot, ".dexter.db")
 	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=5000&_foreign_keys=ON")

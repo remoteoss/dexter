@@ -8,6 +8,30 @@ import (
 	"github.com/remoteoss/dexter/internal/parser"
 )
 
+func TestDBPath(t *testing.T) {
+	got := DBPath("/project/root")
+	want := filepath.Join("/project/root", ".dexter", "dexter.db")
+	if got != want {
+		t.Errorf("DBPath = %q, want %q", got, want)
+	}
+}
+
+func TestDBDir(t *testing.T) {
+	got := DBDir("/project/root")
+	want := filepath.Join("/project/root", ".dexter")
+	if got != want {
+		t.Errorf("DBDir = %q, want %q", got, want)
+	}
+}
+
+func TestLegacyDBPath(t *testing.T) {
+	got := LegacyDBPath("/project/root")
+	want := filepath.Join("/project/root", ".dexter.db")
+	if got != want {
+		t.Errorf("LegacyDBPath = %q, want %q", got, want)
+	}
+}
+
 func setupTestStore(t *testing.T) (*Store, string) {
 	t.Helper()
 	dir := t.TempDir()
