@@ -6,7 +6,6 @@ A fast, full-featured Elixir LSP optimized for large Elixir codebases.
 
 ## Table of contents
 
-- [Table of contents](#table-of-contents)
 - [Features](#features)
 - [Quick start](#quick-start)
   - [Install via mise or asdf](#install-via-mise-or-asdf)
