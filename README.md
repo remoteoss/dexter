@@ -39,7 +39,7 @@ A fast, full-featured Elixir LSP optimized for large Elixir codebases.
 
 ## Features
 
-- **Fast indexing** — cold index completes in ~11s on a 57k-file Elixir monorepo, ~93ms on Oban, ~90ms on the Elixir standard library (measured on an M1 MacBook Pro). After your first index, incremental indexing makes sure that you never have to reindex the whole codebase again.
+- **Fast indexing** — cold index completes in ~11s on a 57k-file Elixir monorepo, ~100ms on Oban, ~300ms on the Elixir standard library (measured on an M1 MacBook Pro). After your first index, incremental indexing makes sure that you never have to reindex the whole codebase again.
 - **Go-to-definition** — jump to any module, function, type, or variable definition. Resolves aliases, imports, `defdelegate` chains, `use` injections, and the Elixir stdlib. Handles all definition forms: `def`, `defp`, `defmacro`, `defprotocol`, `defimpl`, `defstruct`, and more.
 - **Go-to-references** — find all usages of a function or module across the codebase, including through `import`, `use` chains, and `defdelegate`.
 - **Hover documentation** — `@doc`, `@moduledoc`, `@typedoc`, and `@spec` annotations rendered as Markdown when you hover over a symbol.
