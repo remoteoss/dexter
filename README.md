@@ -198,7 +198,7 @@ Configure the binary path in Zed's `settings.json`:
     "dexter": {
       "binary": {
         "path": "/Users/you/.local/share/mise/shims/dexter", // or wherever `which dexter` points to
-        "arguments": ["lsp"],
+        "arguments": ["lsp"]
       }
     }
   }
@@ -215,13 +215,13 @@ The emacs instructions assume you're using **use-package**.
 
 ```emacs-lisp
 (use-package eglot
-  :ensure nil ;; eglot is included in emacs >= 29  
-  
+  :ensure t
+
   :config
   (setf (alist-get '(elixir-mode elixir-ts-mode heex-ts-mode)
                    eglot-server-programs
                    nil nil #'equal)
-        (eglot-alternatives '(("path/to/dexter" "lsp"))))
+        '("/path/to/dexter" "lsp")) ;; wherever `which dexter` points to
 
   ;; other config
   )
@@ -231,34 +231,21 @@ The emacs instructions assume you're using **use-package**.
 
 ```emacs-lisp
 (use-package eglot
-  :ensure nil ;; eglot is included in emacs >= 29, use :ensure t if using an older version
-  
+  :ensure t
+
   :config
   (setf (alist-get 'elixir-mode eglot-server-programs)
-        (eglot-alternatives '(("path/to/dexter" "lsp"))))
+        '("/path/to/dexter" "lsp")) ;; wherever `which dexter` points to
 
   ;; other config
   )
-```
-
-> [!note]
-> 
-> If you are using **elixir-ts-mode** instead of **elixir-mode** replace **(alist-get 'elixir-mode eglot-server-programs)** from the snippet above with **(alist-get '(elixir-mode elixir-ts-mode heex-ts-mode) eglot-server-programs)**
-
-##### Configuration
-
-To configure Dexter settings, use `eglot-workspace-configuration`:
-
-```emacs-lisp
-(setq-default eglot-workspace-configuration
-  '(:dexter (:workspaceSymbols (:minQueryLength 0))))
 ```
 
 #### lsp-mode
 
 ```emacs-lisp
 (use-package lsp-mode
-  :ensure nil
+  :ensure t
   :hook ((elixir-mode elixir-ts-mode heex-ts-mode) . lsp-deferred)
   :config
   (add-to-list 'lsp-disabled-clients 'elixir-ls)
@@ -266,19 +253,11 @@ To configure Dexter settings, use `eglot-workspace-configuration`:
   (lsp-register-client
    (make-lsp-client
     :new-connection (lsp-stdio-connection
-                     '("/path/to/dexter" "lsp"))
+                     '("/path/to/dexter" "lsp")) ;; wherever `which dexter` points to
     :activation-fn (lsp-activate-on "elixir")
     :server-id 'dexter-elixir)))
 ```
 
-##### Configuration
-
-To configure Dexter settings, use `lsp-register-custom-settings`:
-
-```emacs-lisp
-(lsp-register-custom-settings
-  '(("workspaceSymbols.minQueryLength" 0)))
-```
 ## Why build another LSP?
 
 Remote has one of the largest Elixir codebases in existence (at least that we're aware of), now around 57k files. As our codebase has grown, we've had more and more struggles with language servers. We had found that they simply couldn't keep up with such a large codebase. On large codebases like ours, existing LSPs take hours to index, and even after indexing, operations like go-to-definition and go-to-references are still slow. On top of that, changing branches means a whole new round of indexing. The result has been frustration. Many of us on the engineering team had all but given up on the idea of ever having a working LSP.
@@ -289,13 +268,13 @@ Dexter is designed with speed and efficiency as core guiding principles. It take
 
 Measured on a 57k-file Elixir monorepo (330k definitions, 2.7M references) on a 32GB M1 MacBook Pro:
 
-| Operation | Time |
-|-----------|------|
-| Cold first-time index | ~11s |
-| Lookup (LSP or CLI) | ~10ms |
+| Operation                     | Time  |
+| ----------------------------- | ----- |
+| Cold first-time index         | ~11s  |
+| Lookup (LSP or CLI)           | ~10ms |
 | Single file reindex (on save) | ~10ms |
-| Full reindex (no changes) | ~2s |
-| Format on save | <1ms |
+| Full reindex (no changes)     | ~2s   |
+| Format on save                | <1ms  |
 
 ## CLI usage
 
@@ -391,11 +370,11 @@ Fetches a user by ID. Options are passed to the underlying query.
 
 Dexter resolves hover (and go-to-definition) based on which segment of a dotted expression your cursor is on:
 
-| Cursor position | Expression | Resolves to |
-|-----------------|------------|-------------|
-| On `Repo` in `MyApp.Repo.all` | `MyApp.Repo` | The `MyApp.Repo` module |
-| On `all` in `MyApp.Repo.all` | `MyApp.Repo.all` | The `all` function |
-| On `MyApp` in `MyApp.Repo.all` | `MyApp` | The `MyApp` module |
+| Cursor position                | Expression       | Resolves to             |
+| ------------------------------ | ---------------- | ----------------------- |
+| On `Repo` in `MyApp.Repo.all`  | `MyApp.Repo`     | The `MyApp.Repo` module |
+| On `all` in `MyApp.Repo.all`   | `MyApp.Repo.all` | The `all` function      |
+| On `MyApp` in `MyApp.Repo.all` | `MyApp`          | The `MyApp` module      |
 
 ## Rename
 
@@ -406,6 +385,7 @@ Dexter supports renaming modules, functions, and variables across the codebase v
 Place your cursor on any segment of a module name and invoke rename. Dexter highlights just the last segment for editing — the parent namespace is preserved automatically. For example, renaming `Repo` in `MyApp.Repo` to `Repository` renames the module to `MyApp.Repository`.
 
 **What gets updated:**
+
 - The `defmodule` declaration
 - All aliases, imports, and uses referencing the module
 - All call sites
@@ -420,6 +400,7 @@ Files not open in the editor are written directly to disk; open buffers receive 
 ### Functions
 
 Place your cursor on a function name (qualified or bare) and invoke rename. Dexter updates:
+
 - All `def`/`defp`/`defmacro`/`defguard`/etc. clauses
 - `@spec` and `@callback` annotations
 - Direct calls and pipe calls (`|> function_name`)
@@ -496,6 +477,7 @@ If the issue persists, enable debug mode to get verbose logs. You can do this in
 Debug mode logs timing and resolution details for every definition, hover, references, and rename request to stderr. In Neovim you can usually view these at `~/.local/state/nvim/lsp.log`. In VS Code, you can see them in Output > Dexter.
 
 When [filing an issue](https://github.com/remoteoss/dexter/issues/new), please include:
+
 - Your Dexter version (`dexter --version`)
 - Your Elixir version (`elixir --version`)
 - The debug logs from the failing operation
