@@ -32,7 +32,17 @@ mv Formula/dexter.rb.tmp Formula/dexter.rb
 
 git config user.name "github-actions[bot]"
 git config user.email "github-actions[bot]@users.noreply.github.com"
+
+BRANCH="update-dexter-${VERSION}"
+git checkout -b "$BRANCH"
 git add Formula/dexter.rb
 git diff --cached --quiet && echo "No changes to formula" && exit 0
 git commit -m "Update dexter to ${VERSION}"
-git push
+git push origin "$BRANCH"
+
+GH_TOKEN="$TAP_TOKEN" gh pr create \
+  --repo remoteoss/homebrew-tap \
+  --base main \
+  --head "$BRANCH" \
+  --title "Update dexter to ${VERSION}" \
+  --body "Automated PR from [dexter release v${VERSION}](https://github.com/remoteoss/dexter/releases/tag/v${VERSION})."
