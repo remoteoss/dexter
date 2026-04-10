@@ -255,7 +255,6 @@ func (s *Server) watchGitHead() {
 	}()
 }
 
-
 // notifyOTPMismatch checks stderr output for an OTP version mismatch and
 // sends a one-time warning to the editor so the user doesn't have to dig
 // through logs.
