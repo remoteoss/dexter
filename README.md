@@ -186,9 +186,9 @@ lspconfig.dexter.setup({})
 
 Install the [dexter-zed](https://github.com/remoteoss/dexter-zed) extension:
 
-1. Clone the extension: `git clone https://github.com/remoteoss/dexter-zed.git`
-2. In Zed, open the command palette (`Cmd+Shift+P`) and run **"zed: install dev extension"**
-3. Select the `dexter-zed/` directory
+1. In Zed, open **Extensions** (`Cmd+Shift+X`) and search for **"Dexter"**
+2. Click **Install**
+3. Open any Elixir file — the index builds automatically on first startup
 
 Configure the binary path in Zed's `settings.json`:
 
