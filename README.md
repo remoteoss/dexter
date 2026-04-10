@@ -198,11 +198,64 @@ Configure the binary path in Zed's `settings.json`:
     "dexter": {
       "binary": {
         "path": "/Users/you/.local/share/mise/shims/dexter", // or wherever `which dexter` points to
-        "arguments": ["lsp"],
+        "arguments": ["lsp"]
       }
     }
   }
 }
+```
+
+### Emacs
+
+The emacs instructions assume you're using **use-package**.
+
+#### Eglot
+
+##### Emacs version >= 30
+
+```emacs-lisp
+(use-package eglot
+  :ensure t
+
+  :config
+  (setf (alist-get '(elixir-mode elixir-ts-mode heex-ts-mode)
+                   eglot-server-programs
+                   nil nil #'equal)
+        '("/path/to/dexter" "lsp")) ;; wherever `which dexter` points to
+
+  ;; other config
+  )
+```
+
+##### Emacs version <= 29
+
+```emacs-lisp
+(use-package eglot
+  :ensure t
+
+  :config
+  (setf (alist-get 'elixir-mode eglot-server-programs)
+        '("/path/to/dexter" "lsp")) ;; wherever `which dexter` points to
+
+  ;; other config
+  )
+```
+
+#### lsp-mode
+
+```emacs-lisp
+(use-package lsp-mode
+  :ensure t
+  :hook ((elixir-mode elixir-ts-mode heex-ts-mode) . lsp-deferred)
+  :config
+  (add-to-list 'lsp-disabled-clients 'elixir-ls)
+
+  (lsp-register-client
+   (make-lsp-client
+    :new-connection (lsp-stdio-connection
+                     '("/path/to/dexter" "lsp")) ;; wherever `which dexter` points to
+    :activation-fn (lsp-activate-on "elixir")
+    :server-id 'dexter-elixir)))
 ```
 
 ## Why build another LSP?
@@ -215,13 +268,13 @@ Dexter is designed with speed and efficiency as core guiding principles. It take
 
 Measured on a 57k-file Elixir monorepo (330k definitions, 2.7M references) on a 32GB M1 MacBook Pro:
 
-| Operation | Time |
-|-----------|------|
-| Cold first-time index | ~11s |
-| Lookup (LSP or CLI) | ~10ms |
+| Operation                     | Time  |
+| ----------------------------- | ----- |
+| Cold first-time index         | ~11s  |
+| Lookup (LSP or CLI)           | ~10ms |
 | Single file reindex (on save) | ~10ms |
-| Full reindex (no changes) | ~2s |
-| Format on save | <1ms |
+| Full reindex (no changes)     | ~2s   |
+| Format on save                | <1ms  |
 
 ## CLI usage
 
@@ -317,11 +370,11 @@ Fetches a user by ID. Options are passed to the underlying query.
 
 Dexter resolves hover (and go-to-definition) based on which segment of a dotted expression your cursor is on:
 
-| Cursor position | Expression | Resolves to |
-|-----------------|------------|-------------|
-| On `Repo` in `MyApp.Repo.all` | `MyApp.Repo` | The `MyApp.Repo` module |
-| On `all` in `MyApp.Repo.all` | `MyApp.Repo.all` | The `all` function |
-| On `MyApp` in `MyApp.Repo.all` | `MyApp` | The `MyApp` module |
+| Cursor position                | Expression       | Resolves to             |
+| ------------------------------ | ---------------- | ----------------------- |
+| On `Repo` in `MyApp.Repo.all`  | `MyApp.Repo`     | The `MyApp.Repo` module |
+| On `all` in `MyApp.Repo.all`   | `MyApp.Repo.all` | The `all` function      |
+| On `MyApp` in `MyApp.Repo.all` | `MyApp`          | The `MyApp` module      |
 
 ## Rename
 
@@ -332,6 +385,7 @@ Dexter supports renaming modules, functions, and variables across the codebase v
 Place your cursor on any segment of a module name and invoke rename. Dexter highlights just the last segment for editing — the parent namespace is preserved automatically. For example, renaming `Repo` in `MyApp.Repo` to `Repository` renames the module to `MyApp.Repository`.
 
 **What gets updated:**
+
 - The `defmodule` declaration
 - All aliases, imports, and uses referencing the module
 - All call sites
@@ -346,6 +400,7 @@ Files not open in the editor are written directly to disk; open buffers receive 
 ### Functions
 
 Place your cursor on a function name (qualified or bare) and invoke rename. Dexter updates:
+
 - All `def`/`defp`/`defmacro`/`defguard`/etc. clauses
 - `@spec` and `@callback` annotations
 - Direct calls and pipe calls (`|> function_name`)
@@ -422,6 +477,7 @@ If the issue persists, enable debug mode to get verbose logs. You can do this in
 Debug mode logs timing and resolution details for every definition, hover, references, and rename request to stderr. In Neovim you can usually view these at `~/.local/state/nvim/lsp.log`. In VS Code, you can see them in Output > Dexter.
 
 When [filing an issue](https://github.com/remoteoss/dexter/issues/new), please include:
+
 - Your Dexter version (`dexter --version`)
 - Your Elixir version (`elixir --version`)
 - The debug logs from the failing operation
