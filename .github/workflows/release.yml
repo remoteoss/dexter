@@ -108,7 +108,7 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${VERSION#v}"
-          git clone https://x-access-token:${TAP_TOKEN}@github.com/remoteoss/homebrew-dexter.git tap
+          git clone https://x-access-token:${TAP_TOKEN}@github.com/remoteoss/homebrew-tap.git tap
           cd tap
 
           sed -i \
