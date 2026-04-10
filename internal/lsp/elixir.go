@@ -204,12 +204,13 @@ func FindBufferFunctions(text string) []BufferFunction {
 }
 
 var (
-	aliasMultiRe    = regexp.MustCompile(`^\s*alias\s+([A-Za-z0-9_.]+)\.{([^}]+)}`)
-	importRe        = regexp.MustCompile(`^\s*import\s+([A-Za-z0-9_.]+)`)
-	useRe           = regexp.MustCompile(`^\s*use\s+([A-Za-z0-9_.]+)`)
-	usingDefRe      = regexp.MustCompile(`^\s*defmacro\s+__using__`)
-	moduleAttrDefRe = regexp.MustCompile(`^\s*@([a-z_][a-z0-9_]*)\s+[^@]`)
-	keywordModuleRe = regexp.MustCompile(`Keyword\.(?:put_new|put)\([^,]+,\s*:[a-z_]+,\s*([A-Z][A-Za-z0-9_.]+)\)`)
+	aliasMultiRe      = regexp.MustCompile(`^\s*alias\s+([A-Za-z0-9_.]+)\.\{([^}]*)\}?`)
+	aliasNextLineAsRe = regexp.MustCompile(`^\s*as:\s*([A-Za-z0-9_]+)`)
+	importRe          = regexp.MustCompile(`^\s*import\s+([A-Za-z0-9_.]+)`)
+	useRe             = regexp.MustCompile(`^\s*use\s+([A-Za-z0-9_.]+)`)
+	usingDefRe        = regexp.MustCompile(`^\s*defmacro\s+__using__`)
+	moduleAttrDefRe   = regexp.MustCompile(`^\s*@([a-z_][a-z0-9_]*)\s+[^@]`)
+	keywordModuleRe   = regexp.MustCompile(`Keyword\.(?:put_new|put)\([^,]+,\s*:[a-z_]+,\s*([A-Z][A-Za-z0-9_.]+)\)`)
 
 	// Dynamic opt-binding patterns inside __using__ bodies.
 	// var = Keyword.get/pop(opts, :key, Default)
@@ -334,19 +335,37 @@ func extractAliasesFromLines(lines []string, targetLine int) map[string]string {
 		if m := parser.AliasAsRe.FindStringSubmatch(line); m != nil {
 			resolved := resolve(m[1])
 			if !strings.Contains(resolved, "__MODULE__") {
-				allAliases = append(allAliases, struct {
-					scope, short, full string
-				}{currentModule, m[2], resolved})
+				if m[2] != "" {
+					// alias Mod, as: Name — same line
+					allAliases = append(allAliases, struct {
+						scope, short, full string
+					}{currentModule, m[2], resolved})
+				} else {
+					// alias Mod, — trailing comma, peek next line for as:
+					if n := aliasNextLineAsRe.FindStringSubmatch(nextLineAt(lines, i)); n != nil {
+						allAliases = append(allAliases, struct {
+							scope, short, full string
+						}{currentModule, n[1], resolved})
+					}
+				}
 			}
 		} else if m := aliasMultiRe.FindStringSubmatch(line); m != nil {
 			base := resolve(m[1])
 			if !strings.Contains(base, "__MODULE__") {
-				for _, name := range strings.Split(m[2], ",") {
-					name = strings.TrimSpace(name)
+				inner := m[2]
+				if strings.TrimSpace(inner) == "" {
+					// Multi-line: alias MyApp.{\n  Foo,\n  Bar\n}
+					inner = parser.CollectBraceContent(lines, i+1)
+				}
+				for _, seg := range strings.Split(inner, ",") {
+					name := strings.TrimSpace(seg)
 					if len(name) > 0 && unicode.IsUpper(rune(name[0])) {
-						allAliases = append(allAliases, struct {
-							scope, short, full string
-						}{currentModule, name, base + "." + name})
+						childName := parser.ScanModuleName(name)
+						if childName != "" {
+							allAliases = append(allAliases, struct {
+								scope, short, full string
+							}{currentModule, childName, base + "." + childName})
+						}
 					}
 				}
 			}
@@ -383,27 +402,57 @@ func ExtractImports(text string) []string {
 	return imports
 }
 
+// nextLineAt returns lines[i+1] if it exists, otherwise "".
+func nextLineAt(lines []string, i int) string {
+	if i+1 < len(lines) {
+		return lines[i+1]
+	}
+	return ""
+}
+
 // extractAliasFromLine checks whether line matches an alias declaration
 // (alias X, as: Y / alias X.{A, B} / alias X.Y) and, if so, records it in
 // aliases and returns the (possibly newly-created) map plus true. Returns
 // (aliases, false) when the line is not an alias declaration.
-func extractAliasFromLine(line string, aliases map[string]string, resolveAlias func(string) string) (map[string]string, bool) {
+// lines and idx are used for look-ahead on multi-line constructs.
+func extractAliasFromLine(lines []string, idx int, aliases map[string]string, resolveAlias func(string) string) (map[string]string, bool) {
+	line := lines[idx]
 	if m := parser.AliasAsRe.FindStringSubmatch(line); m != nil {
-		if aliases == nil {
-			aliases = make(map[string]string)
+		resolved := resolveAlias(m[1])
+		if m[2] != "" {
+			// alias Mod, as: Name — same line
+			if aliases == nil {
+				aliases = make(map[string]string)
+			}
+			aliases[m[2]] = resolved
+			return aliases, true
 		}
-		aliases[m[2]] = resolveAlias(m[1])
-		return aliases, true
+		// alias Mod, — trailing comma, peek next line for as:
+		if n := aliasNextLineAsRe.FindStringSubmatch(nextLineAt(lines, idx)); n != nil {
+			if aliases == nil {
+				aliases = make(map[string]string)
+			}
+			aliases[n[1]] = resolved
+			return aliases, true
+		}
 	}
 	if m := aliasMultiRe.FindStringSubmatch(line); m != nil {
 		base := resolveAlias(m[1])
-		for _, name := range strings.Split(m[2], ",") {
-			name = strings.TrimSpace(name)
+		inner := m[2]
+		if strings.TrimSpace(inner) == "" {
+			// Multi-line: alias MyApp.{\n  Foo,\n  Bar\n}
+			inner = parser.CollectBraceContent(lines, idx+1)
+		}
+		for _, seg := range strings.Split(inner, ",") {
+			name := strings.TrimSpace(seg)
 			if len(name) > 0 && unicode.IsUpper(rune(name[0])) {
-				if aliases == nil {
-					aliases = make(map[string]string)
+				childName := parser.ScanModuleName(name)
+				if childName != "" {
+					if aliases == nil {
+						aliases = make(map[string]string)
+					}
+					aliases[childName] = base + "." + childName
 				}
-				aliases[name] = base + "." + name
 			}
 		}
 		return aliases, true
@@ -493,7 +542,7 @@ func parseHelperQuoteBlock(lines []string, helperName string, fileAliases map[st
 			transUses = append(transUses, resolveAlias(m[1]))
 			continue
 		}
-		if updated, matched := extractAliasFromLine(line, aliases, resolveAlias); matched {
+		if updated, matched := extractAliasFromLine(lines, i, aliases, resolveAlias); matched {
 			aliases = updated
 			continue
 		}
@@ -707,7 +756,7 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 			continue
 		}
 
-		if updated, matched := extractAliasFromLine(line, aliases, resolveAlias); matched {
+		if updated, matched := extractAliasFromLine(lines, i, aliases, resolveAlias); matched {
 			aliases = updated
 			continue
 		}

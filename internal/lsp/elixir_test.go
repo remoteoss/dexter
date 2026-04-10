@@ -193,6 +193,14 @@ func TestExtractAliases(t *testing.T) {
 		}
 	})
 
+	t.Run("alias with as: on next line", func(t *testing.T) {
+		text := "  alias MyApp.Serializer.Date,\n    as: DateSerializer"
+		aliases := ExtractAliases(text)
+		if aliases["DateSerializer"] != "MyApp.Serializer.Date" {
+			t.Errorf("got %q, want MyApp.Serializer.Date", aliases["DateSerializer"])
+		}
+	})
+
 	t.Run("multi-alias", func(t *testing.T) {
 		aliases := ExtractAliases("  alias MyApp.Handlers.{Foo, Bar, Baz}")
 		if aliases["Foo"] != "MyApp.Handlers.Foo" {
@@ -203,6 +211,20 @@ func TestExtractAliases(t *testing.T) {
 		}
 		if aliases["Baz"] != "MyApp.Handlers.Baz" {
 			t.Errorf("Baz: got %q", aliases["Baz"])
+		}
+	})
+
+	t.Run("multi-alias across lines", func(t *testing.T) {
+		text := "defmodule MyApp.Web do\n  alias MyApp.Handlers.{\n    Foo,\n    Bar,\n    Baz\n  }\nend"
+		aliases := ExtractAliases(text)
+		if aliases["Foo"] != "MyApp.Handlers.Foo" {
+			t.Errorf("Foo: got %q, want MyApp.Handlers.Foo", aliases["Foo"])
+		}
+		if aliases["Bar"] != "MyApp.Handlers.Bar" {
+			t.Errorf("Bar: got %q, want MyApp.Handlers.Bar", aliases["Bar"])
+		}
+		if aliases["Baz"] != "MyApp.Handlers.Baz" {
+			t.Errorf("Baz: got %q, want MyApp.Handlers.Baz", aliases["Baz"])
 		}
 	})
 
@@ -422,6 +444,23 @@ end
 		aliases := ExtractAliasesInScope(stringSrc, 7)
 		if aliases["Settings"] != "MyApp.Settings" {
 			t.Errorf("expected Settings alias with do/end in strings, got %q", aliases["Settings"])
+		}
+	})
+
+	t.Run("multiline alias as: resolves in scope", func(t *testing.T) {
+		multilineSrc := `defmodule MyApp.Controller do
+  alias MyApp.Serializer.Date,
+    as: DateSerializer
+
+  def index do
+    DateSerializer.serialize(%{})
+  end
+end
+`
+		// Line 5 = "DateSerializer.serialize" inside the module
+		aliases := ExtractAliasesInScope(multilineSrc, 5)
+		if aliases["DateSerializer"] != "MyApp.Serializer.Date" {
+			t.Errorf("got %q, want MyApp.Serializer.Date", aliases["DateSerializer"])
 		}
 	})
 

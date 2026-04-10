@@ -7,12 +7,13 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 // Shared regex patterns used by both the parser and the LSP.
 var (
 	AliasRe   = regexp.MustCompile(`^\s*alias\s+([A-Za-z0-9_.]+)`)
-	AliasAsRe = regexp.MustCompile(`^\s*alias\s+([A-Za-z0-9_.]+)\s*,\s*as:\s*([A-Za-z0-9_]+)`)
+	AliasAsRe = regexp.MustCompile(`^\s*alias\s+([A-Za-z0-9_.]+)\s*,\s*(?:as:\s*([A-Za-z0-9_]+))?\s*$`)
 	FuncDefRe = regexp.MustCompile(`^\s*(defp?|defmacrop?|defguardp?|defdelegate)\s+([a-z_][a-z0-9_?!]*)[\s(,]`)
 	TypeDefRe = regexp.MustCompile(`^\s*@(typep?|opaque)\s+([a-z_][a-z0-9_?!]*)`)
 )
@@ -157,43 +158,51 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 					// Multi-alias: alias MyApp.{Accounts, Users}
 					// ScanModuleName consumes the trailing "." so remaining starts with "{"
 					if strings.HasPrefix(remaining, "{") {
+						// Collect inner content — may be single-line or span multiple lines
+						var inner string
 						braceEnd := strings.IndexByte(remaining, '}')
 						if braceEnd >= 0 {
-							inner := remaining[1:braceEnd]
-							// Trim trailing dot from parent module name
-							parent := strings.TrimRight(moduleName, ".")
-							parentResolved := resolveModule(parent, currentModule)
-							for _, segment := range strings.Split(inner, ",") {
-								segment = strings.TrimSpace(segment)
-								childName := ScanModuleName(segment)
-								if childName != "" {
-									fullChild := parentResolved + "." + childName
-									aliasKey := childName
-									if dot := strings.LastIndexByte(childName, '.'); dot >= 0 {
-										aliasKey = childName[dot+1:]
-									}
-									aliases[aliasKey] = fullChild
-									if !strings.Contains(fullChild, "__MODULE__") {
-										refs = append(refs, Reference{Module: fullChild, Line: lineNum, FilePath: path, Kind: "alias"})
-									}
+							inner = remaining[1:braceEnd]
+						} else {
+							inner = CollectBraceContent(lines, lineIdx+1)
+						}
+
+						// Trim trailing dot from parent module name
+						parent := strings.TrimRight(moduleName, ".")
+						parentResolved := resolveModule(parent, currentModule)
+
+						for _, segment := range strings.Split(inner, ",") {
+							segment = strings.TrimSpace(segment)
+							childName := ScanModuleName(segment)
+							if childName != "" {
+								fullChild := parentResolved + "." + childName
+								aliasKey := childName
+								if dot := strings.LastIndexByte(childName, '.'); dot >= 0 {
+									aliasKey = childName[dot+1:]
+								}
+								aliases[aliasKey] = fullChild
+								if !strings.Contains(fullChild, "__MODULE__") {
+									refs = append(refs, Reference{Module: fullChild, Line: lineNum, FilePath: path, Kind: "alias"})
 								}
 							}
-							continue
+						}
+						continue
+					}
+
+					var asStr string
+					if strings.HasPrefix(remaining, ", as:") {
+						asStr = strings.TrimLeft(remaining[5:], " \t") // skip ", as:"
+					} else if strings.HasPrefix(remaining, ",as:") {
+						asStr = strings.TrimLeft(remaining[4:], " \t") // skip ",as:"
+					} else if strings.TrimSpace(remaining) == "," && lineIdx+1 < len(lines) {
+						// Multiline: alias Mod,\n  as: Name
+						nextLine := strings.TrimLeft(lines[lineIdx+1], " \t")
+						if strings.HasPrefix(nextLine, "as:") {
+							asStr = strings.TrimLeft(nextLine[3:], " \t")
 						}
 					}
 
-					if strings.HasPrefix(remaining, ", as:") {
-						asStr := strings.TrimLeft(remaining[5:], " \t") // skip ", as:"
-						asName := scanIdentifier(asStr)
-						if asName != "" {
-							resolved := resolveModule(moduleName, currentModule)
-							if !strings.Contains(resolved, "__MODULE__") {
-								aliases[asName] = resolved
-								refs = append(refs, Reference{Module: resolved, Line: lineNum, FilePath: path, Kind: "alias"})
-							}
-						}
-					} else if strings.HasPrefix(remaining, ",as:") {
-						asStr := strings.TrimLeft(remaining[4:], " \t") // skip ",as:"
+					if asStr != "" {
 						asName := scanIdentifier(asStr)
 						if asName != "" {
 							resolved := resolveModule(moduleName, currentModule)
@@ -733,6 +742,32 @@ func containsFnKeyword(code string) bool {
 
 func isIdentChar(b byte) bool {
 	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_'
+}
+
+// CollectBraceContent scans lines starting at startIdx for content between an
+// already-opened '{' and the closing '}'. Returns the comma-joined inner
+// content. Stops early if a line is empty or doesn't start with an uppercase
+// letter (indicating the brace block has ended without a closing brace).
+func CollectBraceContent(lines []string, startIdx int) string {
+	var parts []string
+	limit := min(len(lines), startIdx+50)
+	for i := startIdx; i < limit; i++ {
+		line := lines[i]
+		if braceEnd := strings.IndexByte(line, '}'); braceEnd >= 0 {
+			parts = append(parts, line[:braceEnd])
+			return strings.Join(parts, ",")
+		}
+		trimmed := strings.TrimSpace(line)
+		if len(trimmed) == 0 || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if unicode.IsUpper(rune(trimmed[0])) {
+			parts = append(parts, trimmed)
+		} else {
+			return strings.Join(parts, ",")
+		}
+	}
+	return ""
 }
 
 // findDelegateTo searches the current line and up to 5 subsequent lines for a to: target,

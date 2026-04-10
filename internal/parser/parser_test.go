@@ -1772,6 +1772,83 @@ end
 	}
 }
 
+func TestParseFileReferences_AliasAsMultiline(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.Controller do
+  alias MyApp.Serializer.Date,
+    as: DateSerializer
+
+  def index do
+    DateSerializer.serialize(%{})
+  end
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	callRefs := filterRefs(refs, "call")
+	found := false
+	for _, r := range callRefs {
+		if r.Module == "MyApp.Serializer.Date" && r.Function == "serialize" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected DateSerializer.serialize to resolve to MyApp.Serializer.Date.serialize; refs: %+v", callRefs)
+	}
+}
+
+func TestParseFileReferences_MultiAliasMultiline(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.Controller do
+  alias MyApp.Handlers.{
+    Accounts,
+    Users,
+    Profiles
+  }
+
+  def index do
+    Accounts.list()
+    Users.get(1)
+  end
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	aliasRefs := filterRefs(refs, "alias")
+	expectedAliases := map[string]bool{
+		"MyApp.Handlers.Accounts": false,
+		"MyApp.Handlers.Users":    false,
+		"MyApp.Handlers.Profiles": false,
+	}
+	for _, r := range aliasRefs {
+		if _, ok := expectedAliases[r.Module]; ok {
+			expectedAliases[r.Module] = true
+		}
+	}
+	for mod, found := range expectedAliases {
+		if !found {
+			t.Errorf("expected alias ref to %s; alias refs: %+v", mod, aliasRefs)
+		}
+	}
+
+	callRefs := filterRefs(refs, "call")
+	found := false
+	for _, r := range callRefs {
+		if r.Module == "MyApp.Handlers.Accounts" && r.Function == "list" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected Accounts.list to resolve to MyApp.Handlers.Accounts.list; refs: %+v", callRefs)
+	}
+}
+
 func TestParseFileReferences_SkipsHeredocs(t *testing.T) {
 	path := writeTempFile(t, `defmodule MyApp.Foo do
   @doc """
