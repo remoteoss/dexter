@@ -104,8 +104,9 @@ jobs:
       - name: Update Homebrew formula
         env:
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          VERSION: ${{ inputs.tag && inputs.tag || github.ref_name }}
+          VERSION: ${{ env.RELEASE_TAG }}
         run: |
+          set -euo pipefail
           VERSION="${VERSION#v}"
           git clone https://x-access-token:${TAP_TOKEN}@github.com/remoteoss/homebrew-dexter.git tap
           cd tap
