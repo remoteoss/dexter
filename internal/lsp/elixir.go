@@ -179,8 +179,9 @@ func FindBufferFunctions(text string) []BufferFunction {
 	for _, line := range strings.Split(text, "\n") {
 		if m := parser.FuncDefRe.FindStringSubmatch(line); m != nil {
 			name := m[2]
-			maxArity := parser.ExtractArity(line, name)
-			minArity := maxArity - parser.CountDefaultParams(line, name)
+			paramContent := parser.FindParamContent(line, name)
+			maxArity := parser.ArityFromParams(paramContent)
+			minArity := maxArity - parser.DefaultsFromParams(paramContent)
 			allParamNames := parser.ExtractParamNames(line, name)
 			for arity := minArity; arity <= maxArity; arity++ {
 				key := name + "/" + strconv.Itoa(arity)
