@@ -83,3 +83,50 @@ jobs:
             --generate-notes \
             artifacts/*.tar.gz \
             artifacts/checksums.txt
+
+  update-homebrew:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: dexter-*
+          merge-multiple: true
+
+      - name: Compute SHA256s
+        id: shas
+        run: |
+          echo "darwin_arm64=$(sha256sum artifacts/dexter_Darwin_arm64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "linux_x86_64=$(sha256sum artifacts/dexter_Linux_x86_64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "linux_arm64=$(sha256sum artifacts/dexter_Linux_arm64.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Update Homebrew formula
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ inputs.tag && inputs.tag || github.ref_name }}
+        run: |
+          VERSION="${VERSION#v}"
+          git clone https://x-access-token:${TAP_TOKEN}@github.com/remoteoss/homebrew-dexter.git tap
+          cd tap
+
+          sed -i \
+            -e "s/version \".*\"/version \"${VERSION}\"/" \
+            -e "s|/download/v[0-9][^/]*/|/download/v${VERSION}/|g" \
+            Formula/dexter.rb
+
+          awk -v d="${{ steps.shas.outputs.darwin_arm64 }}" \
+              -v lx="${{ steps.shas.outputs.linux_x86_64 }}" \
+              -v la="${{ steps.shas.outputs.linux_arm64 }}" \
+            'BEGIN{n=0} /sha256/{n++; if(n==1) sub(/sha256 ".*"/, "sha256 \""d"\"");
+             if(n==2) sub(/sha256 ".*"/, "sha256 \""lx"\"");
+             if(n==3) sub(/sha256 ".*"/, "sha256 \""la"\"")} {print}' \
+            Formula/dexter.rb > Formula/dexter.rb.tmp
+          mv Formula/dexter.rb.tmp Formula/dexter.rb
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/dexter.rb
+          git diff --cached --quiet && echo "No changes to formula" && exit 0
+          git commit -m "Update dexter to ${VERSION}"
+          git push
