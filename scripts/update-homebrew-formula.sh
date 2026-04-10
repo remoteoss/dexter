@@ -3,15 +3,17 @@
 # Updates the Homebrew formula in remoteoss/homebrew-tap with new version and SHA256s.
 #
 # Required environment variables:
-#   TAP_TOKEN        - GitHub PAT with write access to remoteoss/homebrew-tap
-#   VERSION          - Release tag (e.g. v0.5.3, the v prefix is stripped automatically)
-#   SHA_DARWIN_ARM64 - SHA256 of dexter_Darwin_arm64.tar.gz
-#   SHA_LINUX_X86_64 - SHA256 of dexter_Linux_x86_64.tar.gz
-#   SHA_LINUX_ARM64  - SHA256 of dexter_Linux_arm64.tar.gz
+#   TAP_TOKEN      - GitHub PAT with write access to remoteoss/homebrew-tap
+#   VERSION        - Release tag (e.g. v0.5.3, the v prefix is stripped automatically)
+#   ARTIFACTS_DIR  - Directory containing the release tar.gz archives
 
 set -euo pipefail
 
 VERSION="${VERSION#v}"
+
+SHA_DARWIN_ARM64=$(sha256sum "${ARTIFACTS_DIR}/dexter_Darwin_arm64.tar.gz" | cut -d' ' -f1)
+SHA_LINUX_X86_64=$(sha256sum "${ARTIFACTS_DIR}/dexter_Linux_x86_64.tar.gz" | cut -d' ' -f1)
+SHA_LINUX_ARM64=$(sha256sum "${ARTIFACTS_DIR}/dexter_Linux_arm64.tar.gz" | cut -d' ' -f1)
 
 git clone "https://x-access-token:${TAP_TOKEN}@github.com/remoteoss/homebrew-tap.git" tap
 cd tap

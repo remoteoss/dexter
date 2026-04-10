@@ -100,8 +100,5 @@ jobs:
         env:
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           VERSION: ${{ env.RELEASE_TAG }}
-        run: |
-          export SHA_DARWIN_ARM64=$(sha256sum artifacts/dexter_Darwin_arm64.tar.gz | cut -d' ' -f1)
-          export SHA_LINUX_X86_64=$(sha256sum artifacts/dexter_Linux_x86_64.tar.gz | cut -d' ' -f1)
-          export SHA_LINUX_ARM64=$(sha256sum artifacts/dexter_Linux_arm64.tar.gz | cut -d' ' -f1)
-          scripts/update-homebrew-formula.sh
+          ARTIFACTS_DIR: artifacts
+        run: scripts/update-homebrew-formula.sh
