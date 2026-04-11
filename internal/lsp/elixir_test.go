@@ -253,6 +253,83 @@ func TestExtractAliases(t *testing.T) {
 		}
 	})
 
+	t.Run("multi-line alias with as on next line", func(t *testing.T) {
+		text := "defmodule MyApp.Web do\n  alias MyApp.Helpers.Paginator,\n    as: Pages\nend"
+		aliases := ExtractAliases(text)
+		if aliases["Pages"] != "MyApp.Helpers.Paginator" {
+			t.Errorf("Pages: got %q, want MyApp.Helpers.Paginator", aliases["Pages"])
+		}
+		// Should NOT also register as a simple alias under the last segment
+		if _, ok := aliases["Paginator"]; ok {
+			t.Error("should not register simple alias Paginator when as: is on next line")
+		}
+	})
+
+	t.Run("multi-line multi-alias with braces spanning lines", func(t *testing.T) {
+		text := "defmodule MyApp.Web do\n  alias MyApp.Handlers.{\n    Accounts,\n    Users,\n    Profiles\n  }\nend"
+		aliases := ExtractAliases(text)
+		if aliases["Accounts"] != "MyApp.Handlers.Accounts" {
+			t.Errorf("Accounts: got %q, want MyApp.Handlers.Accounts", aliases["Accounts"])
+		}
+		if aliases["Users"] != "MyApp.Handlers.Users" {
+			t.Errorf("Users: got %q, want MyApp.Handlers.Users", aliases["Users"])
+		}
+		if aliases["Profiles"] != "MyApp.Handlers.Profiles" {
+			t.Errorf("Profiles: got %q, want MyApp.Handlers.Profiles", aliases["Profiles"])
+		}
+	})
+
+	t.Run("multi-line multi-alias with comments inside", func(t *testing.T) {
+		text := "defmodule MyApp.Web do\n  alias MyApp.Services.{\n    Accounts,\n    # Users is deprecated\n    Profiles\n  }\nend"
+		aliases := ExtractAliases(text)
+		if aliases["Accounts"] != "MyApp.Services.Accounts" {
+			t.Errorf("Accounts: got %q, want MyApp.Services.Accounts", aliases["Accounts"])
+		}
+		if aliases["Profiles"] != "MyApp.Services.Profiles" {
+			t.Errorf("Profiles: got %q, want MyApp.Services.Profiles", aliases["Profiles"])
+		}
+		if len(aliases) != 2 {
+			t.Errorf("expected 2 aliases, got %d: %v", len(aliases), aliases)
+		}
+	})
+
+	t.Run("multi-line multi-alias with multiple children per line", func(t *testing.T) {
+		text := "defmodule MyApp.Web do\n  alias MyApp.Handlers.{\n    Accounts, Users,\n    Profiles\n  }\nend"
+		aliases := ExtractAliases(text)
+		if aliases["Accounts"] != "MyApp.Handlers.Accounts" {
+			t.Errorf("Accounts: got %q, want MyApp.Handlers.Accounts", aliases["Accounts"])
+		}
+		if aliases["Users"] != "MyApp.Handlers.Users" {
+			t.Errorf("Users: got %q, want MyApp.Handlers.Users", aliases["Users"])
+		}
+		if aliases["Profiles"] != "MyApp.Handlers.Profiles" {
+			t.Errorf("Profiles: got %q, want MyApp.Handlers.Profiles", aliases["Profiles"])
+		}
+	})
+
+	t.Run("multi-line multi-alias with trailing comma", func(t *testing.T) {
+		text := "defmodule MyApp.Web do\n  alias MyApp.Handlers.{\n    Accounts,\n    Users,\n  }\nend"
+		aliases := ExtractAliases(text)
+		if aliases["Accounts"] != "MyApp.Handlers.Accounts" {
+			t.Errorf("Accounts: got %q, want MyApp.Handlers.Accounts", aliases["Accounts"])
+		}
+		if aliases["Users"] != "MyApp.Handlers.Users" {
+			t.Errorf("Users: got %q, want MyApp.Handlers.Users", aliases["Users"])
+		}
+		if len(aliases) != 2 {
+			t.Errorf("expected 2 aliases, got %d: %v", len(aliases), aliases)
+		}
+	})
+
+	t.Run("multi-line alias bail-out on new statement", func(t *testing.T) {
+		text := "defmodule MyApp.Web do\n  alias MyApp.Handlers.{\n    Accounts,\n  def foo, do: :ok\nend"
+		aliases := ExtractAliases(text)
+		// Key assertion: no alias for "foo" or anything weird — the def line must not be swallowed
+		if _, ok := aliases["foo"]; ok {
+			t.Error("should not register 'foo' as an alias")
+		}
+	})
+
 	t.Run("partial __MODULE__ alias resolves in lookup", func(t *testing.T) {
 		// Simulates: alias __MODULE__.Services -> Services = MyApp.HRIS.Services
 		// Then a lookup for "Services.AssociateWithTeamV2" should resolve

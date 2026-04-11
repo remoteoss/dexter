@@ -275,6 +275,21 @@ func extractAliasesFromLines(lines []string, targetLine int) map[string]string {
 	unscoped := targetLine < 0
 	inHeredoc := false
 
+	// Pending state for multi-line alias tracking
+	type pendingAliasAsState struct {
+		moduleName    string
+		scope         string
+		currentModule string
+	}
+	type pendingMultiAliasState struct {
+		parent        string
+		scope         string
+		currentModule string
+		children      []string
+	}
+	var pendingAliasAs *pendingAliasAsState
+	var pendingMultiAlias *pendingMultiAliasState
+
 	for i, line := range lines {
 		var skip bool
 		inHeredoc, skip = parser.CheckHeredoc(line, inHeredoc)
@@ -290,6 +305,108 @@ func extractAliasesFromLines(lines []string, targetLine int) map[string]string {
 
 		trimmed := strings.TrimSpace(line)
 		stripped := strings.TrimSpace(parser.StripCommentsAndStrings(trimmed))
+
+		// Handle pending multi-line alias as: continuation
+		if pendingAliasAs != nil {
+			if strings.HasPrefix(stripped, "as:") {
+				asStr := strings.TrimLeft(stripped[3:], " \t")
+				asName := parser.ScanModuleName(asStr)
+				if asName == "" {
+					// Try scanning as identifier (e.g. "as: MyName")
+					for j := 0; j < len(asStr); j++ {
+						c := asStr[j]
+						if (c < 'A' || c > 'Z') && (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '_' {
+							asName = asStr[:j]
+							break
+						}
+					}
+					if asName == "" && len(asStr) > 0 {
+						asName = asStr
+					}
+				}
+				if asName != "" {
+					resolved := pendingAliasAs.moduleName
+					if pendingAliasAs.currentModule != "" {
+						resolved = strings.ReplaceAll(resolved, "__MODULE__", pendingAliasAs.currentModule)
+					}
+					if !strings.Contains(resolved, "__MODULE__") {
+						allAliases = append(allAliases, struct {
+							scope, short, full string
+						}{pendingAliasAs.scope, asName, resolved})
+					}
+				}
+				pendingAliasAs = nil
+				continue
+			}
+			// Not an as: line — bail out, register as simple alias, and reprocess
+			resolved := pendingAliasAs.moduleName
+			if pendingAliasAs.currentModule != "" {
+				resolved = strings.ReplaceAll(resolved, "__MODULE__", pendingAliasAs.currentModule)
+			}
+			if !strings.Contains(resolved, "__MODULE__") {
+				parts := strings.Split(resolved, ".")
+				allAliases = append(allAliases, struct {
+					scope, short, full string
+				}{pendingAliasAs.scope, parts[len(parts)-1], resolved})
+			}
+			pendingAliasAs = nil
+			// Fall through to process this line normally
+		}
+
+		// Handle pending multi-line multi-alias {Children, ...} continuation
+		if pendingMultiAlias != nil {
+			if stripped == "" || stripped[0] == '#' {
+				continue
+			}
+			// Check for bail-out: line starts a new statement (not } or uppercase module name)
+			if stripped[0] != '}' && (stripped[0] < 'A' || stripped[0] > 'Z') {
+				// Flush accumulated children and reprocess this line
+				base := pendingMultiAlias.parent
+				if pendingMultiAlias.currentModule != "" {
+					base = strings.ReplaceAll(base, "__MODULE__", pendingMultiAlias.currentModule)
+				}
+				if !strings.Contains(base, "__MODULE__") {
+					for _, name := range pendingMultiAlias.children {
+						name = strings.TrimSpace(name)
+						if len(name) > 0 && unicode.IsUpper(rune(name[0])) {
+							allAliases = append(allAliases, struct {
+								scope, short, full string
+							}{pendingMultiAlias.scope, name, base + "." + name})
+						}
+					}
+				}
+				pendingMultiAlias = nil
+				// Fall through to process this line normally
+			} else {
+				// Check if closing brace is on this line
+				braceEnd := strings.IndexByte(stripped, '}')
+				if braceEnd >= 0 {
+					inner := stripped[:braceEnd]
+					if inner != "" {
+						pendingMultiAlias.children = append(pendingMultiAlias.children, strings.Split(inner, ",")...)
+					}
+					// Flush all children
+					base := pendingMultiAlias.parent
+					if pendingMultiAlias.currentModule != "" {
+						base = strings.ReplaceAll(base, "__MODULE__", pendingMultiAlias.currentModule)
+					}
+					if !strings.Contains(base, "__MODULE__") {
+						for _, name := range pendingMultiAlias.children {
+							name = strings.TrimSpace(name)
+							if len(name) > 0 && unicode.IsUpper(rune(name[0])) {
+								allAliases = append(allAliases, struct {
+									scope, short, full string
+								}{pendingMultiAlias.scope, name, base + "." + name})
+							}
+						}
+					}
+					pendingMultiAlias = nil
+				} else {
+					pendingMultiAlias.children = append(pendingMultiAlias.children, strings.Split(stripped, ",")...)
+				}
+				continue
+			}
+		}
 
 		// Track do..end nesting
 		if parser.IsEnd(stripped) {
@@ -353,10 +470,39 @@ func extractAliasesFromLines(lines []string, targetLine int) map[string]string {
 		} else if m := parser.AliasRe.FindStringSubmatch(line); m != nil {
 			fullMod := resolve(m[1])
 			if !strings.Contains(fullMod, "__MODULE__") {
-				parts := strings.Split(fullMod, ".")
-				allAliases = append(allAliases, struct {
-					scope, short, full string
-				}{currentModule, parts[len(parts)-1], fullMod})
+				afterMod := line[strings.Index(line, m[1])+len(m[1]):]
+				afterModStripped := strings.TrimRight(parser.StripCommentsAndStrings(afterMod), " \t\r")
+				if afterModStripped == "," {
+					// Trailing comma — may be multi-line alias with as: on next line
+					pendingAliasAs = &pendingAliasAsState{
+						moduleName:    fullMod,
+						scope:         currentModule,
+						currentModule: currentModule,
+					}
+				} else if strings.HasPrefix(afterModStripped, "{") && !strings.Contains(afterModStripped, "}") {
+					// Opening { without closing } — multi-line multi-alias
+					parent := strings.TrimRight(fullMod, ".")
+					resolvedParent := resolve(parent)
+					if !strings.Contains(resolvedParent, "__MODULE__") {
+						// Collect any children on this same line after the {
+						inner := afterModStripped[1:]
+						var initialChildren []string
+						if strings.TrimSpace(inner) != "" {
+							initialChildren = strings.Split(inner, ",")
+						}
+						pendingMultiAlias = &pendingMultiAliasState{
+							parent:        resolvedParent,
+							scope:         currentModule,
+							currentModule: currentModule,
+							children:      initialChildren,
+						}
+					}
+				} else {
+					parts := strings.Split(fullMod, ".")
+					allAliases = append(allAliases, struct {
+						scope, short, full string
+					}{currentModule, parts[len(parts)-1], fullMod})
+				}
 			}
 		}
 	}

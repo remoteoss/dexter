@@ -1772,6 +1772,215 @@ end
 	}
 }
 
+func TestParseFileReferences_MultiLineAliasAs(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.Controller do
+  alias MyApp.Helpers.Paginator,
+    as: Pages
+
+  def index do
+    Pages.call()
+  end
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The alias ref itself should point to the full module
+	aliasRefs := filterRefs(refs, "alias")
+	found := false
+	for _, r := range aliasRefs {
+		if r.Module == "MyApp.Helpers.Paginator" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected alias ref for MyApp.Helpers.Paginator; alias refs: %+v", aliasRefs)
+	}
+
+	// Pages.call() should resolve through the as: alias
+	callRefs := filterRefs(refs, "call")
+	found = false
+	for _, r := range callRefs {
+		if r.Module == "MyApp.Helpers.Paginator" && r.Function == "call" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected Pages.call to resolve to MyApp.Helpers.Paginator.call; call refs: %+v", callRefs)
+	}
+}
+
+func TestParseFileReferences_MultiLineMultiAlias(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.Web do
+  alias MyApp.Services.{
+    Accounts,
+    Users,
+    Profiles
+  }
+
+  def test do
+    Accounts.list()
+    Users.get(1)
+  end
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// All three modules should have alias refs
+	aliasRefs := filterRefs(refs, "alias")
+	foundModules := map[string]bool{}
+	for _, r := range aliasRefs {
+		foundModules[r.Module] = true
+	}
+	for _, mod := range []string{"MyApp.Services.Accounts", "MyApp.Services.Users", "MyApp.Services.Profiles"} {
+		if !foundModules[mod] {
+			t.Errorf("missing alias ref for %s; alias refs: %+v", mod, aliasRefs)
+		}
+	}
+
+	// Accounts.list() should resolve through multi-alias
+	callRefs := filterRefs(refs, "call")
+	found := false
+	for _, r := range callRefs {
+		if r.Module == "MyApp.Services.Accounts" && r.Function == "list" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected Accounts.list to resolve to MyApp.Services.Accounts.list; call refs: %+v", callRefs)
+	}
+}
+
+func TestParseFileReferences_MultiLineMultiAliasWithComments(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.Web do
+  alias MyApp.Services.{
+    Accounts,
+    # Users is deprecated
+    Profiles
+  }
+
+  def test do
+    Accounts.list()
+    Profiles.get()
+  end
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	aliasRefs := filterRefs(refs, "alias")
+	foundModules := map[string]bool{}
+	for _, r := range aliasRefs {
+		foundModules[r.Module] = true
+	}
+	for _, mod := range []string{"MyApp.Services.Accounts", "MyApp.Services.Profiles"} {
+		if !foundModules[mod] {
+			t.Errorf("missing alias ref for %s; alias refs: %+v", mod, aliasRefs)
+		}
+	}
+	if len(aliasRefs) != 2 {
+		t.Errorf("expected 2 alias refs, got %d: %+v", len(aliasRefs), aliasRefs)
+	}
+}
+
+func TestParseFileReferences_MultiLineMultiAliasMultiplePerLine(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.Web do
+  alias MyApp.Handlers.{
+    Accounts, Users,
+    Profiles
+  }
+
+  def test do
+    Accounts.list()
+  end
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	aliasRefs := filterRefs(refs, "alias")
+	foundModules := map[string]bool{}
+	for _, r := range aliasRefs {
+		foundModules[r.Module] = true
+	}
+	for _, mod := range []string{"MyApp.Handlers.Accounts", "MyApp.Handlers.Users", "MyApp.Handlers.Profiles"} {
+		if !foundModules[mod] {
+			t.Errorf("missing alias ref for %s; alias refs: %+v", mod, aliasRefs)
+		}
+	}
+}
+
+func TestParseFileReferences_MultiLineMultiAliasTrailingComma(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.Web do
+  alias MyApp.Handlers.{
+    Accounts,
+    Users,
+  }
+
+  def test do
+    Accounts.list()
+  end
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	aliasRefs := filterRefs(refs, "alias")
+	foundModules := map[string]bool{}
+	for _, r := range aliasRefs {
+		foundModules[r.Module] = true
+	}
+	for _, mod := range []string{"MyApp.Handlers.Accounts", "MyApp.Handlers.Users"} {
+		if !foundModules[mod] {
+			t.Errorf("missing alias ref for %s; alias refs: %+v", mod, aliasRefs)
+		}
+	}
+	if len(aliasRefs) != 2 {
+		t.Errorf("expected 2 alias refs, got %d: %+v", len(aliasRefs), aliasRefs)
+	}
+}
+
+func TestParseFileReferences_MultiLineAliasBailOut(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.Web do
+  alias MyApp.Handlers.{
+    Accounts,
+  def foo do
+    :ok
+  end
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Should not crash and should not swallow the def
+	callRefs := filterRefs(refs, "call")
+	for _, r := range callRefs {
+		if r.Function == "foo" {
+			// foo should be parsed as a def, not swallowed as an alias child
+			return
+		}
+	}
+}
+
 func TestParseFileReferences_SkipsHeredocs(t *testing.T) {
 	path := writeTempFile(t, `defmodule MyApp.Foo do
   @doc """

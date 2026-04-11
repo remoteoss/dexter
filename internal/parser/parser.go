@@ -94,6 +94,21 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 	injectors := map[string]bool{} // modules from use/import that inject bare functions
 	inHeredoc := false
 
+	// Pending state for multi-line alias tracking
+	type pendingAliasAsState struct {
+		moduleName    string
+		currentModule string
+		line          int
+	}
+	type pendingMultiAliasState struct {
+		parent        string
+		currentModule string
+		startLine     int
+		children      []string // raw segments accumulated so far
+	}
+	var pendingAliasAs *pendingAliasAsState
+	var pendingMultiAlias *pendingMultiAliasState
+
 	for lineIdx, line := range lines {
 		lineNum := lineIdx + 1
 
@@ -115,6 +130,103 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 		rest := line[trimStart:] // line content from first non-whitespace char
 
 		strippedRest := strings.TrimRight(StripCommentsAndStrings(rest), " \t\r")
+
+		// Handle pending multi-line alias as: continuation
+		if pendingAliasAs != nil {
+			stripped := strings.TrimSpace(StripCommentsAndStrings(line))
+			if strings.HasPrefix(stripped, "as:") {
+				asStr := strings.TrimLeft(stripped[3:], " \t")
+				asName := scanIdentifier(asStr)
+				if asName != "" {
+					resolved := resolveModule(pendingAliasAs.moduleName, pendingAliasAs.currentModule)
+					if !strings.Contains(resolved, "__MODULE__") {
+						aliases[asName] = resolved
+						refs = append(refs, Reference{Module: resolved, Line: pendingAliasAs.line, FilePath: path, Kind: "alias"})
+					}
+				}
+				pendingAliasAs = nil
+				continue
+			}
+			// Not an as: line — bail out, register as simple alias, and reprocess this line
+			resolved := resolveModule(pendingAliasAs.moduleName, pendingAliasAs.currentModule)
+			dot := strings.LastIndexByte(resolved, '.')
+			var shortName string
+			if dot >= 0 {
+				shortName = resolved[dot+1:]
+			} else {
+				shortName = resolved
+			}
+			aliases[shortName] = resolved
+			if !strings.Contains(resolved, "__MODULE__") {
+				refs = append(refs, Reference{Module: resolved, Line: pendingAliasAs.line, FilePath: path, Kind: "alias"})
+			}
+			pendingAliasAs = nil
+			// Fall through to process this line normally
+		}
+
+		// Handle pending multi-line multi-alias {Children, ...} continuation
+		if pendingMultiAlias != nil {
+			stripped := strings.TrimSpace(StripCommentsAndStrings(line))
+			if stripped == "" || stripped[0] == '#' {
+				// Comment-only or blank line inside multi-alias block
+				continue
+			}
+			// Check for bail-out: line starts a new statement
+			if stripped[0] != '}' && !isUpperByte(stripped[0]) {
+				// Looks like a new statement (def, defmodule, import, use, @, end, etc.)
+				// Flush whatever children we've accumulated so far and reprocess
+				parentResolved := resolveModule(pendingMultiAlias.parent, pendingMultiAlias.currentModule)
+				for _, segment := range pendingMultiAlias.children {
+					segment = strings.TrimSpace(segment)
+					childName := ScanModuleName(segment)
+					if childName != "" {
+						fullChild := parentResolved + "." + childName
+						aliasKey := childName
+						if dot := strings.LastIndexByte(childName, '.'); dot >= 0 {
+							aliasKey = childName[dot+1:]
+						}
+						aliases[aliasKey] = fullChild
+						if !strings.Contains(fullChild, "__MODULE__") {
+							refs = append(refs, Reference{Module: fullChild, Line: pendingMultiAlias.startLine, FilePath: path, Kind: "alias"})
+						}
+					}
+				}
+				pendingMultiAlias = nil
+				// Fall through to process this line normally
+			} else {
+				// Accumulate children; check if closing brace is on this line
+				braceEnd := strings.IndexByte(stripped, '}')
+				if braceEnd >= 0 {
+					// Closing brace found — collect any children before it
+					inner := stripped[:braceEnd]
+					if inner != "" {
+						pendingMultiAlias.children = append(pendingMultiAlias.children, strings.Split(inner, ",")...)
+					}
+					// Flush all children
+					parentResolved := resolveModule(pendingMultiAlias.parent, pendingMultiAlias.currentModule)
+					for _, segment := range pendingMultiAlias.children {
+						segment = strings.TrimSpace(segment)
+						childName := ScanModuleName(segment)
+						if childName != "" {
+							fullChild := parentResolved + "." + childName
+							aliasKey := childName
+							if dot := strings.LastIndexByte(childName, '.'); dot >= 0 {
+								aliasKey = childName[dot+1:]
+							}
+							aliases[aliasKey] = fullChild
+							if !strings.Contains(fullChild, "__MODULE__") {
+								refs = append(refs, Reference{Module: fullChild, Line: lineNum, FilePath: path, Kind: "alias"})
+							}
+						}
+					}
+					pendingMultiAlias = nil
+				} else {
+					// No closing brace — accumulate children from this line
+					pendingMultiAlias.children = append(pendingMultiAlias.children, strings.Split(stripped, ",")...)
+				}
+				continue
+			}
+		}
 
 		// 'e' — check for "end" to pop module stack; otherwise fall through
 		if first == 'e' {
@@ -180,6 +292,20 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 							}
 							continue
 						}
+						// Opening { without closing } — start multi-line multi-alias
+						parent := strings.TrimRight(moduleName, ".")
+						inner := remaining[1:]
+						var initialChildren []string
+						if strings.TrimSpace(inner) != "" {
+							initialChildren = strings.Split(inner, ",")
+						}
+						pendingMultiAlias = &pendingMultiAliasState{
+							parent:        parent,
+							currentModule: currentModule,
+							startLine:     lineNum,
+							children:      initialChildren,
+						}
+						continue
 					}
 
 					if strings.HasPrefix(remaining, ", as:") {
@@ -203,6 +329,16 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 							}
 						}
 					} else {
+						// Check for trailing comma — may be multi-line alias with as: on next line
+						stripped := strings.TrimRight(StripCommentsAndStrings(remaining), " \t\r")
+						if stripped == "," {
+							pendingAliasAs = &pendingAliasAsState{
+								moduleName:    moduleName,
+								currentModule: currentModule,
+								line:          lineNum,
+							}
+							continue
+						}
 						resolved := resolveModule(moduleName, currentModule)
 						dot := strings.LastIndexByte(resolved, '.')
 						var shortName string
@@ -561,6 +697,10 @@ func ScanFuncName(s string) string {
 }
 
 // scanIdentifier reads an identifier ([A-Za-z0-9_]+) from the start of s.
+func isUpperByte(b byte) bool {
+	return b >= 'A' && b <= 'Z'
+}
+
 func scanIdentifier(s string) string {
 	i := 0
 	for i < len(s) {
