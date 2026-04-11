@@ -178,6 +178,120 @@ func TestExtractModuleAndFunction(t *testing.T) {
 	}
 }
 
+func TestExtractAliasBlockParent(t *testing.T) {
+	t.Run("cursor inside multi-line block", func(t *testing.T) {
+		text := `defmodule MyApp.Web do
+  alias MyApp.Services.{
+    Accounts,
+
+  }
+end`
+		parent, ok := ExtractAliasBlockParent(text, 3)
+		if !ok {
+			t.Fatal("expected to be inside alias block")
+		}
+		if parent != "MyApp.Services" {
+			t.Errorf("got %q, want MyApp.Services", parent)
+		}
+	})
+
+	t.Run("cursor on line with children", func(t *testing.T) {
+		text := `defmodule MyApp.Web do
+  alias MyApp.Services.{
+    Accounts,
+  }
+end`
+		parent, ok := ExtractAliasBlockParent(text, 2)
+		if !ok {
+			t.Fatal("expected to be inside alias block")
+		}
+		if parent != "MyApp.Services" {
+			t.Errorf("got %q, want MyApp.Services", parent)
+		}
+	})
+
+	t.Run("cursor after closing brace", func(t *testing.T) {
+		text := `defmodule MyApp.Web do
+  alias MyApp.Services.{
+    Accounts
+  }
+
+end`
+		_, ok := ExtractAliasBlockParent(text, 4)
+		if ok {
+			t.Error("should not be inside alias block after closing brace")
+		}
+	})
+
+	t.Run("cursor on normal alias line", func(t *testing.T) {
+		text := `defmodule MyApp.Web do
+  alias MyApp.Repo
+
+end`
+		_, ok := ExtractAliasBlockParent(text, 2)
+		if ok {
+			t.Error("should not be inside alias block on a normal line")
+		}
+	})
+
+	t.Run("cursor on same line as opening brace", func(t *testing.T) {
+		text := `defmodule MyApp.Web do
+  alias MyApp.Handlers.{
+end`
+		parent, ok := ExtractAliasBlockParent(text, 1)
+		if !ok {
+			t.Fatal("expected to be inside alias block")
+		}
+		if parent != "MyApp.Handlers" {
+			t.Errorf("got %q, want MyApp.Handlers", parent)
+		}
+	})
+
+	t.Run("resolves __MODULE__ in parent", func(t *testing.T) {
+		text := `defmodule MyApp.HRIS do
+  alias __MODULE__.{
+    Services,
+
+  }
+end`
+		parent, ok := ExtractAliasBlockParent(text, 3)
+		if !ok {
+			t.Fatal("expected to be inside alias block")
+		}
+		if parent != "MyApp.HRIS" {
+			t.Errorf("got %q, want MyApp.HRIS", parent)
+		}
+	})
+
+	t.Run("single-line block with closing brace", func(t *testing.T) {
+		text := `defmodule MyApp.Web do
+  alias MyApp.{Accounts, Users}
+
+end`
+		_, ok := ExtractAliasBlockParent(text, 1)
+		if ok {
+			t.Error("should not be inside alias block when braces close on same line")
+		}
+	})
+
+	t.Run("blank lines between alias and cursor", func(t *testing.T) {
+		text := `defmodule MyApp.Web do
+  alias MyApp.Services.{
+    Accounts,
+
+
+  }
+end`
+		parent, ok := ExtractAliasBlockParent(text, 4)
+		if !ok {
+			t.Fatal("expected to be inside alias block")
+		}
+		if parent != "MyApp.Services" {
+			t.Errorf("got %q, want MyApp.Services", parent)
+		}
+	})
+}
+
 func TestExtractAliases(t *testing.T) {
 	t.Run("simple alias", func(t *testing.T) {
 		aliases := ExtractAliases("  alias MyApp.Repo")
@@ -262,6 +376,17 @@ func TestExtractAliases(t *testing.T) {
 		// Should NOT also register as a simple alias under the last segment
 		if _, ok := aliases["Paginator"]; ok {
 			t.Error("should not register simple alias Paginator when as: is on next line")
+		}
+	})
+
+	t.Run("multi-line alias with as and extra whitespace before comma", func(t *testing.T) {
+		text := "defmodule MyApp.Web do\n  alias MyApp.Billing.Services.MakePayment        ,\n  as: MakePaymentNow\nend"
+		aliases := ExtractAliases(text)
+		if aliases["MakePaymentNow"] != "MyApp.Billing.Services.MakePayment" {
+			t.Errorf("MakePaymentNow: got %q, want MyApp.Billing.Services.MakePayment", aliases["MakePaymentNow"])
+		}
+		if _, ok := aliases["MakePayment"]; ok {
+			t.Error("should not register simple alias MakePayment when as: is on next line")
 		}
 	})
 

@@ -949,6 +949,55 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 	}
 
 	prefix, afterDot, prefixStartCol := ExtractCompletionContext(lines[lineNum], col)
+
+	// Inside a multi-line alias block: complete child module segments under the parent.
+	// Behaves like typing "ParentModule." but only returns modules (not functions),
+	// and labels are the short child path (what goes between the braces).
+	if aliasParent, inBlock := ExtractAliasBlockParent(text, lineNum); inBlock {
+		// Determine the fully-resolved search parent and the segment prefix.
+		// "Ac"       → search MyApp.Services for children starting with "Ac"
+		// "Ecto."    → search MyApp.Ecto for all children
+		// "Ecto.Pag" → search MyApp.Ecto for children starting with "Pag"
+		// ""         → search MyApp for all children (empty prefix / blank line)
+		searchParent := aliasParent
+		segmentPrefix := prefix
+		labelPrefix := ""
+
+		if afterDot && prefix != "" {
+			// "Ecto." → searchParent becomes "MyApp.Ecto", segmentPrefix becomes ""
+			searchParent = aliasParent + "." + prefix
+			segmentPrefix = ""
+			labelPrefix = prefix + "."
+		} else if prefix != "" {
+			if dotIdx := strings.LastIndexByte(prefix, '.'); dotIdx >= 0 {
+				// "Ecto.Pag" → searchParent becomes "MyApp.Ecto", segmentPrefix becomes "Pag"
+				searchParent = aliasParent + "." + prefix[:dotIdx]
+				segmentPrefix = prefix[dotIdx+1:]
+				labelPrefix = prefix[:dotIdx+1]
+			}
+		}
+
+		segments, err := s.store.SearchSubmoduleSegments(searchParent, segmentPrefix)
+		if err != nil {
+			return nil, nil
+		}
+		var items []protocol.CompletionItem
+		for _, segment := range segments {
+			items = append(items, protocol.CompletionItem{
+				Label:  labelPrefix + segment,
+				Kind:   protocol.CompletionItemKindModule,
+				Detail: searchParent + "." + segment,
+			})
+		}
+		if len(items) == 0 {
+			return nil, nil
+		}
+		return &protocol.CompletionList{
+			IsIncomplete: len(items) >= 100,
+			Items:        items,
+		}, nil
+	}
+
 	if prefix == "" && !afterDot {
 		return nil, nil
 	}

@@ -1772,6 +1772,45 @@ end
 	}
 }
 
+func TestParseFileReferences_MultiLineAliasAsExtraWhitespace(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.Controller do
+  alias MyApp.Billing.Services.MakePayment        ,
+  as: MakePaymentNow
+
+  def index do
+    MakePaymentNow.call()
+  end
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	aliasRefs := filterRefs(refs, "alias")
+	found := false
+	for _, r := range aliasRefs {
+		if r.Module == "MyApp.Billing.Services.MakePayment" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected alias ref for MyApp.Billing.Services.MakePayment; alias refs: %+v", aliasRefs)
+	}
+
+	callRefs := filterRefs(refs, "call")
+	found = false
+	for _, r := range callRefs {
+		if r.Module == "MyApp.Billing.Services.MakePayment" && r.Function == "call" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected MakePaymentNow.call to resolve to MyApp.Billing.Services.MakePayment.call; call refs: %+v", callRefs)
+	}
+}
+
 func TestParseFileReferences_MultiLineAliasAs(t *testing.T) {
 	path := writeTempFile(t, `defmodule MyApp.Controller do
   alias MyApp.Helpers.Paginator,

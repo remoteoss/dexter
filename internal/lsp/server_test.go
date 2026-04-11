@@ -752,6 +752,130 @@ end`)
 	}
 }
 
+func TestCompletion_AliasBlock_SimplePrefix(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/services.ex", `defmodule MyApp.Services.Accounts do
+end
+
+defmodule MyApp.Services.Analytics do
+end
+
+defmodule MyApp.Services.Billing do
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyModule do
+  alias MyApp.Services.{
+    Ac
+  }
+end`)
+
+	// cursor at "Ac" → line 2, col 6
+	items := completionAt(t, server, uri, 2, 6)
+	if !hasCompletionItem(items, "Accounts") {
+		t.Error("expected 'Accounts' in alias block completions")
+	}
+	if hasCompletionItem(items, "Analytics") {
+		t.Error("should not include 'Analytics' — doesn't match prefix 'Ac'")
+	}
+	if hasCompletionItem(items, "Billing") {
+		t.Error("should not include 'Billing' — doesn't match prefix 'Ac'")
+	}
+}
+
+func TestCompletion_AliasBlock_DottedPrefix(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/ecto.ex", `defmodule MyApp.Ecto.Paginator do
+end
+
+defmodule MyApp.Ecto.ChangesetHelpers do
+end
+
+defmodule MyApp.Accounts do
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyModule do
+  alias MyApp.{
+    Ecto.
+  }
+end`)
+
+	// cursor after "Ecto." → line 2, col 9
+	items := completionAt(t, server, uri, 2, 9)
+	if !hasCompletionItem(items, "Ecto.Paginator") {
+		t.Error("expected 'Ecto.Paginator' in alias block completions")
+	}
+	if !hasCompletionItem(items, "Ecto.ChangesetHelpers") {
+		t.Error("expected 'Ecto.ChangesetHelpers' in alias block completions")
+	}
+	if hasCompletionItem(items, "Accounts") {
+		t.Error("should not include 'Accounts' — not a child of MyApp.Ecto")
+	}
+}
+
+func TestCompletion_AliasBlock_DottedPrefixWithPartial(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/ecto.ex", `defmodule MyApp.Ecto.Paginator do
+end
+
+defmodule MyApp.Ecto.ChangesetHelpers do
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyModule do
+  alias MyApp.{
+    Ecto.Pag
+  }
+end`)
+
+	// cursor at "Ecto.Pag" → line 2, col 12
+	items := completionAt(t, server, uri, 2, 12)
+	if !hasCompletionItem(items, "Ecto.Paginator") {
+		t.Error("expected 'Ecto.Paginator' in alias block completions")
+	}
+	if hasCompletionItem(items, "Ecto.ChangesetHelpers") {
+		t.Error("should not include 'Ecto.ChangesetHelpers' — doesn't match prefix 'Pag'")
+	}
+}
+
+func TestCompletion_AliasBlock_EmptyPrefix(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/services.ex", `defmodule MyApp.Accounts do
+end
+
+defmodule MyApp.Billing do
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyModule do
+  alias MyApp.{
+
+  }
+end`)
+
+	// cursor on blank line inside the block → line 2, col 4
+	items := completionAt(t, server, uri, 2, 4)
+	if !hasCompletionItem(items, "Accounts") {
+		t.Error("expected 'Accounts' in alias block completions with empty prefix")
+	}
+	if !hasCompletionItem(items, "Billing") {
+		t.Error("expected 'Billing' in alias block completions with empty prefix")
+	}
+}
+
 func TestCompletion_ImportedFunctions(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
