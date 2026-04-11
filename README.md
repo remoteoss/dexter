@@ -15,6 +15,7 @@ A fast, full-featured Elixir LSP optimized for large Elixir codebases.
   - [Neovim (0.11+)](#neovim-011)
   - [Neovim (with nvim-lspconfig — \< 0.11)](#neovim-with-nvim-lspconfig---011)
   - [Zed](#zed)
+  - [Emacs](#emacs)
 - [Why build another LSP?](#why-build-another-lsp)
 - [Performance](#performance)
 - [CLI usage](#cli-usage)
@@ -43,7 +44,7 @@ A fast, full-featured Elixir LSP optimized for large Elixir codebases.
 - **Go-to-definition** — jump to any module, function, type, or variable definition. Resolves aliases, imports, `defdelegate` chains, `use` injections, and the Elixir stdlib. Handles all definition forms: `def`, `defp`, `defmacro`, `defprotocol`, `defimpl`, `defstruct`, and more.
 - **Go-to-references** — find all usages of a function or module across the codebase, including through `import`, `use` chains, and `defdelegate`.
 - **Hover documentation** — `@doc`, `@moduledoc`, `@typedoc`, and `@spec` annotations rendered as Markdown when you hover over a symbol.
-- **Autocompletion** — modules, functions, types, and variables with full snippet support. Resolves through aliases, imports, `use` injections, and the Elixir stdlib. Works for qualified calls (`MyApp.Repo.|`), bare function calls, and module prefixes.
+- **Autocompletion** — modules, functions, types, and variables with full snippet support. Resolves through aliases, imports, `use` injections, and the Elixir stdlib. Works for qualified calls (`MyApp.Accounts.|`), bare function calls, and module prefixes.
 - **Rename** — rename modules, functions, and variables with automatic file renaming when the convention is followed.
 - **No compilation required** — the index is built by parsing source files directly, not by compiling your project. Dexter works immediately on any codebase, even ones that don't compile.
 - **Monorepo and umbrella support** — a single index at the repository root covers all apps and shared libraries. Go-to-definition, find references, and rename work cross-project out of the box.
@@ -61,7 +62,7 @@ A fast, full-featured Elixir LSP optimized for large Elixir codebases.
 <details>
 <summary>More features</summary>
 
-- **Delegate following** — `defdelegate fetch(id), to: MyApp.Repo` jumps to `MyApp.Repo.fetch`, respecting `as:` renames.
+- **Delegate following** — `defdelegate fetch_user(id), to: MyApp.Accounts.Finders.FetchUser, as: :find` jumps to `MyApp.Accounts.Finders.FetchUser.find`, respecting `as:` renames.
 - **Alias resolution** — `alias MyApp.Handlers.Foo`, `alias MyApp.Handlers.Foo, as: Cool`, `alias MyApp.Handlers.{Foo, Bar}`.
 - **Import resolution** — bare function calls resolved through `import` declarations.
 - **Type definitions** — `@type` and `@opaque` are indexed for go-to-definition and hover.
@@ -128,7 +129,7 @@ To enable format-on-save, update your VS Code settings:
 // or, for Elixir specifically
 {
   "[elixir]": {
-      "editor.formatOnSave": true
+      "editor.formatOnSave": true,
       // you may need to set Dexter as your default Elixir formatter, depending on your setup
       "editor.defaultFormatter": "remoteoss.dexter-lsp"
   },
@@ -303,19 +304,19 @@ export DEXTER_ELIXIR_LIB_ROOT="/path/to/elixir/lib"
 
 ```sh
 # Find where a module is defined
-dexter lookup MyApp.Repo
-# => /path/to/lib/my_app/repo.ex:1
+dexter lookup MyApp.Accounts
+# => /path/to/lib/my_app/accounts.ex:1
 
 # Find where a function is defined (follows defdelegates by default)
-dexter lookup MyApp.Repo get
-# => /path/to/lib/my_app/repo.ex:15
+dexter lookup MyApp.Accounts fetch_user
+# => /path/to/lib/my_app/accounts/finders/fetch_user.ex:8
 
 # Don't follow defdelegates
-dexter lookup --no-follow-delegates MyApp.Accounts fetch
+dexter lookup --no-follow-delegates MyApp.Accounts fetch_user
 # => /path/to/lib/my_app/accounts.ex:5
 
 # Strict mode — exit 1 if exact function not found (no fallback to module)
-dexter lookup --strict MyApp.Repo nonexistent
+dexter lookup --strict MyApp.Accounts nonexistent
 # => (exit code 1)
 ```
 
@@ -323,13 +324,13 @@ dexter lookup --strict MyApp.Repo nonexistent
 
 ```sh
 # Find all usages of a module
-dexter references MyApp.Repo
-# => /path/to/lib/my_app/accounts.ex:12
-# => /path/to/lib/my_app/posts.ex:8
+dexter references MyApp.Accounts
+# => /path/to/lib/my_app_web/user_controller.ex:12
+# => /path/to/lib/my_app/auth.ex:8
 
 # Find all usages of a specific function
-dexter references MyApp.Repo get
-# => /path/to/lib/my_app/accounts.ex:45
+dexter references MyApp.Accounts fetch_user
+# => /path/to/lib/my_app_web/user_controller.ex:45
 ```
 
 Exits 1 with a message to stderr if no references are found.
@@ -340,7 +341,7 @@ The LSP does this for you automatically, but if for some reason you need to, you
 
 ```sh
 # Re-index a single file (~10ms)
-dexter reindex /path/to/lib/my_app/repo.ex
+dexter reindex /path/to/lib/my_app/accounts.ex
 
 # Re-index the whole project (only re-parses changed files)
 dexter reindex ~/code/my-elixir-project
@@ -351,7 +352,6 @@ When running as an LSP server, dexter automatically:
 - Reindexes files on save (`textDocument/didSave`)
 - Runs an incremental reindex on startup
 - Watches `.git/HEAD` for branch switches and reindexes when detected
-- Periodically reindexes every 30 seconds
 
 ## Hover documentation
 
@@ -370,11 +370,11 @@ Fetches a user by ID. Options are passed to the underlying query.
 
 Dexter resolves hover (and go-to-definition) based on which segment of a dotted expression your cursor is on:
 
-| Cursor position                | Expression       | Resolves to             |
-| ------------------------------ | ---------------- | ----------------------- |
-| On `Repo` in `MyApp.Repo.all`  | `MyApp.Repo`     | The `MyApp.Repo` module |
-| On `all` in `MyApp.Repo.all`   | `MyApp.Repo.all` | The `all` function      |
-| On `MyApp` in `MyApp.Repo.all` | `MyApp`          | The `MyApp` module      |
+| Cursor position                              | Expression                  | Resolves to                  |
+| -------------------------------------------- | --------------------------- | ---------------------------- |
+| On `Accounts` in `MyApp.Accounts.list_users` | `MyApp.Accounts`            | The `MyApp.Accounts` module  |
+| On `list_users` in `MyApp.Accounts.list_users` | `MyApp.Accounts.list_users` | The `list_users` function  |
+| On `MyApp` in `MyApp.Accounts.list_users`    | `MyApp`                     | The `MyApp` module           |
 
 ## Rename
 
@@ -382,7 +382,7 @@ Dexter supports renaming modules, functions, and variables across the codebase v
 
 ### Modules
 
-Place your cursor on any segment of a module name and invoke rename. Dexter highlights just the last segment for editing — the parent namespace is preserved automatically. For example, renaming `Repo` in `MyApp.Repo` to `Repository` renames the module to `MyApp.Repository`.
+Place your cursor on any segment of a module name and invoke rename. Dexter highlights just the last segment for editing — the parent namespace is preserved automatically. For example, renaming `Accounts` in `MyApp.Accounts` to `Users` renames the module to `MyApp.Users`.
 
 **What gets updated:**
 
@@ -391,9 +391,9 @@ Place your cursor on any segment of a module name and invoke rename. Dexter high
 - All call sites
 - All submodules (renaming `MyApp.Foo` also renames `MyApp.Foo.Bar`, `MyApp.Foo.Baz`, etc.)
 
-**File renaming after a module rename:** If the source file follows the Elixir naming convention (module `MyApp.SomeRepo` → file `some_repo.ex`), dexter renames the file alongside the module. For submodules, the containing directory segment is also renamed to match (e.g., renaming `MyApp.Companies` to `MyApp.Clients` moves `lib/companies/services/do_something.ex` → `lib/clients/services/do_something.ex`). After the rename, dexter opens the new file automatically if your editor supports `window/showDocument`.
+**File renaming after a module rename:** If the source file follows the Elixir naming convention (module `MyApp.Accounts` → file `accounts.ex`), dexter renames the file alongside the module. For submodules, the containing directory segment is also renamed to match (e.g., renaming `MyApp.Companies` to `MyApp.Clients` moves `lib/companies/services/do_something.ex` → `lib/clients/services/do_something.ex`). After the rename, dexter opens the new file automatically if your editor supports `window/showDocument`.
 
-**When path renaming won't happen:** If the file name doesn't match the snake_case form of the module's last segment — for example, a file named `my_custom_name.ex` that defines `MyModule.SomeRepo` — the file stays in place and only the contents are updated.
+**When path renaming won't happen:** If the file name doesn't match the snake_case form of the module's last segment — for example, a file named `my_custom_name.ex` that defines `MyApp.Accounts` — the file stays in place and only the contents are updated.
 
 Files not open in the editor are written directly to disk; open buffers receive edits via the LSP workspace edit response.
 
