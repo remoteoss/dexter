@@ -108,6 +108,7 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 	}
 	var pendingAliasAs *pendingAliasAsState
 	var pendingMultiAlias *pendingMultiAliasState
+	pendingAlias := false // fast check to avoid nil comparisons on every line
 
 	// flushMultiAliasChildren processes accumulated children from a multi-line
 	// alias block and registers each as an alias + reference.
@@ -152,64 +153,67 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 
 		strippedRest := strings.TrimRight(StripCommentsAndStrings(rest), " \t\r")
 
-		// Handle pending multi-line alias as: continuation
-		if pendingAliasAs != nil {
-			stripped := strings.TrimSpace(StripCommentsAndStrings(line))
-			if strings.HasPrefix(stripped, "as:") {
-				asStr := strings.TrimLeft(stripped[3:], " \t")
-				asName := scanIdentifier(asStr)
-				if asName != "" {
-					resolved := resolveModule(pendingAliasAs.moduleName, pendingAliasAs.currentModule)
-					if !strings.Contains(resolved, "__MODULE__") {
-						aliases[asName] = resolved
-						refs = append(refs, Reference{Module: resolved, Line: pendingAliasAs.line, FilePath: path, Kind: "alias"})
+		// Handle pending multi-line alias continuations (guarded by a single
+		// boolean so the common path — no pending alias — is one branch).
+		if pendingAlias {
+			if pendingAliasAs != nil {
+				stripped := strings.TrimSpace(StripCommentsAndStrings(line))
+				if strings.HasPrefix(stripped, "as:") {
+					asStr := strings.TrimLeft(stripped[3:], " \t")
+					asName := scanIdentifier(asStr)
+					if asName != "" {
+						resolved := resolveModule(pendingAliasAs.moduleName, pendingAliasAs.currentModule)
+						if !strings.Contains(resolved, "__MODULE__") {
+							aliases[asName] = resolved
+							refs = append(refs, Reference{Module: resolved, Line: pendingAliasAs.line, FilePath: path, Kind: "alias"})
+						}
 					}
+					pendingAliasAs = nil
+					pendingAlias = false
+					continue
+				}
+				// Not an as: line — bail out, register as simple alias, and reprocess this line
+				resolved := resolveModule(pendingAliasAs.moduleName, pendingAliasAs.currentModule)
+				dot := strings.LastIndexByte(resolved, '.')
+				var shortName string
+				if dot >= 0 {
+					shortName = resolved[dot+1:]
+				} else {
+					shortName = resolved
+				}
+				aliases[shortName] = resolved
+				if !strings.Contains(resolved, "__MODULE__") {
+					refs = append(refs, Reference{Module: resolved, Line: pendingAliasAs.line, FilePath: path, Kind: "alias"})
 				}
 				pendingAliasAs = nil
-				continue
-			}
-			// Not an as: line — bail out, register as simple alias, and reprocess this line
-			resolved := resolveModule(pendingAliasAs.moduleName, pendingAliasAs.currentModule)
-			dot := strings.LastIndexByte(resolved, '.')
-			var shortName string
-			if dot >= 0 {
-				shortName = resolved[dot+1:]
-			} else {
-				shortName = resolved
-			}
-			aliases[shortName] = resolved
-			if !strings.Contains(resolved, "__MODULE__") {
-				refs = append(refs, Reference{Module: resolved, Line: pendingAliasAs.line, FilePath: path, Kind: "alias"})
-			}
-			pendingAliasAs = nil
-			// Fall through to process this line normally
-		}
-
-		// Handle pending multi-line multi-alias {Children, ...} continuation
-		if pendingMultiAlias != nil {
-			stripped := strings.TrimSpace(StripCommentsAndStrings(line))
-			if stripped == "" || stripped[0] == '#' {
-				continue
-			}
-			// Check for bail-out: line starts a new statement
-			if stripped[0] != '}' && !isUpperByte(stripped[0]) {
-				flushMultiAliasChildren(pendingMultiAlias.parent, pendingMultiAlias.currentModule, pendingMultiAlias.children, pendingMultiAlias.startLine)
-				pendingMultiAlias = nil
+				pendingAlias = false
 				// Fall through to process this line normally
-			} else {
-				// Accumulate children; check if closing brace is on this line
-				braceEnd := strings.IndexByte(stripped, '}')
-				if braceEnd >= 0 {
-					inner := stripped[:braceEnd]
-					if inner != "" {
-						pendingMultiAlias.children = append(pendingMultiAlias.children, strings.Split(inner, ",")...)
-					}
-					flushMultiAliasChildren(pendingMultiAlias.parent, pendingMultiAlias.currentModule, pendingMultiAlias.children, lineNum)
-					pendingMultiAlias = nil
-				} else {
-					pendingMultiAlias.children = append(pendingMultiAlias.children, strings.Split(stripped, ",")...)
+			} else if pendingMultiAlias != nil {
+				stripped := strings.TrimSpace(StripCommentsAndStrings(line))
+				if stripped == "" || stripped[0] == '#' {
+					continue
 				}
-				continue
+				// Check for bail-out: line starts a new statement
+				if stripped[0] != '}' && !isUpperByte(stripped[0]) {
+					flushMultiAliasChildren(pendingMultiAlias.parent, pendingMultiAlias.currentModule, pendingMultiAlias.children, pendingMultiAlias.startLine)
+					pendingMultiAlias = nil
+					pendingAlias = false
+					// Fall through to process this line normally
+				} else {
+					braceEnd := strings.IndexByte(stripped, '}')
+					if braceEnd >= 0 {
+						inner := stripped[:braceEnd]
+						if inner != "" {
+							pendingMultiAlias.children = append(pendingMultiAlias.children, strings.Split(inner, ",")...)
+						}
+						flushMultiAliasChildren(pendingMultiAlias.parent, pendingMultiAlias.currentModule, pendingMultiAlias.children, lineNum)
+						pendingMultiAlias = nil
+						pendingAlias = false
+					} else {
+						pendingMultiAlias.children = append(pendingMultiAlias.children, strings.Split(stripped, ",")...)
+					}
+					continue
+				}
 			}
 		}
 
@@ -290,6 +294,7 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 							startLine:     lineNum,
 							children:      initialChildren,
 						}
+						pendingAlias = true
 						continue
 					}
 
@@ -322,6 +327,7 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 								currentModule: currentModule,
 								line:          lineNum,
 							}
+							pendingAlias = true
 							continue
 						}
 						resolved := resolveModule(moduleName, currentModule)

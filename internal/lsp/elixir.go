@@ -405,6 +405,7 @@ func extractAliasesFromLines(lines []string, targetLine int) map[string]string {
 	}
 	var pendingAliasAs *pendingAliasAsState
 	var pendingMultiAlias *pendingMultiAliasState
+	pendingAlias := false
 
 	resolveModuleStr := func(s, currentModule string) string {
 		if currentModule != "" {
@@ -451,57 +452,61 @@ func extractAliasesFromLines(lines []string, targetLine int) map[string]string {
 		trimmed := strings.TrimSpace(line)
 		stripped := strings.TrimSpace(parser.StripCommentsAndStrings(trimmed))
 
-		// Handle pending multi-line alias as: continuation
-		if pendingAliasAs != nil {
-			if strings.HasPrefix(stripped, "as:") {
-				asStr := strings.TrimLeft(stripped[3:], " \t")
-				asName := parser.ScanModuleName(asStr)
-				if asName != "" {
-					resolved := resolveModuleStr(pendingAliasAs.moduleName, pendingAliasAs.currentModule)
-					if !strings.Contains(resolved, "__MODULE__") {
-						allAliases = append(allAliases, struct {
-							scope, short, full string
-						}{pendingAliasAs.scope, asName, resolved})
+		// Handle pending multi-line alias continuations (guarded by a single
+		// boolean so the common path — no pending alias — is one branch).
+		if pendingAlias {
+			if pendingAliasAs != nil {
+				if strings.HasPrefix(stripped, "as:") {
+					asStr := strings.TrimLeft(stripped[3:], " \t")
+					asName := parser.ScanModuleName(asStr)
+					if asName != "" {
+						resolved := resolveModuleStr(pendingAliasAs.moduleName, pendingAliasAs.currentModule)
+						if !strings.Contains(resolved, "__MODULE__") {
+							allAliases = append(allAliases, struct {
+								scope, short, full string
+							}{pendingAliasAs.scope, asName, resolved})
+						}
 					}
+					pendingAliasAs = nil
+					pendingAlias = false
+					continue
+				}
+				// Not an as: line — bail out, register as simple alias, and reprocess
+				resolved := resolveModuleStr(pendingAliasAs.moduleName, pendingAliasAs.currentModule)
+				if !strings.Contains(resolved, "__MODULE__") {
+					parts := strings.Split(resolved, ".")
+					allAliases = append(allAliases, struct {
+						scope, short, full string
+					}{pendingAliasAs.scope, parts[len(parts)-1], resolved})
 				}
 				pendingAliasAs = nil
-				continue
-			}
-			// Not an as: line — bail out, register as simple alias, and reprocess
-			resolved := resolveModuleStr(pendingAliasAs.moduleName, pendingAliasAs.currentModule)
-			if !strings.Contains(resolved, "__MODULE__") {
-				parts := strings.Split(resolved, ".")
-				allAliases = append(allAliases, struct {
-					scope, short, full string
-				}{pendingAliasAs.scope, parts[len(parts)-1], resolved})
-			}
-			pendingAliasAs = nil
-			// Fall through to process this line normally
-		}
-
-		// Handle pending multi-line multi-alias {Children, ...} continuation
-		if pendingMultiAlias != nil {
-			if stripped == "" || stripped[0] == '#' {
-				continue
-			}
-			// Check for bail-out: line starts a new statement (not } or uppercase module name)
-			if stripped[0] != '}' && (stripped[0] < 'A' || stripped[0] > 'Z') {
-				flushMultiAliasChildren(pendingMultiAlias.scope, pendingMultiAlias.parent, pendingMultiAlias.currentModule, pendingMultiAlias.children)
-				pendingMultiAlias = nil
+				pendingAlias = false
 				// Fall through to process this line normally
-			} else {
-				braceEnd := strings.IndexByte(stripped, '}')
-				if braceEnd >= 0 {
-					inner := stripped[:braceEnd]
-					if inner != "" {
-						pendingMultiAlias.children = append(pendingMultiAlias.children, strings.Split(inner, ",")...)
-					}
+			} else if pendingMultiAlias != nil {
+				if stripped == "" || stripped[0] == '#' {
+					continue
+				}
+				// Check for bail-out: line starts a new statement (not } or uppercase module name)
+				if stripped[0] != '}' && (stripped[0] < 'A' || stripped[0] > 'Z') {
 					flushMultiAliasChildren(pendingMultiAlias.scope, pendingMultiAlias.parent, pendingMultiAlias.currentModule, pendingMultiAlias.children)
 					pendingMultiAlias = nil
+					pendingAlias = false
+					// Fall through to process this line normally
 				} else {
-					pendingMultiAlias.children = append(pendingMultiAlias.children, strings.Split(stripped, ",")...)
+					braceEnd := strings.IndexByte(stripped, '}')
+					if braceEnd >= 0 {
+						inner := stripped[:braceEnd]
+						if inner != "" {
+							pendingMultiAlias.children = append(pendingMultiAlias.children, strings.Split(inner, ",")...)
+						}
+						flushMultiAliasChildren(pendingMultiAlias.scope, pendingMultiAlias.parent, pendingMultiAlias.currentModule, pendingMultiAlias.children)
+						pendingMultiAlias = nil
+						pendingAlias = false
+					} else {
+						pendingMultiAlias.children = append(pendingMultiAlias.children, strings.Split(stripped, ",")...)
+					}
+					continue
 				}
-				continue
 			}
 		}
 
@@ -581,6 +586,7 @@ func extractAliasesFromLines(lines []string, targetLine int) map[string]string {
 						scope:         currentModule,
 						currentModule: currentModule,
 					}
+					pendingAlias = true
 				} else if strings.HasPrefix(afterModStripped, "{") && !strings.Contains(afterModStripped, "}") {
 					// Opening { without closing } — multi-line multi-alias
 					parent := strings.TrimRight(fullMod, ".")
@@ -598,6 +604,7 @@ func extractAliasesFromLines(lines []string, targetLine int) map[string]string {
 							currentModule: currentModule,
 							children:      initialChildren,
 						}
+						pendingAlias = true
 					}
 				} else {
 					parts := strings.Split(fullMod, ".")
