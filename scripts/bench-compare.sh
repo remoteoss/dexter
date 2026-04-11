@@ -29,6 +29,8 @@ DEXTER_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 TMPDIR_BASE="$(mktemp -d)"
 
 cleanup() {
+  git -C "$DEXTER_DIR" worktree remove --force "$TMPDIR_BASE/worktree-a" 2>/dev/null || true
+  git -C "$DEXTER_DIR" worktree remove --force "$TMPDIR_BASE/worktree-b" 2>/dev/null || true
   rm -rf "$TMPDIR_BASE"
 }
 trap cleanup EXIT
