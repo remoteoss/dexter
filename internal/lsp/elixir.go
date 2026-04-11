@@ -266,12 +266,14 @@ func extractAliasesFromLines(lines []string, targetLine int) map[string]string {
 	var stack []moduleFrame
 	depth := 0
 
-	// Per-scope alias collection: module name → alias map
-	var allAliases []struct {
+	type alias struct {
 		scope string
 		short string
 		full  string
 	}
+
+	// Per-scope alias collection: module name → alias map
+	var allAliases []alias
 	var targetModule string
 	unscoped := targetLine < 0
 	inHeredoc := false
@@ -331,23 +333,25 @@ func extractAliasesFromLines(lines []string, targetLine int) map[string]string {
 			return s
 		}
 
+		getFullModuleAlias := func(fullMod string) string {
+			parts := strings.Split(fullMod, ".")
+			return parts[len(parts)-1]
+		}
+
 		// Collect alias declarations
 		if m := parser.AliasAsRe.FindStringSubmatch(line); m != nil {
 			resolved := resolve(m[1])
 			if !strings.Contains(resolved, "__MODULE__") {
+				short := ""
 				if m[2] != "" {
-					// alias Mod, as: Name — same line
-					allAliases = append(allAliases, struct {
-						scope, short, full string
-					}{currentModule, m[2], resolved})
-				} else {
-					// alias Mod, — trailing comma, peek next line for as:
-					if n := aliasNextLineAsRe.FindStringSubmatch(nextLineAt(lines, i)); n != nil {
-						allAliases = append(allAliases, struct {
-							scope, short, full string
-						}{currentModule, n[1], resolved})
-					}
+					// alias Mod, as: Name - same line
+					short = m[2]
+				} else if n := aliasNextLineAsRe.FindStringSubmatch(nextLineAt(lines, i)); n != nil { // alias Mod, - trailing comma, peek next line for as:
+					short = n[1]
+				} else { // other keyword opts or no as: - normal alias
+					short = getFullModuleAlias(resolved)
 				}
+				allAliases = append(allAliases, alias{currentModule, short, resolved})
 			}
 		} else if m := aliasMultiRe.FindStringSubmatch(line); m != nil {
 			base := resolve(m[1])
@@ -362,9 +366,7 @@ func extractAliasesFromLines(lines []string, targetLine int) map[string]string {
 					if len(name) > 0 && unicode.IsUpper(rune(name[0])) {
 						childName := parser.ScanModuleName(name)
 						if childName != "" {
-							allAliases = append(allAliases, struct {
-								scope, short, full string
-							}{currentModule, childName, base + "." + childName})
+							allAliases = append(allAliases, alias{currentModule, childName, base + "." + childName})
 						}
 					}
 				}
@@ -372,10 +374,7 @@ func extractAliasesFromLines(lines []string, targetLine int) map[string]string {
 		} else if m := parser.AliasRe.FindStringSubmatch(line); m != nil {
 			fullMod := resolve(m[1])
 			if !strings.Contains(fullMod, "__MODULE__") {
-				parts := strings.Split(fullMod, ".")
-				allAliases = append(allAliases, struct {
-					scope, short, full string
-				}{currentModule, parts[len(parts)-1], fullMod})
+				allAliases = append(allAliases, alias{currentModule, getFullModuleAlias(fullMod), fullMod})
 			}
 		}
 	}
@@ -417,21 +416,18 @@ func nextLineAt(lines []string, i int) string {
 // lines and idx are used for look-ahead on multi-line constructs.
 func extractAliasFromLine(lines []string, idx int, aliases map[string]string, resolveAlias func(string) string) (map[string]string, bool) {
 	line := lines[idx]
+	if aliases == nil {
+		aliases = make(map[string]string)
+	}
 	if m := parser.AliasAsRe.FindStringSubmatch(line); m != nil {
 		resolved := resolveAlias(m[1])
 		if m[2] != "" {
 			// alias Mod, as: Name — same line
-			if aliases == nil {
-				aliases = make(map[string]string)
-			}
 			aliases[m[2]] = resolved
 			return aliases, true
 		}
 		// alias Mod, — trailing comma, peek next line for as:
 		if n := aliasNextLineAsRe.FindStringSubmatch(nextLineAt(lines, idx)); n != nil {
-			if aliases == nil {
-				aliases = make(map[string]string)
-			}
 			aliases[n[1]] = resolved
 			return aliases, true
 		}
@@ -448,9 +444,6 @@ func extractAliasFromLine(lines []string, idx int, aliases map[string]string, re
 			if len(name) > 0 && unicode.IsUpper(rune(name[0])) {
 				childName := parser.ScanModuleName(name)
 				if childName != "" {
-					if aliases == nil {
-						aliases = make(map[string]string)
-					}
 					aliases[childName] = base + "." + childName
 				}
 			}
@@ -460,9 +453,6 @@ func extractAliasFromLine(lines []string, idx int, aliases map[string]string, re
 	if m := parser.AliasRe.FindStringSubmatch(line); m != nil {
 		resolved := resolveAlias(m[1])
 		parts := strings.Split(resolved, ".")
-		if aliases == nil {
-			aliases = make(map[string]string)
-		}
 		aliases[parts[len(parts)-1]] = resolved
 		return aliases, true
 	}

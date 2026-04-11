@@ -201,6 +201,14 @@ func TestExtractAliases(t *testing.T) {
 		}
 	})
 
+	t.Run("alias with warn: on next line", func(t *testing.T) {
+		text := "defmodule MyApp.Core do\n  alias MyApp.Accounts.Worker,\n    warn: false\nend"
+		aliases := ExtractAliases(text)
+		if aliases["Worker"] != "MyApp.Accounts.Worker" {
+			t.Errorf("Worker: got %q, want MyApp.Accounts.Worker", aliases["Worker"])
+		}
+	})
+
 	t.Run("multi-alias", func(t *testing.T) {
 		aliases := ExtractAliases("  alias MyApp.Handlers.{Foo, Bar, Baz}")
 		if aliases["Foo"] != "MyApp.Handlers.Foo" {
