@@ -1026,3 +1026,133 @@ end`
 		t.Errorf("expected submodule in hover, got %q", hover.Contents.Value)
 	}
 }
+
+func TestHover_QualifiedCallViaUseChain(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// SharedLib.Storage defines __using__ that imports SharedLib.Queryable
+	storageSrc := `defmodule SharedLib.Storage do
+  defmacro __using__(_opts) do
+    quote do
+      import SharedLib.Queryable
+    end
+  end
+end`
+	queryableSrc := `defmodule SharedLib.Queryable do
+  @doc "Fetches all records matching the query."
+  def all(queryable), do: queryable
+end`
+
+	// MyApp.Repo uses SharedLib.Storage, so all/1 is injected
+	repoSrc := `defmodule MyApp.Repo do
+  use SharedLib.Storage
+end`
+
+	callerSrc := `defmodule MyApp.Accounts do
+  alias MyApp.Repo
+
+  def list do
+    Repo.all(User)
+  end
+end`
+
+	indexFile(t, server.store, server.projectRoot, "lib/storage.ex", storageSrc)
+	storageURI := "file://" + filepath.Join(server.projectRoot, "lib/storage.ex")
+	server.docs.Set(storageURI, storageSrc)
+
+	indexFile(t, server.store, server.projectRoot, "lib/queryable.ex", queryableSrc)
+
+	indexFile(t, server.store, server.projectRoot, "lib/repo.ex", repoSrc)
+	repoURI := "file://" + filepath.Join(server.projectRoot, "lib/repo.ex")
+	server.docs.Set(repoURI, repoSrc)
+
+	callerURI := "file://" + filepath.Join(server.projectRoot, "lib/accounts.ex")
+	server.docs.Set(callerURI, callerSrc)
+
+	// line 4 (0-indexed): `    Repo.all(User)` — col 9 is on `all`
+	hover := hoverAt(t, server, callerURI, 4, 9)
+	if hover == nil {
+		t.Fatal("expected hover result for Repo.all resolved via use-chain, got nil")
+	}
+	if !strings.Contains(hover.Contents.Value, "Fetches all records") {
+		t.Errorf("expected doc from use-chain source, got %q", hover.Contents.Value)
+	}
+}
+
+func TestHover_QualifiedCallViaUseChain_CallbackDoc(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// SharedLib.Storage defines @callback with @doc and injects bare def via __using__.
+	// The @callback for get spans multiple lines to test multi-line extraction.
+	storageSrc := `defmodule SharedLib.Storage do
+  @doc """
+  Fetches all records from the data store.
+  """
+  @callback all(queryable :: term) :: [term]
+
+  @doc """
+  Fetches a single record by its ID.
+  """
+  @callback get(queryable :: term, id :: term) ::
+              term | nil
+
+  defmacro __using__(_opts) do
+    quote do
+      @behaviour SharedLib.Storage
+
+      def all(queryable), do: queryable
+      def get(queryable, id), do: nil
+    end
+  end
+end`
+
+	repoSrc := `defmodule MyApp.Repo do
+  use SharedLib.Storage
+end`
+
+	callerSrc := `defmodule MyApp.Accounts do
+  alias MyApp.Repo
+
+  def list do
+    Repo.all(User)
+  end
+
+  def find(id) do
+    Repo.get(User, id)
+  end
+end`
+
+	indexFile(t, server.store, server.projectRoot, "lib/storage.ex", storageSrc)
+	storageURI := "file://" + filepath.Join(server.projectRoot, "lib/storage.ex")
+	server.docs.Set(storageURI, storageSrc)
+
+	indexFile(t, server.store, server.projectRoot, "lib/repo.ex", repoSrc)
+	repoURI := "file://" + filepath.Join(server.projectRoot, "lib/repo.ex")
+	server.docs.Set(repoURI, repoSrc)
+
+	callerURI := "file://" + filepath.Join(server.projectRoot, "lib/accounts.ex")
+	server.docs.Set(callerURI, callerSrc)
+
+	// line 4 (0-indexed): `    Repo.all(User)` — col 9 is on `all`
+	hover := hoverAt(t, server, callerURI, 4, 9)
+	if hover == nil {
+		t.Fatal("expected hover result for Repo.all via callback doc, got nil")
+	}
+	if !strings.Contains(hover.Contents.Value, "Fetches all records") {
+		t.Errorf("expected callback doc for all, got %q", hover.Contents.Value)
+	}
+
+	// line 8 (0-indexed): `    Repo.get(User, id)` — col 9 is on `get`
+	hover = hoverAt(t, server, callerURI, 8, 9)
+	if hover == nil {
+		t.Fatal("expected hover result for Repo.get via callback doc, got nil")
+	}
+	if !strings.Contains(hover.Contents.Value, "Fetches a single record") {
+		t.Errorf("expected callback doc for get, got %q", hover.Contents.Value)
+	}
+	if !strings.Contains(hover.Contents.Value, "term | nil") {
+		t.Errorf("expected full multi-line callback spec for get, got %q", hover.Contents.Value)
+	}
+}

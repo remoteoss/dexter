@@ -2696,6 +2696,12 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 		if err == nil && len(results) > 0 {
 			return s.hoverFromFile(functionName, results[0])
 		}
+
+		// Not directly defined — the function may have been injected by a
+		// `use` macro in fullModule's source (e.g. Ecto.Repo injects `all`).
+		if results := s.lookupThroughUseOf(fullModule, functionName); len(results) > 0 {
+			return s.hoverFromFile(functionName, results[0])
+		}
 	}
 
 	results, err := s.store.LookupModule(fullModule)
