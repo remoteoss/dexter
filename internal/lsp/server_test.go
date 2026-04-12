@@ -752,6 +752,130 @@ end`)
 	}
 }
 
+func TestCompletion_AliasBlock_SimplePrefix(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/services.ex", `defmodule MyApp.Services.Accounts do
+end
+
+defmodule MyApp.Services.Analytics do
+end
+
+defmodule MyApp.Services.Billing do
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyModule do
+  alias MyApp.Services.{
+    Ac
+  }
+end`)
+
+	// cursor at "Ac" → line 2, col 6
+	items := completionAt(t, server, uri, 2, 6)
+	if !hasCompletionItem(items, "Accounts") {
+		t.Error("expected 'Accounts' in alias block completions")
+	}
+	if hasCompletionItem(items, "Analytics") {
+		t.Error("should not include 'Analytics' — doesn't match prefix 'Ac'")
+	}
+	if hasCompletionItem(items, "Billing") {
+		t.Error("should not include 'Billing' — doesn't match prefix 'Ac'")
+	}
+}
+
+func TestCompletion_AliasBlock_DottedPrefix(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/ecto.ex", `defmodule MyApp.Ecto.Paginator do
+end
+
+defmodule MyApp.Ecto.ChangesetHelpers do
+end
+
+defmodule MyApp.Accounts do
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyModule do
+  alias MyApp.{
+    Ecto.
+  }
+end`)
+
+	// cursor after "Ecto." → line 2, col 9
+	items := completionAt(t, server, uri, 2, 9)
+	if !hasCompletionItem(items, "Ecto.Paginator") {
+		t.Error("expected 'Ecto.Paginator' in alias block completions")
+	}
+	if !hasCompletionItem(items, "Ecto.ChangesetHelpers") {
+		t.Error("expected 'Ecto.ChangesetHelpers' in alias block completions")
+	}
+	if hasCompletionItem(items, "Accounts") {
+		t.Error("should not include 'Accounts' — not a child of MyApp.Ecto")
+	}
+}
+
+func TestCompletion_AliasBlock_DottedPrefixWithPartial(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/ecto.ex", `defmodule MyApp.Ecto.Paginator do
+end
+
+defmodule MyApp.Ecto.ChangesetHelpers do
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyModule do
+  alias MyApp.{
+    Ecto.Pag
+  }
+end`)
+
+	// cursor at "Ecto.Pag" → line 2, col 12
+	items := completionAt(t, server, uri, 2, 12)
+	if !hasCompletionItem(items, "Ecto.Paginator") {
+		t.Error("expected 'Ecto.Paginator' in alias block completions")
+	}
+	if hasCompletionItem(items, "Ecto.ChangesetHelpers") {
+		t.Error("should not include 'Ecto.ChangesetHelpers' — doesn't match prefix 'Pag'")
+	}
+}
+
+func TestCompletion_AliasBlock_EmptyPrefix(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/services.ex", `defmodule MyApp.Accounts do
+end
+
+defmodule MyApp.Billing do
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyModule do
+  alias MyApp.{
+
+  }
+end`)
+
+	// cursor on blank line inside the block → line 2, col 4
+	items := completionAt(t, server, uri, 2, 4)
+	if !hasCompletionItem(items, "Accounts") {
+		t.Error("expected 'Accounts' in alias block completions with empty prefix")
+	}
+	if !hasCompletionItem(items, "Billing") {
+		t.Error("expected 'Billing' in alias block completions with empty prefix")
+	}
+}
+
 func TestCompletion_ImportedFunctions(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
@@ -944,6 +1068,46 @@ func TestCompletion_NoResults(t *testing.T) {
 	items := completionAt(t, server, uri, 0, 2)
 	if len(items) != 0 {
 		t.Errorf("expected no completions on whitespace, got %d", len(items))
+	}
+}
+
+func TestCompletion_FunctionResultDotNoResults(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", `defmodule MyApp.Accounts do
+  def list, do: []
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyApp.Web do
+  alias MyApp.Accounts
+  Accounts.list.
+end`)
+
+	// col 16 = right after "Accounts.list." on line 2
+	items := completionAt(t, server, uri, 2, 16)
+	if len(items) != 0 {
+		t.Errorf("expected no completions after function result dot, got %d: %v", len(items), items)
+	}
+}
+
+func TestCompletion_VariableDotNoResults(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyApp.Web do
+  def run(config) do
+    config.
+  end
+end`)
+
+	// col 11 = right after "config." on line 2
+	items := completionAt(t, server, uri, 2, 11)
+	if len(items) != 0 {
+		t.Errorf("expected no completions after variable dot, got %d: %v", len(items), items)
 	}
 }
 
@@ -1254,6 +1418,47 @@ end`)
 	items = completionAt(t, server, uri, 3, 4)
 	if !hasCompletionItem(items, "triple") {
 		t.Error("expected 'triple' in completions from use-injected inline def")
+	}
+}
+
+func TestCompletion_MultilineUseOpts(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/custom_mock.ex", `defmodule MyApp.CustomMock do
+  def mock_func, do: :ok
+end
+`)
+
+	indexFile(t, server.store, server.projectRoot, "lib/mox_base.ex", `defmodule MyApp.MoxBase do
+  defmacro __using__(opts) do
+    mod = Keyword.get(opts, :mod, MyApp.DefaultMod)
+    quote do
+      import unquote(mod)
+    end
+  end
+end
+`)
+
+	uri := "file:///test.ex"
+	src := `defmodule MyApp.Test do
+  use MyApp.MoxBase,
+    mod: MyApp.CustomMock
+
+  def test, do: mock_func()
+end`
+	server.docs.Set(uri, src)
+
+	aliases := map[string]string{}
+	calls := ExtractUsesWithOpts(src, aliases)
+	found := false
+	for _, c := range calls {
+		if c.Module == "MyApp.MoxBase" && c.Opts["mod"] == "MyApp.CustomMock" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected use MyApp.MoxBase with mod: MyApp.CustomMock; got %+v", calls)
 	}
 }
 

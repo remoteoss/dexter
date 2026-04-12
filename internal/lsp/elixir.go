@@ -148,6 +148,147 @@ func ExtractCompletionContext(line string, col int) (prefix string, afterDot boo
 	return raw, false, start
 }
 
+// ExtractAliasBlockParent detects whether the given 0-based line is inside
+// a multi-line alias brace block (alias Parent.{ ... }). If so, it returns
+// the resolved parent module name. This is used by the completion and hover
+// handlers to resolve module names inside multi-line alias blocks.
+func ExtractAliasBlockParent(lines []string, targetLine int) (string, bool) {
+	if targetLine < 0 || targetLine >= len(lines) {
+		return "", false
+	}
+
+	// Quick pre-check: scan backward for an "alias ...{" line without a
+	// matching "}" on the same line.  Pure string ops, no allocations in
+	// the fast path, so this is nearly free for the 99% of hover/definition
+	// requests that are not inside an alias block.
+	found := false
+	for i := targetLine; i >= 0; i-- {
+		trimmed := strings.TrimSpace(lines[i])
+		if strings.HasPrefix(trimmed, "alias ") && strings.Contains(trimmed, "{") && !strings.Contains(trimmed, "}") {
+			found = true
+			break
+		}
+		// Any def/defp/defmodule means we've left the possible alias context.
+		if strings.HasPrefix(trimmed, "def ") || strings.HasPrefix(trimmed, "defp ") || strings.HasPrefix(trimmed, "defmodule ") {
+			break
+		}
+	}
+	if !found {
+		return "", false
+	}
+
+	// If the current line is just a closing brace (e.g. "  }"), we're past the block.
+	// But if it has module content before the brace (e.g. "  Services.MakePayment }"),
+	// we're still inside the alias block on the last line.
+	currentLine := strings.TrimSpace(parser.StripCommentsAndStrings(lines[targetLine]))
+	if strings.Contains(currentLine, "}") {
+		withoutBrace := strings.TrimSpace(strings.Replace(currentLine, "}", "", 1))
+		withoutBrace = strings.TrimRight(withoutBrace, ", ")
+		if withoutBrace == "" {
+			return "", false
+		}
+	}
+
+	// Scan backward from the current line looking for the opening "alias Parent.{"
+	for i := targetLine; i >= 0; i-- {
+		line := lines[i]
+		stripped := strings.TrimSpace(parser.StripCommentsAndStrings(line))
+
+		// If we encounter a closing brace scanning backward, we're not in an open block
+		if i < targetLine && strings.Contains(stripped, "}") {
+			return "", false
+		}
+
+		// Look for "alias Module.{" pattern
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "alias ") {
+			// Skip blank/comment lines
+			if stripped == "" {
+				continue
+			}
+			// Any other statement means we've left the alias context
+			continue
+		}
+
+		// Found an alias line — check if it opens a brace block
+		afterAlias := strings.TrimSpace(trimmed[6:])
+		moduleName := parser.ScanModuleName(afterAlias)
+		if moduleName == "" {
+			return "", false
+		}
+		remaining := afterAlias[len(moduleName):]
+		remainingStripped := strings.TrimSpace(parser.StripCommentsAndStrings(remaining))
+
+		if !strings.HasPrefix(remainingStripped, "{") {
+			return "", false
+		}
+		// Has opening { — check that } is NOT on this same line
+		if strings.Contains(remainingStripped, "}") {
+			return "", false
+		}
+
+		// We're inside a multi-line alias block — resolve the parent module
+		parent := strings.TrimRight(moduleName, ".")
+
+		// Resolve __MODULE__
+		enclosingModule := extractEnclosingModule(lines, i)
+		if enclosingModule != "" {
+			parent = strings.ReplaceAll(parent, "__MODULE__", enclosingModule)
+		}
+		if strings.Contains(parent, "__MODULE__") {
+			return "", false
+		}
+		return parent, true
+	}
+
+	return "", false
+}
+
+// extractEnclosingModule finds the innermost defmodule enclosing the given line.
+func extractEnclosingModule(lines []string, targetLine int) string {
+	type moduleFrame struct {
+		name  string
+		depth int
+	}
+	var stack []moduleFrame
+	depth := 0
+	inHeredoc := false
+
+	for i := 0; i <= targetLine && i < len(lines); i++ {
+		var skip bool
+		inHeredoc, skip = parser.CheckHeredoc(lines[i], inHeredoc)
+		if skip {
+			continue
+		}
+		stripped := strings.TrimSpace(parser.StripCommentsAndStrings(strings.TrimSpace(lines[i])))
+
+		if parser.IsEnd(stripped) {
+			if len(stack) > 0 && stack[len(stack)-1].depth == depth {
+				stack = stack[:len(stack)-1]
+			}
+			depth--
+			if depth < 0 {
+				depth = 0
+			}
+		}
+		if parser.OpensBlock(stripped) {
+			depth++
+		}
+		if m := parser.DefmoduleRe.FindStringSubmatch(strings.TrimSpace(lines[i])); m != nil {
+			name := m[1]
+			if !strings.Contains(name, ".") && len(stack) > 0 {
+				name = stack[len(stack)-1].name + "." + name
+			}
+			stack = append(stack, moduleFrame{name, depth})
+		}
+	}
+
+	if len(stack) > 0 {
+		return stack[len(stack)-1].name
+	}
+	return ""
+}
+
 // IsPipeContext returns true if the text before prefixStartCol on this line
 // contains a pipe operator (|>), meaning the first argument is supplied by the
 // pipe and should be omitted from the completion snippet.
@@ -275,6 +416,51 @@ func extractAliasesFromLines(lines []string, targetLine int) map[string]string {
 	unscoped := targetLine < 0
 	inHeredoc := false
 
+	// Pending state for multi-line alias tracking
+	type pendingAliasAsState struct {
+		moduleName    string
+		scope         string
+		currentModule string
+	}
+	type pendingMultiAliasState struct {
+		parent        string
+		scope         string
+		currentModule string
+		children      []string
+	}
+	var pendingAliasAs *pendingAliasAsState
+	var pendingMultiAlias *pendingMultiAliasState
+	pendingAlias := false
+
+	resolveModuleStr := func(s, currentModule string) string {
+		if currentModule != "" {
+			return strings.ReplaceAll(s, "__MODULE__", currentModule)
+		}
+		return s
+	}
+
+	// flushMultiAliasChildren processes accumulated children from a multi-line
+	// alias block and appends each as an alias entry.
+	flushMultiAliasChildren := func(scope, parent, currentModule string, children []string) {
+		base := resolveModuleStr(parent, currentModule)
+		if strings.Contains(base, "__MODULE__") {
+			return
+		}
+		for _, segment := range children {
+			segment = strings.TrimSpace(segment)
+			childName := parser.ScanModuleName(segment)
+			if childName != "" {
+				aliasKey := childName
+				if dot := strings.LastIndexByte(childName, '.'); dot >= 0 {
+					aliasKey = childName[dot+1:]
+				}
+				allAliases = append(allAliases, struct {
+					scope, short, full string
+				}{scope, aliasKey, base + "." + childName})
+			}
+		}
+	}
+
 	for i, line := range lines {
 		var skip bool
 		inHeredoc, skip = parser.CheckHeredoc(line, inHeredoc)
@@ -290,6 +476,68 @@ func extractAliasesFromLines(lines []string, targetLine int) map[string]string {
 
 		trimmed := strings.TrimSpace(line)
 		stripped := strings.TrimSpace(parser.StripCommentsAndStrings(trimmed))
+
+		// Handle pending multi-line alias continuations (guarded by a single
+		// boolean so the common path — no pending alias — is one branch).
+		if pendingAlias {
+			if pendingAliasAs != nil {
+				// Skip blank and comment-only lines while waiting for as:
+				if stripped == "" || stripped[0] == '#' {
+					continue
+				}
+				if strings.HasPrefix(stripped, "as:") {
+					asStr := strings.TrimLeft(stripped[3:], " \t")
+					asName := parser.ScanModuleName(asStr)
+					if asName != "" {
+						resolved := resolveModuleStr(pendingAliasAs.moduleName, pendingAliasAs.currentModule)
+						if !strings.Contains(resolved, "__MODULE__") {
+							allAliases = append(allAliases, struct {
+								scope, short, full string
+							}{pendingAliasAs.scope, asName, resolved})
+						}
+					}
+					pendingAliasAs = nil
+					pendingAlias = false
+					continue
+				}
+				// Not an as: line — bail out, register as simple alias, and reprocess
+				resolved := resolveModuleStr(pendingAliasAs.moduleName, pendingAliasAs.currentModule)
+				if !strings.Contains(resolved, "__MODULE__") {
+					parts := strings.Split(resolved, ".")
+					allAliases = append(allAliases, struct {
+						scope, short, full string
+					}{pendingAliasAs.scope, parts[len(parts)-1], resolved})
+				}
+				pendingAliasAs = nil
+				pendingAlias = false
+				// Fall through to process this line normally
+			} else if pendingMultiAlias != nil {
+				if stripped == "" || stripped[0] == '#' {
+					continue
+				}
+				// Check for bail-out: line starts a new statement (not } or uppercase module name)
+				if stripped[0] != '}' && (stripped[0] < 'A' || stripped[0] > 'Z') {
+					flushMultiAliasChildren(pendingMultiAlias.scope, pendingMultiAlias.parent, pendingMultiAlias.currentModule, pendingMultiAlias.children)
+					pendingMultiAlias = nil
+					pendingAlias = false
+					// Fall through to process this line normally
+				} else {
+					braceEnd := strings.IndexByte(stripped, '}')
+					if braceEnd >= 0 {
+						inner := stripped[:braceEnd]
+						if inner != "" {
+							pendingMultiAlias.children = append(pendingMultiAlias.children, strings.Split(inner, ",")...)
+						}
+						flushMultiAliasChildren(pendingMultiAlias.scope, pendingMultiAlias.parent, pendingMultiAlias.currentModule, pendingMultiAlias.children)
+						pendingMultiAlias = nil
+						pendingAlias = false
+					} else {
+						pendingMultiAlias.children = append(pendingMultiAlias.children, strings.Split(stripped, ",")...)
+					}
+					continue
+				}
+			}
+		}
 
 		// Track do..end nesting
 		if parser.IsEnd(stripped) {
@@ -341,22 +589,58 @@ func extractAliasesFromLines(lines []string, targetLine int) map[string]string {
 		} else if m := aliasMultiRe.FindStringSubmatch(line); m != nil {
 			base := resolve(m[1])
 			if !strings.Contains(base, "__MODULE__") {
-				for _, name := range strings.Split(m[2], ",") {
-					name = strings.TrimSpace(name)
-					if len(name) > 0 && unicode.IsUpper(rune(name[0])) {
+				for _, segment := range strings.Split(m[2], ",") {
+					segment = strings.TrimSpace(segment)
+					childName := parser.ScanModuleName(segment)
+					if childName != "" {
+						aliasKey := childName
+						if dot := strings.LastIndexByte(childName, '.'); dot >= 0 {
+							aliasKey = childName[dot+1:]
+						}
 						allAliases = append(allAliases, struct {
 							scope, short, full string
-						}{currentModule, name, base + "." + name})
+						}{currentModule, aliasKey, base + "." + childName})
 					}
 				}
 			}
 		} else if m := parser.AliasRe.FindStringSubmatch(line); m != nil {
 			fullMod := resolve(m[1])
 			if !strings.Contains(fullMod, "__MODULE__") {
-				parts := strings.Split(fullMod, ".")
-				allAliases = append(allAliases, struct {
-					scope, short, full string
-				}{currentModule, parts[len(parts)-1], fullMod})
+				afterMod := line[strings.Index(line, m[1])+len(m[1]):]
+				afterModStripped := strings.TrimSpace(parser.StripCommentsAndStrings(afterMod))
+				if afterModStripped == "," {
+					// Trailing comma — may be multi-line alias with as: on next line
+					pendingAliasAs = &pendingAliasAsState{
+						moduleName:    fullMod,
+						scope:         currentModule,
+						currentModule: currentModule,
+					}
+					pendingAlias = true
+				} else if strings.HasPrefix(afterModStripped, "{") && !strings.Contains(afterModStripped, "}") {
+					// Opening { without closing } — multi-line multi-alias
+					parent := strings.TrimRight(fullMod, ".")
+					resolvedParent := resolve(parent)
+					if !strings.Contains(resolvedParent, "__MODULE__") {
+						// Collect any children on this same line after the {
+						inner := afterModStripped[1:]
+						var initialChildren []string
+						if strings.TrimSpace(inner) != "" {
+							initialChildren = strings.Split(inner, ",")
+						}
+						pendingMultiAlias = &pendingMultiAliasState{
+							parent:        resolvedParent,
+							scope:         currentModule,
+							currentModule: currentModule,
+							children:      initialChildren,
+						}
+						pendingAlias = true
+					}
+				} else {
+					parts := strings.Split(fullMod, ".")
+					allAliases = append(allAliases, struct {
+						scope, short, full string
+					}{currentModule, parts[len(parts)-1], fullMod})
+				}
 			}
 		}
 	}
@@ -397,13 +681,18 @@ func extractAliasFromLine(line string, aliases map[string]string, resolveAlias f
 	}
 	if m := aliasMultiRe.FindStringSubmatch(line); m != nil {
 		base := resolveAlias(m[1])
-		for _, name := range strings.Split(m[2], ",") {
-			name = strings.TrimSpace(name)
-			if len(name) > 0 && unicode.IsUpper(rune(name[0])) {
+		for _, segment := range strings.Split(m[2], ",") {
+			segment = strings.TrimSpace(segment)
+			childName := parser.ScanModuleName(segment)
+			if childName != "" {
 				if aliases == nil {
 					aliases = make(map[string]string)
 				}
-				aliases[name] = base + "." + name
+				aliasKey := childName
+				if dot := strings.LastIndexByte(childName, '.'); dot >= 0 {
+					aliasKey = childName[dot+1:]
+				}
+				aliases[aliasKey] = base + "." + childName
 			}
 		}
 		return aliases, true
@@ -425,6 +714,9 @@ func extractAliasFromLine(line string, aliases map[string]string, resolveAlias f
 // Returns nil slices if the function or its quote block can't be found.
 func parseHelperQuoteBlock(lines []string, helperName string, fileAliases map[string]string) (imported []string, inlineDefs map[string][]inlineDef, transUses []string, optBindings []optBinding, aliases map[string]string) {
 	resolveAlias := func(modName string) string {
+		if resolved := parser.ResolveModuleRef(modName, aliases, ""); resolved != modName {
+			return resolved
+		}
 		return parser.ResolveModuleRef(modName, fileAliases, "")
 	}
 
@@ -530,23 +822,53 @@ type UseCall struct {
 
 // ExtractUsesWithOpts parses all `use Module` and `use Module, key: Val`
 // declarations, returning each as a UseCall. Aliases are resolved using the
-// provided map.
+// provided map. Handles opts spanning multiple lines.
 func ExtractUsesWithOpts(text string, aliases map[string]string) []UseCall {
 	var calls []UseCall
-	for _, line := range strings.Split(text, "\n") {
-		// use Module, key: Val
+	lines := strings.Split(text, "\n")
+	for i := 0; i < len(lines); i++ {
+		line := lines[i]
+		// use Module, key: Val (single line)
 		if m := useWithOptsRe.FindStringSubmatch(line); m != nil {
 			module := parser.ResolveModuleRef(m[1], aliases, "")
 			calls = append(calls, UseCall{Module: module, Opts: ParseKeywordModuleOpts(m[2], aliases)})
 			continue
 		}
-		// plain use Module
+		// plain use Module (possibly with trailing comma for multiline opts)
 		if m := useRe.FindStringSubmatch(line); m != nil {
-			calls = append(calls, UseCall{Module: parser.ResolveModuleRef(m[1], aliases, "")})
+			module := parser.ResolveModuleRef(m[1], aliases, "")
+			trimmed := strings.TrimRight(parser.StripCommentsAndStrings(line), " \t\r")
+			if strings.HasSuffix(trimmed, ",") {
+				// Multiline opts: collect continuation lines
+				var optsBuilder strings.Builder
+				for i+1 < len(lines) {
+					next := strings.TrimSpace(lines[i+1])
+					if next == "" || next[0] == '#' {
+						i++
+						continue
+					}
+					// Continuation lines are keyword opts (lowercase_key:) or
+					// known option patterns; stop on anything else.
+					if !parser.LooksLikeKeywordOpt(next) {
+						break
+					}
+					i++
+					if optsBuilder.Len() > 0 {
+						optsBuilder.WriteString(", ")
+					}
+					optsBuilder.WriteString(strings.TrimRight(next, ","))
+				}
+				calls = append(calls, UseCall{Module: module, Opts: ParseKeywordModuleOpts(optsBuilder.String(), aliases)})
+			} else {
+				calls = append(calls, UseCall{Module: module})
+			}
 		}
 	}
 	return calls
 }
+
+// looksLikeOptContinuation returns true if the trimmed line looks like a
+// keyword list continuation (e.g. "name: \"foo\"", "permissions: :inherited").
 
 // ParseKeywordModuleOpts parses an Elixir keyword list string (e.g. "mod: Hammox, repo: MyRepo")
 // into a map of key → value. Only entries whose value starts with an uppercase letter
@@ -575,7 +897,7 @@ type inlineDef struct {
 // a Keyword.get on opts), and alias declarations that get injected into the
 // consumer module.
 func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inlineDef, transUses []string, optBindings []optBinding, aliases map[string]string) {
-	lines := strings.Split(text, "\n")
+	lines := parser.JoinLines(strings.Split(text, "\n"))
 	fileAliases := extractAliasesFromLines(lines, -1)
 
 	// Check if this module uses ExUnit.CaseTemplate (which provides the `using` macro)
@@ -630,6 +952,9 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 	inlineDefs = make(map[string][]inlineDef)
 
 	resolveAlias := func(modName string) string {
+		if resolved := parser.ResolveModuleRef(modName, aliases, ""); resolved != modName {
+			return resolved
+		}
 		return parser.ResolveModuleRef(modName, fileAliases, "")
 	}
 
@@ -979,6 +1304,7 @@ func ExtractCallContext(text string, lineNum, col int) (funcExpr string, argInde
 // extractParamNames reads the function definition line at defIdx and returns
 // the parameter names. Falls back to positional names (arg1, arg2, ...) for
 // complex patterns.
+
 func extractParamNames(lines []string, defIdx int) []string {
 	if defIdx < 0 || defIdx >= len(lines) {
 		return nil

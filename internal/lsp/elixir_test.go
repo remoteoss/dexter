@@ -1,6 +1,7 @@
 package lsp
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -178,6 +179,134 @@ func TestExtractModuleAndFunction(t *testing.T) {
 	}
 }
 
+func TestExtractAliasBlockParent(t *testing.T) {
+	t.Run("cursor inside multi-line block", func(t *testing.T) {
+		text := `defmodule MyApp.Web do
+  alias MyApp.Services.{
+    Accounts,
+
+  }
+end`
+		parent, ok := ExtractAliasBlockParent(strings.Split(text, "\n"), 3)
+		if !ok {
+			t.Fatal("expected to be inside alias block")
+		}
+		if parent != "MyApp.Services" {
+			t.Errorf("got %q, want MyApp.Services", parent)
+		}
+	})
+
+	t.Run("cursor on line with children", func(t *testing.T) {
+		text := `defmodule MyApp.Web do
+  alias MyApp.Services.{
+    Accounts,
+  }
+end`
+		parent, ok := ExtractAliasBlockParent(strings.Split(text, "\n"), 2)
+		if !ok {
+			t.Fatal("expected to be inside alias block")
+		}
+		if parent != "MyApp.Services" {
+			t.Errorf("got %q, want MyApp.Services", parent)
+		}
+	})
+
+	t.Run("cursor after closing brace", func(t *testing.T) {
+		text := `defmodule MyApp.Web do
+  alias MyApp.Services.{
+    Accounts
+  }
+
+end`
+		_, ok := ExtractAliasBlockParent(strings.Split(text, "\n"), 4)
+		if ok {
+			t.Error("should not be inside alias block after closing brace")
+		}
+	})
+
+	t.Run("cursor on normal alias line", func(t *testing.T) {
+		text := `defmodule MyApp.Web do
+  alias MyApp.Repo
+
+end`
+		_, ok := ExtractAliasBlockParent(strings.Split(text, "\n"), 2)
+		if ok {
+			t.Error("should not be inside alias block on a normal line")
+		}
+	})
+
+	t.Run("cursor on same line as opening brace", func(t *testing.T) {
+		text := `defmodule MyApp.Web do
+  alias MyApp.Handlers.{
+end`
+		parent, ok := ExtractAliasBlockParent(strings.Split(text, "\n"), 1)
+		if !ok {
+			t.Fatal("expected to be inside alias block")
+		}
+		if parent != "MyApp.Handlers" {
+			t.Errorf("got %q, want MyApp.Handlers", parent)
+		}
+	})
+
+	t.Run("resolves __MODULE__ in parent", func(t *testing.T) {
+		text := `defmodule MyApp.HRIS do
+  alias __MODULE__.{
+    Services,
+
+  }
+end`
+		parent, ok := ExtractAliasBlockParent(strings.Split(text, "\n"), 3)
+		if !ok {
+			t.Fatal("expected to be inside alias block")
+		}
+		if parent != "MyApp.HRIS" {
+			t.Errorf("got %q, want MyApp.HRIS", parent)
+		}
+	})
+
+	t.Run("single-line block with closing brace", func(t *testing.T) {
+		text := `defmodule MyApp.Web do
+  alias MyApp.{Accounts, Users}
+
+end`
+		_, ok := ExtractAliasBlockParent(strings.Split(text, "\n"), 1)
+		if ok {
+			t.Error("should not be inside alias block when braces close on same line")
+		}
+	})
+
+	t.Run("trailing brace on content line", func(t *testing.T) {
+		text := `defmodule MyApp.Web do
+  alias MyApp.Billing.{
+    Services.MakePayment }
+end`
+		parent, ok := ExtractAliasBlockParent(strings.Split(text, "\n"), 2)
+		if !ok {
+			t.Fatal("expected to be inside alias block when } follows module content")
+		}
+		if parent != "MyApp.Billing" {
+			t.Errorf("got %q, want MyApp.Billing", parent)
+		}
+	})
+
+	t.Run("blank lines between alias and cursor", func(t *testing.T) {
+		text := `defmodule MyApp.Web do
+  alias MyApp.Services.{
+    Accounts,
+
+
+  }
+end`
+		parent, ok := ExtractAliasBlockParent(strings.Split(text, "\n"), 4)
+		if !ok {
+			t.Fatal("expected to be inside alias block")
+		}
+		if parent != "MyApp.Services" {
+			t.Errorf("got %q, want MyApp.Services", parent)
+		}
+	})
+}
+
 func TestExtractAliases(t *testing.T) {
 	t.Run("simple alias", func(t *testing.T) {
 		aliases := ExtractAliases("  alias MyApp.Repo")
@@ -250,6 +379,94 @@ func TestExtractAliases(t *testing.T) {
 		aliases := ExtractAliases(text)
 		if aliases["MyPayProvider"] != "MyApp.MyPayProvider" {
 			t.Errorf("MyPayProvider: got %q, want MyApp.MyPayProvider", aliases["MyPayProvider"])
+		}
+	})
+
+	t.Run("multi-line alias with as on next line", func(t *testing.T) {
+		text := "defmodule MyApp.Web do\n  alias MyApp.Helpers.Paginator,\n    as: Pages\nend"
+		aliases := ExtractAliases(text)
+		if aliases["Pages"] != "MyApp.Helpers.Paginator" {
+			t.Errorf("Pages: got %q, want MyApp.Helpers.Paginator", aliases["Pages"])
+		}
+		// Should NOT also register as a simple alias under the last segment
+		if _, ok := aliases["Paginator"]; ok {
+			t.Error("should not register simple alias Paginator when as: is on next line")
+		}
+	})
+
+	t.Run("multi-line alias with as and extra whitespace before comma", func(t *testing.T) {
+		text := "defmodule MyApp.Web do\n  alias MyApp.Billing.Services.MakePayment        ,\n  as: MakePaymentNow\nend"
+		aliases := ExtractAliases(text)
+		if aliases["MakePaymentNow"] != "MyApp.Billing.Services.MakePayment" {
+			t.Errorf("MakePaymentNow: got %q, want MyApp.Billing.Services.MakePayment", aliases["MakePaymentNow"])
+		}
+		if _, ok := aliases["MakePayment"]; ok {
+			t.Error("should not register simple alias MakePayment when as: is on next line")
+		}
+	})
+
+	t.Run("multi-line multi-alias with braces spanning lines", func(t *testing.T) {
+		text := "defmodule MyApp.Web do\n  alias MyApp.Handlers.{\n    Accounts,\n    Users,\n    Profiles\n  }\nend"
+		aliases := ExtractAliases(text)
+		if aliases["Accounts"] != "MyApp.Handlers.Accounts" {
+			t.Errorf("Accounts: got %q, want MyApp.Handlers.Accounts", aliases["Accounts"])
+		}
+		if aliases["Users"] != "MyApp.Handlers.Users" {
+			t.Errorf("Users: got %q, want MyApp.Handlers.Users", aliases["Users"])
+		}
+		if aliases["Profiles"] != "MyApp.Handlers.Profiles" {
+			t.Errorf("Profiles: got %q, want MyApp.Handlers.Profiles", aliases["Profiles"])
+		}
+	})
+
+	t.Run("multi-line multi-alias with comments inside", func(t *testing.T) {
+		text := "defmodule MyApp.Web do\n  alias MyApp.Services.{\n    Accounts,\n    # Users is deprecated\n    Profiles\n  }\nend"
+		aliases := ExtractAliases(text)
+		if aliases["Accounts"] != "MyApp.Services.Accounts" {
+			t.Errorf("Accounts: got %q, want MyApp.Services.Accounts", aliases["Accounts"])
+		}
+		if aliases["Profiles"] != "MyApp.Services.Profiles" {
+			t.Errorf("Profiles: got %q, want MyApp.Services.Profiles", aliases["Profiles"])
+		}
+		if len(aliases) != 2 {
+			t.Errorf("expected 2 aliases, got %d: %v", len(aliases), aliases)
+		}
+	})
+
+	t.Run("multi-line multi-alias with multiple children per line", func(t *testing.T) {
+		text := "defmodule MyApp.Web do\n  alias MyApp.Handlers.{\n    Accounts, Users,\n    Profiles\n  }\nend"
+		aliases := ExtractAliases(text)
+		if aliases["Accounts"] != "MyApp.Handlers.Accounts" {
+			t.Errorf("Accounts: got %q, want MyApp.Handlers.Accounts", aliases["Accounts"])
+		}
+		if aliases["Users"] != "MyApp.Handlers.Users" {
+			t.Errorf("Users: got %q, want MyApp.Handlers.Users", aliases["Users"])
+		}
+		if aliases["Profiles"] != "MyApp.Handlers.Profiles" {
+			t.Errorf("Profiles: got %q, want MyApp.Handlers.Profiles", aliases["Profiles"])
+		}
+	})
+
+	t.Run("multi-line multi-alias with trailing comma", func(t *testing.T) {
+		text := "defmodule MyApp.Web do\n  alias MyApp.Handlers.{\n    Accounts,\n    Users,\n  }\nend"
+		aliases := ExtractAliases(text)
+		if aliases["Accounts"] != "MyApp.Handlers.Accounts" {
+			t.Errorf("Accounts: got %q, want MyApp.Handlers.Accounts", aliases["Accounts"])
+		}
+		if aliases["Users"] != "MyApp.Handlers.Users" {
+			t.Errorf("Users: got %q, want MyApp.Handlers.Users", aliases["Users"])
+		}
+		if len(aliases) != 2 {
+			t.Errorf("expected 2 aliases, got %d: %v", len(aliases), aliases)
+		}
+	})
+
+	t.Run("multi-line alias bail-out on new statement", func(t *testing.T) {
+		text := "defmodule MyApp.Web do\n  alias MyApp.Handlers.{\n    Accounts,\n  def foo, do: :ok\nend"
+		aliases := ExtractAliases(text)
+		// Key assertion: no alias for "foo" or anything weird — the def line must not be swallowed
+		if _, ok := aliases["foo"]; ok {
+			t.Error("should not register 'foo' as an alias")
 		}
 	})
 
@@ -1384,6 +1601,34 @@ func TestExtractUsesWithOpts(t *testing.T) {
 			t.Errorf("alias not resolved: got %q", calls[0].Opts["mod"])
 		}
 	})
+
+	t.Run("multiline opts", func(t *testing.T) {
+		text := "defmodule Foo do\n  use Tool,\n    name: \"mock\",\n    controller: CompanyController,\n    action: :show\nend"
+		calls := ExtractUsesWithOpts(text, nil)
+		if len(calls) != 1 {
+			t.Fatalf("expected 1 use call, got %d", len(calls))
+		}
+		if calls[0].Module != "Tool" {
+			t.Errorf("module: want Tool, got %q", calls[0].Module)
+		}
+		if calls[0].Opts["controller"] != "CompanyController" {
+			t.Errorf("controller: want CompanyController, got %q", calls[0].Opts["controller"])
+		}
+	})
+
+	t.Run("multiline opts with module values", func(t *testing.T) {
+		text := "defmodule Foo do\n  use Remote.Mox,\n    mod: Hammox,\n    repo: MyRepo\nend"
+		calls := ExtractUsesWithOpts(text, nil)
+		if len(calls) != 1 {
+			t.Fatalf("expected 1 use call, got %d", len(calls))
+		}
+		if calls[0].Opts["mod"] != "Hammox" {
+			t.Errorf("mod: want Hammox, got %q", calls[0].Opts["mod"])
+		}
+		if calls[0].Opts["repo"] != "MyRepo" {
+			t.Errorf("repo: want MyRepo, got %q", calls[0].Opts["repo"])
+		}
+	})
 }
 
 func TestFindBufferFunctions(t *testing.T) {
@@ -1628,5 +1873,113 @@ func TestExtractParamNames(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestExtractAliasesInScope_AliasInString(t *testing.T) {
+	text := `defmodule MyApp.Foo do
+  def bar do
+    x = "alias MyApp.Helpers, as: H"
+    H.help()
+  end
+end`
+	aliases := ExtractAliasesInScope(text, 3)
+	if _, ok := aliases["H"]; ok {
+		t.Error("should not extract alias from string content")
+	}
+}
+
+func TestExtractAliasesInScope_AliasInHeredoc(t *testing.T) {
+	text := `defmodule MyApp.Foo do
+  @doc """
+  alias MyApp.Helpers, as: H
+  """
+  def bar do
+    H.help()
+  end
+end`
+	aliases := ExtractAliasesInScope(text, 5)
+	if _, ok := aliases["H"]; ok {
+		t.Error("should not extract alias from heredoc content")
+	}
+}
+
+func TestExtractAliasesInScope_MultilineAliasWithComment(t *testing.T) {
+	text := `defmodule MyApp.Foo do
+  alias MyApp.Helpers.Paginator,
+    # Short name for convenience
+    as: Pages
+
+  def bar, do: Pages.paginate()
+end`
+	aliases := ExtractAliasesInScope(text, 5)
+	if aliases["Pages"] != "MyApp.Helpers.Paginator" {
+		t.Errorf("expected Pages -> MyApp.Helpers.Paginator, got %q", aliases["Pages"])
+	}
+}
+
+func TestExtractAliasesInScope_NestedModuleScope(t *testing.T) {
+	text := `defmodule MyApp.Outer do
+  alias MyApp.Helpers
+
+  defmodule Inner do
+    def bar, do: Helpers.help()
+  end
+end`
+	outerAliases := ExtractAliasesInScope(text, 1)
+	innerAliases := ExtractAliasesInScope(text, 4)
+
+	if outerAliases["Helpers"] != "MyApp.Helpers" {
+		t.Error("outer module should have the alias")
+	}
+	if _, ok := innerAliases["Helpers"]; ok {
+		t.Error("inner module should NOT inherit outer alias")
+	}
+}
+
+func TestExtractAliasesInScope_MultilineBlockTrailingComma(t *testing.T) {
+	text := `defmodule MyApp.Web do
+  alias MyApp.{
+    Accounts,
+    Users,
+  }
+
+  def foo, do: Accounts.list()
+end`
+	aliases := ExtractAliasesInScope(text, 6)
+	if aliases["Accounts"] != "MyApp.Accounts" {
+		t.Errorf("Accounts: got %q, want MyApp.Accounts", aliases["Accounts"])
+	}
+	if aliases["Users"] != "MyApp.Users" {
+		t.Errorf("Users: got %q, want MyApp.Users", aliases["Users"])
+	}
+}
+
+func TestExtractUsesWithOpts_StringContent(t *testing.T) {
+	text := `defmodule MyApp.Foo do
+  def bar do
+    x = "use Tool,"
+    y = "name: mock"
+  end
+end`
+	calls := ExtractUsesWithOpts(text, nil)
+	for _, c := range calls {
+		if c.Module == "Tool" {
+			t.Error("should not extract use from string content")
+		}
+	}
+}
+
+func TestExtractAliasBlockParent_NotConfusedByMapBraces(t *testing.T) {
+	lines := strings.Split(`defmodule MyApp.Foo do
+  def bar do
+    map = %{
+      key: "value"
+    }
+  end
+end`, "\n")
+	_, inBlock := ExtractAliasBlockParent(lines, 3)
+	if inBlock {
+		t.Error("map literal brace should not be detected as alias block")
 	}
 }

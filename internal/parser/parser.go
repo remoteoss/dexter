@@ -75,6 +75,357 @@ func ParseFile(path string) ([]Definition, []Reference, error) {
 	return ParseText(path, string(data))
 }
 
+// Line represents a line of source code with its content and original line number.
+// The original line number is the line (1-indexed) where this line appears in the source file,
+// or for joined lines, the line where the joined group begins.
+type Line struct {
+	Content string
+	OrigNum int // 1-indexed original line number
+}
+
+// joinContinuedLines joins lines ending with a bare backslash (line continuation)
+// with the next line. A trailing \\ only counts as continuation when it is outside
+// string literals and comments. Returns a slice of Line structs with original line numbers.
+func joinContinuedLines(lines []string) []Line {
+	var result []Line
+	i := 0
+	for i < len(lines) {
+		origNum := i + 1 // 1-indexed
+		line := lines[i]
+		for hasTrailingBackslash(line) && i+1 < len(lines) {
+			i++
+			line = strings.TrimRight(line[:len(line)-1], " \t") + " " + lines[i]
+		}
+		result = append(result, Line{Content: line, OrigNum: origNum})
+		i++
+	}
+	return result
+}
+
+// JoinContinuedLines is the exported version that returns just strings.
+// Used by tests and other code that doesn't need line number tracking.
+// JoinLines applies all three joining passes (continued lines, bracket lines,
+// trailing comma) and returns the joined content strings. This is the same
+// pipeline used by ParseText.
+func JoinLines(raw []string) []string {
+	joined := joinContinuedLines(raw)
+	joined = joinBracketLines(joined)
+	joined = joinTrailingComma(joined)
+	result := make([]string, len(joined))
+	for i, l := range joined {
+		result[i] = l.Content
+	}
+	return result
+}
+
+func JoinContinuedLines(lines []string) []string {
+	joined := joinContinuedLines(lines)
+	result := make([]string, len(joined))
+	for i, l := range joined {
+		result[i] = l.Content
+	}
+	return result
+}
+
+// hasTrailingBackslash returns true if line ends with a \\ that is outside strings/comments.
+func hasTrailingBackslash(line string) bool {
+	j := len(line) - 1
+	for j >= 0 && (line[j] == ' ' || line[j] == '\t' || line[j] == '\r') {
+		j--
+	}
+	if j < 0 || line[j] != '\\' {
+		return false
+	}
+	inSingle := false
+	inDouble := false
+	for k := 0; k < j; k++ {
+		ch := line[k]
+		if ch == '\\' && (inSingle || inDouble) {
+			k++
+			continue
+		}
+		if ch == '"' && !inSingle {
+			inDouble = !inDouble
+		} else if ch == '\'' && !inDouble {
+			inSingle = !inSingle
+		}
+		if ch == '#' && !inSingle && !inDouble {
+			return false
+		}
+	}
+	return !inSingle && !inDouble
+}
+
+// joinBracketLines joins lines that have unclosed brackets (parentheses, square
+// brackets, or curly braces). Brackets inside string literals, charlists,
+// comments, and sigils are ignored. The joined line retains the line number of
+// the first line in the group.
+func joinBracketLines(lines []Line) []Line {
+	var result []Line
+	i := 0
+	for i < len(lines) {
+		origNum := lines[i].OrigNum // Keep the first line's original number
+		line := lines[i].Content
+		depth := bracketDepth(line)
+		for depth > 0 && i+1 < len(lines) {
+			i++
+			line = line + " " + lines[i].Content
+			depth = bracketDepth(line)
+		}
+		result = append(result, Line{Content: line, OrigNum: origNum})
+		i++
+	}
+	return result
+}
+
+// JoinBracketLines is the exported version that takes and returns strings.
+// Used by tests and other code that doesn't need line number tracking.
+func JoinBracketLines(lines []string) []string {
+	lineObjs := make([]Line, len(lines))
+	for i, l := range lines {
+		lineObjs[i] = Line{Content: l, OrigNum: i + 1}
+	}
+	joined := joinBracketLines(lineObjs)
+	result := make([]string, len(joined))
+	for i, l := range joined {
+		result[i] = l.Content
+	}
+	return result
+}
+
+// joinTrailingComma joins lines where a directive (alias, import, use, require)
+// ends with a trailing comma and the next line is a continuation (starts with
+// whitespace followed by a keyword or keyword-like argument). This handles
+// multi-line constructs like:
+//
+//	alias MyModule.MySubModule,
+//	  as: Something
+//
+//	use SomeModule,
+//	  key: Val
+//
+// These have no unclosed brackets, so joinBracketLines doesn't catch them.
+func joinTrailingComma(lines []Line) []Line {
+	var result []Line
+	i := 0
+	for i < len(lines) {
+		origNum := lines[i].OrigNum
+		content := lines[i].Content
+
+		if isDirectiveWithTrailingComma(content) {
+			// Join with subsequent continuation lines
+			for i+1 < len(lines) {
+				next := lines[i+1].Content
+				trimmed := strings.TrimSpace(next)
+				// Skip blank lines — they signal a new statement
+				if trimmed == "" {
+					break
+				}
+				// Skip comment-only lines inside the continuation
+				if strings.HasPrefix(trimmed, "#") {
+					i++
+					continue
+				}
+				if !LooksLikeKeywordOpt(trimmed) {
+					break
+				}
+				content = content + " " + trimmed
+				i++
+			}
+		}
+
+		result = append(result, Line{Content: content, OrigNum: origNum})
+		i++
+	}
+	return result
+}
+
+// directivePrefixes are the keywords that can have multi-line comma continuations.
+var directivePrefixes = []string{"alias ", "import ", "use ", "require "}
+
+// isDirectiveWithTrailingComma returns true if the line starts with a directive
+// keyword and ends with a comma (outside strings/comments), with no unclosed brackets.
+func isDirectiveWithTrailingComma(line string) bool {
+	trimmed := strings.TrimLeft(line, " \t")
+	for _, prefix := range directivePrefixes {
+		if strings.HasPrefix(trimmed, prefix) {
+			// Check the line ends with a trailing comma (outside strings/comments)
+			stripped := StripCommentsAndStrings(trimmed)
+			stripped = strings.TrimRight(stripped, " \t\r")
+			return strings.HasSuffix(stripped, ",")
+		}
+	}
+	return false
+}
+
+// LooksLikeKeywordOpt returns true if trimmed starts with a lowercase
+// identifier followed by ':' (e.g. "as: Something", "name: \"foo\"").
+// Used by both the parser's line joining and the LSP's multiline use opts.
+func LooksLikeKeywordOpt(trimmed string) bool {
+	for i := 0; i < len(trimmed); i++ {
+		ch := trimmed[i]
+		if ch == ':' && i > 0 {
+			return true
+		}
+		if !IsLowerIdentChar(ch) {
+			return false
+		}
+	}
+	return false
+}
+
+// bracketDepth returns the net bracket depth of a line: positive if there are
+// unclosed brackets. Only counts (, [, { outside strings, charlists, sigils,
+// and comments. Handles <<>> bitstring syntax.
+func bracketDepth(line string) int {
+	depth := 0
+	i := 0
+	for i < len(line) {
+		ch := line[i]
+		// Skip escaped characters inside strings/charlists
+		if ch == '\\' && i+1 < len(line) {
+			i += 2
+			continue
+		}
+		// Comment — stop counting
+		if ch == '#' {
+			break
+		}
+		// Double-quoted string
+		if ch == '"' {
+			i = skipQuoted(line, i+1, '"')
+			continue
+		}
+		// Single-quoted charlist
+		if ch == '\'' {
+			i = skipQuoted(line, i+1, '\'')
+			continue
+		}
+		// Sigil
+		if ch == '~' && i+1 < len(line) {
+			next := line[i+1]
+			if (next >= 'a' && next <= 'z') || (next >= 'A' && next <= 'Z') {
+				i = skipSigil(line, i+2)
+				continue
+			}
+		}
+		// Bitstring << >>
+		if ch == '<' && i+1 < len(line) && line[i+1] == '<' {
+			// Skip over <<, but don't count as bracket
+			i += 2
+			continue
+		}
+		if ch == '>' && i+1 < len(line) && line[i+1] == '>' {
+			i += 2
+			continue
+		}
+		switch ch {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			depth--
+		}
+		i++
+	}
+	return depth
+}
+
+// skipQuoted advances past a quoted literal content until the closing quote.
+func skipQuoted(line string, i int, quote byte) int {
+	for i < len(line) {
+		if line[i] == '\\' && i+1 < len(line) {
+			i += 2
+			continue
+		}
+		if line[i] == quote {
+			return i + 1
+		}
+		// Interpolation in double-quoted strings
+		if quote == '"' && line[i] == '#' && i+1 < len(line) && line[i+1] == '{' {
+			i += 2
+			// Track nested braces in interpolation
+			braceDepth := 1
+			for i < len(line) && braceDepth > 0 {
+				if line[i] == '\\' && i+1 < len(line) {
+					i += 2
+					continue
+				}
+				switch line[i] {
+				case '{':
+					braceDepth++
+				case '}':
+					braceDepth--
+				}
+				if braceDepth > 0 {
+					i++
+				}
+			}
+			continue
+		}
+		i++
+	}
+	return i
+}
+
+// skipSigil advances past a sigil's content until the closing delimiter.
+func skipSigil(line string, i int) int {
+	if i >= len(line) {
+		return i
+	}
+	// Determine delimiter
+	ch := line[i]
+	var openDelim, closeDelim byte
+	switch ch {
+	case '(', '[', '{', '<':
+		openDelim = ch
+		switch ch {
+		case '(':
+			closeDelim = ')'
+		case '[':
+			closeDelim = ']'
+		case '{':
+			closeDelim = '}'
+		case '<':
+			closeDelim = '>'
+		}
+	default:
+		// Non-bracket delimiter (e.g. /, |, ")
+		closeDelim = ch
+		openDelim = ch
+	}
+	i++ // skip opening delimiter
+	depth := 1
+	for i < len(line) && depth > 0 {
+		if line[i] == '\\' && i+1 < len(line) {
+			i += 2
+			continue
+		}
+		if openDelim != closeDelim {
+			switch line[i] {
+			case openDelim:
+				depth++
+			case closeDelim:
+				depth--
+			}
+		} else {
+			if line[i] == closeDelim {
+				depth--
+			}
+		}
+		if depth > 0 {
+			i++
+		}
+	}
+	if i < len(line) {
+		i++ // skip closing delimiter
+	}
+	// Skip optional modifiers (e.g. ~r/pattern/s)
+	for i < len(line) && ((line[i] >= 'a' && line[i] <= 'z') || (line[i] >= 'A' && line[i] <= 'Z')) {
+		i++
+	}
+	return i
+}
+
 // ParseText parses Elixir source text and returns definitions and references.
 // The path is used to populate FilePath fields but the text is not read from disk.
 func ParseText(path, text string) ([]Definition, []Reference, error) {
@@ -85,7 +436,10 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 		savedInjectors map[string]bool
 	}
 
-	lines := strings.Split(text, "\n")
+	origLines := strings.Split(text, "\n")
+	lines := joinContinuedLines(origLines)
+	lines = joinBracketLines(lines)
+	lines = joinTrailingComma(lines)
 	var defs []Definition
 	var refs []Reference
 	var moduleStack []moduleFrame
@@ -94,25 +448,64 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 	injectors := map[string]bool{} // modules from use/import that inject bare functions
 	inHeredoc := false
 
+	// Multi-line sigil tracking: when a sigil opener (~X with bracket delimiter)
+	// doesn't close on the same line, we track the closing delimiter and depth
+	// so subsequent lines inside the sigil are skipped.
+	var sigilCloser byte
+	var sigilDepth int
+
 	for lineIdx, line := range lines {
-		lineNum := lineIdx + 1
+		lineNum := line.OrigNum // Use original line number, not joined index
+		content := line.Content
+
+		// Skip lines inside a multi-line sigil
+		if sigilCloser != 0 {
+			for j := 0; j < len(content); j++ {
+				if content[j] == '\\' && j+1 < len(content) {
+					j++
+					continue
+				}
+				if content[j] == sigilCloser {
+					sigilDepth--
+					if sigilDepth == 0 {
+						sigilCloser = 0
+						break
+					}
+				} else if isSigilBracketOpener(content[j], sigilCloser) {
+					sigilDepth++
+				}
+			}
+			if sigilCloser != 0 {
+				continue // sigil still open, skip this line
+			}
+			// Sigil closed on this line — it's just a closing delimiter, skip it
+			continue
+		}
+
+		// Check for a sigil opener that doesn't close on this line.
+		// Must run before CheckHeredoc so ~s""" is treated as a sigil, not heredoc.
+		if opener, ok := findUnclosedSigil(content); ok {
+			sigilCloser = opener.closer
+			sigilDepth = opener.depth
+			continue
+		}
 
 		var skip bool
-		inHeredoc, skip = CheckHeredoc(line, inHeredoc)
+		inHeredoc, skip = CheckHeredoc(content, inHeredoc)
 		if skip {
 			continue
 		}
 
 		// Find first non-whitespace character for fast pre-filtering.
 		trimStart := 0
-		for trimStart < len(line) && (line[trimStart] == ' ' || line[trimStart] == '\t') {
+		for trimStart < len(content) && (content[trimStart] == ' ' || content[trimStart] == '\t') {
 			trimStart++
 		}
-		if trimStart >= len(line) {
+		if trimStart >= len(content) {
 			continue
 		}
-		first := line[trimStart]
-		rest := line[trimStart:] // line content from first non-whitespace char
+		first := content[trimStart]
+		rest := content[trimStart:] // line content from first non-whitespace char
 
 		strippedRest := strings.TrimRight(StripCommentsAndStrings(rest), " \t\r")
 
@@ -276,7 +669,7 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 						defs = append(defs, Definition{
 							Module:   currentModule,
 							Function: name,
-							Arity:    ExtractArity(line, name),
+							Arity:    ExtractArity(content, name),
 							Line:     lineNum,
 							FilePath: path,
 							Kind:     kind,
@@ -313,7 +706,7 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 						defs = append(defs, Definition{
 							Module:   currentModule,
 							Function: name,
-							Arity:    ExtractArity(line, name),
+							Arity:    ExtractArity(content, name),
 							Line:     lineNum,
 							FilePath: path,
 							Kind:     callbackKind,
@@ -377,7 +770,7 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 
 			if currentModule != "" {
 				if kind, funcName, ok := ScanFuncDef(rest); ok {
-					paramContent := FindParamContent(line, funcName)
+					paramContent := FindParamContent(content, funcName)
 					maxArity := ArityFromParams(paramContent)
 					defaultCount := DefaultsFromParams(paramContent)
 					minArity := maxArity - defaultCount
@@ -387,7 +780,7 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 						delegateTo, delegateAs = findDelegateToAndAs(lines, lineIdx, aliases, currentModule)
 					}
 
-					allParamNames := ExtractParamNames(line, funcName)
+					allParamNames := ExtractParamNames(content, funcName)
 
 					for arity := minArity; arity <= maxArity; arity++ {
 						params := JoinParams(allParamNames, arity)
@@ -467,11 +860,11 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 		}
 
 		// Extract Module.function calls and %Module{} struct literals from any line.
-		if !hasUppercase(line) {
+		if !hasUppercase(content) {
 			continue
 		}
 		{
-			codeLine := StripCommentsAndStrings(line)
+			codeLine := StripCommentsAndStrings(content)
 
 			// Module.function calls (including type refs like User.t())
 			for _, match := range moduleCallRe.FindAllStringSubmatch(codeLine, -1) {
@@ -648,16 +1041,19 @@ func ScanFuncDef(rest string) (string, string, bool) {
 // inHeredoc state and whether this line is a heredoc boundary or content that
 // should be skipped by callers doing line-by-line analysis.
 func CheckHeredoc(line string, inHeredoc bool) (newState bool, skip bool) {
-	if strings.IndexByte(line, '"') >= 0 {
-		if c := strings.Count(line, `"""`); c > 0 {
+	// Strip sigil content before checking for heredoc markers so that
+	// """ or ''' inside ~s(...) doesn't toggle heredoc mode.
+	stripped := stripSigils(line)
+	if strings.IndexByte(stripped, '"') >= 0 {
+		if c := countHeredocMarkers(stripped, '"'); c > 0 {
 			if c < 2 {
 				inHeredoc = !inHeredoc
 			}
 			return inHeredoc, true
 		}
 	}
-	if strings.IndexByte(line, '\'') >= 0 {
-		if c := strings.Count(line, `'''`); c > 0 {
+	if strings.IndexByte(stripped, '\'') >= 0 {
+		if c := countHeredocMarkers(stripped, '\''); c > 0 {
 			if c < 2 {
 				inHeredoc = !inHeredoc
 			}
@@ -665,6 +1061,208 @@ func CheckHeredoc(line string, inHeredoc bool) (newState bool, skip bool) {
 		}
 	}
 	return inHeredoc, inHeredoc
+}
+
+// stripSigils replaces sigil content with spaces, preserving the opening ~X
+// and closing delimiter so that heredoc detection only sees code, not string
+// content. This is a simplified version of StripCommentsAndStrings that only
+// handles sigils.
+func stripSigils(line string) string {
+	if !strings.ContainsRune(line, '~') {
+		return line
+	}
+	buf := []byte(line)
+	i := 0
+	for i < len(buf) {
+		if buf[i] == '\\' && i+1 < len(buf) {
+			i += 2
+			continue
+		}
+		if buf[i] == '"' {
+			// Skip string content so we don't match ~ inside strings
+			i++
+			for i < len(buf) {
+				if buf[i] == '\\' && i+1 < len(buf) {
+					i += 2
+					continue
+				}
+				if buf[i] == '"' {
+					i++
+					break
+				}
+				i++
+			}
+			continue
+		}
+		if buf[i] == '~' && i+1 < len(buf) {
+			next := buf[i+1]
+			if (next >= 'a' && next <= 'z') || (next >= 'A' && next <= 'Z') {
+				sigilStart := i + 2
+				if sigilStart < len(buf) {
+					i = blankSigilForHeredoc(buf, sigilStart)
+					continue
+				}
+			}
+		}
+		i++
+	}
+	return string(buf)
+}
+
+// blankSigilForHeredoc blanks sigil content (replacing with spaces) starting
+// at the opening delimiter. Returns the index after the closing delimiter +
+// modifiers.
+func blankSigilForHeredoc(buf []byte, i int) int {
+	if i >= len(buf) {
+		return i
+	}
+	opener := buf[i]
+	var closer byte
+	switch opener {
+	case '(':
+		closer = ')'
+	case '[':
+		closer = ']'
+	case '{':
+		closer = '}'
+	case '<':
+		closer = '>'
+	default:
+		closer = opener
+	}
+	i++ // skip opening delimiter
+	depth := 1
+	for i < len(buf) && depth > 0 {
+		if buf[i] == '\\' && i+1 < len(buf) {
+			buf[i] = ' '
+			buf[i+1] = ' '
+			i += 2
+			continue
+		}
+		if buf[i] == closer {
+			depth--
+			if depth == 0 {
+				i++
+				// skip modifiers
+				for i < len(buf) && ((buf[i] >= 'a' && buf[i] <= 'z') || (buf[i] >= 'A' && buf[i] <= 'Z')) {
+					i++
+				}
+				return i
+			}
+		} else if closer != opener && buf[i] == opener {
+			depth++
+		}
+		if depth > 0 {
+			buf[i] = ' '
+			i++
+		}
+	}
+	return i
+}
+
+// sigilBracketPairs maps bracket openers to their closers.
+var sigilBracketPairs = map[byte]byte{
+	'(': ')',
+	'[': ']',
+	'{': '}',
+	'<': '>',
+}
+
+// sigilResult holds the closer byte and remaining depth after scanning a line
+// for an unclosed sigil.
+type sigilResult struct {
+	closer byte
+	depth  int
+}
+
+// findUnclosedSigil scans content for a sigil (~X followed by a bracket delimiter)
+// that doesn't close on the same line. Returns the closer and remaining depth.
+func findUnclosedSigil(content string) (sigilResult, bool) {
+	for i := 0; i < len(content); i++ {
+		// Skip past strings so we don't match ~ inside them
+		if content[i] == '"' {
+			i = skipQuoted(content, i+1, '"')
+			i-- // outer loop will i++
+			continue
+		}
+		if content[i] == '\'' {
+			i = skipQuoted(content, i+1, '\'')
+			i--
+			continue
+		}
+		if content[i] == '~' && i+1 < len(content) {
+			next := content[i+1]
+			if (next >= 'a' && next <= 'z') || (next >= 'A' && next <= 'Z') {
+				sigilStart := i + 2
+				if sigilStart >= len(content) {
+					continue
+				}
+				delim := content[sigilStart]
+				closer, isBracket := sigilBracketPairs[delim]
+				if !isBracket {
+					continue
+				}
+				// Scan to end of line tracking bracket depth
+				depth := 1
+				for j := sigilStart + 1; j < len(content); j++ {
+					if content[j] == '\\' && j+1 < len(content) {
+						j++
+						continue
+					}
+					if content[j] == closer {
+						depth--
+						if depth == 0 {
+							break
+						}
+					} else if content[j] == delim {
+						depth++
+					}
+				}
+				if depth > 0 {
+					return sigilResult{closer: closer, depth: depth}, true
+				}
+			}
+		}
+	}
+	return sigilResult{}, false
+}
+
+// isSigilBracketOpener returns true if ch is a bracket opener that matches
+// the given closer (i.e. closer ')' matches opener '(').
+func isSigilBracketOpener(ch byte, closer byte) bool {
+	for o, c := range sigilBracketPairs {
+		if c == closer && o == ch {
+			return true
+		}
+	}
+	return false
+}
+
+// countHeredocMarkers counts occurrences of triple-quote markers (\"\"\" or \”'\)
+// in the line, but only when they appear outside of single-line string literals.
+func countHeredocMarkers(line string, quote byte) int {
+	inString := false
+	count := 0
+	for i := 0; i < len(line); i++ {
+		if line[i] == '\\' && inString {
+			i++ // skip escaped char
+			continue
+		}
+		if line[i] == quote {
+			if inString {
+				inString = false
+				continue
+			}
+			// Check for triple quote
+			if i+2 < len(line) && line[i+1] == quote && line[i+2] == quote {
+				count++
+				i += 2
+				continue
+			}
+			inString = true
+		}
+	}
+	return count
 }
 
 // ContainsDo returns true if the trimmed line ends with a block-opening " do"
@@ -732,12 +1330,20 @@ func containsFnKeyword(code string) bool {
 }
 
 func isIdentChar(b byte) bool {
+	return IsIdentChar(b)
+}
+
+func IsIdentChar(b byte) bool {
 	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_'
+}
+
+func IsLowerIdentChar(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') || b == '_'
 }
 
 // findDelegateTo searches the current line and up to 5 subsequent lines for a to: target,
 // then resolves it via aliases.
-func findDelegateToAndAs(lines []string, startIdx int, aliases map[string]string, currentModule string) (string, string) {
+func findDelegateToAndAs(lines []Line, startIdx int, aliases map[string]string, currentModule string) (string, string) {
 	end := startIdx + 6
 	if end > len(lines) {
 		end = len(lines)
@@ -746,10 +1352,10 @@ func findDelegateToAndAs(lines []string, startIdx int, aliases map[string]string
 	var targetModule, targetFunc string
 	for i := startIdx; i < end; i++ {
 		// A new statement on any line after the first means the current defdelegate ended
-		if i > startIdx && newStatementRe.MatchString(lines[i]) {
+		if i > startIdx && newStatementRe.MatchString(lines[i].Content) {
 			break
 		}
-		if m := delegateToRe.FindStringSubmatch(lines[i]); m != nil && targetModule == "" {
+		if m := delegateToRe.FindStringSubmatch(lines[i].Content); m != nil && targetModule == "" {
 			target := m[1]
 			// Resolve __MODULE__ directly in to: field
 			if currentModule != "" {
@@ -769,7 +1375,7 @@ func findDelegateToAndAs(lines []string, startIdx int, aliases map[string]string
 				targetModule = target
 			}
 		}
-		if m := delegateAsRe.FindStringSubmatch(lines[i]); m != nil && targetFunc == "" {
+		if m := delegateAsRe.FindStringSubmatch(lines[i].Content); m != nil && targetFunc == "" {
 			targetFunc = m[1]
 		}
 	}
@@ -1083,11 +1689,21 @@ func StripCommentsAndStrings(line string) string {
 		}
 		// String literal (double-quoted)
 		if ch == '"' {
+			// Check for char literal: ?\" is the integer value of ", not a string start
+			if i > 0 && buf[i-1] == '?' {
+				i++
+				continue
+			}
 			i = blankQuoted(buf, i, '"')
 			continue
 		}
 		// Single-quoted charlist
 		if ch == '\'' {
+			// Check for char literal: ?' is also a char literal
+			if i > 0 && buf[i-1] == '?' {
+				i++
+				continue
+			}
 			i = blankQuoted(buf, i, '\'')
 			continue
 		}
@@ -1113,6 +1729,55 @@ func blankQuoted(buf []byte, i int, quote byte) int {
 			buf[j] = ' '
 			buf[j+1] = ' '
 			j += 2
+			continue
+		}
+		// Handle interpolation: #{...} can contain nested strings/braces
+		if quote == '"' && buf[j] == '#' && j+1 < len(buf) && buf[j+1] == '{' {
+			buf[j] = ' '
+			buf[j+1] = ' '
+			j += 2
+			braceDepth := 1
+			for j < len(buf) && braceDepth > 0 {
+				if buf[j] == '\\' && j+1 < len(buf) {
+					buf[j] = ' '
+					buf[j+1] = ' '
+					j += 2
+					continue
+				}
+				if buf[j] == '"' || buf[j] == '\'' {
+					// Nested string inside interpolation — blank it recursively
+					nestedQuote := buf[j]
+					j++
+					for j < len(buf) {
+						if buf[j] == '\\' && j+1 < len(buf) {
+							buf[j] = ' '
+							buf[j+1] = ' '
+							j += 2
+							continue
+						}
+						if buf[j] == nestedQuote {
+							buf[j] = ' '
+							j++
+							break
+						}
+						buf[j] = ' '
+						j++
+					}
+					continue
+				}
+				if buf[j] == '{' {
+					braceDepth++
+				} else if buf[j] == '}' {
+					braceDepth--
+					if braceDepth == 0 {
+						buf[j] = ' '
+						j++
+						break
+					}
+				}
+				buf[j] = ' '
+				j++
+			}
 			continue
 		}
 		if buf[j] == quote {

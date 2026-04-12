@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -2045,5 +2046,764 @@ end
 	}
 	if !refModules["String.t"] {
 		t.Errorf("expected String.t ref from callback type annotation, refs: %v", refs)
+	}
+}
+
+// --- Regression tests for parser edge cases ---
+
+func TestStripCommentsAndStrings_CharLiteralQuote(t *testing.T) {
+	// Bug 1: ?" is a char literal, should not start a string.
+	input := `x = ?"; Foo.bar()`
+	result := StripCommentsAndStrings(input)
+	if !strings.Contains(result, "Foo.bar") {
+		t.Errorf("Foo.bar should survive stripping, got %q", result)
+	}
+}
+
+func TestParseFile_CharLiteralDoesNotConfuseStringBlanking(t *testing.T) {
+	// Bug 1: char literal ?" should not eat the module ref on the same line
+	path := writeTempFile(t, "defmodule MyApp.Foo do\n  def bar do\n    x = ?\"\n    Real.Module.call()\n  end\nend\n")
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found := false
+	for _, r := range refs {
+		if r.Module == "Real.Module" && r.Function == "call" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected Real.Module.call ref; got refs: %+v", refs)
+	}
+}
+
+func TestStripCommentsAndStrings_Interpolation(t *testing.T) {
+	// Bug 2: interpolation #{...} with nested quotes should not terminate string blanking early
+	input := `foo "hello #{bar("world")}"`
+	result := StripCommentsAndStrings(input)
+	if strings.Contains(result, "world") {
+		t.Errorf("interpolation content should be blanked, got %q", result)
+	}
+	if strings.Contains(result, "bar") {
+		t.Errorf("interpolation content should be blanked, got %q", result)
+	}
+}
+
+func TestParseFile_InterpolationDoesNotConfuseRefExtraction(t *testing.T) {
+	// Bug 2: string interpolation with nested quotes containing module refs
+	path := writeTempFile(t, "defmodule MyApp.Foo do\n  def bar do\n    x = \"hello #{Real.Module.call(\\\"arg\\\"}\"\n    Other.Module.work()\n  end\nend\n")
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, r := range refs {
+		if r.Module == "Real.Module" {
+			t.Errorf("should not extract refs from inside string interpolation, got %+v", r)
+		}
+	}
+
+	found := false
+	for _, r := range refs {
+		if r.Module == "Other.Module" && r.Function == "work" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected Other.Module.work ref; got refs: %+v", refs)
+	}
+}
+
+func TestCheckHeredoc_TripleQuoteInsideString(t *testing.T) {
+	// Bug 3: """ inside a string literal should not toggle heredoc state
+	line := `x = "contains triple quote: """ and more"`
+	newState, skip := CheckHeredoc(line, false)
+	if newState {
+		t.Error(`""" inside string should not toggle heredoc on`)
+	}
+	if skip {
+		t.Error(`line with """ inside string should not be skipped`)
+	}
+}
+
+func TestParseFile_TripleQuoteInStringDoesNotToggleHeredoc(t *testing.T) {
+	// Bug 3: """ inside a string should not cause subsequent lines to be skipped
+	path := writeTempFile(t, "defmodule MyApp.Foo do\n  def bar do\n    x = \"contains \\\"\\\"\\\" triple quotes\"\n    Real.Module.call()\n  end\nend\n")
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found := false
+	for _, r := range refs {
+		if r.Module == "Real.Module" && r.Function == "call" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("Real.Module.call should be found; got refs: %+v", refs)
+	}
+}
+
+func TestParseText_LineContinuation(t *testing.T) {
+	// Bug 4: backslash at EOL joins with next line.
+	// Use a case where the module name spans the continuation boundary.
+	text := "defmodule MyApp.Foo\n  alias Some.\\\n    Module\n  def bar, do: Some.Module.call()\nend\n"
+
+	_, refs, err := ParseText("test.ex", text)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found := false
+	for _, r := range refs {
+		if r.Module == "Some.Module" && r.Function == "call" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("Some.Module.call should be resolved after line continuation; got refs: %+v", refs)
+	}
+}
+
+func TestJoinContinuedLines_BareBackslash(t *testing.T) {
+	result := JoinContinuedLines([]string{"def foo,\\", "  do: :bar"})
+	if len(result) != 1 {
+		t.Fatalf("expected 1 line, got %d: %v", len(result), result)
+	}
+	if !strings.Contains(result[0], "do: :bar") {
+		t.Errorf("lines should be joined, got %q", result[0])
+	}
+}
+
+func TestJoinContinuedLines_BackslashInString(t *testing.T) {
+	// Backslash inside a string at EOL should NOT join lines
+	result := JoinContinuedLines([]string{`x = "hello\"`, "y = 1"})
+	if len(result) != 2 {
+		t.Errorf("backslash in string should not join lines, got %d: %v", len(result), result)
+	}
+}
+
+func TestJoinContinuedLines_MultipleContinuations(t *testing.T) {
+	result := JoinContinuedLines([]string{"def foo,\\", "  arg1,\\", "  do: :bar"})
+	if len(result) != 1 {
+		t.Fatalf("expected 1 line after 3 continuations, got %d: %v", len(result), result)
+	}
+}
+
+func TestJoinBracketLines_MultiLineAlias(t *testing.T) {
+	result := JoinBracketLines([]string{
+		"alias MyApp.{",
+		"  Accounts,",
+		"  Users,",
+		"  Billing",
+		"}",
+	})
+	if len(result) != 1 {
+		t.Fatalf("expected 1 joined line, got %d: %v", len(result), result)
+	}
+	if !strings.Contains(result[0], "Accounts") || !strings.Contains(result[0], "Billing") {
+		t.Errorf("joined line should contain all segments, got %q", result[0])
+	}
+}
+
+func TestJoinBracketLines_MultiLineDef(t *testing.T) {
+	result := JoinBracketLines([]string{
+		"def foo(arg1,",
+		"  arg2)",
+	})
+	if len(result) != 1 {
+		t.Fatalf("expected 1 joined line, got %d: %v", len(result), result)
+	}
+	if !strings.Contains(result[0], "arg1") || !strings.Contains(result[0], "arg2") {
+		t.Errorf("joined line should contain both args, got %q", result[0])
+	}
+}
+
+func TestJoinBracketLines_NestedBrackets(t *testing.T) {
+	result := JoinBracketLines([]string{
+		"alias MyApp.{Accounts.{Admin, User}}",
+	})
+	if len(result) != 1 {
+		t.Fatalf("single line with balanced brackets should stay 1 line, got %d", len(result))
+	}
+}
+
+func TestJoinBracketLines_BracketInString(t *testing.T) {
+	result := JoinBracketLines([]string{
+		`foo("bar { baz")`,
+		"next_line()",
+	})
+	if len(result) != 2 {
+		t.Errorf("bracket in string should not cause joining, got %d: %v", len(result), result)
+	}
+}
+
+func TestJoinBracketLines_NoOpenBrackets(t *testing.T) {
+	result := JoinBracketLines([]string{
+		"def foo do",
+		"  :ok",
+		"end",
+	})
+	if len(result) != 3 {
+		t.Errorf("lines without open brackets should pass through, got %d: %v", len(result), result)
+	}
+}
+
+func TestJoinBracketLines_BitstringNotDoubleAngle(t *testing.T) {
+	// << and >> are bitstring delimiters, not double < or >
+	result := JoinBracketLines([]string{
+		`x = <<1, 2, 3>>`,
+		"y = 1",
+	})
+	if len(result) != 2 {
+		t.Errorf("bitstring on one line should not join, got %d: %v", len(result), result)
+	}
+}
+
+func TestParseText_MultiLineAlias(t *testing.T) {
+	text := "defmodule MyApp do\n" +
+		"  alias MyApp.{\n" +
+		"    Accounts,\n" +
+		"    Users\n" +
+		"  }\n" +
+		"\n" +
+		"  def foo do\n" +
+		"    Accounts.list()\n" +
+		"  end\n" +
+		"end\n"
+
+	_, refs, err := ParseText("test.ex", text)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Should have alias refs for MyApp.Accounts and MyApp.Users
+	aliasRefs := filterRefs(refs, "alias")
+	found := map[string]bool{}
+	for _, r := range aliasRefs {
+		found[r.Module] = true
+	}
+	if !found["MyApp.Accounts"] {
+		t.Error("expected alias ref for MyApp.Accounts from multi-line alias")
+	}
+	if !found["MyApp.Users"] {
+		t.Error("expected alias ref for MyApp.Users from multi-line alias")
+	}
+
+	// Accounts.list() should resolve via the alias
+	callRefs := filterRefs(refs, "call")
+	foundCall := false
+	for _, r := range callRefs {
+		if r.Module == "MyApp.Accounts" && r.Function == "list" {
+			foundCall = true
+		}
+	}
+	if !foundCall {
+		t.Error("expected Accounts.list() to resolve to MyApp.Accounts.list via alias")
+	}
+}
+
+func TestParseText_MultiLineDefArgs(t *testing.T) {
+	text := "defmodule MyApp do\n" +
+		"  def foo(arg1,\n" +
+		"      arg2) do\n" +
+		"    :ok\n" +
+		"  end\n" +
+		"end\n"
+
+	defs, _, err := ParseText("test.ex", text)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found := false
+	for _, d := range defs {
+		if d.Function == "foo" {
+			found = true
+			if d.Arity != 2 {
+				t.Errorf("foo should have arity 2, got %d", d.Arity)
+			}
+			if d.Line != 2 {
+				t.Errorf("foo should be on line 2 (first line of joined group), got %d", d.Line)
+			}
+		}
+	}
+	if !found {
+		t.Error("missing def foo from multi-line definition")
+	}
+}
+
+func TestJoinBracketLines_CommentWithBackslash(t *testing.T) {
+	// Backslash in a comment should NOT join lines
+	result := JoinContinuedLines([]string{"x = 1 # trailing \\", "y = 2"})
+	if len(result) != 2 {
+		t.Errorf("backslash in comment should not join lines, got %d: %v", len(result), result)
+	}
+}
+
+// --- Regression tests for multi-line construct bugs ---
+
+func TestParseFile_MultiLineAliasAs(t *testing.T) {
+	// Bug: alias with multi-line as: was silently lost because the trailing
+	// comma didn't trigger bracket joining and the parser saw two separate lines.
+	path := writeTempFile(t, `defmodule MyApp do
+  alias MyModule.MySubModule,
+    as: Something
+
+  def foo do
+    Something.call()
+  end
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The alias ref should be recorded
+	foundAlias := false
+	for _, r := range refs {
+		if r.Kind == "alias" && r.Module == "MyModule.MySubModule" {
+			foundAlias = true
+		}
+	}
+	if !foundAlias {
+		t.Error("expected alias ref for MyModule.MySubModule")
+	}
+
+	// Something.call() should resolve via the as: alias
+	foundCall := false
+	for _, r := range refs {
+		if r.Kind == "call" && r.Module == "MyModule.MySubModule" && r.Function == "call" {
+			foundCall = true
+		}
+	}
+	if !foundCall {
+		t.Error("expected Something.call() to resolve to MyModule.MySubModule.call via as: alias")
+	}
+}
+
+func TestParseFile_MultiLineAliasAs_Defdelegate(t *testing.T) {
+	// Multi-line alias ... as: must resolve for defdelegate targets too.
+	path := writeTempFile(t, `defmodule MyApp do
+  alias MyApp.Serializer.Date,
+    as: DateSerializer
+
+  defdelegate format(date), to: DateSerializer
+end
+`)
+
+	defs, _, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, d := range defs {
+		if d.Function == "format" {
+			if d.DelegateTo != "MyApp.Serializer.Date" {
+				t.Errorf("expected DelegateTo MyApp.Serializer.Date, got %q", d.DelegateTo)
+			}
+			return
+		}
+	}
+	t.Error("missing defdelegate format")
+}
+
+func TestParseFile_SigilTripleQuoteDoesNotToggleHeredoc(t *testing.T) {
+	// Bug: """ inside ~s(...) toggled heredoc mode on, causing subsequent
+	// lines to be silently skipped by the parser.
+	path := writeTempFile(t, `defmodule MyApp do
+  def foo do
+    x = ~s(this has """ inside parens)
+    Real.Module.call()
+  end
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found := false
+	for _, r := range refs {
+		if r.Module == "Real.Module" && r.Function == "call" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected Real.Module.call ref — triple quote inside sigil may have toggled heredoc")
+	}
+}
+
+func TestParseFile_SigilTripleQuoteDoesNotToggleHeredoc_Bracket(t *testing.T) {
+	// Same bug with ~s[...] delimiter.
+	path := writeTempFile(t, `defmodule MyApp do
+  def foo do
+    x = ~s[this has """ inside brackets]
+    Real.Module.call()
+  end
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found := false
+	for _, r := range refs {
+		if r.Module == "Real.Module" && r.Function == "call" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected Real.Module.call ref")
+	}
+}
+
+func TestParseFile_MultiLineSigilNoFalseRefs(t *testing.T) {
+	// Bug: multi-line sigil content was indexed as real references because the
+	// parser had no "inside sigil" tracking (only heredoc tracking).
+	path := writeTempFile(t, `defmodule MyApp do
+  @doc ~S(
+    Fake.Module.ref() inside sigil
+  )
+  def foo do
+    Real.Module.call()
+  end
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, r := range refs {
+		if r.Module == "Fake.Module" {
+			t.Errorf("should not extract refs from inside multi-line sigil, got %+v", r)
+		}
+	}
+
+	found := false
+	for _, r := range refs {
+		if r.Module == "Real.Module" && r.Function == "call" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected Real.Module.call ref after multi-line sigil")
+	}
+}
+
+func TestParseFile_MultiLineSigilNoFalseDefs(t *testing.T) {
+	// Multi-line sigil should not swallow subsequent function definitions.
+	path := writeTempFile(t, `defmodule MyApp do
+  @doc ~S(
+    multi-line sigil content
+  )
+  def foo do
+    :ok
+  end
+
+  def bar do
+    :ok
+  end
+end
+`)
+
+	defs, _, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	funcs := map[string]bool{}
+	for _, d := range defs {
+		if d.Function != "" {
+			funcs[d.Function] = true
+		}
+	}
+	if !funcs["foo"] {
+		t.Error("missing def foo after multi-line sigil")
+	}
+	if !funcs["bar"] {
+		t.Error("missing def bar after multi-line sigil")
+	}
+}
+
+func TestFindUnclosedSigil(t *testing.T) {
+	tests := []struct {
+		line  string
+		found bool
+	}{
+		{`  @doc ~S(`, true},
+		{`  )`, false},
+		{`  x = ~s(foo)`, false},
+		{`  x = ~s(foo`, true},
+		{`    Fake.Module.ref() inside sigil`, false},
+	}
+	for _, tt := range tests {
+		_, ok := findUnclosedSigil(tt.line)
+		if ok != tt.found {
+			t.Errorf("findUnclosedSigil(%q) = %v, want %v", tt.line, ok, tt.found)
+		}
+	}
+}
+
+func TestBracketDepth_SigilOpen(t *testing.T) {
+	tests := []struct {
+		line   string
+		expect int
+	}{
+		{`  @doc ~S(`, 0},
+		{`  @doc ~S(    Fake.Module.ref() inside sigil`, 0},
+		{`  @doc ~S(    Fake.Module.ref() inside sigil  )`, 0},
+		{`  def foo(arg1,`, 1},
+	}
+	for _, tt := range tests {
+		got := bracketDepth(tt.line)
+		if got != tt.expect {
+			t.Errorf("bracketDepth(%q) = %d, want %d", tt.line, got, tt.expect)
+		}
+	}
+}
+
+// --- Additional regression tests for edge cases ---
+
+func TestParseFile_MultiLineUseWithOpts(t *testing.T) {
+	// use with opts spanning multiple lines must produce correct refs
+	path := writeTempFile(t, `defmodule MyApp.Worker do
+  use GenServer,
+    restart: :transient
+
+  def init(state), do: {:ok, state}
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found := false
+	for _, r := range refs {
+		if r.Module == "GenServer" && r.Kind == "use" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected use ref for GenServer; refs: %+v", refs)
+	}
+}
+
+func TestParseFile_MultilineDefWithDefaults(t *testing.T) {
+	// Function head with params spanning lines AND \\\\ defaults
+	path := writeTempFile(t, `defmodule MyApp.Accounts do
+  def fetch(
+    slug,
+    opts \\ []
+  ) do
+    :ok
+  end
+end
+`)
+
+	defs, _, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found := map[string]bool{}
+	for _, d := range defs {
+		if d.Function == "fetch" {
+			found[fmt.Sprintf("fetch/%d", d.Arity)] = true
+		}
+	}
+	if !found["fetch/1"] || !found["fetch/2"] {
+		t.Errorf("expected fetch/1 and fetch/2 from multiline def with defaults; got %v", found)
+	}
+}
+
+func TestParseFile_StringContainingDirectiveComma(t *testing.T) {
+	// A string literal that looks like "alias Foo," must NOT trigger joining
+	path := writeTempFile(t, `defmodule MyApp.Foo do
+  def bar do
+    x = "alias Fake.Module,"
+    Real.Module.call()
+  end
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	foundReal := false
+	for _, r := range refs {
+		if r.Module == "Real.Module" && r.Function == "call" {
+			foundReal = true
+		}
+		if r.Module == "Fake.Module" {
+			t.Errorf("should not extract refs from string content, got %+v", r)
+		}
+	}
+	if !foundReal {
+		t.Errorf("Real.Module.call should be found; refs: %+v", refs)
+	}
+}
+
+func TestJoinTrailingComma_CommentBetweenLines(t *testing.T) {
+	// Comment between directive and continuation should not break joining
+	lines := []Line{
+		{Content: "  alias MyModule.MySubModule,", OrigNum: 1},
+		{Content: "    # the short name", OrigNum: 2},
+		{Content: "    as: Something", OrigNum: 3},
+	}
+	result := joinTrailingComma(lines)
+	joined := false
+	for _, l := range result {
+		if strings.Contains(l.Content, "as: Something") && strings.Contains(l.Content, "alias") {
+			joined = true
+		}
+	}
+	if !joined {
+		t.Errorf("comment between directive and continuation should not break joining; got %+v", result)
+	}
+}
+
+func TestJoinTrailingComma_BlankLineBetween(t *testing.T) {
+	// Blank line between directive and continuation should stop joining
+	// (a blank line indicates a new statement in Elixir)
+	lines := []Line{
+		{Content: "  use Tool,", OrigNum: 1},
+		{Content: "", OrigNum: 2},
+		{Content: "    name: \"foo\"", OrigNum: 3},
+	}
+	result := joinTrailingComma(lines)
+	if len(result) < 2 {
+		t.Errorf("blank line should stop joining; got %d lines: %+v", len(result), result)
+	}
+}
+
+func TestJoinTrailingComma_NewStatementNotSwallowed(t *testing.T) {
+	// A new def on the next line should NOT be joined as a continuation
+	lines := []Line{
+		{Content: "  use Module,", OrigNum: 1},
+		{Content: "  def foo, do: :ok", OrigNum: 2},
+	}
+	result := joinTrailingComma(lines)
+	if len(result) != 2 {
+		t.Errorf("new statement should not be swallowed as continuation; got %d lines: %+v", len(result), result)
+	}
+}
+
+func TestParseFile_MultiLineAliasAs_PreservesLineNumber(t *testing.T) {
+	// Verify that joining preserves the original line number for definitions
+	path := writeTempFile(t, `defmodule MyApp.Foo do
+  alias MyModule.MySubModule,
+    as: Something
+
+  def bar do
+    :ok
+  end
+end
+`)
+
+	defs, _, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, d := range defs {
+		if d.Function == "bar" {
+			if d.Line != 5 {
+				t.Errorf("def bar should be on original line 5, got %d", d.Line)
+			}
+		}
+	}
+}
+
+func TestParseFile_SigilContainingDirective(t *testing.T) {
+	// Sigil content containing alias/use keywords should not produce refs
+	path := writeTempFile(t, `defmodule MyApp.Foo do
+  def bar do
+    x = ~s(alias Fake.Module)
+    y = ~s(use Fake.Module, key: val)
+    Real.Module.call()
+  end
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, r := range refs {
+		if r.Module == "Fake.Module" {
+			t.Errorf("should not extract refs from sigil content, got %+v", r)
+		}
+	}
+
+	foundReal := false
+	for _, r := range refs {
+		if r.Module == "Real.Module" && r.Function == "call" {
+			foundReal = true
+		}
+	}
+	if !foundReal {
+		t.Errorf("Real.Module.call should be found; refs: %+v", refs)
+	}
+}
+
+func TestParseFile_TrailingCommaInAliasBlock(t *testing.T) {
+	// Trailing comma after last child in alias block (common formatter output)
+	path := writeTempFile(t, `defmodule MyApp.Web do
+  alias MyApp.{
+    Accounts,
+    Users,
+  }
+
+  def foo do
+    Accounts.list()
+  end
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	aliasRefs := filterRefs(refs, "alias")
+	found := map[string]bool{}
+	for _, r := range aliasRefs {
+		found[r.Module] = true
+	}
+	if !found["MyApp.Accounts"] {
+		t.Error("expected alias ref for MyApp.Accounts from block with trailing comma")
+	}
+	if !found["MyApp.Users"] {
+		t.Error("expected alias ref for MyApp.Users from block with trailing comma")
+	}
+
+	callRefs := filterRefs(refs, "call")
+	foundCall := false
+	for _, r := range callRefs {
+		if r.Module == "MyApp.Accounts" && r.Function == "list" {
+			foundCall = true
+		}
+	}
+	if !foundCall {
+		t.Error("expected Accounts.list() to resolve to MyApp.Accounts.list via alias")
 	}
 }
