@@ -150,18 +150,43 @@ func ExtractCompletionContext(line string, col int) (prefix string, afterDot boo
 
 // ExtractAliasBlockParent detects whether the given 0-based line is inside
 // a multi-line alias brace block (alias Parent.{ ... }). If so, it returns
-// the resolved parent module name. This is used by the completion handler to
-// scope suggestions to children of the parent module.
-func ExtractAliasBlockParent(text string, targetLine int) (string, bool) {
-	lines := strings.Split(text, "\n")
+// the resolved parent module name. This is used by the completion and hover
+// handlers to resolve module names inside multi-line alias blocks.
+func ExtractAliasBlockParent(lines []string, targetLine int) (string, bool) {
 	if targetLine < 0 || targetLine >= len(lines) {
 		return "", false
 	}
 
-	// Check the current line first — cursor might be on the same line as "alias Parent.{"
+	// Quick pre-check: scan backward for an "alias ...{" line without a
+	// matching "}" on the same line.  Pure string ops, no allocations in
+	// the fast path, so this is nearly free for the 99% of hover/definition
+	// requests that are not inside an alias block.
+	found := false
+	for i := targetLine; i >= 0; i-- {
+		trimmed := strings.TrimSpace(lines[i])
+		if strings.HasPrefix(trimmed, "alias ") && strings.Contains(trimmed, "{") && !strings.Contains(trimmed, "}") {
+			found = true
+			break
+		}
+		// Any def/defp/defmodule means we've left the possible alias context.
+		if strings.HasPrefix(trimmed, "def ") || strings.HasPrefix(trimmed, "defp ") || strings.HasPrefix(trimmed, "defmodule ") {
+			break
+		}
+	}
+	if !found {
+		return "", false
+	}
+
+	// If the current line is just a closing brace (e.g. "  }"), we're past the block.
+	// But if it has module content before the brace (e.g. "  Services.MakePayment }"),
+	// we're still inside the alias block on the last line.
 	currentLine := strings.TrimSpace(parser.StripCommentsAndStrings(lines[targetLine]))
 	if strings.Contains(currentLine, "}") {
-		return "", false
+		withoutBrace := strings.TrimSpace(strings.Replace(currentLine, "}", "", 1))
+		withoutBrace = strings.TrimRight(withoutBrace, ", ")
+		if withoutBrace == "" {
+			return "", false
+		}
 	}
 
 	// Scan backward from the current line looking for the opening "alias Parent.{"
@@ -790,22 +815,66 @@ type UseCall struct {
 
 // ExtractUsesWithOpts parses all `use Module` and `use Module, key: Val`
 // declarations, returning each as a UseCall. Aliases are resolved using the
-// provided map.
+// provided map. Handles opts spanning multiple lines.
 func ExtractUsesWithOpts(text string, aliases map[string]string) []UseCall {
 	var calls []UseCall
-	for _, line := range strings.Split(text, "\n") {
-		// use Module, key: Val
+	lines := strings.Split(text, "\n")
+	for i := 0; i < len(lines); i++ {
+		line := lines[i]
+		// use Module, key: Val (single line)
 		if m := useWithOptsRe.FindStringSubmatch(line); m != nil {
 			module := parser.ResolveModuleRef(m[1], aliases, "")
 			calls = append(calls, UseCall{Module: module, Opts: ParseKeywordModuleOpts(m[2], aliases)})
 			continue
 		}
-		// plain use Module
+		// plain use Module (possibly with trailing comma for multiline opts)
 		if m := useRe.FindStringSubmatch(line); m != nil {
-			calls = append(calls, UseCall{Module: parser.ResolveModuleRef(m[1], aliases, "")})
+			module := parser.ResolveModuleRef(m[1], aliases, "")
+			trimmed := strings.TrimRight(parser.StripCommentsAndStrings(line), " \t\r")
+			if strings.HasSuffix(trimmed, ",") {
+				// Multiline opts: collect continuation lines
+				var optsBuilder strings.Builder
+				for i+1 < len(lines) {
+					next := strings.TrimSpace(lines[i+1])
+					if next == "" || next[0] == '#' {
+						i++
+						continue
+					}
+					// Continuation lines are keyword opts (lowercase_key:) or
+					// known option patterns; stop on anything else.
+					if !looksLikeOptContinuation(next) {
+						break
+					}
+					i++
+					if optsBuilder.Len() > 0 {
+						optsBuilder.WriteString(", ")
+					}
+					optsBuilder.WriteString(strings.TrimRight(next, ","))
+				}
+				calls = append(calls, UseCall{Module: module, Opts: ParseKeywordModuleOpts(optsBuilder.String(), aliases)})
+			} else {
+				calls = append(calls, UseCall{Module: module})
+			}
 		}
 	}
 	return calls
+}
+
+// looksLikeOptContinuation returns true if the trimmed line looks like a
+// keyword list continuation (e.g. "name: \"foo\"", "permissions: :inherited").
+func looksLikeOptContinuation(trimmed string) bool {
+	// keyword key: value
+	for i := 0; i < len(trimmed); i++ {
+		ch := trimmed[i]
+		if ch == ':' && i > 0 {
+			return true
+		}
+		if parser.IsLowerIdentChar(ch) {
+			continue
+		}
+		break
+	}
+	return false
 }
 
 // ParseKeywordModuleOpts parses an Elixir keyword list string (e.g. "mod: Hammox, repo: MyRepo")

@@ -553,6 +553,13 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 	}
 
 	moduleRef, functionName := ExtractModuleAndFunction(expr)
+
+	if moduleRef != "" {
+		if aliasParent, inBlock := ExtractAliasBlockParent(lines, lineNum); inBlock {
+			moduleRef = aliasParent + "." + moduleRef
+		}
+	}
+
 	aliases := ExtractAliasesInScope(text, lineNum)
 	s.mergeAliasesFromUse(text, aliases)
 	s.debugf("Definition: expr=%q module=%q function=%q", expr, moduleRef, functionName)
@@ -953,7 +960,7 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 	// Inside a multi-line alias block: complete child module segments under the parent.
 	// Behaves like typing "ParentModule." but only returns modules (not functions),
 	// and labels are the short child path (what goes between the braces).
-	if aliasParent, inBlock := ExtractAliasBlockParent(text, lineNum); inBlock {
+	if aliasParent, inBlock := ExtractAliasBlockParent(lines, lineNum); inBlock {
 		// Determine the fully-resolved search parent and the segment prefix.
 		// "Ac"       → search MyApp.Services for children starting with "Ac"
 		// "Ecto."    → search MyApp.Ecto for all children
@@ -1011,6 +1018,12 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 
 	moduleRef, funcPrefix := ExtractModuleAndFunction(prefix)
 	inPipe := IsPipeContext(lines[lineNum], prefixStartCol)
+
+	// "Module.func." or "variable." — dot after a function call result or
+	// map/struct field access. We have no type info to complete the result.
+	if afterDot && (funcPrefix != "" || moduleRef == "") {
+		return nil, nil
+	}
 
 	var items []protocol.CompletionItem
 
@@ -2692,6 +2705,15 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 	}
 
 	moduleRef, functionName := ExtractModuleAndFunction(expr)
+
+	// Inside a multi-line alias block like "alias MyModule.{ Something }",
+	// prepend the parent so "Something" resolves to "MyModule.Something".
+	if moduleRef != "" {
+		if aliasParent, inBlock := ExtractAliasBlockParent(lines, lineNum); inBlock {
+			moduleRef = aliasParent + "." + moduleRef
+		}
+	}
+
 	aliases := ExtractAliasesInScope(text, lineNum)
 	s.mergeAliasesFromUse(text, aliases)
 
@@ -3024,6 +3046,13 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 	}
 
 	moduleRef, functionName := ExtractModuleAndFunction(expr)
+
+	if moduleRef != "" {
+		if aliasParent, inBlock := ExtractAliasBlockParent(lines, lineNum); inBlock {
+			moduleRef = aliasParent + "." + moduleRef
+		}
+	}
+
 	aliases := ExtractAliasesInScope(text, lineNum)
 	s.mergeAliasesFromUse(text, aliases)
 	s.debugf("References: expr=%q module=%q function=%q", expr, moduleRef, functionName)

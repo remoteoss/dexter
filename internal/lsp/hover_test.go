@@ -1026,3 +1026,65 @@ end`
 		t.Errorf("expected submodule in hover, got %q", hover.Contents.Value)
 	}
 }
+
+func TestHover_MultiLineAliasBlock(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", `defmodule MyApp.Accounts do
+  @moduledoc "The Accounts context."
+  def list, do: []
+end
+`)
+
+	indexFile(t, server.store, server.projectRoot, "lib/users.ex", `defmodule MyApp.Users do
+  @moduledoc "User management."
+  def get(id), do: nil
+end
+`)
+
+	src := `defmodule MyApp.Web do
+  alias MyApp.{
+    Accounts,
+    Users
+  }
+
+  def run, do: Accounts.list()
+end`
+	uri := "file:///test.ex"
+	server.docs.Set(uri, src)
+
+	// Hover on "Accounts" inside the multi-line alias block (line 2, col 4)
+	hover := hoverAt(t, server, uri, 2, 4)
+	if hover == nil {
+		t.Fatal("expected hover for Accounts inside multi-line alias block")
+	}
+	if !strings.Contains(hover.Contents.Value, "The Accounts context") {
+		t.Errorf("expected moduledoc in hover, got %q", hover.Contents.Value)
+	}
+
+	// Hover on "Users" inside the multi-line alias block (line 3, col 4)
+	hover = hoverAt(t, server, uri, 3, 4)
+	if hover == nil {
+		t.Fatal("expected hover for Users inside multi-line alias block")
+	}
+	if !strings.Contains(hover.Contents.Value, "User management") {
+		t.Errorf("expected moduledoc in hover, got %q", hover.Contents.Value)
+	}
+
+	// Trailing brace on content line: alias MyApp.{ Users }
+	src2 := `defmodule MyApp.Web do
+  alias MyApp.{
+    Accounts }
+end`
+	uri2 := "file:///test2.ex"
+	server.docs.Set(uri2, src2)
+
+	hover = hoverAt(t, server, uri2, 2, 6)
+	if hover == nil {
+		t.Fatal("expected hover for module on line with trailing brace")
+	}
+	if !strings.Contains(hover.Contents.Value, "The Accounts context") {
+		t.Errorf("expected moduledoc in hover, got %q", hover.Contents.Value)
+	}
+}

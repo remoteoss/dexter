@@ -1500,6 +1500,66 @@ end
 	}
 }
 
+func TestParseFile_DefaultParamExpansion_Multiline(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.Companies do
+  def fetch(
+    slug,
+    opts \\ []
+  ) do
+    :ok
+  end
+
+  def create(
+    name,
+    region \\ "US",
+    opts \\ []
+  ) do
+    :ok
+  end
+end
+`)
+
+	defs, _, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found := map[string]bool{}
+	paramsByKey := map[string]string{}
+	for _, d := range defs {
+		if d.Function != "" {
+			key := d.Function + "/" + fmt.Sprintf("%d", d.Arity)
+			found[key] = true
+			paramsByKey[key] = d.Params
+		}
+	}
+
+	for _, expected := range []string{
+		"fetch/1",
+		"fetch/2",
+		"create/1",
+		"create/2",
+		"create/3",
+	} {
+		if !found[expected] {
+			t.Errorf("expected definition %s not found; got %v", expected, found)
+		}
+	}
+
+	if params := paramsByKey["fetch/1"]; params != "slug" {
+		t.Errorf("fetch/1 params: got %q, want %q", params, "slug")
+	}
+	if params := paramsByKey["fetch/2"]; params != "slug,opts" {
+		t.Errorf("fetch/2 params: got %q, want %q", params, "slug,opts")
+	}
+	if params := paramsByKey["create/1"]; params != "name" {
+		t.Errorf("create/1 params: got %q, want %q", params, "name")
+	}
+	if params := paramsByKey["create/3"]; params != "name,region,opts" {
+		t.Errorf("create/3 params: got %q, want %q", params, "name,region,opts")
+	}
+}
+
 func TestParseFile_Arity(t *testing.T) {
 	path := writeTempFile(t, `defmodule MyApp.Accounts do
   def create(attrs) do

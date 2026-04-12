@@ -1071,6 +1071,46 @@ func TestCompletion_NoResults(t *testing.T) {
 	}
 }
 
+func TestCompletion_FunctionResultDotNoResults(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", `defmodule MyApp.Accounts do
+  def list, do: []
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyApp.Web do
+  alias MyApp.Accounts
+  Accounts.list.
+end`)
+
+	// col 16 = right after "Accounts.list." on line 2
+	items := completionAt(t, server, uri, 2, 16)
+	if len(items) != 0 {
+		t.Errorf("expected no completions after function result dot, got %d: %v", len(items), items)
+	}
+}
+
+func TestCompletion_VariableDotNoResults(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyApp.Web do
+  def run(config) do
+    config.
+  end
+end`)
+
+	// col 11 = right after "config." on line 2
+	items := completionAt(t, server, uri, 2, 11)
+	if len(items) != 0 {
+		t.Errorf("expected no completions after variable dot, got %d: %v", len(items), items)
+	}
+}
+
 func TestCompletionResolve_WithDoc(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()

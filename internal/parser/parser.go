@@ -504,7 +504,7 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 
 			if currentModule != "" {
 				if kind, funcName, ok := ScanFuncDef(rest); ok {
-					paramContent := FindParamContent(line, funcName)
+					paramContent := FindParamContentMultiline(lines, lineIdx, funcName)
 					maxArity := ArityFromParams(paramContent)
 					defaultCount := DefaultsFromParams(paramContent)
 					minArity := maxArity - defaultCount
@@ -514,7 +514,7 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 						delegateTo, delegateAs = findDelegateToAndAs(lines, lineIdx, aliases, currentModule)
 					}
 
-					allParamNames := ExtractParamNames(line, funcName)
+					allParamNames := ExtractParamNamesMultiline(lines, lineIdx, funcName)
 
 					for arity := minArity; arity <= maxArity; arity++ {
 						params := JoinParams(allParamNames, arity)
@@ -627,7 +627,7 @@ func ParseText(path, text string) ([]Definition, []Reference, error) {
 				modRef := codeLine[modStart:modEnd]
 				// Skip Module.function — already caught by moduleCallRe
 				if modEnd < len(codeLine) && codeLine[modEnd] == '.' &&
-					modEnd+1 < len(codeLine) && ((codeLine[modEnd+1] >= 'a' && codeLine[modEnd+1] <= 'z') || codeLine[modEnd+1] == '_') {
+					modEnd+1 < len(codeLine) && IsLowerIdentChar(codeLine[modEnd+1]) {
 					continue
 				}
 				// Skip %Module{ — already caught by structLiteralRe
@@ -654,7 +654,7 @@ func ScanModuleName(s string) string {
 	i := 0
 	for i < len(s) {
 		c := s[i]
-		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '.' {
+		if IsIdentChar(c) || c == '.' {
 			i++
 		} else {
 			break
@@ -678,7 +678,7 @@ func ScanFuncName(s string) string {
 	i := 1
 	for i < len(s) {
 		c = s[i]
-		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '?' || c == '!' {
+		if IsLowerIdentChar(c) || c == '?' || c == '!' {
 			i++
 		} else {
 			break
@@ -695,8 +695,7 @@ func isUpperByte(b byte) bool {
 func scanIdentifier(s string) string {
 	i := 0
 	for i < len(s) {
-		c := s[i]
-		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' {
+		if IsIdentChar(s[i]) {
 			i++
 		} else {
 			break
@@ -812,7 +811,7 @@ func IsEnd(trimmed string) bool {
 		return false
 	}
 	// "end" at end of string, or followed by a non-identifier char
-	return len(trimmed) == 3 || !isIdentChar(trimmed[3])
+	return len(trimmed) == 3 || !IsIdentChar(trimmed[3])
 }
 
 // OpensBlock returns true if the trimmed line opens a block that will be closed
@@ -849,12 +848,12 @@ func containsFnKeyword(code string) bool {
 		}
 		// Check character before: must be start of string or non-identifier.
 		// ':' before means it's an atom (:fn), not the keyword.
-		if i > 0 && (isIdentChar(code[i-1]) || code[i-1] == ':') {
+		if i > 0 && (IsIdentChar(code[i-1]) || code[i-1] == ':') {
 			continue
 		}
 		// Check character after: must be end of string or non-identifier.
 		// ':' after means it's a keyword key (fn: value), not the keyword.
-		if i+2 < len(code) && (isIdentChar(code[i+2]) || code[i+2] == ':') {
+		if i+2 < len(code) && (IsIdentChar(code[i+2]) || code[i+2] == ':') {
 			continue
 		}
 		return true
@@ -862,8 +861,12 @@ func containsFnKeyword(code string) bool {
 	return false
 }
 
-func isIdentChar(b byte) bool {
+func IsIdentChar(b byte) bool {
 	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_'
+}
+
+func IsLowerIdentChar(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') || b == '_'
 }
 
 // findDelegateTo searches the current line and up to 5 subsequent lines for a to: target,
@@ -923,6 +926,65 @@ func FindParamContent(line, funcName string) string {
 		return ""
 	}
 	return rest[parenIdx+1:]
+}
+
+// FindParamContentMultiline works like FindParamContent but joins subsequent
+// lines when the closing ')' is not on the same line as the opening '('.
+func FindParamContentMultiline(lines []string, lineIdx int, funcName string) string {
+	line := lines[lineIdx]
+	idx := strings.Index(line, funcName)
+	if idx < 0 {
+		return ""
+	}
+	rest := line[idx+len(funcName):]
+	parenIdx := strings.IndexByte(rest, '(')
+	if parenIdx < 0 {
+		return ""
+	}
+	content := rest[parenIdx+1:]
+	// Check if the closing ')' is already in content (common single-line case).
+	if parensClosed(content) {
+		return content
+	}
+	// Join subsequent lines until we find the matching ')'.
+	var buf strings.Builder
+	buf.WriteString(content)
+	limit := lineIdx + 50
+	if limit > len(lines) {
+		limit = len(lines)
+	}
+	for i := lineIdx + 1; i < limit; i++ {
+		buf.WriteByte(' ')
+		buf.WriteString(strings.TrimSpace(lines[i]))
+		joined := buf.String()
+		if parensClosed(joined) {
+			return joined
+		}
+	}
+	return buf.String()
+}
+
+// parensClosed returns true if inside (starting at depth 1 after an opening
+// paren) contains a matching closing ')' at depth 0.
+func parensClosed(inside string) bool {
+	depth := 1
+	for i := 0; i < len(inside); i++ {
+		ch := inside[i]
+		if ch == '"' || ch == '\'' {
+			i = skipStringLiteral(inside, i)
+			continue
+		}
+		switch ch {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			depth--
+			if depth == 0 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ArityFromParams counts the number of top-level arguments in the parameter
@@ -1091,6 +1153,46 @@ found:
 		names = append(names, name)
 	}
 	return names
+}
+
+// ExtractParamNamesMultiline works like ExtractParamNames but joins subsequent
+// lines when the closing ')' is not on the first line.
+func ExtractParamNamesMultiline(lines []string, lineIdx int, funcName string) []string {
+	joined := joinFuncHead(lines, lineIdx, funcName)
+	return ExtractParamNames(joined, funcName)
+}
+
+// joinFuncHead joins lines starting at lineIdx until the function head's
+// closing ')' is found, returning a single string. Returns the original line
+// if the parens close on the same line (or there are no parens).
+func joinFuncHead(lines []string, lineIdx int, funcName string) string {
+	line := lines[lineIdx]
+	idx := strings.Index(line, funcName)
+	if idx < 0 {
+		return line
+	}
+	rest := line[idx+len(funcName):]
+	parenIdx := strings.IndexByte(rest, '(')
+	if parenIdx < 0 || parensClosed(rest[parenIdx+1:]) {
+		return line
+	}
+	var buf strings.Builder
+	buf.WriteString(line)
+	limit := lineIdx + 50
+	if limit > len(lines) {
+		limit = len(lines)
+	}
+	for i := lineIdx + 1; i < limit; i++ {
+		buf.WriteByte(' ')
+		buf.WriteString(strings.TrimSpace(lines[i]))
+		joined := buf.String()
+		afterParen := joined[strings.Index(joined, funcName)+len(funcName):]
+		p := strings.IndexByte(afterParen, '(')
+		if p >= 0 && parensClosed(afterParen[p+1:]) {
+			return joined
+		}
+	}
+	return buf.String()
 }
 
 // JoinParams returns a comma-separated string of the first `arity` parameter

@@ -1,6 +1,7 @@
 package lsp
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -186,7 +187,7 @@ func TestExtractAliasBlockParent(t *testing.T) {
 
   }
 end`
-		parent, ok := ExtractAliasBlockParent(text, 3)
+		parent, ok := ExtractAliasBlockParent(strings.Split(text, "\n"), 3)
 		if !ok {
 			t.Fatal("expected to be inside alias block")
 		}
@@ -201,7 +202,7 @@ end`
     Accounts,
   }
 end`
-		parent, ok := ExtractAliasBlockParent(text, 2)
+		parent, ok := ExtractAliasBlockParent(strings.Split(text, "\n"), 2)
 		if !ok {
 			t.Fatal("expected to be inside alias block")
 		}
@@ -217,7 +218,7 @@ end`
   }
 
 end`
-		_, ok := ExtractAliasBlockParent(text, 4)
+		_, ok := ExtractAliasBlockParent(strings.Split(text, "\n"), 4)
 		if ok {
 			t.Error("should not be inside alias block after closing brace")
 		}
@@ -228,7 +229,7 @@ end`
   alias MyApp.Repo
 
 end`
-		_, ok := ExtractAliasBlockParent(text, 2)
+		_, ok := ExtractAliasBlockParent(strings.Split(text, "\n"), 2)
 		if ok {
 			t.Error("should not be inside alias block on a normal line")
 		}
@@ -238,7 +239,7 @@ end`
 		text := `defmodule MyApp.Web do
   alias MyApp.Handlers.{
 end`
-		parent, ok := ExtractAliasBlockParent(text, 1)
+		parent, ok := ExtractAliasBlockParent(strings.Split(text, "\n"), 1)
 		if !ok {
 			t.Fatal("expected to be inside alias block")
 		}
@@ -254,7 +255,7 @@ end`
 
   }
 end`
-		parent, ok := ExtractAliasBlockParent(text, 3)
+		parent, ok := ExtractAliasBlockParent(strings.Split(text, "\n"), 3)
 		if !ok {
 			t.Fatal("expected to be inside alias block")
 		}
@@ -268,9 +269,23 @@ end`
   alias MyApp.{Accounts, Users}
 
 end`
-		_, ok := ExtractAliasBlockParent(text, 1)
+		_, ok := ExtractAliasBlockParent(strings.Split(text, "\n"), 1)
 		if ok {
 			t.Error("should not be inside alias block when braces close on same line")
+		}
+	})
+
+	t.Run("trailing brace on content line", func(t *testing.T) {
+		text := `defmodule MyApp.Web do
+  alias MyApp.Billing.{
+    Services.MakePayment }
+end`
+		parent, ok := ExtractAliasBlockParent(strings.Split(text, "\n"), 2)
+		if !ok {
+			t.Fatal("expected to be inside alias block when } follows module content")
+		}
+		if parent != "MyApp.Billing" {
+			t.Errorf("got %q, want MyApp.Billing", parent)
 		}
 	})
 
@@ -282,7 +297,7 @@ end`
 
   }
 end`
-		parent, ok := ExtractAliasBlockParent(text, 4)
+		parent, ok := ExtractAliasBlockParent(strings.Split(text, "\n"), 4)
 		if !ok {
 			t.Fatal("expected to be inside alias block")
 		}
@@ -1584,6 +1599,34 @@ func TestExtractUsesWithOpts(t *testing.T) {
 		calls := ExtractUsesWithOpts(text, aliases)
 		if calls[0].Opts["mod"] != "MyApp.Hammox" {
 			t.Errorf("alias not resolved: got %q", calls[0].Opts["mod"])
+		}
+	})
+
+	t.Run("multiline opts", func(t *testing.T) {
+		text := "defmodule Foo do\n  use Tool,\n    name: \"mock\",\n    controller: CompanyController,\n    action: :show\nend"
+		calls := ExtractUsesWithOpts(text, nil)
+		if len(calls) != 1 {
+			t.Fatalf("expected 1 use call, got %d", len(calls))
+		}
+		if calls[0].Module != "Tool" {
+			t.Errorf("module: want Tool, got %q", calls[0].Module)
+		}
+		if calls[0].Opts["controller"] != "CompanyController" {
+			t.Errorf("controller: want CompanyController, got %q", calls[0].Opts["controller"])
+		}
+	})
+
+	t.Run("multiline opts with module values", func(t *testing.T) {
+		text := "defmodule Foo do\n  use Remote.Mox,\n    mod: Hammox,\n    repo: MyRepo\nend"
+		calls := ExtractUsesWithOpts(text, nil)
+		if len(calls) != 1 {
+			t.Fatalf("expected 1 use call, got %d", len(calls))
+		}
+		if calls[0].Opts["mod"] != "Hammox" {
+			t.Errorf("mod: want Hammox, got %q", calls[0].Opts["mod"])
+		}
+		if calls[0].Opts["repo"] != "MyRepo" {
+			t.Errorf("repo: want MyRepo, got %q", calls[0].Opts["repo"])
 		}
 	})
 }
