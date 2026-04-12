@@ -255,6 +255,19 @@ func (s *Server) watchGitHead() {
 	}()
 }
 
+// periodicReindex runs backgroundReindex on a fixed interval to catch files
+// created or deleted outside the editor.
+func (s *Server) periodicReindex() {
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			s.backgroundReindex()
+		}
+	}()
+}
+
 // notifyOTPMismatch checks stderr output for an OTP version mismatch and
 // sends a one-time warning to the editor so the user doesn't have to dig
 // through logs.
@@ -342,6 +355,7 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 		s.initialized = true
 		s.backgroundReindex()
 		s.watchGitHead()
+		s.periodicReindex()
 	}
 
 	if params.Capabilities.Window != nil && params.Capabilities.Window.ShowDocument != nil {
@@ -553,6 +567,13 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 	}
 
 	moduleRef, functionName := ExtractModuleAndFunction(expr)
+
+	if moduleRef != "" {
+		if aliasParent, inBlock := ExtractAliasBlockParent(lines, lineNum); inBlock {
+			moduleRef = aliasParent + "." + moduleRef
+		}
+	}
+
 	aliases := ExtractAliasesInScope(text, lineNum)
 	s.mergeAliasesFromUse(text, aliases)
 	s.debugf("Definition: expr=%q module=%q function=%q", expr, moduleRef, functionName)
@@ -949,6 +970,46 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 	}
 
 	prefix, afterDot, prefixStartCol := ExtractCompletionContext(lines[lineNum], col)
+
+	// Inside a multi-line alias block: complete child module segments under the parent.
+	if aliasParent, inBlock := ExtractAliasBlockParent(lines, lineNum); inBlock {
+		searchParent := aliasParent
+		segmentPrefix := prefix
+		labelPrefix := ""
+
+		if afterDot && prefix != "" {
+			searchParent = aliasParent + "." + prefix
+			segmentPrefix = ""
+			labelPrefix = prefix + "."
+		} else if prefix != "" {
+			if dotIdx := strings.LastIndexByte(prefix, '.'); dotIdx >= 0 {
+				searchParent = aliasParent + "." + prefix[:dotIdx]
+				segmentPrefix = prefix[dotIdx+1:]
+				labelPrefix = prefix[:dotIdx+1]
+			}
+		}
+
+		segments, err := s.store.SearchSubmoduleSegments(searchParent, segmentPrefix)
+		if err != nil {
+			return nil, nil
+		}
+		var items []protocol.CompletionItem
+		for _, segment := range segments {
+			items = append(items, protocol.CompletionItem{
+				Label:  labelPrefix + segment,
+				Kind:   protocol.CompletionItemKindModule,
+				Detail: searchParent + "." + segment,
+			})
+		}
+		if len(items) == 0 {
+			return nil, nil
+		}
+		return &protocol.CompletionList{
+			IsIncomplete: len(items) >= 100,
+			Items:        items,
+		}, nil
+	}
+
 	if prefix == "" && !afterDot {
 		return nil, nil
 	}
@@ -962,6 +1023,12 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 
 	moduleRef, funcPrefix := ExtractModuleAndFunction(prefix)
 	inPipe := IsPipeContext(lines[lineNum], prefixStartCol)
+
+	// "Module.func." or "variable." — dot after a function call result or
+	// map/struct field access. We have no type info to complete the result.
+	if afterDot && (funcPrefix != "" || moduleRef == "") {
+		return nil, nil
+	}
 
 	var items []protocol.CompletionItem
 
@@ -2643,6 +2710,15 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 	}
 
 	moduleRef, functionName := ExtractModuleAndFunction(expr)
+
+	// Inside a multi-line alias block like "alias MyModule.{ Something }",
+	// prepend the parent so "Something" resolves to "MyModule.Something".
+	if moduleRef != "" {
+		if aliasParent, inBlock := ExtractAliasBlockParent(lines, lineNum); inBlock {
+			moduleRef = aliasParent + "." + moduleRef
+		}
+	}
+
 	aliases := ExtractAliasesInScope(text, lineNum)
 	s.mergeAliasesFromUse(text, aliases)
 
@@ -2975,6 +3051,13 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 	}
 
 	moduleRef, functionName := ExtractModuleAndFunction(expr)
+
+	if moduleRef != "" {
+		if aliasParent, inBlock := ExtractAliasBlockParent(lines, lineNum); inBlock {
+			moduleRef = aliasParent + "." + moduleRef
+		}
+	}
+
 	aliases := ExtractAliasesInScope(text, lineNum)
 	s.mergeAliasesFromUse(text, aliases)
 	s.debugf("References: expr=%q module=%q function=%q", expr, moduleRef, functionName)
@@ -3172,6 +3255,7 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 	s.debugf("References: returning %d locations", len(locations))
 	return locations, nil
 }
+
 func (s *Server) Rename(ctx context.Context, params *protocol.RenameParams) (*protocol.WorkspaceEdit, error) {
 	docURI := string(params.TextDocument.URI)
 	text, ok := s.docs.Get(docURI)
@@ -4009,6 +4093,7 @@ func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string) *
 	applyTokenEdits := func(origLines []string, fileSites []renameSite) []string {
 		lines := make([]string, len(origLines))
 		copy(lines, origLines)
+
 		for _, site := range fileSites {
 			if site.line-1 >= len(lines) {
 				continue
