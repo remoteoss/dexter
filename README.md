@@ -185,13 +185,26 @@ lspconfig.dexter.setup({})
 
 ### Zed
 
-Install the [dexter-zed](https://github.com/remoteoss/dexter-zed) extension:
+Dexter is included in Zed's official [Elixir extension](https://github.com/zed-extensions/elixir). No extra installation needed — just enable it in your Zed `settings.json`:
 
-1. In Zed, open **Extensions** (`Cmd+Shift+X`) and search for **"Dexter"**
-2. Click **Install**
-3. Open any Elixir file — the index builds automatically on first startup
+```json
+{
+  "languages": {
+    "Elixir": {
+      "language_servers": ["dexter", "!elixir-ls", "!expert"]
+    },
+    "HEEx": {
+      "language_servers": ["dexter", "!elixir-ls", "!expert"]
+    }
+  }
+}
+```
 
-Configure the binary path in Zed's `settings.json`:
+Open any Elixir file — the binary will be downloaded automatically on first startup.
+
+If you already have Dexter installed via [mise](https://mise.jdx.dev/), the extension will use your local binary from PATH instead of downloading.
+
+To override the binary path manually, add this to your `settings.json`:
 
 ```json
 {
