@@ -5,9 +5,9 @@ Dexter is a fast Elixir LSP server. It indexes module and function definitions f
 ## Module structure
 
 - `cmd/main.go` — CLI entrypoint: `init`, `reindex`, `lookup`, `lsp` subcommands
-- `internal/parser/` — Regex-based Elixir parser. Extracts defmodule, def, defp, defmacro, defdelegate, defguard, defprotocol, defimpl, @type, @callback. Handles heredocs, module nesting, alias resolution for defdelegate targets.
+- `internal/parser/` — Elixir parser backed by a hand-rolled tokenizer (`tokenizer.go`). The tokenizer produces a flat token stream (handling heredocs, sigils, strings, comments as opaque tokens) and `parser_tokenized.go` walks it to extract defmodule, def, defp, defmacro, defdelegate, defguard, defprotocol, defimpl, @type, @callback, alias, import, use, and Module.function references. Handles module nesting, alias resolution for defdelegate targets, and multi-line expressions natively via bracket depth tracking.
 - `internal/store/` — SQLite layer. Tables: `files` (path + mtime), `definitions` (module, function, kind, line, file_path, delegate_to, delegate_as), `refs` (module, function, line, file_path, kind).
-- `internal/lsp/` — LSP server. `server.go` handles all LSP methods. `elixir.go` contains pure functions for cursor expression extraction, alias/import resolution, use-chain parsing. `rename.go` has rename helpers. `hover.go` has hover formatting. `documents.go` is an in-memory open-buffer store.
+- `internal/lsp/` — LSP server. `server.go` handles all LSP methods. `elixir.go` contains pure functions for cursor expression extraction, alias/import/use extraction (tokenizer-based), and use-chain parsing. `rename.go` has rename helpers. `hover.go` has hover formatting. `documents.go` is an in-memory open-buffer store.
 - `internal/treesitter/` — Tree-sitter integration for scope-aware variable rename and go-to-references.
 
 ## LSP feature map
@@ -45,7 +45,7 @@ The `__using__` cache (`usingCacheEntry`) stores the parsed result of each modul
 - **`transUses`** — `use Mod` inside the body (double-use chains); also a heuristic for `Keyword.put_new/put`
 - **`optBindings`** — dynamic `import unquote(var)` where `var` comes from `Keyword.get(opts, :key, Default)`; stores `{optKey, defaultMod, kind}` so consumer opts override the default
 
-`parseUsingBody` handles three forms:
+`parseUsingBody` uses the tokenizer to walk the `__using__` body directly on the token stream. This avoids line-joining heuristics and correctly handles heredocs in moduledocs (which previously caused a regression where `bracketDepth` in line-based joining treated `#` inside markdown links as comments, cascading into file-wide line merges). It handles three forms:
 - `defmacro __using__` — standard form
 - `using opts do` — ExUnit.CaseTemplate form (only when `use ExUnit.CaseTemplate` is present)
 - Function delegation — when the body calls a local helper like `using_block(opts)`, `parseHelperQuoteBlock` finds the function definition and parses its `quote do` body
@@ -84,11 +84,10 @@ Call sites are attributed to the **injecting module** in the store (not the defi
 
 ## Key design decisions
 
-- **Regex instead of tree-sitter for indexing** — 7.5x faster per file. Tree-sitter is only used when necessary in a
-  file already opened by the editor.
+- **Tokenizer instead of tree-sitter for indexing** — a hand-rolled tokenizer + walker replaced the original regex-based parser for both file indexing and runtime `__using__` parsing. The tokenizer handles heredocs, sigils, multi-line expressions, and comments as opaque tokens, eliminating fragile line-joining heuristics. Tree-sitter is only used for scope-aware variable operations in files already opened by the editor.
 - **SQLite for storage** — single file, fast reads, incremental updates via mtime tracking.
 - **Parallel indexing** — `init` uses all CPU cores for parsing, single writer for SQLite.
-- **Delegate following** — `defdelegate` targets are resolved at index time (including alias resolution and `as:` renames).
+- **Delegate following** — `defdelegate` targets are resolved at index time (including alias resolution and `as:` renames). `LookupFollowDelegate` follows chains recursively (up to 5 hops) so `A → B → C` resolves to `C`.
 - **Git HEAD polling** — watches `.git/HEAD` mtime every 2 seconds to detect branch switches and trigger reindex.
 - **Full document sync** — `TextDocumentSyncKindFull`; Elixir files are small enough that incremental sync adds complexity without benefit.
 - **Index versioning** — `IndexVersion` in `internal/version/version.go`. Mismatch on startup triggers a forced rebuild. Bump when parser or schema changes would invalidate existing indexes.
