@@ -1304,11 +1304,11 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 				if k < n && tokens[k].Kind == parser.TokModule && txt(tokens[k]) == "Keyword" {
 					funcName, atomKey, defaultMod, endJ := scanKeywordCall(k)
 					switch funcName {
-					case "get", "pop":
+					case "get", "pop", "pop!":
 						if atomKey != "" {
 							varToOpt[identName] = varBinding{optKey: atomKey, defaultMod: resolveAlias(defaultMod)}
 						}
-					case "fetch", "pop_lazy":
+					case "fetch", "fetch!", "pop_lazy":
 						if atomKey != "" {
 							varToOpt[identName] = varBinding{optKey: atomKey}
 						}
@@ -1381,9 +1381,9 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 					kw := nextSig(eq + 1)
 					if kw < n && tokens[kw].Kind == parser.TokModule && txt(tokens[kw]) == "Keyword" {
 						funcName, atomKey, defaultMod, endJ := scanKeywordCall(kw)
-						if funcName == "pop" && atomKey != "" {
+						if (funcName == "pop" || funcName == "pop!") && atomKey != "" {
 							varToOpt[varName] = varBinding{optKey: atomKey, defaultMod: resolveAlias(defaultMod)}
-						} else if (funcName == "fetch" || funcName == "pop_lazy") && atomKey != "" {
+						} else if (funcName == "fetch" || funcName == "fetch!" || funcName == "pop_lazy") && atomKey != "" {
 							varToOpt[varName] = varBinding{optKey: atomKey}
 						}
 						i = endJ

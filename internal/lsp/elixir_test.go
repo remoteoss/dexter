@@ -1390,6 +1390,43 @@ end`
 		}
 	})
 
+	t.Run("Keyword.fetch! and Keyword.pop! bindings", func(t *testing.T) {
+		text := `defmodule MyLib do
+  defmacro __using__(opts) do
+    fetched = Keyword.fetch!(opts, :fetched_mod)
+    {popped, opts} = Keyword.pop!(opts, :popped_mod, DefaultMod)
+
+    quote do
+      import unquote(fetched)
+      use unquote(popped)
+    end
+  end
+end`
+		_, _, _, optBindings, _ := parseUsingBody(text)
+		foundFetch := false
+		foundPop := false
+		for _, b := range optBindings {
+			if b.optKey == "fetched_mod" && b.kind == "import" {
+				foundFetch = true
+				if b.defaultMod != "" {
+					t.Errorf("fetch! should have no default, got %q", b.defaultMod)
+				}
+			}
+			if b.optKey == "popped_mod" && b.kind == "use" {
+				foundPop = true
+				if b.defaultMod != "DefaultMod" {
+					t.Errorf("pop! default: want DefaultMod, got %q", b.defaultMod)
+				}
+			}
+		}
+		if !foundFetch {
+			t.Errorf("expected opt binding for fetched_mod (via fetch!), got %v", optBindings)
+		}
+		if !foundPop {
+			t.Errorf("expected opt binding for popped_mod (via pop!), got %v", optBindings)
+		}
+	})
+
 	t.Run("use unquote(mod) with Keyword.get default", func(t *testing.T) {
 		text := `defmodule MyLib do
   defmacro __using__(opts \\ []) do
