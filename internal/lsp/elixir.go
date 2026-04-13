@@ -736,7 +736,11 @@ func parseHelperQuoteBlock(lines []string, helperName string, fileAliases map[st
 						}
 						aliases[aliasKey] = base + "." + child
 					}
-					k = nk
+					if nk == k {
+						k++ // ensure forward progress
+					} else {
+						k = nk
+					}
 					if k < n && tokens[k].Kind == parser.TokComma {
 						k++
 					}
@@ -1267,7 +1271,11 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 						}
 						aliases[aliasKey] = parent + "." + childName
 					}
-					k = newK
+					if newK == k {
+						k++ // ensure forward progress
+					} else {
+						k = newK
+					}
 					if k < n && tokens[k].Kind == parser.TokComma {
 						k++
 					}

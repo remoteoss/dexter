@@ -828,6 +828,19 @@ func TestExtractExpression_PipeOperator(t *testing.T) {
 	}
 }
 
+func TestExtractAliases_MultiAliasBraceUnexpectedTokenForwardProgress(t *testing.T) {
+	text := `defmodule MyApp.Web do
+  alias MyApp.{:unexpected, Accounts, 42, Users}
+end`
+	aliases := ExtractAliases(text)
+	if aliases["Accounts"] != "MyApp.Accounts" {
+		t.Errorf("Accounts: got %q, want MyApp.Accounts", aliases["Accounts"])
+	}
+	if aliases["Users"] != "MyApp.Users" {
+		t.Errorf("Users: got %q, want MyApp.Users", aliases["Users"])
+	}
+}
+
 func TestExtractAliases_DoesNotMatchAliasInStrings(t *testing.T) {
 	// Lines that happen to contain "alias" but aren't real alias declarations
 	text := `  some_var = "alias MyApp.Fake"
@@ -1576,6 +1589,20 @@ end`
 			t.Errorf("expected nil aliases, got %v", aliases)
 		}
 	})
+
+	t.Run("multi alias with unexpected tokens does not hang", func(t *testing.T) {
+		text := `defmodule MyApp.Schema do
+  defmacro __using__(_opts) do
+    quote do
+      alias MyApp.{:unexpected, Repo, 42}
+    end
+  end
+end`
+		_, _, _, _, aliases := parseUsingBody(text)
+		if aliases == nil || aliases["Repo"] != "MyApp.Repo" {
+			t.Errorf("Repo: got %q, want MyApp.Repo", aliases["Repo"])
+		}
+	})
 }
 
 func TestParseUsingBody_IgnoresHelperCallsInsideInlineDefBodies(t *testing.T) {
@@ -1618,6 +1645,21 @@ end`
 	imported, _, _, _, _ := parseHelperQuoteBlock(lines, "helper_name", nil)
 	if len(imported) != 0 {
 		t.Fatalf("expected no imports from inside inline def body, got %v", imported)
+	}
+}
+
+func TestParseHelperQuoteBlock_MultiAliasUnexpectedTokenForwardProgress(t *testing.T) {
+	text := `defmodule MyLib do
+  def build_aliases(_opts) do
+    quote do
+      alias MyApp.{:unexpected, Accounts, 42}
+    end
+  end
+end`
+	lines := strings.Split(text, "\n")
+	_, _, _, _, aliases := parseHelperQuoteBlock(lines, "build_aliases", nil)
+	if aliases == nil || aliases["Accounts"] != "MyApp.Accounts" {
+		t.Errorf("Accounts: got %q, want MyApp.Accounts", aliases["Accounts"])
 	}
 }
 

@@ -96,3 +96,33 @@ end
 		}
 	}
 }
+
+func TestMultiAliasBrace_UnexpectedTokenForwardProgress(t *testing.T) {
+	dir := t.TempDir()
+	content := `defmodule MyApp.Web do
+  alias MyApp.{:unexpected, Accounts, 42}
+
+  def test do
+    Accounts.list()
+  end
+end
+`
+	path := filepath.Join(dir, "web.ex")
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found := false
+	for _, r := range refs {
+		if r.Module == "MyApp.Accounts" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected MyApp.Accounts ref despite unexpected tokens in brace block")
+	}
+}

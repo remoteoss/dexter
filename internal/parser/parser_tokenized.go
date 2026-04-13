@@ -434,7 +434,11 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 						aliases[aliasKey] = fullChild
 						emitModuleRef(fullChild, aliasLine, "alias")
 					}
-					k = newK
+					if newK == k {
+						k++ // ensure forward progress
+					} else {
+						k = newK
+					}
 					if k < n && tokens[k].Kind == TokComma {
 						k++
 					}
