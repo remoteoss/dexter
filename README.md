@@ -185,12 +185,28 @@ lspconfig.dexter.setup({})
 
 ### Zed
 
-Dexter is included in Zed's official [Elixir extension](https://github.com/zed-extensions/elixir). No extra installation needed — just enable it in your Zed `settings.json`:
+Zed support is available via a dev extension while the official Elixir extension PR is in [review](https://github.com/zed-extensions/elixir/pull/115).
+
+To install it:
+
+1. Clone the repo and checkout the branch:
+   ```bash
+   git clone https://github.com/flowerett/zed-elixir-extensions.git
+   cd zed-elixir-extensions
+   git checkout add-dexter-support
+   ```
+2. In Zed, open the command palette (`Cmd+Shift+P`) and run **zed: install dev extension**
+3. Select the cloned `zed-elixir-extensions` directory
+
+Once installed, enable it in your Zed `settings.json`:
 
 ```json
 {
   "languages": {
     "Elixir": {
+      "language_servers": ["dexter", "!elixir-ls", "!expert"]
+    },
+    "EEx": {
       "language_servers": ["dexter", "!elixir-ls", "!expert"]
     },
     "HEEx": {
@@ -199,8 +215,6 @@ Dexter is included in Zed's official [Elixir extension](https://github.com/zed-e
   }
 }
 ```
-
-Open any Elixir file — the binary will be downloaded automatically on first startup.
 
 If you already have Dexter installed via [mise](https://mise.jdx.dev/), the extension will use your local binary from PATH instead of downloading.
 
