@@ -410,14 +410,20 @@ func extractAliasesFromText(text string, targetLine int) map[string]string {
 		if !strings.Contains(name, ".") && currentModule() != "" {
 			name = currentModule() + "." + name
 		}
-		// Scan forward to consume TokDo
+		// Scan forward to consume TokDo. Do not stop at TokEOL because
+		// Elixir allows:
+		//   defmodule Foo
+		//   do
+		//     ...
+		//   end
+		// and we still need to push the module frame for scope tracking.
 		for pos := k; pos < n; pos++ {
 			if tokens[pos].Kind == parser.TokDo {
 				depth++
 				stack = append(stack, moduleFrame{name, depth})
 				return pos + 1
 			}
-			if tokens[pos].Kind == parser.TokEOL || tokens[pos].Kind == parser.TokEOF {
+			if tokens[pos].Kind == parser.TokEOF {
 				break
 			}
 		}
@@ -642,6 +648,41 @@ func parseHelperQuoteBlock(lines []string, helperName string, fileAliases map[st
 		return
 	}
 
+	// skipInlineDefBody advances from a def head position (typically right after
+	// the parameter list) to the token after the def body. For one-line defs
+	// (`def foo, do: ...`) it returns the end-of-line token index.
+	skipInlineDefBody := func(from int) int {
+		// First, scan the current statement header.
+		k := from
+		for k < n {
+			switch tokens[k].Kind {
+			case parser.TokDo:
+				afterDo := tokNextSig(tokens, n, k+1)
+				// `do:` one-line form — no matching `end` to skip.
+				if afterDo < n && tokens[afterDo].Kind == parser.TokColon {
+					return k
+				}
+				// Block form (`... do ... end`) — skip nested do/fn..end.
+				bodyDepth := 1
+				k++
+				for k < n && bodyDepth > 0 {
+					switch tokens[k].Kind {
+					case parser.TokDo, parser.TokFn:
+						bodyDepth++
+					case parser.TokEnd:
+						bodyDepth--
+					}
+					k++
+				}
+				return k
+			case parser.TokEOL, parser.TokEOF:
+				return k
+			}
+			k++
+		}
+		return k
+	}
+
 	// Walk the quote do block (depth 1 = inside quote do, 0 = we hit its end)
 	inlineDefs = make(map[string][]inlineDef)
 	depth = 1
@@ -742,11 +783,12 @@ func parseHelperQuoteBlock(lines []string, helperName string, fileAliases map[st
 			funcName := txt(tokens[j])
 			j++
 			pj := tokNextSig(tokens, n, j)
+			nextPos := pj
 			maxArity := 0
 			defaultCount := 0
 			var paramNames []string
 			if pj < n && tokens[pj].Kind == parser.TokOpenParen {
-				maxArity, defaultCount, paramNames, _ = collectParamsFromTokens(source, tokens, n, pj)
+				maxArity, defaultCount, paramNames, nextPos = collectParamsFromTokens(source, tokens, n, pj)
 				paramNames = parser.FixParamNames(paramNames)
 			}
 			minArity := maxArity - defaultCount
@@ -758,6 +800,7 @@ func parseHelperQuoteBlock(lines []string, helperName string, fileAliases map[st
 					params: parser.JoinParams(paramNames, arity),
 				})
 			}
+			i = skipInlineDefBody(nextPos) - 1
 		}
 	}
 	return
@@ -1016,6 +1059,39 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 		return i
 	}
 
+	// skipInlineDefBody advances from a def head position (typically right after
+	// params) to after the inline def body. This keeps statements inside inline
+	// function bodies from being treated as top-level __using__ statements.
+	skipInlineDefBody := func(from int) int {
+		headerEnd := skipToEndOfStatement(from)
+		// Look for block-style `do` in the current def head.
+		for k := from; k < n && k < headerEnd; k++ {
+			if tokens[k].Kind != parser.TokDo {
+				continue
+			}
+			afterDo := nextSig(k + 1)
+			// `do:` one-line form; no trailing `end` to consume.
+			if afterDo < n && tokens[afterDo].Kind == parser.TokColon {
+				return headerEnd
+			}
+			// Block form (`... do ... end`) — skip nested do/fn..end.
+			bodyDepth := 1
+			k++
+			for k < n && bodyDepth > 0 {
+				switch tokens[k].Kind {
+				case parser.TokDo, parser.TokFn:
+					bodyDepth++
+				case parser.TokEnd:
+					bodyDepth--
+				}
+				k++
+			}
+			return k
+		}
+		// No `do` in the head (e.g. malformed input); fall back to statement end.
+		return headerEnd
+	}
+
 	// scanKeywordCall checks if tokens starting at i match:
 	//   Keyword.{get|pop|put|put_new|fetch|fetch!|pop!|pop_lazy}(ident, :key [, Default])
 	// Returns (funcName, argIdent, atomKey, defaultModule, endPos) or empty strings if no match.
@@ -1248,11 +1324,12 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 			funcName := txt(tokens[j])
 			j++
 			pj := nextSig(j)
+			nextPos := pj
 			maxArity := 0
 			defaultCount := 0
 			var paramNames []string
 			if pj < n && tokens[pj].Kind == parser.TokOpenParen {
-				maxArity, defaultCount, paramNames, _ = collectParamsFromTokens(source, tokens, n, pj)
+				maxArity, defaultCount, paramNames, nextPos = collectParamsFromTokens(source, tokens, n, pj)
 				paramNames = parser.FixParamNames(paramNames)
 			}
 			minArity := maxArity - defaultCount
@@ -1264,7 +1341,8 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 					params: parser.JoinParams(paramNames, arity),
 				})
 			}
-			i = pj
+			i = skipInlineDefBody(nextPos)
+			continue
 
 		case parser.TokModule:
 			// Check for Keyword.put/put_new(opts, :key, Module) heuristic

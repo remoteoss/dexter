@@ -562,6 +562,32 @@ end
 		}
 	})
 
+	t.Run("defmodule with do on next line keeps alias in inner scope", func(t *testing.T) {
+		src := `defmodule MyApp.Outer do
+  defmodule Inner
+  do
+    alias MyApp.InnerOnly
+    def run, do: InnerOnly.call()
+  end
+
+  def outer_run do
+    :ok
+  end
+end
+`
+		// Line 4 = inside Inner module body.
+		innerAliases := ExtractAliasesInScope(src, 4)
+		if innerAliases["InnerOnly"] != "MyApp.InnerOnly" {
+			t.Errorf("expected InnerOnly alias in inner scope, got %q", innerAliases["InnerOnly"])
+		}
+
+		// Line 7 = inside Outer after Inner ends.
+		outerAliases := ExtractAliasesInScope(src, 7)
+		if _, ok := outerAliases["InnerOnly"]; ok {
+			t.Error("InnerOnly alias should NOT leak to outer scope")
+		}
+	})
+
 	t.Run("fn...end block does not break scope tracking", func(t *testing.T) {
 		// Regression: fn...end has an "end" without a corresponding "do",
 		// which caused the depth counter to go out of sync and pop the
@@ -1550,6 +1576,49 @@ end`
 			t.Errorf("expected nil aliases, got %v", aliases)
 		}
 	})
+}
+
+func TestParseUsingBody_IgnoresHelperCallsInsideInlineDefBodies(t *testing.T) {
+	text := `defmodule MyLib do
+  def helper_name(_opts) do
+    quote do
+      import SharedLib.Hidden
+    end
+  end
+
+  defmacro __using__(opts) do
+    quote do
+      def run(value) do
+        helper_name(opts)
+        value
+      end
+    end
+  end
+end`
+
+	imported, _, _, _, _ := parseUsingBody(text)
+	if len(imported) != 0 {
+		t.Fatalf("expected no imports from helper call inside inline def body, got %v", imported)
+	}
+}
+
+func TestParseHelperQuoteBlock_IgnoresInlineDefBodies(t *testing.T) {
+	text := `defmodule MyLib do
+  def helper_name(_opts) do
+    quote do
+      def run(value) do
+        import SharedLib.Hidden
+        value
+      end
+    end
+  end
+end`
+
+	lines := strings.Split(text, "\n")
+	imported, _, _, _, _ := parseHelperQuoteBlock(lines, "helper_name", nil)
+	if len(imported) != 0 {
+		t.Fatalf("expected no imports from inside inline def body, got %v", imported)
+	}
 }
 
 func TestParseUsingBody_HeredocModuledoc(t *testing.T) {
