@@ -1125,6 +1125,7 @@ func TestParseUsingBody_InlineDefArity(t *testing.T) {
       def zero_arity, do: :ok
       def one_arity(x), do: x
       def two_arity(x, y), do: x + y
+      def bitstring_param(<<header::binary-size(4), rest::binary>>), do: {header, rest}
       defmacro my_macro(ast), do: ast
     end
   end
@@ -1149,6 +1150,7 @@ end`
 	check("zero_arity", 0, "def")
 	check("one_arity", 1, "def")
 	check("two_arity", 2, "def")
+	check("bitstring_param", 1, "def")
 	check("my_macro", 1, "defmacro")
 }
 
@@ -1680,60 +1682,6 @@ func mapKeys[V any](m map[string][]V) []string {
 		keys = append(keys, k)
 	}
 	return keys
-}
-
-func TestParseKeywordModuleOpts(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		aliases  map[string]string
-		expected map[string]string
-	}{
-		{
-			name:     "single module opt",
-			input:    "mod: Hammox",
-			expected: map[string]string{"mod": "Hammox"},
-		},
-		{
-			name:     "multiple module opts",
-			input:    "mod: Hammox, repo: MyRepo",
-			expected: map[string]string{"mod": "Hammox", "repo": "MyRepo"},
-		},
-		{
-			name:     "alias resolved",
-			input:    "mod: Hammox",
-			aliases:  map[string]string{"Hammox": "MyApp.Hammox"},
-			expected: map[string]string{"mod": "MyApp.Hammox"},
-		},
-		{
-			name:     "non-module values ignored",
-			input:    "mod: Hammox, async: true, queue: :default",
-			expected: map[string]string{"mod": "Hammox"},
-		},
-		{
-			name:     "empty string",
-			input:    "",
-			expected: map[string]string{},
-		},
-		{
-			name:     "dotted module name",
-			input:    "repo: MyApp.Oban.Repo",
-			expected: map[string]string{"repo": "MyApp.Oban.Repo"},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := ParseKeywordModuleOpts(tt.input, tt.aliases)
-			if len(got) != len(tt.expected) {
-				t.Fatalf("ParseKeywordModuleOpts(%q) = %v, want %v", tt.input, got, tt.expected)
-			}
-			for k, v := range tt.expected {
-				if got[k] != v {
-					t.Errorf("key %q: got %q, want %q", k, got[k], v)
-				}
-			}
-		})
-	}
 }
 
 func TestExtractUsesWithOpts(t *testing.T) {

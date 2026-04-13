@@ -346,9 +346,6 @@ func FindBufferFunctions(text string) []BufferFunction {
 
 var (
 	moduleAttrDefRe = regexp.MustCompile(`^\s*@([a-z_][a-z0-9_]*)\s+[^@]`)
-
-	// individual key: Module pairs in opts (used by ParseKeywordModuleOpts)
-	optKeyModuleRe = regexp.MustCompile(`([a-z_][a-z0-9_]*):\s*([A-Z][A-Za-z0-9_.]+)`)
 )
 
 // ExtractAliases parses all alias declarations from document text.
@@ -551,36 +548,12 @@ func extractAliasesFromText(text string, targetLine int) map[string]string {
 	return aliases
 }
 
-// Token-walking helpers shared by the Extract* functions below.
-
-func tokNextSig(tokens []parser.Token, n, from int) int {
-	for from < n {
-		k := tokens[from].Kind
-		if k != parser.TokEOL && k != parser.TokComment {
-			return from
-		}
-		from++
-	}
-	return n
-}
-
-func tokCollectModuleName(source []byte, tokens []parser.Token, n, i int) (string, int) {
-	if i >= n || tokens[i].Kind != parser.TokModule {
-		return "", i
-	}
-	var parts []string
-	parts = append(parts, string(source[tokens[i].Start:tokens[i].End]))
-	i++
-	for i+1 < n && tokens[i].Kind == parser.TokDot && tokens[i+1].Kind == parser.TokModule {
-		parts = append(parts, string(source[tokens[i+1].Start:tokens[i+1].End]))
-		i += 2
-	}
-	return strings.Join(parts, "."), i
-}
-
-func tokText(source []byte, t parser.Token) string {
-	return string(source[t.Start:t.End])
-}
+// Token-walking aliases for the shared parser helpers.
+var (
+	tokNextSig           = parser.NextSigToken
+	tokCollectModuleName = parser.CollectModuleName
+	tokText              = parser.TokenText
+)
 
 // ExtractImports parses all import declarations from document text.
 // Returns a slice of full module names.
@@ -774,11 +747,7 @@ func parseHelperQuoteBlock(lines []string, helperName string, fileAliases map[st
 			var paramNames []string
 			if pj < n && tokens[pj].Kind == parser.TokOpenParen {
 				maxArity, defaultCount, paramNames, _ = collectParamsFromTokens(source, tokens, n, pj)
-				for pi, pn := range paramNames {
-					if pn == "" {
-						paramNames[pi] = "arg" + strconv.Itoa(pi+1)
-					}
-				}
+				paramNames = parser.FixParamNames(paramNames)
 			}
 			minArity := maxArity - defaultCount
 			for arity := minArity; arity <= maxArity; arity++ {
@@ -892,20 +861,6 @@ func tokCollectKeywordModuleOpts(source []byte, tokens []parser.Token, n, pos in
 			}
 		}
 		i++
-	}
-	return result
-}
-
-// looksLikeOptContinuation returns true if the trimmed line looks like a
-// keyword list continuation (e.g. "name: \"foo\"", "permissions: :inherited").
-
-// ParseKeywordModuleOpts parses an Elixir keyword list string (e.g. "mod: Hammox, repo: MyRepo")
-// into a map of key → value. Only entries whose value starts with an uppercase letter
-// (module names) are included. Alias resolution is applied to module values.
-func ParseKeywordModuleOpts(optsStr string, aliases map[string]string) map[string]string {
-	result := make(map[string]string)
-	for _, m := range optKeyModuleRe.FindAllStringSubmatch(optsStr, -1) {
-		result[m[1]] = parser.ResolveModuleRef(m[2], aliases, "")
 	}
 	return result
 }
@@ -1298,11 +1253,7 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 			var paramNames []string
 			if pj < n && tokens[pj].Kind == parser.TokOpenParen {
 				maxArity, defaultCount, paramNames, _ = collectParamsFromTokens(source, tokens, n, pj)
-				for pi, pn := range paramNames {
-					if pn == "" {
-						paramNames[pi] = "arg" + strconv.Itoa(pi+1)
-					}
-				}
+				paramNames = parser.FixParamNames(paramNames)
 			}
 			minArity := maxArity - defaultCount
 			for arity := minArity; arity <= maxArity; arity++ {
@@ -1449,87 +1400,8 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 	return
 }
 
-// collectParamsFromTokens mirrors the parameter collection from parser_tokenized.go
-// for use in parseUsingBody's inline def extraction.
-func collectParamsFromTokens(source []byte, tokens []parser.Token, n, i int) (int, int, []string, int) {
-	if i >= n || tokens[i].Kind != parser.TokOpenParen {
-		return 0, 0, nil, i
-	}
-	i++ // consume open paren
-	bracketDepth := 1
-	commas := 0
-	defaults := 0
-	hasContent := false
-	var paramNames []string
-	currentParamName := ""
-	seenDefault := false
-
-	for i < n && bracketDepth > 0 {
-		tok := tokens[i]
-		switch tok.Kind {
-		case parser.TokOpenParen, parser.TokOpenBracket, parser.TokOpenBrace:
-			bracketDepth++
-			hasContent = true
-			i++
-		case parser.TokCloseParen, parser.TokCloseBracket, parser.TokCloseBrace:
-			bracketDepth--
-			if bracketDepth == 0 {
-				if hasContent {
-					if seenDefault {
-						defaults++
-					}
-					paramNames = append(paramNames, currentParamName)
-				}
-				i++
-				bti := 0
-				if hasContent {
-					bti = 1
-				}
-				return commas + bti, defaults, paramNames, i
-			}
-			i++
-		case parser.TokComma:
-			if bracketDepth == 1 {
-				commas++
-				if seenDefault {
-					defaults++
-				}
-				paramNames = append(paramNames, currentParamName)
-				currentParamName = ""
-				seenDefault = false
-			}
-			i++
-		case parser.TokBackslash:
-			if bracketDepth == 1 {
-				seenDefault = true
-			}
-			hasContent = true
-			i++
-		case parser.TokIdent:
-			if bracketDepth == 1 && currentParamName == "" {
-				name := string(source[tok.Start:tok.End])
-				if name != "_" {
-					currentParamName = name
-				}
-			}
-			hasContent = true
-			i++
-		case parser.TokEOL, parser.TokComment:
-			i++
-		default:
-			hasContent = true
-			i++
-		}
-	}
-	if hasContent {
-		if seenDefault {
-			defaults++
-		}
-		paramNames = append(paramNames, currentParamName)
-		return commas + 1, defaults, paramNames, i
-	}
-	return 0, 0, nil, i
-}
+// collectParamsFromTokens delegates to the shared parser implementation.
+var collectParamsFromTokens = parser.CollectParams
 
 // ExtractModuleAttribute returns the attribute name if the cursor is on a @attr reference,
 // otherwise returns "". For example, on "@endpoint_scopes" returns "endpoint_scopes".

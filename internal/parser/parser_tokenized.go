@@ -24,14 +24,11 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 	n := len(tokens)
 
 	tokenText := func(t Token) string {
-		return string(source[t.Start:t.End])
+		return TokenText(source, t)
 	}
 
 	nextSig := func(from int) int {
-		for from < n && (tokens[from].Kind == TokEOL || tokens[from].Kind == TokComment) {
-			from++
-		}
-		return from
+		return NextSigToken(tokens, n, from)
 	}
 
 	// isUserModuleToken returns true if the TokModule token represents a user-defined
@@ -41,115 +38,15 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 	}
 
 	collectModuleName := func(i int) (string, int) {
-		if i >= n || tokens[i].Kind != TokModule {
-			return "", i
-		}
-		var parts []string
-		parts = append(parts, tokenText(tokens[i]))
-		i++
-		for i+1 < n && tokens[i].Kind == TokDot && tokens[i+1].Kind == TokModule {
-			parts = append(parts, tokenText(tokens[i+1]))
-			i += 2
-		}
-		return strings.Join(parts, "."), i
+		return CollectModuleName(source, tokens, n, i)
 	}
 
 	collectParamsFromTokens := func(i int) (int, int, []string, int) {
-		if i >= n || tokens[i].Kind != TokOpenParen {
-			return 0, 0, nil, i
-		}
-		i++ // consume open paren
-		bracketDepth := 1
-		commas := 0
-		defaults := 0
-		hasContent := false
-		var paramNames []string
-		currentParamName := ""
-		seenDefault := false
-
-		for i < n && bracketDepth > 0 {
-			tok := tokens[i]
-			switch tok.Kind {
-			case TokOpenParen, TokOpenBracket, TokOpenBrace:
-				bracketDepth++
-				hasContent = true
-				i++
-			case TokCloseParen, TokCloseBracket, TokCloseBrace:
-				bracketDepth--
-				if bracketDepth == 0 {
-					if hasContent {
-						if seenDefault {
-							defaults++
-						}
-						paramNames = append(paramNames, currentParamName)
-					}
-					i++
-					return commas + boolToInt(hasContent), defaults, paramNames, i
-				}
-				i++
-			case TokOpenAngle:
-				bracketDepth++
-				hasContent = true
-				i++
-			case TokCloseAngle:
-				bracketDepth--
-				i++
-			case TokComma:
-				if bracketDepth == 1 {
-					commas++
-					if seenDefault {
-						defaults++
-					}
-					paramNames = append(paramNames, currentParamName)
-					currentParamName = ""
-					seenDefault = false
-				}
-				i++
-			case TokBackslash:
-				if bracketDepth == 1 {
-					seenDefault = true
-				}
-				hasContent = true
-				i++
-			case TokIdent:
-				if bracketDepth == 1 && currentParamName == "" {
-					name := tokenText(tok)
-					if name != "_" {
-						currentParamName = name
-					}
-				}
-				hasContent = true
-				i++
-			case TokOther:
-				if bracketDepth == 1 && tok.End-tok.Start == 1 && source[tok.Start] == '=' {
-					currentParamName = ""
-				}
-				hasContent = true
-				i++
-			case TokEOL, TokComment:
-				i++
-			default:
-				hasContent = true
-				i++
-			}
-		}
-		if hasContent {
-			if seenDefault {
-				defaults++
-			}
-			paramNames = append(paramNames, currentParamName)
-			return commas + 1, defaults, paramNames, i
-		}
-		return 0, 0, nil, i
+		return CollectParams(source, tokens, n, i)
 	}
 
 	fixParamNames := func(names []string) []string {
-		for idx, name := range names {
-			if name == "" {
-				names[idx] = "arg" + itoa(idx+1)
-			}
-		}
-		return names
+		return FixParamNames(names)
 	}
 
 	currentModule := func() string {
@@ -904,4 +801,129 @@ func itoa(n int) string {
 		return string(rune('0' + n))
 	}
 	return itoa(n/10) + string(rune('0'+n%10))
+}
+
+// Exported token-walking helpers shared with the LSP package.
+
+func TokenText(source []byte, t Token) string {
+	return string(source[t.Start:t.End])
+}
+
+func NextSigToken(tokens []Token, n, from int) int {
+	for from < n && (tokens[from].Kind == TokEOL || tokens[from].Kind == TokComment) {
+		from++
+	}
+	return from
+}
+
+func CollectModuleName(source []byte, tokens []Token, n, i int) (string, int) {
+	if i >= n || tokens[i].Kind != TokModule {
+		return "", i
+	}
+	var parts []string
+	parts = append(parts, string(source[tokens[i].Start:tokens[i].End]))
+	i++
+	for i+1 < n && tokens[i].Kind == TokDot && tokens[i+1].Kind == TokModule {
+		parts = append(parts, string(source[tokens[i+1].Start:tokens[i+1].End]))
+		i += 2
+	}
+	return strings.Join(parts, "."), i
+}
+
+func CollectParams(source []byte, tokens []Token, n, i int) (int, int, []string, int) {
+	if i >= n || tokens[i].Kind != TokOpenParen {
+		return 0, 0, nil, i
+	}
+	i++
+	bracketDepth := 1
+	commas := 0
+	defaults := 0
+	hasContent := false
+	var paramNames []string
+	currentParamName := ""
+	seenDefault := false
+
+	for i < n && bracketDepth > 0 {
+		tok := tokens[i]
+		switch tok.Kind {
+		case TokOpenParen, TokOpenBracket, TokOpenBrace:
+			bracketDepth++
+			hasContent = true
+			i++
+		case TokOpenAngle:
+			bracketDepth++
+			hasContent = true
+			i++
+		case TokCloseAngle:
+			bracketDepth--
+			i++
+		case TokCloseParen, TokCloseBracket, TokCloseBrace:
+			bracketDepth--
+			if bracketDepth == 0 {
+				if hasContent {
+					if seenDefault {
+						defaults++
+					}
+					paramNames = append(paramNames, currentParamName)
+				}
+				i++
+				return commas + boolToInt(hasContent), defaults, paramNames, i
+			}
+			i++
+		case TokComma:
+			if bracketDepth == 1 {
+				commas++
+				if seenDefault {
+					defaults++
+				}
+				paramNames = append(paramNames, currentParamName)
+				currentParamName = ""
+				seenDefault = false
+			}
+			i++
+		case TokBackslash:
+			if bracketDepth == 1 {
+				seenDefault = true
+			}
+			hasContent = true
+			i++
+		case TokIdent:
+			if bracketDepth == 1 && currentParamName == "" {
+				name := string(source[tok.Start:tok.End])
+				if name != "_" {
+					currentParamName = name
+				}
+			}
+			hasContent = true
+			i++
+		case TokOther:
+			if bracketDepth == 1 && tok.End-tok.Start == 1 && source[tok.Start] == '=' {
+				currentParamName = ""
+			}
+			hasContent = true
+			i++
+		case TokEOL, TokComment:
+			i++
+		default:
+			hasContent = true
+			i++
+		}
+	}
+	if hasContent {
+		if seenDefault {
+			defaults++
+		}
+		paramNames = append(paramNames, currentParamName)
+		return commas + 1, defaults, paramNames, i
+	}
+	return 0, 0, nil, i
+}
+
+func FixParamNames(names []string) []string {
+	for idx, name := range names {
+		if name == "" {
+			names[idx] = "arg" + itoa(idx+1)
+		}
+	}
+	return names
 }
