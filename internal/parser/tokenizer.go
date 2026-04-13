@@ -638,24 +638,7 @@ func scanHeredocContent(source []byte, i, line int, delim byte) (int, int) {
 			i += 2
 		} else if ch == '#' && i+1 < len(source) && source[i+1] == '{' {
 			i += 2
-			depth := 1
-			for i < len(source) && depth > 0 {
-				switch source[i] {
-				case '\n':
-					line++
-					i++
-				case '\\':
-					i += 2
-				case '{':
-					depth++
-					i++
-				case '}':
-					depth--
-					i++
-				default:
-					i++
-				}
-			}
+			i, line = scanInterpolation(source, i, line)
 		} else {
 			i++
 		}

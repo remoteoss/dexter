@@ -1502,6 +1502,186 @@ end`
 	})
 }
 
+func TestParseUsingBody_HeredocModuledoc(t *testing.T) {
+	// Regression: moduledocs with code examples containing brackets that span
+	// multiple lines (e.g. multi-line keyword lists, markdown links) must not
+	// confuse the parser. Line-based joinBracketLines treats heredoc content as
+	// code, causing unmatched [ or ( on one line to join with all subsequent
+	// lines until the bracket closes — potentially swallowing defmacro __using__.
+	t.Run("import inside __using__ survives moduledoc with brackets", func(t *testing.T) {
+		text := `defmodule SharedLib.Pro.Workers.Chunk do
+  @moduledoc """
+  Chunk workers execute jobs in groups based on a size or timeout option.
+
+  ## Usage
+
+      defmodule MyApp.ChunkWorker do
+        use SharedLib.Pro.Workers.Chunk, queue: :messages, size: 100
+      end
+
+  ## Options
+
+  Options are passed as a keyword list:
+
+      [
+        by: :worker,
+        size: 100,
+        timeout: 1000
+      ]
+
+  The [return values](#t:result/0) are different from standard workers.
+
+  See [the documentation](#module-options) for more details.
+  """
+
+  @type options :: [
+          by: atom(),
+          size: pos_integer(),
+          timeout: pos_integer()
+        ]
+
+  @doc false
+  defmacro __using__(opts) do
+    {chunk_opts, other_opts} = Keyword.split(opts, [:by, :size, :timeout])
+
+    quote do
+      use SharedLib.Pro.Worker, unquote(other_opts)
+
+      alias SharedLib.Pro.Workers.Chunk
+
+      @impl SharedLib.Worker
+      def new(args, opts) when is_map(args) and is_list(opts) do
+        super(args, opts)
+      end
+
+      @impl SharedLib.Worker
+      def perform(%Job{} = job) do
+        :ok
+      end
+    end
+  end
+end`
+		imports, inlineDefs, transUses, _, _ := parseUsingBody(text)
+		// The __using__ body has "use SharedLib.Pro.Worker" — should appear in transUses
+		found := false
+		for _, u := range transUses {
+			if u == "SharedLib.Pro.Worker" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("expected SharedLib.Pro.Worker in transUses, got %v", transUses)
+		}
+		// Inline defs: new/2, perform/1
+		if _, ok := inlineDefs["new"]; !ok {
+			t.Errorf("expected 'new' in inlineDefs, got keys: %v", mapKeys(inlineDefs))
+		}
+		if _, ok := inlineDefs["perform"]; !ok {
+			t.Errorf("expected 'perform' in inlineDefs, got keys: %v", mapKeys(inlineDefs))
+		}
+		_ = imports
+	})
+
+	t.Run("full chain: import through __using__ with long moduledoc", func(t *testing.T) {
+		text := `defmodule SharedLib.Pro.Worker do
+  @moduledoc """
+  The SharedLib.Pro.Worker is a replacement for SharedLib.Worker with expanded
+  capabilities such as encryption and output recording.
+
+  ## Usage
+
+      def MyApp.Worker do
+        use SharedLib.Pro.Worker
+
+        @impl SharedLib.Pro.Worker
+        def process(%Job{} = job) do
+          :ok
+        end
+      end
+
+  ## Encryption
+
+  Workers can be encrypted by passing the ` + "`:encrypted`" + ` option:
+
+      use SharedLib.Pro.Worker,
+        encrypted: [key: {MyApp.Config, :secret_key}]
+
+  ## Hooks
+
+  Lifecycle hooks are declared with the ` + "`:hooks`" + ` option:
+
+      use SharedLib.Pro.Worker,
+        hooks: [
+          on_start: &MyApp.Telemetry.worker_started/1,
+          on_complete: &MyApp.Telemetry.worker_completed/1
+        ]
+  """
+
+  defmacro __using__(opts) do
+    {_hook_opts, other_opts} = Keyword.split(opts, [:hooks, :encrypted])
+
+    quote do
+      @behaviour SharedLib.Worker
+      @behaviour SharedLib.Pro.Worker
+
+      import SharedLib.Pro.Worker,
+        only: [
+          args_schema: 1,
+          field: 2,
+          field: 3,
+          embeds_one: 2,
+          embeds_one: 3
+        ]
+
+      alias SharedLib.{Job, Worker}
+
+      def __opts__, do: unquote(other_opts)
+    end
+  end
+
+  defmacro args_schema(do: block) do
+    quote do
+      Module.register_attribute(__MODULE__, :args_fields, accumulate: true)
+      unquote(block)
+    end
+  end
+
+  defmacro field(name, type, opts \\ []) do
+    quote do
+      @args_fields {unquote(name), unquote(type), unquote(opts)}
+    end
+  end
+end`
+		imports, inlineDefs, _, _, aliases := parseUsingBody(text)
+		// Should find the import
+		found := false
+		for _, imp := range imports {
+			if imp == "SharedLib.Pro.Worker" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("expected SharedLib.Pro.Worker in imports, got %v", imports)
+		}
+		// Should find inline def __opts__
+		if _, ok := inlineDefs["__opts__"]; !ok {
+			t.Errorf("expected '__opts__' in inlineDefs, got keys: %v", mapKeys(inlineDefs))
+		}
+		// Should find aliases
+		if aliases == nil || aliases["Job"] != "SharedLib.Job" {
+			t.Errorf("expected alias Job -> SharedLib.Job, got %v", aliases)
+		}
+	})
+}
+
+func mapKeys[V any](m map[string][]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
 func TestParseKeywordModuleOpts(t *testing.T) {
 	tests := []struct {
 		name     string

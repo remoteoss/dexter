@@ -255,19 +255,6 @@ func (s *Server) watchGitHead() {
 	}()
 }
 
-// periodicReindex runs backgroundReindex on a fixed interval to catch files
-// created or deleted outside the editor.
-func (s *Server) periodicReindex() {
-	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-
-		for range ticker.C {
-			s.backgroundReindex()
-		}
-	}()
-}
-
 // notifyOTPMismatch checks stderr output for an OTP version mismatch and
 // sends a one-time warning to the editor so the user doesn't have to dig
 // through logs.
@@ -355,7 +342,6 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 		s.initialized = true
 		s.backgroundReindex()
 		s.watchGitHead()
-		s.periodicReindex()
 	}
 
 	if params.Capabilities.Window != nil && params.Capabilities.Window.ShowDocument != nil {

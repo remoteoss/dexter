@@ -1103,6 +1103,14 @@ func (s *Store) NextFunctionLine(filePath string, startLine int) int {
 }
 
 func (s *Store) LookupFollowDelegate(module, function string) ([]LookupResult, error) {
+	return s.lookupFollowDelegate(module, function, 0)
+}
+
+func (s *Store) lookupFollowDelegate(module, function string, depth int) ([]LookupResult, error) {
+	if depth > 5 {
+		return nil, nil
+	}
+
 	results, err := s.LookupFunction(module, function)
 	if err != nil {
 		return nil, err
@@ -1123,7 +1131,7 @@ func (s *Store) LookupFollowDelegate(module, function string) ([]LookupResult, e
 		if results[0].DelegateAs != "" {
 			targetFunc = results[0].DelegateAs
 		}
-		targetResults, err := s.LookupFunction(targetModule, targetFunc)
+		targetResults, err := s.lookupFollowDelegate(targetModule, targetFunc, depth+1)
 		if err != nil {
 			return nil, err
 		}

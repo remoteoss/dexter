@@ -2788,3 +2788,152 @@ end
 		t.Error("expected Accounts.list() to resolve to MyApp.Accounts.list via alias")
 	}
 }
+
+func TestParseFile_BareMacroCallMultiTokenBeforeDo(t *testing.T) {
+	// Bare macro calls with complex arguments before do must be detected.
+	// These are real patterns from ExUnit (use ExUnit.Case injects setup/test).
+	path := writeTempFile(t, `defmodule MyApp.Test do
+  use ExUnit.Case
+
+  setup %{conn: conn} do
+    {:ok, conn: conn}
+  end
+
+  test "creates user", %{conn: conn} do
+    assert conn
+  end
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	callRefs := filterRefs(refs, "call")
+	foundSetup := false
+	foundTest := false
+	for _, r := range callRefs {
+		if r.Function == "setup" {
+			foundSetup = true
+		}
+		if r.Function == "test" {
+			foundTest = true
+		}
+	}
+	if !foundSetup {
+		t.Errorf("expected bare macro call ref for setup; got refs: %+v", callRefs)
+	}
+	if !foundTest {
+		t.Errorf("expected bare macro call ref for test; got refs: %+v", callRefs)
+	}
+}
+
+func TestParseFile_BareMacroCallDoOnNextLine(t *testing.T) {
+	// do can appear on a separate line from the macro call in valid Elixir.
+	path := writeTempFile(t, `defmodule MyApp.Test do
+  use ExUnit.Case
+
+  setup :ok
+  do
+    :ok
+  end
+
+  setup %{
+    conn: conn
+  } do
+    {:ok, conn: conn}
+  end
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	callRefs := filterRefs(refs, "call")
+	setupCount := 0
+	for _, r := range callRefs {
+		if r.Function == "setup" {
+			setupCount++
+		}
+	}
+	if setupCount < 2 {
+		t.Errorf("expected 2 bare macro call refs for setup, got %d; refs: %+v", setupCount, callRefs)
+	}
+}
+
+func TestTokenize_HeredocInterpolationWithNestedString(t *testing.T) {
+	// #{"}"} inside a heredoc must not close the interpolation prematurely.
+	source := []byte("x = \"\"\"\n#{\"}\"}\n\"\"\"")
+	tokens := Tokenize(source)
+
+	var kinds []TokenKind
+	for _, tok := range tokens {
+		if tok.Kind != TokEOL {
+			kinds = append(kinds, tok.Kind)
+		}
+	}
+	if len(kinds) < 3 {
+		t.Fatalf("expected at least 3 non-EOL tokens, got %d: %v", len(kinds), kinds)
+	}
+	if kinds[2] != TokHeredoc {
+		t.Errorf("expected TokHeredoc at position 2, got %v (tokens: %v)", kinds[2], kinds)
+	}
+	heredocTok := tokens[0]
+	for _, tok := range tokens {
+		if tok.Kind == TokHeredoc {
+			heredocTok = tok
+			break
+		}
+	}
+	content := string(source[heredocTok.Start:heredocTok.End])
+	if !strings.Contains(content, "#{") {
+		t.Errorf("heredoc token should contain interpolation, got: %q", content)
+	}
+}
+
+func TestBareMacroCall_NoFalsePositiveAcrossStatements(t *testing.T) {
+	source := `defmodule Test do
+  use SomeMacroLib
+
+  x = 1
+  if x > 0 do
+    :positive
+  end
+end
+`
+	_, refs, _ := ParseText("test.ex", source)
+	for _, r := range refs {
+		if r.Kind == "call" && r.Function == "x" {
+			t.Errorf("false positive: x detected as bare macro call: %+v", r)
+		}
+	}
+}
+
+func TestBareMacroCall_CommentBetweenArgsAndDo(t *testing.T) {
+	source := `defmodule Test do
+  use SomeMacroLib
+
+  setup %{
+    # this sets up the connection
+    conn: conn
+  }
+  # yeah, I know it's odd
+  do
+    :ok
+  end
+end
+`
+	_, refs, _ := ParseText("test.ex", source)
+	found := false
+	for _, r := range refs {
+		if r.Kind == "call" && r.Function == "setup" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected bare macro call ref for setup with comment before do")
+	}
+}

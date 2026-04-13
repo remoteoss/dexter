@@ -348,31 +348,10 @@ var (
 	aliasMultiRe    = regexp.MustCompile(`^\s*alias\s+([A-Za-z0-9_.]+)\.{([^}]+)}`)
 	importRe        = regexp.MustCompile(`^\s*import\s+([A-Za-z0-9_.]+)`)
 	useRe           = regexp.MustCompile(`^\s*use\s+([A-Za-z0-9_.]+)`)
-	usingDefRe      = regexp.MustCompile(`^\s*defmacro\s+__using__`)
 	moduleAttrDefRe = regexp.MustCompile(`^\s*@([a-z_][a-z0-9_]*)\s+[^@]`)
-	keywordModuleRe = regexp.MustCompile(`Keyword\.(?:put_new|put)\([^,]+,\s*:[a-z_]+,\s*([A-Z][A-Za-z0-9_.]+)\)`)
 
-	// Dynamic opt-binding patterns inside __using__ bodies.
-	// var = Keyword.get/pop(opts, :key, Default)
-	varKeywordWithDefaultRe = regexp.MustCompile(`^\s*([a-z_][a-z0-9_]*)\s*=\s*Keyword\.(?:get|pop)\s*\([^,]+,\s*:([a-z_][a-z0-9_]*),\s*([A-Z][A-Za-z0-9_.]+)\)`)
-	// {var, _} = Keyword.pop(opts, :key, Default) — tuple destructuring
-	varTupleKeywordRe = regexp.MustCompile(`^\s*\{([a-z_][a-z0-9_]*),\s*[^}]+\}\s*=\s*Keyword\.pop\s*\([^,]+,\s*:([a-z_][a-z0-9_]*),\s*([A-Z][A-Za-z0-9_.]+)\)`)
-	// var = Keyword.fetch/fetch!/pop!/pop_lazy(opts, :key) — no parseable default
-	varKeywordNoDefaultRe = regexp.MustCompile(`^\s*([a-z_][a-z0-9_]*)\s*=\s*Keyword\.(?:fetch!?|pop!|pop_lazy)\s*\([^,]+,\s*:([a-z_][a-z0-9_]*)\b`)
-	// var = ModuleName (simple assignment to a capitalized module)
-	varSimpleModuleRe = regexp.MustCompile(`^\s*([a-z_][a-z0-9_]*)\s*=\s*([A-Z][A-Za-z0-9_.]+)\s*$`)
-
-	// import/use with unquote(var) — captures the var name
-	importUnquoteRe = regexp.MustCompile(`^\s*import\s+unquote\(([a-z_][a-z0-9_]*)\)`)
-	useUnquoteRe    = regexp.MustCompile(`^\s*use\s+unquote\(([a-z_][a-z0-9_]*)\)`)
-
-	// ExUnit.CaseTemplate detection and `using` macro form
-	caseTemplateRe      = regexp.MustCompile(`^\s*use\s+ExUnit\.CaseTemplate\b`)
-	caseTemplateUsingRe = regexp.MustCompile(`^\s*using\b`)
 	// quote do block inside a helper function
 	quoteDoRe = regexp.MustCompile(`^\s*quote\s+do\b`)
-	// bare function call: function_name( — used to detect delegation to a helper
-	bareCallRe = regexp.MustCompile(`^\s*([a-z_][a-z0-9_]*)\s*\(`)
 
 	// use Module, key: Val, key2: Val2  — captures (module, opts_string)
 	useWithOptsRe = regexp.MustCompile(`^\s*use\s+([A-Za-z0-9_.]+)\s*,\s*(.+)$`)
@@ -899,58 +878,104 @@ type inlineDef struct {
 // dynamic opt-driven imports (e.g. `import unquote(mod)` where `mod` comes from
 // a Keyword.get on opts), and alias declarations that get injected into the
 // consumer module.
+//
+// Uses the tokenizer so that heredocs, multi-line expressions, and comments are
+// handled correctly without line-joining heuristics.
 func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inlineDef, transUses []string, optBindings []optBinding, aliases map[string]string) {
-	lines := parser.JoinLines(strings.Split(text, "\n"))
-	fileAliases := extractAliasesFromLines(lines, -1)
+	source := []byte(text)
+	tokens := parser.Tokenize(source)
+	n := len(tokens)
 
-	// Check if this module uses ExUnit.CaseTemplate (which provides the `using` macro)
+	txt := func(t parser.Token) string { return string(source[t.Start:t.End]) }
+
+	nextSig := func(from int) int {
+		for from < n {
+			k := tokens[from].Kind
+			if k != parser.TokEOL && k != parser.TokComment {
+				return from
+			}
+			from++
+		}
+		return n
+	}
+
+	collectModuleName := func(i int) (string, int) {
+		if i >= n || tokens[i].Kind != parser.TokModule {
+			return "", i
+		}
+		var parts []string
+		parts = append(parts, txt(tokens[i]))
+		i++
+		for i+1 < n && tokens[i].Kind == parser.TokDot && tokens[i+1].Kind == parser.TokModule {
+			parts = append(parts, txt(tokens[i+1]))
+			i += 2
+		}
+		return strings.Join(parts, "."), i
+	}
+
+	// Check if this module uses ExUnit.CaseTemplate
 	usesCaseTemplate := false
-	for _, line := range lines {
-		if caseTemplateRe.MatchString(line) {
-			usesCaseTemplate = true
-			break
+	for i := 0; i < n; i++ {
+		if tokens[i].Kind == parser.TokUse {
+			j := nextSig(i + 1)
+			mod, _ := collectModuleName(j)
+			if mod == "ExUnit.CaseTemplate" {
+				usesCaseTemplate = true
+				break
+			}
 		}
 	}
 
-	usingIdx := -1
-	usingIndent := 0
-	inHeredoc := false
-	for i, line := range lines {
-		if strings.IndexByte(line, '"') >= 0 {
-			if count := strings.Count(line, `"""`); count > 0 {
-				if count < 2 {
-					inHeredoc = !inHeredoc
+	// Find the __using__ entry point: defmacro __using__ or ExUnit.CaseTemplate `using`
+	usingBodyStart := -1
+	usingDepth := -1
+
+	for i := 0; i < n; i++ {
+		tok := tokens[i]
+		if tok.Kind == parser.TokDefmacro {
+			j := nextSig(i + 1)
+			if j < n && tokens[j].Kind == parser.TokIdent && txt(tokens[j]) == "__using__" {
+				// Scan forward to find TokDo, then body starts after it
+				for k := j + 1; k < n; k++ {
+					if tokens[k].Kind == parser.TokDo {
+						usingBodyStart = k + 1
+						usingDepth = 1 // inside the defmacro do..end
+						break
+					}
+					if tokens[k].Kind == parser.TokEOL {
+						break
+					}
 				}
-				continue
+				break
 			}
 		}
-		if strings.IndexByte(line, '\'') >= 0 {
-			if count := strings.Count(line, `'''`); count > 0 {
-				if count < 2 {
-					inHeredoc = !inHeredoc
+		// ExUnit.CaseTemplate: `using do` or `using opts do`
+		if usesCaseTemplate && tok.Kind == parser.TokIdent && txt(tok) == "using" {
+			// Must be at statement start
+			if i == 0 || tokens[i-1].Kind == parser.TokEOL {
+				for k := i + 1; k < n; k++ {
+					if tokens[k].Kind == parser.TokDo {
+						usingBodyStart = k + 1
+						usingDepth = 1
+						break
+					}
+					if tokens[k].Kind == parser.TokEOL {
+						break
+					}
 				}
-				continue
+				if usingBodyStart >= 0 {
+					break
+				}
 			}
-		}
-		if inHeredoc {
-			continue
-		}
-		if usingDefRe.MatchString(line) {
-			usingIdx = i
-			usingIndent = len(line) - len(strings.TrimLeft(line, " \t"))
-			break
-		}
-		// ExUnit.CaseTemplate's `using opts do` form — only when the module
-		// explicitly uses ExUnit.CaseTemplate (or a known subclass).
-		if usesCaseTemplate && caseTemplateUsingRe.MatchString(line) {
-			usingIdx = i
-			usingIndent = len(line) - len(strings.TrimLeft(line, " \t"))
-			break
 		}
 	}
-	if usingIdx < 0 {
+	if usingBodyStart < 0 {
 		return
 	}
+
+	// Extract file-level aliases for resolution
+	lines := strings.Split(text, "\n")
+	fileAliases := extractAliasesFromLines(lines, -1)
 
 	inlineDefs = make(map[string][]inlineDef)
 
@@ -961,120 +986,502 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 		return parser.ResolveModuleRef(modName, fileAliases, "")
 	}
 
-	// varToOpt tracks variables bound from opts: var_name → {optKey, defaultMod}
 	type varBinding struct {
 		optKey     string
 		defaultMod string
 	}
 	varToOpt := make(map[string]varBinding)
 
-	for i := usingIdx + 1; i < len(lines); i++ {
-		line := lines[i]
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" {
-			continue
-		}
-		indent := len(line) - len(strings.TrimLeft(line, " \t"))
-		// Stop at another definition or closing end at the same indentation level
-		if indent <= usingIndent && (parser.FuncDefRe.MatchString(line) || trimmed == "end") {
-			break
-		}
-
-		// Detect var = Keyword.get/pop(opts, :key, Default)
-		if m := varKeywordWithDefaultRe.FindStringSubmatch(line); m != nil {
-			varToOpt[m[1]] = varBinding{optKey: m[2], defaultMod: resolveAlias(m[3])}
-			continue
-		}
-		// Detect {var, _} = Keyword.pop(opts, :key, Default) — tuple destructuring
-		if m := varTupleKeywordRe.FindStringSubmatch(line); m != nil {
-			varToOpt[m[1]] = varBinding{optKey: m[2], defaultMod: resolveAlias(m[3])}
-			continue
-		}
-		// Detect var = Keyword.fetch/fetch!/pop!/pop_lazy(opts, :key) — no parseable default
-		if m := varKeywordNoDefaultRe.FindStringSubmatch(line); m != nil {
-			varToOpt[m[1]] = varBinding{optKey: m[2]}
-			continue
-		}
-		// Detect var = ModuleName (simple assignment to a module constant)
-		if m := varSimpleModuleRe.FindStringSubmatch(line); m != nil {
-			varToOpt[m[1]] = varBinding{defaultMod: resolveAlias(m[2])}
-			continue
-		}
-		// Keyword.put_new/put with a module default: the module may be passed
-		// into a transitive `use` via unquote(opts) — keep as a heuristic.
-		if m := keywordModuleRe.FindStringSubmatch(line); m != nil {
-			transUses = append(transUses, resolveAlias(m[1]))
-		}
-
-		// import unquote(var) — dynamic import, goes into optBindings only so
-		// consumer-provided opts take priority over the default.
-		if m := importUnquoteRe.FindStringSubmatch(line); m != nil {
-			varName := m[1]
-			if b, ok := varToOpt[varName]; ok {
-				optBindings = append(optBindings, optBinding{optKey: b.optKey, defaultMod: b.defaultMod, kind: "import"})
-			}
-			continue
-		}
-
-		// use unquote(var) — dynamic use, goes into optBindings only.
-		if m := useUnquoteRe.FindStringSubmatch(line); m != nil {
-			varName := m[1]
-			if b, ok := varToOpt[varName]; ok {
-				optBindings = append(optBindings, optBinding{optKey: b.optKey, defaultMod: b.defaultMod, kind: "use"})
-			}
-			continue
-		}
-
-		if m := importRe.FindStringSubmatch(line); m != nil {
-			imported = append(imported, resolveAlias(m[1]))
-			continue
-		}
-
-		if m := useRe.FindStringSubmatch(line); m != nil {
-			transUses = append(transUses, resolveAlias(m[1]))
-			continue
-		}
-
-		if updated, matched := extractAliasFromLine(line, aliases, resolveAlias); matched {
-			aliases = updated
-			continue
-		}
-
-		// Delegation to a helper function: `using_block(opts)` or similar.
-		// Find that function's definition in the same file and parse its
-		// quote do block, which contains the actual imports/uses to inject.
-		if m := bareCallRe.FindStringSubmatch(line); m != nil {
-			helperName := m[1]
-			helperImported, helperDefs, helperTransUses, helperBindings, helperAliases := parseHelperQuoteBlock(lines, helperName, fileAliases)
-			if helperImported != nil {
-				imported = append(imported, helperImported...)
-				for k, v := range helperDefs {
-					inlineDefs[k] = append(inlineDefs[k], v...)
+	// skipToEndOfStatement advances i past the current statement (to the next
+	// TokEOL at bracket depth 0, or to end of tokens).
+	skipToEndOfStatement := func(i int) int {
+		depth := 0
+		for i < n {
+			switch tokens[i].Kind {
+			case parser.TokOpenParen, parser.TokOpenBracket, parser.TokOpenBrace:
+				depth++
+			case parser.TokCloseParen, parser.TokCloseBracket, parser.TokCloseBrace:
+				depth--
+			case parser.TokEOL:
+				if depth <= 0 {
+					return i
 				}
-				transUses = append(transUses, helperTransUses...)
-				optBindings = append(optBindings, helperBindings...)
+			case parser.TokEOF:
+				return i
 			}
-			for k, v := range helperAliases {
-				if aliases == nil {
-					aliases = make(map[string]string)
-				}
-				aliases[k] = v
-			}
-			continue
+			i++
 		}
+		return i
+	}
 
-		if m := parser.FuncDefRe.FindStringSubmatch(line); m != nil {
-			funcName := m[2]
-			arity := parser.ExtractArity(line, funcName)
-			inlineDefs[funcName] = append(inlineDefs[funcName], inlineDef{
-				line:   i + 1,
-				arity:  arity,
-				kind:   m[1],
-				params: parser.JoinParams(parser.ExtractParamNames(line, funcName), arity),
-			})
+	// scanKeywordCall checks if tokens starting at i match:
+	//   Keyword.{get|pop|put|put_new|fetch|fetch!|pop!|pop_lazy}(ident, :key [, Default])
+	// Returns (funcName, argIdent, atomKey, defaultModule, endPos) or empty strings if no match.
+	scanKeywordCall := func(i int) (string, string, string, int) {
+		// Expect: TokModule("Keyword") TokDot TokIdent(funcName) TokOpenParen
+		if i+3 >= n {
+			return "", "", "", i
+		}
+		if tokens[i].Kind != parser.TokModule || txt(tokens[i]) != "Keyword" {
+			return "", "", "", i
+		}
+		if tokens[i+1].Kind != parser.TokDot {
+			return "", "", "", i
+		}
+		if tokens[i+2].Kind != parser.TokIdent {
+			return "", "", "", i
+		}
+		funcName := txt(tokens[i+2])
+		j := nextSig(i + 3)
+		if j >= n || tokens[j].Kind != parser.TokOpenParen {
+			return "", "", "", i
+		}
+		j++ // skip (
+
+		// Skip first argument (the opts variable) up to comma
+		depth := 1
+		for j < n && depth > 0 {
+			switch tokens[j].Kind {
+			case parser.TokOpenParen, parser.TokOpenBracket, parser.TokOpenBrace:
+				depth++
+			case parser.TokCloseParen, parser.TokCloseBracket, parser.TokCloseBrace:
+				depth--
+				if depth == 0 {
+					return funcName, "", "", j + 1
+				}
+			case parser.TokComma:
+				if depth == 1 {
+					j++
+					goto foundFirstComma
+				}
+			}
+			j++
+		}
+		return funcName, "", "", j
+	foundFirstComma:
+
+		// Expect :atom_key
+		j = nextSig(j)
+		if j >= n || tokens[j].Kind != parser.TokAtom {
+			return funcName, "", "", skipToEndOfStatement(j)
+		}
+		atomText := txt(tokens[j])
+		atomKey := ""
+		if len(atomText) > 1 && atomText[0] == ':' {
+			atomKey = atomText[1:]
+		}
+		j++
+
+		// Check for optional comma + default module
+		j = nextSig(j)
+		if j >= n {
+			return funcName, atomKey, "", j
+		}
+		if tokens[j].Kind == parser.TokCloseParen {
+			return funcName, atomKey, "", j + 1
+		}
+		if tokens[j].Kind == parser.TokComma {
+			j = nextSig(j + 1)
+			defaultMod, endJ := collectModuleName(j)
+			if defaultMod != "" {
+				// Advance to close paren
+				for endJ < n && tokens[endJ].Kind != parser.TokCloseParen {
+					endJ++
+				}
+				if endJ < n {
+					endJ++
+				}
+				return funcName, atomKey, defaultMod, endJ
+			}
+		}
+		// Skip to end
+		return funcName, atomKey, "", skipToEndOfStatement(j)
+	}
+
+	// Walk tokens inside the __using__ body
+	depth := usingDepth
+	i := usingBodyStart
+	for i < n && depth > 0 {
+		tok := tokens[i]
+
+		switch tok.Kind {
+		case parser.TokDo:
+			depth++
+			i++
+		case parser.TokFn:
+			depth++
+			i++
+		case parser.TokEnd:
+			depth--
+			i++
+		case parser.TokEOL, parser.TokComment, parser.TokString, parser.TokHeredoc,
+			parser.TokSigil, parser.TokAtom, parser.TokNumber, parser.TokCharLiteral,
+			parser.TokEOF:
+			i++
+
+		case parser.TokImport:
+			i++
+			j := nextSig(i)
+			// import unquote(var)
+			if j < n && tokens[j].Kind == parser.TokIdent && txt(tokens[j]) == "unquote" {
+				if j+2 < n && tokens[j+1].Kind == parser.TokOpenParen && tokens[j+2].Kind == parser.TokIdent {
+					varName := txt(tokens[j+2])
+					if b, ok := varToOpt[varName]; ok {
+						optBindings = append(optBindings, optBinding{optKey: b.optKey, defaultMod: b.defaultMod, kind: "import"})
+					}
+				}
+				i = skipToEndOfStatement(j)
+				continue
+			}
+			// import Module
+			modName, k := collectModuleName(j)
+			if modName != "" {
+				imported = append(imported, resolveAlias(modName))
+			}
+			i = k
+
+		case parser.TokUse:
+			i++
+			j := nextSig(i)
+			// use unquote(var)
+			if j < n && tokens[j].Kind == parser.TokIdent && txt(tokens[j]) == "unquote" {
+				if j+2 < n && tokens[j+1].Kind == parser.TokOpenParen && tokens[j+2].Kind == parser.TokIdent {
+					varName := txt(tokens[j+2])
+					if b, ok := varToOpt[varName]; ok {
+						optBindings = append(optBindings, optBinding{optKey: b.optKey, defaultMod: b.defaultMod, kind: "use"})
+					}
+				}
+				i = skipToEndOfStatement(j)
+				continue
+			}
+			// use Module
+			modName, k := collectModuleName(j)
+			if modName != "" {
+				transUses = append(transUses, resolveAlias(modName))
+			}
+			i = k
+
+		case parser.TokAlias:
+			i++
+			j := nextSig(i)
+			modName, k := collectModuleName(j)
+			if modName == "" {
+				i = k
+				continue
+			}
+			// Multi-alias: alias Parent.{A, B}
+			if k < n && tokens[k].Kind == parser.TokDot && k+1 < n && tokens[k+1].Kind == parser.TokOpenBrace {
+				parent := resolveAlias(modName)
+				k += 2 // skip .{
+				for k < n && tokens[k].Kind != parser.TokCloseBrace && tokens[k].Kind != parser.TokEOF {
+					k = nextSig(k)
+					if k >= n || tokens[k].Kind == parser.TokCloseBrace {
+						break
+					}
+					childName, newK := collectModuleName(k)
+					if childName != "" {
+						if aliases == nil {
+							aliases = make(map[string]string)
+						}
+						aliasKey := childName
+						if dot := strings.LastIndexByte(childName, '.'); dot >= 0 {
+							aliasKey = childName[dot+1:]
+						}
+						aliases[aliasKey] = parent + "." + childName
+					}
+					k = newK
+					if k < n && tokens[k].Kind == parser.TokComma {
+						k++
+					}
+				}
+				if k < n && tokens[k].Kind == parser.TokCloseBrace {
+					k++
+				}
+				i = k
+				continue
+			}
+			// alias Module, as: Name
+			nk := nextSig(k)
+			if nk < n && tokens[nk].Kind == parser.TokComma {
+				afterComma := nextSig(nk + 1)
+				if afterComma < n && tokens[afterComma].Kind == parser.TokIdent && txt(tokens[afterComma]) == "as" {
+					afterAs := nextSig(afterComma + 1)
+					if afterAs < n && tokens[afterAs].Kind == parser.TokColon {
+						afterColon := nextSig(afterAs + 1)
+						if afterColon < n && (tokens[afterColon].Kind == parser.TokModule || tokens[afterColon].Kind == parser.TokIdent) {
+							asName := txt(tokens[afterColon])
+							if aliases == nil {
+								aliases = make(map[string]string)
+							}
+							aliases[asName] = resolveAlias(modName)
+							i = afterColon + 1
+							continue
+						}
+					}
+				}
+			}
+			// Simple alias
+			resolved := resolveAlias(modName)
+			if aliases == nil {
+				aliases = make(map[string]string)
+			}
+			dot := strings.LastIndexByte(resolved, '.')
+			if dot >= 0 {
+				aliases[resolved[dot+1:]] = resolved
+			} else {
+				aliases[resolved] = resolved
+			}
+			i = k
+
+		case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
+			parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate:
+			kind := txt(tok)
+			defLine := tok.Line
+			i++
+			j := nextSig(i)
+			if j >= n || tokens[j].Kind != parser.TokIdent {
+				i = j
+				continue
+			}
+			funcName := txt(tokens[j])
+			j++
+			pj := nextSig(j)
+			maxArity := 0
+			defaultCount := 0
+			var paramNames []string
+			if pj < n && tokens[pj].Kind == parser.TokOpenParen {
+				maxArity, defaultCount, paramNames, pj = collectParamsFromTokens(source, tokens, n, pj)
+				for pi, pn := range paramNames {
+					if pn == "" {
+						paramNames[pi] = "arg" + strconv.Itoa(pi+1)
+					}
+				}
+			}
+			minArity := maxArity - defaultCount
+			for arity := minArity; arity <= maxArity; arity++ {
+				inlineDefs[funcName] = append(inlineDefs[funcName], inlineDef{
+					line:   defLine,
+					arity:  arity,
+					kind:   kind,
+					params: parser.JoinParams(paramNames, arity),
+				})
+			}
+			i = pj
+
+		case parser.TokModule:
+			// Check for Keyword.put/put_new(opts, :key, Module) heuristic
+			modText := txt(tok)
+			if modText == "Keyword" && i+2 < n && tokens[i+1].Kind == parser.TokDot && tokens[i+2].Kind == parser.TokIdent {
+				funcName := txt(tokens[i+2])
+				if funcName == "put" || funcName == "put_new" {
+					_, atomKey, defaultMod, endJ := scanKeywordCall(i)
+					if atomKey != "" && defaultMod != "" {
+						transUses = append(transUses, resolveAlias(defaultMod))
+					}
+					i = endJ
+					continue
+				}
+				if funcName == "get" || funcName == "pop" {
+					_, atomKey, defaultMod, endJ := scanKeywordCall(i)
+					if atomKey != "" {
+						// This is just a bare Keyword.get/pop, not an assignment.
+						// Only var = Keyword.get/pop patterns are handled in the TokIdent case.
+						_ = defaultMod
+						i = endJ
+						continue
+					}
+				}
+			}
+			i++
+
+		case parser.TokIdent:
+			identName := txt(tok)
+			isStmtStart := i == 0 || tokens[i-1].Kind == parser.TokEOL || tokens[i-1].Kind == parser.TokComment
+			j := nextSig(i + 1)
+
+			// Check for var = Keyword.{get,pop,put,put_new,...}(opts, :key, Default)
+			// or var = ModuleName
+			if isStmtStart && j < n && tokens[j].Kind == parser.TokOther && txt(tokens[j]) == "=" {
+				k := nextSig(j + 1)
+				if k < n && tokens[k].Kind == parser.TokModule && txt(tokens[k]) == "Keyword" {
+					funcName, atomKey, defaultMod, endJ := scanKeywordCall(k)
+					switch funcName {
+					case "get", "pop":
+						if atomKey != "" {
+							varToOpt[identName] = varBinding{optKey: atomKey, defaultMod: resolveAlias(defaultMod)}
+						}
+					case "fetch", "pop_lazy":
+						if atomKey != "" {
+							varToOpt[identName] = varBinding{optKey: atomKey}
+						}
+					case "put", "put_new":
+						if atomKey != "" && defaultMod != "" {
+							transUses = append(transUses, resolveAlias(defaultMod))
+						}
+					}
+					i = endJ
+					continue
+				}
+				// var = ModuleName
+				if k < n && tokens[k].Kind == parser.TokModule {
+					modName, endK := collectModuleName(k)
+					if modName != "" {
+						// Check it's a simple assignment (next sig token is EOL or EOF)
+						peek := nextSig(endK)
+						if peek >= n || tokens[peek].Kind == parser.TokEOL || tokens[peek].Kind == parser.TokEOF {
+							varToOpt[identName] = varBinding{defaultMod: resolveAlias(modName)}
+							i = endK
+							continue
+						}
+					}
+				}
+			}
+			// Check for bare function call that delegates to a helper:
+			// helper_name(opts) where helper_name is a def/defp in the same file.
+			// Only at statement start to avoid matching function calls inside expressions.
+			if isStmtStart && j < n && tokens[j].Kind == parser.TokOpenParen && !parser.IsElixirKeyword(identName) {
+				helperImported, helperDefs, helperTransUses, helperBindings, helperAliases := parseHelperQuoteBlock(lines, identName, fileAliases)
+				if helperImported != nil {
+					imported = append(imported, helperImported...)
+					for hk, hv := range helperDefs {
+						inlineDefs[hk] = append(inlineDefs[hk], hv...)
+					}
+					transUses = append(transUses, helperTransUses...)
+					optBindings = append(optBindings, helperBindings...)
+				}
+				for hk, hv := range helperAliases {
+					if aliases == nil {
+						aliases = make(map[string]string)
+					}
+					aliases[hk] = hv
+				}
+				i = skipToEndOfStatement(i)
+				continue
+			}
+			i++
+
+		case parser.TokOpenBrace:
+			// Check for {var, _} = Keyword.pop(opts, :key, Default)
+			j := nextSig(i + 1)
+			if j < n && tokens[j].Kind == parser.TokIdent {
+				varName := txt(tokens[j])
+				// Scan forward to find } = Keyword.pop pattern
+				k := j + 1
+				braceDepth := 1
+				for k < n && braceDepth > 0 {
+					switch tokens[k].Kind {
+					case parser.TokOpenBrace:
+						braceDepth++
+					case parser.TokCloseBrace:
+						braceDepth--
+					}
+					k++
+				}
+				// k is now past }
+				eq := nextSig(k)
+				if eq < n && tokens[eq].Kind == parser.TokOther && txt(tokens[eq]) == "=" {
+					kw := nextSig(eq + 1)
+					if kw < n && tokens[kw].Kind == parser.TokModule && txt(tokens[kw]) == "Keyword" {
+						funcName, atomKey, defaultMod, endJ := scanKeywordCall(kw)
+						if funcName == "pop" && atomKey != "" {
+							varToOpt[varName] = varBinding{optKey: atomKey, defaultMod: resolveAlias(defaultMod)}
+						} else if (funcName == "fetch" || funcName == "pop_lazy") && atomKey != "" {
+							varToOpt[varName] = varBinding{optKey: atomKey}
+						}
+						i = endJ
+						continue
+					}
+				}
+			}
+			i++
+
+		default:
+			i++
 		}
 	}
 	return
+}
+
+// collectParamsFromTokens mirrors the parameter collection from parser_tokenized.go
+// for use in parseUsingBody's inline def extraction.
+func collectParamsFromTokens(source []byte, tokens []parser.Token, n, i int) (int, int, []string, int) {
+	if i >= n || tokens[i].Kind != parser.TokOpenParen {
+		return 0, 0, nil, i
+	}
+	i++ // consume open paren
+	bracketDepth := 1
+	commas := 0
+	defaults := 0
+	hasContent := false
+	var paramNames []string
+	currentParamName := ""
+	seenDefault := false
+
+	for i < n && bracketDepth > 0 {
+		tok := tokens[i]
+		switch tok.Kind {
+		case parser.TokOpenParen, parser.TokOpenBracket, parser.TokOpenBrace:
+			bracketDepth++
+			hasContent = true
+			i++
+		case parser.TokCloseParen, parser.TokCloseBracket, parser.TokCloseBrace:
+			bracketDepth--
+			if bracketDepth == 0 {
+				if hasContent {
+					if seenDefault {
+						defaults++
+					}
+					paramNames = append(paramNames, currentParamName)
+				}
+				i++
+				bti := 0
+				if hasContent {
+					bti = 1
+				}
+				return commas + bti, defaults, paramNames, i
+			}
+			i++
+		case parser.TokComma:
+			if bracketDepth == 1 {
+				commas++
+				if seenDefault {
+					defaults++
+				}
+				paramNames = append(paramNames, currentParamName)
+				currentParamName = ""
+				seenDefault = false
+			}
+			i++
+		case parser.TokBackslash:
+			if bracketDepth == 1 {
+				seenDefault = true
+			}
+			hasContent = true
+			i++
+		case parser.TokIdent:
+			if bracketDepth == 1 && currentParamName == "" {
+				name := string(source[tok.Start:tok.End])
+				if name != "_" {
+					currentParamName = name
+				}
+			}
+			hasContent = true
+			i++
+		case parser.TokEOL, parser.TokComment:
+			i++
+		default:
+			hasContent = true
+			i++
+		}
+	}
+	if hasContent {
+		if seenDefault {
+			defaults++
+		}
+		paramNames = append(paramNames, currentParamName)
+		return commas + 1, defaults, paramNames, i
+	}
+	return 0, 0, nil, i
 }
 
 // ExtractModuleAttribute returns the attribute name if the cursor is on a @attr reference,

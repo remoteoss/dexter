@@ -781,29 +781,60 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 				if isStatementStart {
 					name := tokenText(tok)
 					if !elixirKeyword[name] {
+						emit := false
 						j := i + 1
 						if j < n {
-							next := tokens[j]
-							switch next.Kind {
+							switch tokens[j].Kind {
 							case TokDo:
-								for mod := range injectors {
-									refs = append(refs, Reference{Module: mod, Function: name, Line: tok.Line, FilePath: path, Kind: "call"})
-								}
+								// macro_name do
+								emit = true
 							case TokOpenParen:
-								for mod := range injectors {
-									refs = append(refs, Reference{Module: mod, Function: name, Line: tok.Line, FilePath: path, Kind: "call"})
-								}
+								// macro_name(...)
+								emit = true
 							case TokAtom:
-								for mod := range injectors {
-									refs = append(refs, Reference{Module: mod, Function: name, Line: tok.Line, FilePath: path, Kind: "call"})
-								}
-							case TokString, TokHeredoc, TokSigil:
-								afterStr := nextSig(j + 1)
-								if afterStr < n && tokens[afterStr].Kind == TokDo {
-									for mod := range injectors {
-										refs = append(refs, Reference{Module: mod, Function: name, Line: tok.Line, FilePath: path, Kind: "call"})
+								// macro_name :atom
+								emit = true
+							default:
+								// Scan forward to see if TokDo follows the arguments.
+								// In Elixir, `do` can follow across EOLs and blank lines
+								// but not past an intervening statement. We track whether
+								// we've seen EOL at bracket depth 0: once we have, the
+								// only token that can continue the expression is `do`.
+								scanDepth := 0
+								seenEOLAtZero := false
+								for k := j; k < n; k++ {
+									switch tokens[k].Kind {
+									case TokDo:
+										if scanDepth == 0 {
+											emit = true
+										}
+									case TokEOL, TokComment:
+										if scanDepth == 0 {
+											seenEOLAtZero = true
+										}
+									case TokOpenParen, TokOpenBracket, TokOpenBrace:
+										scanDepth++
+										seenEOLAtZero = false
+									case TokCloseParen, TokCloseBracket, TokCloseBrace:
+										scanDepth--
+									case TokEOF:
+										k = n
+									default:
+										// At depth 0, after seeing EOL, any non-do
+										// token means a new statement started.
+										if scanDepth == 0 && seenEOLAtZero {
+											k = n // stop
+										}
+									}
+									if emit {
+										break
 									}
 								}
+							}
+						}
+						if emit {
+							for mod := range injectors {
+								refs = append(refs, Reference{Module: mod, Function: name, Line: tok.Line, FilePath: path, Kind: "call"})
 							}
 						}
 					}
