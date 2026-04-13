@@ -447,7 +447,7 @@ func extractAliasesFromText(text string, targetLine int) map[string]string {
 			}
 
 		case parser.TokDefmodule, parser.TokDefprotocol, parser.TokDefimpl:
-			i = processModuleDef(i + 1)
+			i = processModuleDef(i+1) - 1 // -1: loop post-increment will advance to the returned position
 			continue
 
 		case parser.TokAlias:

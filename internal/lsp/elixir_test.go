@@ -488,6 +488,17 @@ func TestExtractAliases(t *testing.T) {
 			t.Errorf("got %q, want MyApp.HRIS.Services.AssociateWithTeamV2", full)
 		}
 	})
+
+	t.Run("alias on same line as defmodule do is not skipped", func(t *testing.T) {
+		// Regression: the for-loop post-increment skipped the first token after
+		// processModuleDef returned. On a single-line defmodule + alias, the
+		// alias token was missed.
+		text := "defmodule MyApp.Web do alias MyApp.Accounts\nend"
+		aliases := ExtractAliases(text)
+		if aliases["Accounts"] != "MyApp.Accounts" {
+			t.Errorf("Accounts: got %q, want MyApp.Accounts", aliases["Accounts"])
+		}
+	})
 }
 
 func TestExtractAliasesInScope(t *testing.T) {
