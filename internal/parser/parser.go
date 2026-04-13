@@ -94,7 +94,8 @@ func joinContinuedLines(lines []string) []Line {
 		line := lines[i]
 		for hasTrailingBackslash(line) && i+1 < len(lines) {
 			i++
-			line = strings.TrimRight(line[:len(line)-1], " \t") + " " + lines[i]
+			trimmed := strings.TrimRight(line, " \t\r")
+			line = trimmed[:len(trimmed)-1] + " " + lines[i]
 		}
 		result = append(result, Line{Content: line, OrigNum: origNum})
 		i++

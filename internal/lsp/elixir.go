@@ -843,7 +843,10 @@ func ExtractUsesWithOpts(text string, aliases map[string]string) []UseCall {
 				var optsBuilder strings.Builder
 				for i+1 < len(lines) {
 					next := strings.TrimSpace(lines[i+1])
-					if next == "" || next[0] == '#' {
+					if next == "" {
+						break
+					}
+					if next[0] == '#' {
 						i++
 						continue
 					}
