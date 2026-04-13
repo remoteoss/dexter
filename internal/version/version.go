@@ -5,4 +5,4 @@ const Version = "0.5.3"
 // IndexVersion is incremented whenever the index schema or parser changes in a
 // way that requires a full rebuild. Bump this alongside Version when releasing
 // a change that makes existing indexes stale.
-const IndexVersion = 10
+const IndexVersion = 11

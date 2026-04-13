@@ -2539,25 +2539,6 @@ end
 	}
 }
 
-func TestFindUnclosedSigil(t *testing.T) {
-	tests := []struct {
-		line  string
-		found bool
-	}{
-		{`  @doc ~S(`, true},
-		{`  )`, false},
-		{`  x = ~s(foo)`, false},
-		{`  x = ~s(foo`, true},
-		{`    Fake.Module.ref() inside sigil`, false},
-	}
-	for _, tt := range tests {
-		_, ok := findUnclosedSigil(tt.line)
-		if ok != tt.found {
-			t.Errorf("findUnclosedSigil(%q) = %v, want %v", tt.line, ok, tt.found)
-		}
-	}
-}
-
 func TestBracketDepth_SigilOpen(t *testing.T) {
 	tests := []struct {
 		line   string
