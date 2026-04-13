@@ -519,8 +519,45 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 			continue
 
 		case TokRequire:
+			requireLine := tok.Line
 			i++
-			goto extractRefsForLine
+			j := nextSig(i)
+			modName, k := collectModuleName(j)
+			if modName == "" {
+				i = k
+				goto extractRefsForLine
+			}
+			cm := currentModule()
+
+			// Check for require Module, as: Name
+			nk := nextSig(k)
+			if nk < n && tokens[nk].Kind == TokComma {
+				afterComma := nextSig(nk + 1)
+				if afterComma < n && tokens[afterComma].Kind == TokIdent && tokenText(tokens[afterComma]) == "as" {
+					afterAs := nextSig(afterComma + 1)
+					if afterAs < n && tokens[afterAs].Kind == TokColon {
+						afterColon := nextSig(afterAs + 1)
+						if afterColon < n && (tokens[afterColon].Kind == TokModule || tokens[afterColon].Kind == TokIdent) {
+							asName := tokenText(tokens[afterColon])
+							resolved := resolveModule(modName, cm)
+							if !strings.Contains(resolved, "__MODULE__") {
+								aliases[asName] = resolved
+								refs = append(refs, Reference{Module: resolved, Line: requireLine, FilePath: path, Kind: "require"})
+							}
+							i = afterColon + 1
+							continue
+						}
+					}
+				}
+			}
+
+			// Simple require (no as:) — still emit reference but no alias
+			resolved := resolveModule(modName, cm)
+			if !strings.Contains(resolved, "__MODULE__") {
+				refs = append(refs, Reference{Module: resolved, Line: requireLine, FilePath: path, Kind: "require"})
+			}
+			i = k
+			continue
 
 		case TokAttrType:
 			cm := currentModule()

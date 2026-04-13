@@ -537,6 +537,35 @@ func extractAliasesFromText(text string, targetLine int) map[string]string {
 				allAliases = append(allAliases, aliasEntry{cm, short, resolved})
 			}
 			i = k - 1
+
+		case parser.TokRequire:
+			cm := currentModule()
+			j := tokNextSig(tokens, n, i+1)
+			modName, k := tokCollectModuleName(source, tokens, n, j)
+			if modName == "" {
+				continue
+			}
+
+			// Check for require Module, as: Name
+			nk := tokNextSig(tokens, n, k)
+			if nk < n && tokens[nk].Kind == parser.TokComma {
+				ac := tokNextSig(tokens, n, nk+1)
+				if ac < n && tokens[ac].Kind == parser.TokIdent && tokText(source, tokens[ac]) == "as" {
+					ac2 := tokNextSig(tokens, n, ac+1)
+					if ac2 < n && tokens[ac2].Kind == parser.TokColon {
+						ac3 := tokNextSig(tokens, n, ac2+1)
+						if ac3 < n && (tokens[ac3].Kind == parser.TokModule || tokens[ac3].Kind == parser.TokIdent) {
+							resolved := resolve(modName)
+							if !strings.Contains(resolved, "__MODULE__") {
+								allAliases = append(allAliases, aliasEntry{cm, tokText(source, tokens[ac3]), resolved})
+							}
+							i = ac3
+							continue
+						}
+					}
+				}
+			}
+			i = k - 1
 		}
 	}
 

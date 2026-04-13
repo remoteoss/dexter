@@ -1833,6 +1833,74 @@ end`
 	}
 }
 
+func TestDefinition_AliasInjectedByUse_MultiAliasUnexpectedTokens_NoHang(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Regression: malformed tokens inside a multi-alias brace list must not hang
+	// alias parsing, and valid children in the same list should still resolve.
+	schemaSrc := `defmodule MyApp.Schema do
+  defmacro __using__(_opts) do
+    quote do
+      alias MyApp.{:unexpected, Meta, 42}
+    end
+  end
+end`
+	metaSrc := `defmodule MyApp.Meta do
+  def source(x), do: x
+end`
+	callerSrc := `defmodule MyApp.MyCheck do
+  use MyApp.Schema
+
+  def run do
+    Meta.source(:foo)
+  end
+end`
+
+	indexFile(t, server.store, server.projectRoot, "lib/schema.ex", schemaSrc)
+	indexFile(t, server.store, server.projectRoot, "lib/meta.ex", metaSrc)
+
+	callerURI := "file://" + filepath.Join(server.projectRoot, "lib/my_check.ex")
+	server.docs.Set(callerURI, callerSrc)
+
+	type definitionResult struct {
+		locs []protocol.Location
+		err  error
+	}
+	done := make(chan definitionResult, 1)
+	go func() {
+		locs, err := server.Definition(context.Background(), &protocol.DefinitionParams{
+			TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+				TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(callerURI)},
+				Position:     protocol.Position{Line: 4, Character: 4},
+			},
+		})
+		done <- definitionResult{locs: locs, err: err}
+	}()
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		if len(got.locs) == 0 {
+			t.Fatal("expected definition for Meta from use-injected alias")
+		}
+		foundMeta := false
+		for _, loc := range got.locs {
+			if strings.Contains(string(loc.URI), "meta.ex") {
+				foundMeta = true
+				break
+			}
+		}
+		if !foundMeta {
+			t.Fatalf("expected definition location in meta.ex, got %v", got.locs)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("definition timed out; possible infinite loop in multi-alias brace scanning")
+	}
+}
+
 func TestReferences_UseWithOptOverride(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
@@ -4387,5 +4455,49 @@ end`)
 	}
 	if !hasReplacement {
 		t.Error("expected an edit replacing the module ref with 'Client'")
+	}
+}
+
+func TestDefinition_RequireWithAs(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	snapshotSrc := `defmodule MyApp.Snapshots.ContractSnapshotSchema do
+  defmacro snapshot_fields do
+    quote do
+      field(:snapshot_data, :map)
+    end
+  end
+end`
+
+	contractSrc := `defmodule MyApp.Contract do
+  require MyApp.Snapshots.ContractSnapshotSchema, as: ContractSnapshotSchema
+
+  schema "contracts" do
+    ContractSnapshotSchema.snapshot_fields()
+  end
+end`
+
+	indexFile(t, server.store, server.projectRoot, "lib/snapshots/contract_snapshot_schema.ex", snapshotSrc)
+	snapshotURI := "file://" + filepath.Join(server.projectRoot, "lib/snapshots/contract_snapshot_schema.ex")
+	server.docs.Set(snapshotURI, snapshotSrc)
+
+	contractURI := "file://" + filepath.Join(server.projectRoot, "lib/contract.ex")
+	server.docs.Set(contractURI, contractSrc)
+
+	// line 4 (0-indexed): `    ContractSnapshotSchema.snapshot_fields()` — col 4 is on ContractSnapshotSchema
+	locs := definitionAt(t, server, contractURI, 4, 4)
+	if len(locs) == 0 {
+		t.Fatal("expected go-to-definition for ContractSnapshotSchema resolved via require with as:")
+	}
+
+	found := false
+	for _, loc := range locs {
+		if strings.Contains(string(loc.URI), "contract_snapshot_schema.ex") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected definition location in contract_snapshot_schema.ex, got %v", locs)
 	}
 }
