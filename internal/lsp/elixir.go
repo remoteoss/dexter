@@ -686,11 +686,6 @@ func parseHelperQuoteBlock(lines []string, helperName string, fileAliases map[st
 		for k < n {
 			switch tokens[k].Kind {
 			case parser.TokDo:
-				afterDo := tokNextSig(tokens, n, k+1)
-				// `do:` one-line form — no matching `end` to skip.
-				if afterDo < n && tokens[afterDo].Kind == parser.TokColon {
-					return k
-				}
 				// Block form (`... do ... end`) — skip nested do/fn..end.
 				bodyDepth := 1
 				k++
@@ -1101,11 +1096,6 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 		for k := from; k < n && k < headerEnd; k++ {
 			if tokens[k].Kind != parser.TokDo {
 				continue
-			}
-			afterDo := nextSig(k + 1)
-			// `do:` one-line form; no trailing `end` to consume.
-			if afterDo < n && tokens[afterDo].Kind == parser.TokColon {
-				return headerEnd
 			}
 			// Block form (`... do ... end`) — skip nested do/fn..end.
 			bodyDepth := 1
