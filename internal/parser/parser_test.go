@@ -131,6 +131,72 @@ end
 	}
 }
 
+func TestParseFile_NestedModuleDoNextLine(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.Outer do
+  defmodule Inner
+  do
+    def inner_func, do: :ok
+  end
+
+  def outer_func, do: :ok
+end
+`)
+
+	defs, _, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var innerMod, innerFunc bool
+	for _, d := range defs {
+		if d.Kind == "module" && d.Module == "MyApp.Outer.Inner" {
+			innerMod = true
+		}
+		if d.Function == "inner_func" {
+			innerFunc = true
+			if d.Module != "MyApp.Outer.Inner" {
+				t.Errorf("inner_func should belong to MyApp.Outer.Inner, got %s", d.Module)
+			}
+		}
+		if d.Function == "outer_func" && d.Module != "MyApp.Outer" {
+			t.Errorf("outer_func should belong to MyApp.Outer, got %s", d.Module)
+		}
+	}
+	if !innerMod {
+		t.Error("missing inner module definition")
+	}
+	if !innerFunc {
+		t.Error("missing inner_func")
+	}
+}
+
+func TestParseFile_InlineDoModule(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.Outer do
+  defmodule Inline, do: (def greet, do: :hi)
+
+  def outer_func, do: :ok
+end
+`)
+
+	defs, _, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var inlineMod bool
+	for _, d := range defs {
+		if d.Kind == "module" && d.Module == "MyApp.Outer.Inline" {
+			inlineMod = true
+		}
+		if d.Function == "outer_func" && d.Module != "MyApp.Outer" {
+			t.Errorf("outer_func should belong to MyApp.Outer, got %s", d.Module)
+		}
+	}
+	if !inlineMod {
+		t.Error("missing MyApp.Outer.Inline module definition from inline do: form")
+	}
+}
+
 func TestParseFile_Macros(t *testing.T) {
 	path := writeTempFile(t, `defmodule MyApp.Macros do
   defmacro my_macro(arg) do
@@ -2126,7 +2192,7 @@ func TestParseFile_TripleQuoteInStringDoesNotToggleHeredoc(t *testing.T) {
 func TestParseText_LineContinuation(t *testing.T) {
 	// Bug 4: backslash at EOL joins with next line.
 	// Use a case where the module name spans the continuation boundary.
-	text := "defmodule MyApp.Foo\n  alias Some.\\\n    Module\n  def bar, do: Some.Module.call()\nend\n"
+	text := "defmodule MyApp.Foo do\n  alias Some.\\\n    Module\n  def bar, do: Some.Module.call()\nend\n"
 
 	_, refs, err := ParseText("test.ex", text)
 	if err != nil {

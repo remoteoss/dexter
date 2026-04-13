@@ -59,6 +59,8 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 	// processModuleDef handles defmodule/defprotocol/defimpl.
 	// It collects the module name, scans forward to consume the TokDo token,
 	// increments depth, and pushes the module frame with the post-increment depth.
+	// For inline `, do:` modules the definition is still emitted but no frame is
+	// pushed (no do..end scope to track).
 	processModuleDef := func(i int, kind string) int {
 		kwLine := tokens[i-1].Line
 		j := nextSig(i)
@@ -70,33 +72,43 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 			name = currentModule() + "." + name
 		}
 
-		// Scan forward to find and consume TokDo (skipping "for: Module" etc.)
-		scanPos := j
-		for scanPos < n {
-			if tokens[scanPos].Kind == TokDo {
-				depth++
-				scanPos++ // consume TokDo
-				break
-			}
-			if tokens[scanPos].Kind == TokEOL || tokens[scanPos].Kind == TokEOF {
-				break
-			}
-			scanPos++
-		}
-
-		moduleStack = append(moduleStack, moduleFrame{
-			name:           name,
-			depth:          depth,
-			savedAliases:   copyMap(aliases),
-			savedInjectors: copyBoolMap(injectors),
-		})
+		// Always emit the module definition — even `, do:` one-liners must be
+		// tracked so callers can find the module.
 		defs = append(defs, Definition{
 			Module:   name,
 			Line:     kwLine,
 			FilePath: path,
 			Kind:     kind,
 		})
-		return scanPos
+
+		// Scan forward to find and consume TokDo (skipping "for: Module" etc.).
+		// Do not stop at TokEOL — Elixir allows `defmodule Name` then `do` on the
+		// next line; stopping at EOL left TokDo to the main loop (double-counting
+		// depth) so inner `end` did not pop the inner module frame.
+		// Stop at statement-boundary tokens to avoid stealing a later module's TokDo
+		// when the current module uses the `, do:` keyword form.
+		scanPos := j
+		for scanPos < n {
+			switch tokens[scanPos].Kind {
+			case TokDo:
+				depth++
+				scanPos++ // consume TokDo
+				moduleStack = append(moduleStack, moduleFrame{
+					name:           name,
+					depth:          depth,
+					savedAliases:   copyMap(aliases),
+					savedInjectors: copyBoolMap(injectors),
+				})
+				return scanPos
+			case TokEOF, TokEnd,
+				TokDefmodule, TokDefprotocol, TokDefimpl,
+				TokDef, TokDefp, TokDefmacro, TokDefmacrop,
+				TokDefguard, TokDefguardp, TokDefdelegate:
+				return scanPos
+			}
+			scanPos++
+		}
+		return j
 	}
 
 	emitModuleRef := func(modName string, line int, kind string) {

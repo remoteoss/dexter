@@ -411,20 +411,20 @@ func extractAliasesFromText(text string, targetLine int) map[string]string {
 			name = currentModule() + "." + name
 		}
 		// Scan forward to consume TokDo. Do not stop at TokEOL because
-		// Elixir allows:
-		//   defmodule Foo
-		//   do
-		//     ...
-		//   end
-		// and we still need to push the module frame for scope tracking.
+		// Elixir allows `defmodule Foo` then `do` on the next line.
+		// Stop at statement-boundary tokens to avoid stealing a later
+		// module's TokDo when the current module uses `, do:` form.
 		for pos := k; pos < n; pos++ {
-			if tokens[pos].Kind == parser.TokDo {
+			switch tokens[pos].Kind {
+			case parser.TokDo:
 				depth++
 				stack = append(stack, moduleFrame{name, depth})
 				return pos + 1
-			}
-			if tokens[pos].Kind == parser.TokEOF {
-				break
+			case parser.TokEOF, parser.TokEnd,
+				parser.TokDefmodule, parser.TokDefprotocol, parser.TokDefimpl,
+				parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
+				parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate:
+				return pos
 			}
 		}
 		return k
