@@ -509,6 +509,35 @@ func extractEnclosingModuleFromTokens(source []byte, tokens []parser.Token, targ
 	var stack []moduleFrame
 	depth := 0
 
+	processModuleDef := func(i int) int {
+		j := tokNextSig(tokens, n, i)
+		name, k := tokCollectModuleName(source, tokens, n, j)
+		if name == "" {
+			return i
+		}
+		if !strings.Contains(name, ".") && len(stack) > 0 {
+			name = stack[len(stack)-1].name + "." + name
+		}
+		// Scan forward to consume TokDo. Do not stop at TokEOL because
+		// Elixir allows `defmodule Foo` then `do` on the next line.
+		// Stop at statement-boundary tokens to avoid stealing a later
+		// module's TokDo when the current module uses `, do:` form.
+		for pos := k; pos < n; pos++ {
+			switch tokens[pos].Kind {
+			case parser.TokDo:
+				depth++
+				stack = append(stack, moduleFrame{name, depth})
+				return pos + 1
+			case parser.TokEOF, parser.TokEnd,
+				parser.TokDefmodule, parser.TokDefprotocol, parser.TokDefimpl,
+				parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
+				parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate:
+				return pos
+			}
+		}
+		return k
+	}
+
 	for i := 0; i < n; i++ {
 		tok := tokens[i]
 		if tok.Line > targetLine1 {
@@ -527,25 +556,8 @@ func extractEnclosingModuleFromTokens(source []byte, tokens []parser.Token, targ
 				depth = 0
 			}
 		case parser.TokDefmodule:
-			j := tokNextSig(tokens, n, i+1)
-			name, k := tokCollectModuleName(source, tokens, n, j)
-			if name == "" {
-				continue
-			}
-			if !strings.Contains(name, ".") && len(stack) > 0 {
-				name = stack[len(stack)-1].name + "." + name
-			}
-			// Find the do token
-			for pos := k; pos < n; pos++ {
-				if tokens[pos].Kind == parser.TokDo {
-					depth++
-					stack = append(stack, moduleFrame{name, depth})
-					break
-				}
-				if tokens[pos].Kind == parser.TokEOF {
-					break
-				}
-			}
+			i = processModuleDef(i+1) - 1 // -1: loop post-increment will advance to the returned position
+			continue
 		}
 	}
 

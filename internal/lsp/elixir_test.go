@@ -2682,6 +2682,49 @@ end`
 	}
 }
 
+func TestExtractEnclosingModuleFromTokens_NestedModules(t *testing.T) {
+	text := `defmodule MyApp.Outer do
+  defmodule Inner do
+    def run do
+      __MODULE__
+    end
+  end
+
+  def call do
+    __MODULE__
+  end
+end`
+
+	tokens := parser.Tokenize([]byte(text))
+
+	inner := extractEnclosingModuleFromTokens([]byte(text), tokens, 3)
+	if inner != "MyApp.Outer.Inner" {
+		t.Errorf("inner: got %q, want MyApp.Outer.Inner", inner)
+	}
+
+	outer := extractEnclosingModuleFromTokens([]byte(text), tokens, 7)
+	if outer != "MyApp.Outer" {
+		t.Errorf("outer: got %q, want MyApp.Outer", outer)
+	}
+}
+
+func TestExtractEnclosingModuleFromTokens_DoesNotStealLaterDoFromInlineModule(t *testing.T) {
+	text := `defmodule MyApp.Outer do
+  defmodule Inline, do: nil
+
+  def run do
+    __MODULE__
+  end
+end`
+
+	tokens := parser.Tokenize([]byte(text))
+
+	enclosing := extractEnclosingModuleFromTokens([]byte(text), tokens, 4)
+	if enclosing != "MyApp.Outer" {
+		t.Errorf("got %q, want MyApp.Outer", enclosing)
+	}
+}
+
 func TestExtractUsesWithOpts_StringContent(t *testing.T) {
 	text := `defmodule MyApp.Foo do
   def bar do
