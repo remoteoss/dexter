@@ -2212,6 +2212,15 @@ func TestCallContextAtCursor(t *testing.T) {
 			wantOK:     true,
 		},
 		{
+			name:       "no-paren keyword if is not a call",
+			text:       "if true do\n  :ok\nend",
+			line:       0,
+			col:        5,
+			wantExpr:   "",
+			wantArgIdx: 0,
+			wantOK:     false,
+		},
+		{
 			name:       "no-paren two args second",
 			text:       `Enum.each list, fun`,
 			line:       0,

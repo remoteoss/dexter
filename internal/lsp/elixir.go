@@ -2082,7 +2082,7 @@ func callContextNoParen(tokens []parser.Token, source []byte, startIdx int, _ in
 					// value-like token (not an operator like =, ->, etc.)
 					if next.Start > tok.End && isArgStartToken(next.Kind) {
 						expr := collectDotChain(tokens, source, i)
-						if expr == "" {
+						if expr == "" || parser.IsElixirKeyword(expr) {
 							return "", 0, false
 						}
 						return expr, commas, true
