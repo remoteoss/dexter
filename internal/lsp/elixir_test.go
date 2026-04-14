@@ -445,11 +445,20 @@ end`
     # missing close brace
   end
 end`
-		// It should not panic or hang, and should return true because the user might be typing
-		// and hasn't closed the brace yet. We still want to resolve the parent for completions.
-		parent, ok := ExtractAliasBlockParent(strings.Split(text, "\n"), 3)
-		if !ok || parent != "MyApp.Services" {
-			t.Errorf("expected to be in block with parent MyApp.Services, got %q, %v", parent, ok)
+		lines := strings.Split(text, "\n")
+		// Unclosed `{`: user is still typing. We still want the parent for completion/hover
+		// on lines inside the block, and the forward scan must not walk the whole file
+		// looking for a `}` on the same line as `{` (regression guard for the line-bound
+		// scan in ExtractAliasBlockParent).
+		for _, line := range []int{2, 3} {
+			parent, ok := ExtractAliasBlockParent(lines, line)
+			if !ok || parent != "MyApp.Services" {
+				t.Errorf("line %d: expected in block parent MyApp.Services, got %q, ok=%v", line, parent, ok)
+			}
+		}
+		parent, ok := ExtractAliasBlockParent(lines, 0)
+		if ok {
+			t.Errorf("line 0 (defmodule): expected not in alias block, got parent %q", parent)
 		}
 	})
 }
@@ -848,21 +857,34 @@ end
 			t.Errorf("expected Validator alias after trailing fn, got %q", aliases["Validator"])
 		}
 	})
-	t.Run("multiple on same line", func(t *testing.T) {
+	t.Run("alias and require as on same line with semicolon", func(t *testing.T) {
+		// Regression: after `alias Mod, as: Name` / `require Mod, as: Name`, the token
+		// walker must resume at the value token (ScanKeywordOptionValue's nextPos) so the
+		// for-loop post-increment does not skip the next statement on the same line.
 		text := `defmodule MyApp.Outer do
   alias MyApp.Foo, as: MyFoo; alias MyApp.Bar, as: MyBar
-  
+  require MyApp.Baz, as: MyBaz; require MyApp.Qux, as: MyQux
+
   def call do
     MyFoo.run()
     MyBar.run()
+    MyBaz.ok()
+    MyQux.ok()
   end
 end`
+		// Line 4 is `def call do` — still inside Outer; aliases from lines 1–2 must be visible.
 		aliases := ExtractAliasesInScope(text, 4)
 		if aliases["MyFoo"] != "MyApp.Foo" {
-			t.Errorf("got %q, want MyApp.Foo", aliases["MyFoo"])
+			t.Errorf("MyFoo: got %q, want MyApp.Foo", aliases["MyFoo"])
 		}
 		if aliases["MyBar"] != "MyApp.Bar" {
-			t.Errorf("got %q, want MyApp.Bar", aliases["MyBar"])
+			t.Errorf("MyBar: got %q, want MyApp.Bar", aliases["MyBar"])
+		}
+		if aliases["MyBaz"] != "MyApp.Baz" {
+			t.Errorf("MyBaz: got %q, want MyApp.Baz", aliases["MyBaz"])
+		}
+		if aliases["MyQux"] != "MyApp.Qux" {
+			t.Errorf("MyQux: got %q, want MyApp.Qux", aliases["MyQux"])
 		}
 	})
 }
@@ -1736,6 +1758,28 @@ end`
 		}
 		if aliases["Helper"] != "MyApp.Helper" {
 			t.Errorf("Helper: got %q, want MyApp.Helper", aliases["Helper"])
+		}
+	})
+
+	t.Run("two alias as on one line in quote", func(t *testing.T) {
+		// Same regression as ExtractAliasesInScope semicolon case, but through parseUsingBody
+		// (use-chain / __using__ extraction uses a separate loop with the same nextPos rule).
+		text := `defmodule MyApp.Schema do
+  defmacro __using__(_opts) do
+    quote do
+      alias MyApp.Foo, as: MyFoo; alias MyApp.Bar, as: MyBar
+    end
+  end
+end`
+		_, _, _, _, aliases := parseUsingBody(text)
+		if aliases == nil {
+			t.Fatal("expected aliases, got nil")
+		}
+		if aliases["MyFoo"] != "MyApp.Foo" {
+			t.Errorf("MyFoo: got %q, want MyApp.Foo", aliases["MyFoo"])
+		}
+		if aliases["MyBar"] != "MyApp.Bar" {
+			t.Errorf("MyBar: got %q, want MyApp.Bar", aliases["MyBar"])
 		}
 	})
 
