@@ -436,6 +436,22 @@ end`
 			t.Errorf("got %q, want MyApp.Services", parent)
 		}
 	})
+	t.Run("missing close brace", func(t *testing.T) {
+		text := `defmodule MyApp.Web do
+  alias MyApp.Services.{
+    Accounts,
+  
+  def foo do
+    # missing close brace
+  end
+end`
+		// It should not panic or hang, and should return true because the user might be typing
+		// and hasn't closed the brace yet. We still want to resolve the parent for completions.
+		parent, ok := ExtractAliasBlockParent(strings.Split(text, "\n"), 3)
+		if !ok || parent != "MyApp.Services" {
+			t.Errorf("expected to be in block with parent MyApp.Services, got %q, %v", parent, ok)
+		}
+	})
 }
 
 func TestExtractAliases(t *testing.T) {
@@ -830,6 +846,23 @@ end
 		aliases := ExtractAliasesInScope(trailingFnSrc, 10)
 		if aliases["Validator"] != "MyApp.Validator" {
 			t.Errorf("expected Validator alias after trailing fn, got %q", aliases["Validator"])
+		}
+	})
+	t.Run("multiple on same line", func(t *testing.T) {
+		text := `defmodule MyApp.Outer do
+  alias MyApp.Foo, as: MyFoo; alias MyApp.Bar, as: MyBar
+  
+  def call do
+    MyFoo.run()
+    MyBar.run()
+  end
+end`
+		aliases := ExtractAliasesInScope(text, 4)
+		if aliases["MyFoo"] != "MyApp.Foo" {
+			t.Errorf("got %q, want MyApp.Foo", aliases["MyFoo"])
+		}
+		if aliases["MyBar"] != "MyApp.Bar" {
+			t.Errorf("got %q, want MyApp.Bar", aliases["MyBar"])
 		}
 	})
 }
