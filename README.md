@@ -238,20 +238,6 @@ To override the binary path manually, add this to your `settings.json`:
 
 The emacs instructions assume you're using **use-package**.
 
-### Helix
-
-Add to your LSP configuration in `~/.config/helix/languages.toml`:
-
-```toml
-[language-server.dexter]
-command = "dexter"
-args = ["lsp"]
-
-[[language]]
-name = "elixir"
-language-servers = ["dexter"]
-```
-
 #### Eglot
 
 ##### Emacs version >= 30
@@ -299,6 +285,20 @@ language-servers = ["dexter"]
                      '("/path/to/dexter" "lsp")) ;; wherever `which dexter` points to
     :activation-fn (lsp-activate-on "elixir")
     :server-id 'dexter-elixir)))
+```
+
+### Helix
+
+Add to your LSP configuration in `~/.config/helix/languages.toml`:
+
+```toml
+[language-server.dexter]
+command = "dexter"
+args = ["lsp"]
+
+[[language]]
+name = "elixir"
+language-servers = ["dexter"]
 ```
 
 ## Why build another LSP?
