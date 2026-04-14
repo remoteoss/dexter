@@ -595,27 +595,6 @@ func IsDefmoduleLine(text string, lineNum int) (string, bool) {
 	return "", false
 }
 
-// IsDefinitionLine checks if the given line contains a definition
-// (defmodule, def, defp, defmacro, @type, etc.). Used to find boundaries
-// when extracting documentation.
-func IsDefinitionLine(line string) bool {
-	if len(line) == 0 {
-		return false
-	}
-
-	tokens := parser.Tokenize([]byte(line))
-	for _, tok := range tokens {
-		switch tok.Kind {
-		case parser.TokDefmodule, parser.TokDefprotocol, parser.TokDefimpl,
-			parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
-			parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate,
-			parser.TokAttrType:
-			return true
-		}
-	}
-	return false
-}
-
 // FindModuleAttributeDefinitionTokenized searches for the line where @attr_name
 // is defined (assigned a value, not used). Returns the 1-based line number and
 // true if found. Uses the tokenizer for accurate parsing.
@@ -644,14 +623,28 @@ func FindModuleAttributeDefinitionTokenized(text string, attrName string) (int, 
 			continue
 		}
 
-		// Check that it's followed by a value (not just a reference like @attr)
-		j := tokNextSig(tokens, n, i+1)
-		if j >= n {
+		// Match only line-start attributes (equivalent to ^\s*@attr from
+		// the line-based parser), not references inside expressions.
+		atLineStart := true
+		for k := i - 1; k >= 0 && tokens[k].Kind != parser.TokEOL; k-- {
+			if tokens[k].Kind != parser.TokComment {
+				atLineStart = false
+				break
+			}
+		}
+		if !atLineStart {
 			continue
 		}
 
-		// A definition has something after the attribute on the same statement
-		// Skip if followed by another @ (like @attr @other_attr)
+		// A definition needs a value token on the same line after @attr.
+		j := i + 1
+		for j < n && tokens[j].Kind == parser.TokComment {
+			j++
+		}
+		if j >= n || tokens[j].Kind == parser.TokEOL || tokens[j].Line != tok.Line {
+			continue
+		}
+		// Skip invalid `@attr @other_attr` patterns.
 		if tokens[j].Kind == parser.TokAttr {
 			continue
 		}

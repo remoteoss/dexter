@@ -1061,6 +1061,21 @@ end`
 			t.Error("expected not found for nonexistent attribute")
 		}
 	})
+
+	t.Run("does not treat attribute reference as definition", func(t *testing.T) {
+		refText := `defmodule MyApp.Worker do
+  def run(job) do
+    process(@my_attr)
+    @my_attr
+    :ok
+  end
+end`
+
+		_, found := FindModuleAttributeDefinition(refText, "my_attr")
+		if found {
+			t.Error("expected reference-only @my_attr to not be treated as a definition")
+		}
+	})
 }
 
 func TestExtractCompletionContext(t *testing.T) {

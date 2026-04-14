@@ -203,6 +203,92 @@ end`
 	}
 }
 
+func TestExtractModuledoc_SigilHeredoc(t *testing.T) {
+	src := `defmodule MyApp.Users do
+  @moduledoc ~S"""
+  Manages user accounts.
+
+  Keep #{interpolation} literal.
+  """
+
+  def create(attrs) do
+    :ok
+  end
+end`
+
+	doc := NewTokenizedFile(src).ExtractModuledoc(0)
+
+	if !strings.Contains(doc, "Manages user accounts.") {
+		t.Errorf("expected moduledoc content, got %q", doc)
+	}
+	if !strings.Contains(doc, "#{interpolation}") {
+		t.Errorf("expected sigil heredoc content, got %q", doc)
+	}
+}
+
+func TestExtractModuledoc_SigilVariants(t *testing.T) {
+	tests := []struct {
+		name string
+		src  string
+		want string
+	}{
+		{
+			name: "raw pipe delimiter",
+			src: `defmodule MyApp.Users do
+  @moduledoc ~S|Pipe-delimited docs|
+end`,
+			want: "Pipe-delimited docs",
+		},
+		{
+			name: "escaped paren delimiter",
+			src: `defmodule MyApp.Users do
+  @moduledoc ~s(Paren docs)
+end`,
+			want: "Paren docs",
+		},
+		{
+			name: "single quote delimiter",
+			src: `defmodule MyApp.Users do
+  @moduledoc ~s'Single-quoted docs'
+end`,
+			want: "Single-quoted docs",
+		},
+		{
+			name: "delimiter with modifier",
+			src: `defmodule MyApp.Users do
+  @moduledoc ~s|Docs with modifier|m
+end`,
+			want: "Docs with modifier",
+		},
+		{
+			name: "multi-char uppercase sigil",
+			src: `defmodule MyApp.Users do
+  @moduledoc ~HTML|HTML-like docs|
+end`,
+			want: "HTML-like docs",
+		},
+		{
+			name: "single quote heredoc",
+			src: `defmodule MyApp.Users do
+  @moduledoc ~S'''
+  Multi-line docs.
+  Keep #{raw} literal.
+  '''
+end`,
+			want: "Multi-line docs.\nKeep #{raw} literal.",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doc := NewTokenizedFile(tt.src).ExtractModuledoc(0)
+			if doc != tt.want {
+				t.Errorf("ExtractModuledoc() = %q, want %q", doc, tt.want)
+			}
+		})
+	}
+}
+
 func TestExtractModuledoc_False(t *testing.T) {
 	src := `defmodule MyApp.Internal do
   @moduledoc false

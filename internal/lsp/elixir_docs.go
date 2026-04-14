@@ -140,7 +140,7 @@ func (tf *TokenizedFile) ExtractModuledoc(defLineIdx int) string {
 				j := parser.NextSigToken(tf.tokens, n, i+1)
 				if j < n {
 					nextTok := tf.tokens[j]
-					if nextTok.Kind == parser.TokHeredoc || nextTok.Kind == parser.TokString {
+					if nextTok.Kind == parser.TokHeredoc || nextTok.Kind == parser.TokString || nextTok.Kind == parser.TokSigil {
 						return extractDocFromStringToken(tf.source, nextTok)
 					} else if nextTok.Kind == parser.TokIdent && parser.TokenText(tf.source, nextTok) == "false" {
 						return ""
@@ -167,5 +167,114 @@ func extractDocFromStringToken(source []byte, tok parser.Token) string {
 	if tok.Kind == parser.TokString {
 		return extractQuotedString(text)
 	}
+	if tok.Kind == parser.TokSigil {
+		if doc := extractDocFromSigilToken(text); doc != "" {
+			return doc
+		}
+	}
 	return text
+}
+
+func extractDocFromSigilToken(text string) string {
+	if len(text) < 3 || text[0] != '~' || !isASCIILetter(text[1]) {
+		return ""
+	}
+	i := 2
+	sigilLetter := text[1]
+	if isUpperASCII(sigilLetter) {
+		for i < len(text) && isUpperASCII(text[i]) {
+			i++
+		}
+	}
+	if i >= len(text) {
+		return ""
+	}
+
+	open := text[i]
+	close := open
+	nested := false
+	switch open {
+	case '(':
+		close = ')'
+		nested = true
+	case '[':
+		close = ']'
+		nested = true
+	case '{':
+		close = '}'
+		nested = true
+	case '<':
+		close = '>'
+		nested = true
+	}
+
+	end := len(text)
+	for end > i+1 && isASCIILetter(text[end-1]) {
+		end--
+	}
+	if end <= i+1 {
+		return ""
+	}
+
+	// Heredoc sigils: ~s"""...""" or ~S'''...'''
+	if (open == '"' || open == '\'') && i+2 < end && text[i+1] == open && text[i+2] == open {
+		if end < i+6 || text[end-3] != open || text[end-2] != open || text[end-1] != open {
+			return ""
+		}
+		body := text[i+3 : end-3]
+		lines := strings.Split(body, "\n")
+		if len(lines) > 0 && lines[0] == "" {
+			lines = lines[1:]
+		}
+		return dedentBlock(lines)
+	}
+
+	contentStart := i + 1
+	escapes := isLowerASCII(sigilLetter)
+
+	if nested {
+		depth := 1
+		for j := contentStart; j < end; j++ {
+			ch := text[j]
+			if escapes && ch == '\\' && j+1 < end {
+				j++
+				continue
+			}
+			if ch == open {
+				depth++
+				continue
+			}
+			if ch == close {
+				depth--
+				if depth == 0 {
+					return text[contentStart:j]
+				}
+			}
+		}
+		return ""
+	}
+
+	for j := contentStart; j < end; j++ {
+		ch := text[j]
+		if escapes && ch == '\\' && j+1 < end {
+			j++
+			continue
+		}
+		if ch == close {
+			return text[contentStart:j]
+		}
+	}
+	return ""
+}
+
+func isASCIILetter(ch byte) bool {
+	return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
+}
+
+func isUpperASCII(ch byte) bool {
+	return ch >= 'A' && ch <= 'Z'
+}
+
+func isLowerASCII(ch byte) bool {
+	return ch >= 'a' && ch <= 'z'
 }
