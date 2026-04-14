@@ -1,6 +1,7 @@
 package lsp
 
 import (
+	"slices"
 	"strconv"
 	"strings"
 	"unicode"
@@ -471,6 +472,9 @@ func ExtractAliasBlockParent(lines []string, targetLine int) (string, bool) {
 
 		// Check that "}" is NOT on the same line as "{"
 		for m := k + 1; m < n; m++ {
+			if tokens[m].Line > openBraceLine {
+				break
+			}
 			if tokens[m].Kind == parser.TokCloseBrace {
 				if tokens[m].Line == openBraceLine {
 					return "", false // single-line alias block
@@ -870,7 +874,7 @@ func extractAliasesFromTokens(source []byte, tokens []parser.Token, targetLine i
 				if !strings.Contains(resolved, "__MODULE__") {
 					allAliases = append(allAliases, aliasEntry{cm, asName, resolved})
 				}
-				i = nextPos
+				i = nextPos - 1
 				continue
 			}
 
@@ -895,7 +899,7 @@ func extractAliasesFromTokens(source []byte, tokens []parser.Token, targetLine i
 				if !strings.Contains(resolved, "__MODULE__") {
 					allAliases = append(allAliases, aliasEntry{cm, asName, resolved})
 				}
-				i = nextPos
+				i = nextPos - 1
 				continue
 			}
 			i = k - 1
@@ -942,6 +946,30 @@ func ExtractImports(text string) []string {
 	return imports
 }
 
+// skipToEndOfStatement advances from the given token index past the current statement
+// (to the next TokEOL at bracket/block depth 0, or to end of tokens).
+func skipToEndOfStatement(tokens []parser.Token, n, from int) int {
+	depth := 0
+	blockDepth := 0
+	for i := from; i < n; i++ {
+		switch tokens[i].Kind {
+		case parser.TokOpenParen, parser.TokOpenBracket, parser.TokOpenBrace, parser.TokOpenAngle:
+			depth++
+		case parser.TokCloseParen, parser.TokCloseBracket, parser.TokCloseBrace, parser.TokCloseAngle:
+			depth--
+		case parser.TokDo, parser.TokFn:
+			blockDepth++
+		case parser.TokEnd:
+			blockDepth--
+		case parser.TokEOL, parser.TokEOF:
+			if depth <= 0 && blockDepth <= 0 {
+				return i
+			}
+		}
+	}
+	return n
+}
+
 // parseHelperQuoteBlock finds `def/defp helperName` in the source text, locates
 // its `quote do` block, and extracts imports/uses/inline-defs/aliases from it.
 // Uses the tokenizer for correct heredoc and multi-line handling.
@@ -949,7 +977,6 @@ func parseHelperQuoteBlock(lines []string, helperName string, fileAliases map[st
 	source := []byte(strings.Join(lines, "\n"))
 	tokens := parser.Tokenize(source)
 	n := len(tokens)
-	txt := func(t parser.Token) string { return string(source[t.Start:t.End]) }
 
 	resolveAlias := func(modName string) string {
 		if resolved := parser.ResolveModuleRef(modName, aliases, ""); resolved != modName {
@@ -965,7 +992,7 @@ func parseHelperQuoteBlock(lines []string, helperName string, fileAliases map[st
 			continue
 		}
 		j := tokNextSig(tokens, n, i+1)
-		if j < n && tokens[j].Kind == parser.TokIdent && txt(tokens[j]) == helperName {
+		if j < n && tokens[j].Kind == parser.TokIdent && string(source[tokens[j].Start:tokens[j].End]) == helperName {
 			// Find the TokDo that opens this function. Don't stop at TokEOL
 			// because Elixir allows `do` on the next line after multi-line params.
 			if _, nextPos, hasDo := parser.ScanForwardToBlockDo(tokens, n, j+1); hasDo {
@@ -985,7 +1012,7 @@ func parseHelperQuoteBlock(lines []string, helperName string, fileAliases map[st
 		parser.TrackBlockDepth(tokens[i].Kind, &depth)
 		switch tokens[i].Kind {
 		case parser.TokIdent:
-			if txt(tokens[i]) == "quote" {
+			if string(source[tokens[i].Start:tokens[i].End]) == "quote" {
 				j := tokNextSig(tokens, n, i+1)
 				if j < n && tokens[j].Kind == parser.TokDo {
 					quoteBodyStart = j + 1
@@ -998,36 +1025,6 @@ func parseHelperQuoteBlock(lines []string, helperName string, fileAliases map[st
 	}
 	if quoteBodyStart < 0 {
 		return
-	}
-
-	// skipInlineDefBody advances from a def head position (typically right after
-	// the parameter list) to the token after the def body. For one-line defs
-	// (`def foo, do: ...`) it returns the end-of-line token index.
-	skipInlineDefBody := func(from int) int {
-		// First, scan the current statement header.
-		k := from
-		for k < n {
-			switch tokens[k].Kind {
-			case parser.TokDo:
-				// Block form (`... do ... end`) — skip nested do/fn..end.
-				bodyDepth := 1
-				k++
-				for k < n && bodyDepth > 0 {
-					switch tokens[k].Kind {
-					case parser.TokDo, parser.TokFn:
-						bodyDepth++
-					case parser.TokEnd:
-						bodyDepth--
-					}
-					k++
-				}
-				return k
-			case parser.TokEOL, parser.TokEOF:
-				return k
-			}
-			k++
-		}
-		return k
 	}
 
 	// Walk the quote do block (depth 1 = inside quote do, 0 = we hit its end)
@@ -1076,7 +1073,7 @@ func parseHelperQuoteBlock(lines []string, helperName string, fileAliases map[st
 					aliases = make(map[string]string)
 				}
 				aliases[asName] = resolveAlias(modName)
-				i = nextPos
+				i = nextPos - 1
 				continue
 			}
 			// Simple alias
@@ -1089,13 +1086,13 @@ func parseHelperQuoteBlock(lines []string, helperName string, fileAliases map[st
 
 		case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
 			parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate:
-			kind := txt(tok)
+			kind := string(source[tok.Start:tok.End])
 			defLine := tok.Line
 			j := tokNextSig(tokens, n, i+1)
 			if j >= n || tokens[j].Kind != parser.TokIdent {
 				continue
 			}
-			funcName := txt(tokens[j])
+			funcName := string(source[tokens[j].Start:tokens[j].End])
 			j++
 			pj := tokNextSig(tokens, n, j)
 			nextPos := pj
@@ -1115,7 +1112,7 @@ func parseHelperQuoteBlock(lines []string, helperName string, fileAliases map[st
 					params: parser.JoinParams(paramNames, arity),
 				})
 			}
-			i = skipInlineDefBody(nextPos) - 1
+			i = skipToEndOfStatement(tokens, n, nextPos) - 1
 		}
 	}
 	return
@@ -1246,8 +1243,6 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 	tokens := parser.Tokenize(source)
 	n := len(tokens)
 
-	txt := func(t parser.Token) string { return string(source[t.Start:t.End]) }
-
 	nextSig := func(from int) int {
 		for from < n {
 			k := tokens[from].Kind
@@ -1264,10 +1259,10 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 			return "", i
 		}
 		var parts []string
-		parts = append(parts, txt(tokens[i]))
+		parts = append(parts, string(source[tokens[i].Start:tokens[i].End]))
 		i++
 		for i+1 < n && tokens[i].Kind == parser.TokDot && tokens[i+1].Kind == parser.TokModule {
-			parts = append(parts, txt(tokens[i+1]))
+			parts = append(parts, string(source[tokens[i+1].Start:tokens[i+1].End]))
 			i += 2
 		}
 		return strings.Join(parts, "."), i
@@ -1294,7 +1289,7 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 		tok := tokens[i]
 		if tok.Kind == parser.TokDefmacro {
 			j := nextSig(i + 1)
-			if j < n && tokens[j].Kind == parser.TokIdent && txt(tokens[j]) == "__using__" {
+			if j < n && tokens[j].Kind == parser.TokIdent && string(source[tokens[j].Start:tokens[j].End]) == "__using__" {
 				// Scan forward to find TokDo; Elixir allows split-line heads.
 				if _, nextPos, hasDo := parser.ScanForwardToBlockDo(tokens, n, j+1); hasDo {
 					usingBodyStart = nextPos
@@ -1304,7 +1299,7 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 			}
 		}
 		// ExUnit.CaseTemplate: `using do` or `using opts do`
-		if usesCaseTemplate && tok.Kind == parser.TokIdent && txt(tok) == "using" {
+		if usesCaseTemplate && tok.Kind == parser.TokIdent && string(source[tok.Start:tok.End]) == "using" {
 			// Must be at statement start
 			if i == 0 || tokens[i-1].Kind == parser.TokEOL {
 				if _, nextPos, hasDo := parser.ScanForwardToBlockDo(tokens, n, i+1); hasDo {
@@ -1340,56 +1335,6 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 	}
 	varToOpt := make(map[string]varBinding)
 
-	// skipToEndOfStatement advances i past the current statement (to the next
-	// TokEOL at bracket depth 0, or to end of tokens).
-	skipToEndOfStatement := func(i int) int {
-		depth := 0
-		for i < n {
-			switch tokens[i].Kind {
-			case parser.TokOpenParen, parser.TokOpenBracket, parser.TokOpenBrace:
-				depth++
-			case parser.TokCloseParen, parser.TokCloseBracket, parser.TokCloseBrace:
-				depth--
-			case parser.TokEOL:
-				if depth <= 0 {
-					return i
-				}
-			case parser.TokEOF:
-				return i
-			}
-			i++
-		}
-		return i
-	}
-
-	// skipInlineDefBody advances from a def head position (typically right after
-	// params) to after the inline def body. This keeps statements inside inline
-	// function bodies from being treated as top-level __using__ statements.
-	skipInlineDefBody := func(from int) int {
-		headerEnd := skipToEndOfStatement(from)
-		// Look for block-style `do` in the current def head.
-		for k := from; k < n && k < headerEnd; k++ {
-			if tokens[k].Kind != parser.TokDo {
-				continue
-			}
-			// Block form (`... do ... end`) — skip nested do/fn..end.
-			bodyDepth := 1
-			k++
-			for k < n && bodyDepth > 0 {
-				switch tokens[k].Kind {
-				case parser.TokDo, parser.TokFn:
-					bodyDepth++
-				case parser.TokEnd:
-					bodyDepth--
-				}
-				k++
-			}
-			return k
-		}
-		// No `do` in the head (e.g. malformed input); fall back to statement end.
-		return headerEnd
-	}
-
 	// scanKeywordCall checks if tokens starting at i match:
 	//   Keyword.{get|pop|put|put_new|fetch|fetch!|pop!|pop_lazy}(ident, :key [, Default])
 	// Returns (funcName, argIdent, atomKey, defaultModule, endPos) or empty strings if no match.
@@ -1398,7 +1343,7 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 		if i+3 >= n {
 			return "", "", "", i
 		}
-		if tokens[i].Kind != parser.TokModule || txt(tokens[i]) != "Keyword" {
+		if tokens[i].Kind != parser.TokModule || string(source[tokens[i].Start:tokens[i].End]) != "Keyword" {
 			return "", "", "", i
 		}
 		if tokens[i+1].Kind != parser.TokDot {
@@ -1407,7 +1352,7 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 		if tokens[i+2].Kind != parser.TokIdent {
 			return "", "", "", i
 		}
-		funcName := txt(tokens[i+2])
+		funcName := string(source[tokens[i+2].Start:tokens[i+2].End])
 		j := nextSig(i + 3)
 		if j >= n || tokens[j].Kind != parser.TokOpenParen {
 			return "", "", "", i
@@ -1439,9 +1384,9 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 		// Expect :atom_key
 		j = nextSig(j)
 		if j >= n || tokens[j].Kind != parser.TokAtom {
-			return funcName, "", "", skipToEndOfStatement(j)
+			return funcName, "", "", skipToEndOfStatement(tokens, n, j)
 		}
-		atomText := txt(tokens[j])
+		atomText := string(source[tokens[j].Start:tokens[j].End])
 		atomKey := ""
 		if len(atomText) > 1 && atomText[0] == ':' {
 			atomKey = atomText[1:]
@@ -1471,7 +1416,7 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 			}
 		}
 		// Skip to end
-		return funcName, atomKey, "", skipToEndOfStatement(j)
+		return funcName, atomKey, "", skipToEndOfStatement(tokens, n, j)
 	}
 
 	// Walk tokens inside the __using__ body
@@ -1493,14 +1438,14 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 			i++
 			j := nextSig(i)
 			// import unquote(var)
-			if j < n && tokens[j].Kind == parser.TokIdent && txt(tokens[j]) == "unquote" {
+			if j < n && tokens[j].Kind == parser.TokIdent && string(source[tokens[j].Start:tokens[j].End]) == "unquote" {
 				if j+2 < n && tokens[j+1].Kind == parser.TokOpenParen && tokens[j+2].Kind == parser.TokIdent {
-					varName := txt(tokens[j+2])
-					if b, ok := varToOpt[varName]; ok {
+					varName := source[tokens[j+2].Start:tokens[j+2].End]
+					if b, ok := varToOpt[string(varName)]; ok {
 						optBindings = append(optBindings, optBinding{optKey: b.optKey, defaultMod: b.defaultMod, kind: "import"})
 					}
 				}
-				i = skipToEndOfStatement(j)
+				i = skipToEndOfStatement(tokens, n, j)
 				continue
 			}
 			// import Module
@@ -1514,14 +1459,14 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 			i++
 			j := nextSig(i)
 			// use unquote(var)
-			if j < n && tokens[j].Kind == parser.TokIdent && txt(tokens[j]) == "unquote" {
+			if j < n && tokens[j].Kind == parser.TokIdent && string(source[tokens[j].Start:tokens[j].End]) == "unquote" {
 				if j+2 < n && tokens[j+1].Kind == parser.TokOpenParen && tokens[j+2].Kind == parser.TokIdent {
-					varName := txt(tokens[j+2])
-					if b, ok := varToOpt[varName]; ok {
+					varName := source[tokens[j+2].Start:tokens[j+2].End]
+					if b, ok := varToOpt[string(varName)]; ok {
 						optBindings = append(optBindings, optBinding{optKey: b.optKey, defaultMod: b.defaultMod, kind: "use"})
 					}
 				}
-				i = skipToEndOfStatement(j)
+				i = skipToEndOfStatement(tokens, n, j)
 				continue
 			}
 			// use Module
@@ -1548,7 +1493,7 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 					}
 					aliases[parser.AliasShortName(childName)] = parent + "." + childName
 				}
-				i = nextPos
+				i = nextPos - 1
 				continue
 			}
 			// alias Module, as: Name
@@ -1557,7 +1502,7 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 					aliases = make(map[string]string)
 				}
 				aliases[asName] = resolveAlias(modName)
-				i = nextPos + 1
+				i = nextPos - 1
 				continue
 			}
 			// Simple alias
@@ -1570,7 +1515,7 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 
 		case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
 			parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate:
-			kind := txt(tok)
+			kind := string(source[tok.Start:tok.End])
 			defLine := tok.Line
 			i++
 			j := nextSig(i)
@@ -1578,7 +1523,7 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 				i = j
 				continue
 			}
-			funcName := txt(tokens[j])
+			funcName := string(source[tokens[j].Start:tokens[j].End])
 			j++
 			pj := nextSig(j)
 			nextPos := pj
@@ -1598,14 +1543,14 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 					params: parser.JoinParams(paramNames, arity),
 				})
 			}
-			i = skipInlineDefBody(nextPos)
+			i = skipToEndOfStatement(tokens, n, nextPos)
 			continue
 
 		case parser.TokModule:
 			// Check for Keyword.put/put_new(opts, :key, Module) heuristic
-			modText := txt(tok)
+			modText := string(source[tok.Start:tok.End])
 			if modText == "Keyword" && i+2 < n && tokens[i+1].Kind == parser.TokDot && tokens[i+2].Kind == parser.TokIdent {
-				funcName := txt(tokens[i+2])
+				funcName := string(source[tokens[i+2].Start:tokens[i+2].End])
 				if funcName == "put" || funcName == "put_new" {
 					_, atomKey, defaultMod, endJ := scanKeywordCall(i)
 					if atomKey != "" && defaultMod != "" {
@@ -1628,15 +1573,15 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 			i++
 
 		case parser.TokIdent:
-			identName := txt(tok)
+			identName := string(source[tok.Start:tok.End])
 			isStmtStart := i == 0 || tokens[i-1].Kind == parser.TokEOL || tokens[i-1].Kind == parser.TokComment
 			j := nextSig(i + 1)
 
 			// Check for var = Keyword.{get,pop,put,put_new,...}(opts, :key, Default)
 			// or var = ModuleName
-			if isStmtStart && j < n && tokens[j].Kind == parser.TokOther && txt(tokens[j]) == "=" {
+			if isStmtStart && j < n && tokens[j].Kind == parser.TokOther && string(source[tokens[j].Start:tokens[j].End]) == "=" {
 				k := nextSig(j + 1)
-				if k < n && tokens[k].Kind == parser.TokModule && txt(tokens[k]) == "Keyword" {
+				if k < n && tokens[k].Kind == parser.TokModule && string(source[tokens[k].Start:tokens[k].End]) == "Keyword" {
 					funcName, atomKey, defaultMod, endJ := scanKeywordCall(k)
 					switch funcName {
 					case "get", "pop", "pop!":
@@ -1688,7 +1633,7 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 					}
 					aliases[hk] = hv
 				}
-				i = skipToEndOfStatement(i)
+				i = skipToEndOfStatement(tokens, n, i)
 				continue
 			}
 			i++
@@ -1697,7 +1642,7 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 			// Check for {var, _} = Keyword.pop(opts, :key, Default)
 			j := nextSig(i + 1)
 			if j < n && tokens[j].Kind == parser.TokIdent {
-				varName := txt(tokens[j])
+				varName := string(source[tokens[j].Start:tokens[j].End])
 				// Scan forward to find } = Keyword.pop pattern
 				k := j + 1
 				braceDepth := 1
@@ -1712,14 +1657,14 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 				}
 				// k is now past }
 				eq := nextSig(k)
-				if eq < n && tokens[eq].Kind == parser.TokOther && txt(tokens[eq]) == "=" {
+				if eq < n && tokens[eq].Kind == parser.TokOther && string(source[tokens[eq].Start:tokens[eq].End]) == "=" {
 					kw := nextSig(eq + 1)
-					if kw < n && tokens[kw].Kind == parser.TokModule && txt(tokens[kw]) == "Keyword" {
+					if kw < n && tokens[kw].Kind == parser.TokModule && string(source[tokens[kw].Start:tokens[kw].End]) == "Keyword" {
 						funcName, atomKey, defaultMod, endJ := scanKeywordCall(kw)
 						if (funcName == "pop" || funcName == "pop!") && atomKey != "" {
-							varToOpt[varName] = varBinding{optKey: atomKey, defaultMod: resolveAlias(defaultMod)}
+							varToOpt[string(varName)] = varBinding{optKey: atomKey, defaultMod: resolveAlias(defaultMod)}
 						} else if (funcName == "fetch" || funcName == "fetch!" || funcName == "pop_lazy") && atomKey != "" {
-							varToOpt[varName] = varBinding{optKey: atomKey}
+							varToOpt[string(varName)] = varBinding{optKey: atomKey}
 						}
 						i = endJ
 						continue
@@ -1870,12 +1815,8 @@ func FindBareFunctionCalls(text string, functionName string) []int {
 	for line := range seenLines {
 		lineNums = append(lineNums, line)
 	}
-	// Sort for deterministic output - use insertion sort since results are typically small
-	for i := 1; i < len(lineNums); i++ {
-		for j := i; j > 0 && lineNums[j-1] > lineNums[j]; j-- {
-			lineNums[j-1], lineNums[j] = lineNums[j], lineNums[j-1]
-		}
-	}
+	// Sort for deterministic output
+	slices.Sort(lineNums)
 	return lineNums
 }
 
