@@ -2090,15 +2090,6 @@ end
 
 // --- Regression tests for parser edge cases ---
 
-func TestStripCommentsAndStrings_CharLiteralQuote(t *testing.T) {
-	// Bug 1: ?" is a char literal, should not start a string.
-	input := `x = ?"; Foo.bar()`
-	result := StripCommentsAndStrings(input)
-	if !strings.Contains(result, "Foo.bar") {
-		t.Errorf("Foo.bar should survive stripping, got %q", result)
-	}
-}
-
 func TestParseFile_CharLiteralDoesNotConfuseStringBlanking(t *testing.T) {
 	// Bug 1: char literal ?" should not eat the module ref on the same line
 	path := writeTempFile(t, "defmodule MyApp.Foo do\n  def bar do\n    x = ?\"\n    Real.Module.call()\n  end\nend\n")
@@ -2116,18 +2107,6 @@ func TestParseFile_CharLiteralDoesNotConfuseStringBlanking(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("expected Real.Module.call ref; got refs: %+v", refs)
-	}
-}
-
-func TestStripCommentsAndStrings_Interpolation(t *testing.T) {
-	// Bug 2: interpolation #{...} with nested quotes should not terminate string blanking early
-	input := `foo "hello #{bar("world")}"`
-	result := StripCommentsAndStrings(input)
-	if strings.Contains(result, "world") {
-		t.Errorf("interpolation content should be blanked, got %q", result)
-	}
-	if strings.Contains(result, "bar") {
-		t.Errorf("interpolation content should be blanked, got %q", result)
 	}
 }
 
@@ -2154,18 +2133,6 @@ func TestParseFile_InterpolationDoesNotConfuseRefExtraction(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("expected Other.Module.work ref; got refs: %+v", refs)
-	}
-}
-
-func TestCheckHeredoc_TripleQuoteInsideString(t *testing.T) {
-	// Bug 3: """ inside a string literal should not toggle heredoc state
-	line := `x = "contains triple quote: """ and more"`
-	newState, skip := CheckHeredoc(line, false)
-	if newState {
-		t.Error(`""" inside string should not toggle heredoc on`)
-	}
-	if skip {
-		t.Error(`line with """ inside string should not be skipped`)
 	}
 }
 

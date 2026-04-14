@@ -541,16 +541,17 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		return nil, nil
 	}
 
+	// Get cached tokens for efficient multi-query operations
+	var tf *TokenizedFile
+	if tokens, src, ok := s.docs.GetTokens(docURI); ok {
+		tf = NewTokenizedFileFromCache(tokens, src)
+	} else {
+		tf = NewTokenizedFile(text)
+	}
+
 	// Substitute __MODULE__ with the actual module name so that expressions
 	// like __MODULE__.User resolve correctly through normal alias/module paths.
-	if strings.Contains(expr, "__MODULE__") {
-		for _, l := range lines {
-			if m := parser.DefmoduleRe.FindStringSubmatch(l); m != nil {
-				expr = strings.ReplaceAll(expr, "__MODULE__", m[1])
-				break
-			}
-		}
-	}
+	expr = tf.ResolveModuleExpr(expr, lineNum)
 
 	moduleRef, functionName := ExtractModuleAndFunction(expr)
 
@@ -560,7 +561,7 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		}
 	}
 
-	aliases := ExtractAliasesInScope(text, lineNum)
+	aliases := tf.ExtractAliasesInScope(lineNum)
 	s.mergeAliasesFromUse(text, aliases)
 	s.debugf("Definition: expr=%q module=%q function=%q", expr, moduleRef, functionName)
 
@@ -582,7 +583,7 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 			}
 		}
 
-		currentModule := firstDefmodule(lines)
+		currentModule := tf.FirstDefmodule()
 		fullModule := s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, lines, lineNum, functionName, aliases)
 		s.debugf("Definition: resolved bare %q -> %q", functionName, fullModule)
 		if fullModule == "" {
@@ -592,7 +593,7 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 
 		// Current module — return buffer location directly (works before indexing)
 		if fullModule == currentModule {
-			if line, found := FindFunctionDefinition(text, functionName); found {
+			if line, found := tf.FindFunctionDefinition(functionName); found {
 				return []protocol.Location{{
 					URI:   params.TextDocument.URI,
 					Range: lineRange(line - 1),
@@ -1579,16 +1580,6 @@ func (s *Server) addCompletionsFromUsing(moduleName, funcPrefix string, seen map
 	}
 }
 
-// firstDefmodule returns the first defmodule name found in the file, or "".
-func firstDefmodule(lines []string) string {
-	for _, l := range lines {
-		if m := parser.DefmoduleRe.FindStringSubmatch(l); m != nil {
-			return m[1]
-		}
-	}
-	return ""
-}
-
 // resolveBareFunctionModule finds the module that defines a bare function name.
 // Mirrors the go-to-definition priority: current file modules → imports → use chains → Kernel.
 // Callers should pass pre-computed aliases to avoid redundant ExtractAliases scans.
@@ -2550,74 +2541,67 @@ func (s *Server) FoldingRanges(ctx context.Context, params *protocol.FoldingRang
 		return nil, nil
 	}
 
-	lines := strings.Split(text, "\n")
-	var ranges []protocol.FoldingRange
-	inHeredoc := false
-	heredocStart := 0
+	// Use cached tokens if available
+	var tokens []parser.Token
+	var source []byte
+	if cachedTokens, cachedSrc, ok := s.docs.GetTokens(docURI); ok {
+		tokens = cachedTokens
+		source = cachedSrc
+	} else {
+		source = []byte(text)
+		tokens = parser.Tokenize(source)
+	}
+	n := len(tokens)
 
+	var ranges []protocol.FoldingRange
+
+	// Track do/fn..end blocks by depth
 	type blockStart struct {
-		line   int
-		indent int
+		line  int
+		depth int
 	}
 	var stack []blockStart
+	depth := 0
 
-	for i, line := range lines {
-		// Track heredoc boundaries as foldable regions (""" and ''')
-		isHeredocDelimiter := false
-		if strings.Contains(line, `"""`) {
-			if strings.Count(line, `"""`) < 2 {
-				isHeredocDelimiter = true
-			}
-		} else if strings.Contains(line, `'''`) {
-			if strings.Count(line, `'''`) < 2 {
-				isHeredocDelimiter = true
-			}
-		}
-		if isHeredocDelimiter {
-			if !inHeredoc {
-				inHeredoc = true
-				heredocStart = i
-			} else {
-				inHeredoc = false
-				if i > heredocStart {
-					ranges = append(ranges, protocol.FoldingRange{
-						StartLine: uint32(heredocStart),
-						EndLine:   uint32(i),
-					})
+	for i := 0; i < n; i++ {
+		tok := tokens[i]
+
+		switch tok.Kind {
+		case parser.TokHeredoc:
+			// Heredocs are single tokens spanning multiple lines — fold them
+			// Find the end line by scanning for last newline in the token
+			startLine := tok.Line
+			endLine := startLine
+			for j := tok.Start; j < tok.End; j++ {
+				if source[j] == '\n' {
+					endLine++
 				}
 			}
-			continue
-		}
-		if inHeredoc {
-			continue
-		}
+			if endLine > startLine {
+				ranges = append(ranges, protocol.FoldingRange{
+					StartLine: uint32(startLine - 1), // convert to 0-based
+					EndLine:   uint32(endLine - 1),
+				})
+			}
 
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" {
-			continue
-		}
-		indent := len(line) - len(strings.TrimLeft(line, " \t"))
+		case parser.TokDo, parser.TokFn:
+			depth++
+			stack = append(stack, blockStart{line: tok.Line, depth: depth})
 
-		// Strip strings/comments for block detection so content like
-		// `x = "foo do"` doesn't create a false folding range.
-		stripped := strings.TrimSpace(parser.StripCommentsAndStrings(trimmed))
-
-		if parser.OpensBlock(stripped) {
-			stack = append(stack, blockStart{line: i, indent: indent})
-			continue
-		}
-
-		// Pop on "end" at matching indent
-		if parser.IsEnd(stripped) && len(stack) > 0 {
-			top := stack[len(stack)-1]
-			if indent == top.indent {
+		case parser.TokEnd:
+			if len(stack) > 0 && stack[len(stack)-1].depth == depth {
+				top := stack[len(stack)-1]
 				stack = stack[:len(stack)-1]
-				if i > top.line {
+				if tok.Line > top.line {
 					ranges = append(ranges, protocol.FoldingRange{
-						StartLine: uint32(top.line),
-						EndLine:   uint32(i),
+						StartLine: uint32(top.line - 1), // convert to 0-based
+						EndLine:   uint32(tok.Line - 1),
 					})
 				}
+			}
+			depth--
+			if depth < 0 {
+				depth = 0
 			}
 		}
 	}
@@ -2686,14 +2670,15 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 		return nil, nil
 	}
 
-	if strings.Contains(expr, "__MODULE__") {
-		for _, l := range lines {
-			if m := parser.DefmoduleRe.FindStringSubmatch(l); m != nil {
-				expr = strings.ReplaceAll(expr, "__MODULE__", m[1])
-				break
-			}
-		}
+	// Get cached tokens for efficient multi-query operations
+	var tf *TokenizedFile
+	if tokens, src, ok := s.docs.GetTokens(docURI); ok {
+		tf = NewTokenizedFileFromCache(tokens, src)
+	} else {
+		tf = NewTokenizedFile(text)
 	}
+
+	expr = tf.ResolveModuleExpr(expr, lineNum)
 
 	moduleRef, functionName := ExtractModuleAndFunction(expr)
 
@@ -2705,7 +2690,7 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 		}
 	}
 
-	aliases := ExtractAliasesInScope(text, lineNum)
+	aliases := tf.ExtractAliasesInScope(lineNum)
 	s.mergeAliasesFromUse(text, aliases)
 
 	if moduleRef == "" {
@@ -2713,13 +2698,13 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 			return nil, nil
 		}
 
-		currentModule := firstDefmodule(lines)
+		currentModule := tf.FirstDefmodule()
 		fullModule := s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, lines, lineNum, functionName, aliases)
 
 		if fullModule != "" {
 			// Current module — hover from the buffer directly
 			if fullModule == currentModule {
-				if line, found := FindFunctionDefinition(text, functionName); found {
+				if line, found := tf.FindFunctionDefinition(functionName); found {
 					return s.hoverFromBuffer(text, line-1)
 				}
 			}
@@ -3002,39 +2987,39 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 		return nil, nil
 	}
 
+	// Get cached tokens for efficient multi-query operations
+	var tf *TokenizedFile
+	if tokens, src, ok := s.docs.GetTokens(docURI); ok {
+		tf = NewTokenizedFileFromCache(tokens, src)
+	} else {
+		tf = NewTokenizedFile(text)
+	}
+
 	// Special case: cursor on defmacro __using__ — find all `use ModuleName` sites.
 	if expr == "__using__" {
-		for _, l := range lines {
-			if m := parser.DefmoduleRe.FindStringSubmatch(l); m != nil {
-				s.debugf("References: __using__ in module %s — looking up use sites", m[1])
-				allRefs, err := s.store.LookupReferences(m[1], "")
-				if err != nil {
-					return nil, nil
-				}
-				var locations []protocol.Location
-				for _, r := range allRefs {
-					if r.Kind == "use" {
-						locations = append(locations, protocol.Location{
-							URI:   uri.File(r.FilePath),
-							Range: lineRange(r.Line - 1),
-						})
-					}
-				}
-				s.debugf("References: returning %d use sites", len(locations))
-				return locations, nil
+		moduleName := tf.FirstDefmodule()
+		if moduleName != "" {
+			s.debugf("References: __using__ in module %s — looking up use sites", moduleName)
+			allRefs, err := s.store.LookupReferences(moduleName, "")
+			if err != nil {
+				return nil, nil
 			}
+			var locations []protocol.Location
+			for _, r := range allRefs {
+				if r.Kind == "use" {
+					locations = append(locations, protocol.Location{
+						URI:   uri.File(r.FilePath),
+						Range: lineRange(r.Line - 1),
+					})
+				}
+			}
+			s.debugf("References: returning %d use sites", len(locations))
+			return locations, nil
 		}
 		return nil, nil
 	}
 
-	if strings.Contains(expr, "__MODULE__") {
-		for _, l := range lines {
-			if m := parser.DefmoduleRe.FindStringSubmatch(l); m != nil {
-				expr = strings.ReplaceAll(expr, "__MODULE__", m[1])
-				break
-			}
-		}
-	}
+	expr = tf.ResolveModuleExpr(expr, lineNum)
 
 	moduleRef, functionName := ExtractModuleAndFunction(expr)
 
@@ -3044,7 +3029,7 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 		}
 	}
 
-	aliases := ExtractAliasesInScope(text, lineNum)
+	aliases := tf.ExtractAliasesInScope(lineNum)
 	s.mergeAliasesFromUse(text, aliases)
 	s.debugf("References: expr=%q module=%q function=%q", expr, moduleRef, functionName)
 
@@ -3089,7 +3074,7 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 		// When cursor is on a defmodule line, use the store's fully-qualified
 		// name directly — the user is asking about the module being defined,
 		// not a reference that might be shadowed by an alias with the same name.
-		if m := parser.DefmoduleRe.FindStringSubmatch(lines[lineNum]); m != nil {
+		if _, isDefmod := IsDefmoduleLine(text, lineNum); isDefmod {
 			if enclosing := s.store.LookupEnclosingModule(uriToPath(params.TextDocument.URI), lineNum+1); enclosing != "" {
 				fullModule = enclosing
 			} else {
@@ -4322,7 +4307,15 @@ func (s *Server) SignatureHelp(ctx context.Context, params *protocol.SignatureHe
 		return nil, nil
 	}
 
-	aliases := ExtractAliasesInScope(text, lineNum)
+	// Get cached tokens for efficient multi-query operations
+	var tf *TokenizedFile
+	if tokens, src, ok := s.docs.GetTokens(docURI); ok {
+		tf = NewTokenizedFileFromCache(tokens, src)
+	} else {
+		tf = NewTokenizedFile(text)
+	}
+
+	aliases := tf.ExtractAliasesInScope(lineNum)
 	s.mergeAliasesFromUse(text, aliases)
 	lines := strings.Split(text, "\n")
 
@@ -4335,7 +4328,7 @@ func (s *Server) SignatureHelp(ctx context.Context, params *protocol.SignatureHe
 		}
 	} else {
 		// Bare function — check buffer, imports, use chains, Kernel
-		if defLine, found := FindFunctionDefinition(text, functionName); found {
+		if defLine, found := tf.FindFunctionDefinition(functionName); found {
 			// Build signature from buffer
 			paramNames := extractParamNames(lines, defLine-1)
 			if paramNames == nil {
@@ -4349,7 +4342,7 @@ func (s *Server) SignatureHelp(ctx context.Context, params *protocol.SignatureHe
 			}, nil
 		}
 
-		for _, mod := range ExtractImports(text) {
+		for _, mod := range tf.ExtractImports() {
 			if results, err := s.store.LookupFunction(mod, functionName); err == nil && len(results) > 0 {
 				result = &results[0]
 				break

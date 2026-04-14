@@ -1993,3 +1993,84 @@ func kindsOf(tokens []Token) []TokenKind {
 	}
 	return kinds
 }
+
+func TestTokenize_EscapedNewlineLineTracking(t *testing.T) {
+	// Regression: backslash-escaped newlines were not incrementing the line
+	// counter, causing all subsequent tokens to have wrong line numbers.
+	// This affected scanStringContent, scanHeredocContent, scanInterpolation,
+	// scanSigilContent, and char literals.
+
+	findLine := func(t *testing.T, src string, kind TokenKind) int {
+		t.Helper()
+		tokens := Tokenize([]byte(src))
+		for _, tok := range tokens {
+			if tok.Kind == kind {
+				return tok.Line
+			}
+		}
+		t.Fatalf("token kind %d not found", kind)
+		return 0
+	}
+
+	t.Run("heredoc", func(t *testing.T) {
+		src := "@doc \"\"\"\n  Line one \\\n  continued \\\n  more\n  \"\"\"\n  defmacro foo do\n  end\n"
+		if got := findLine(t, src, TokDefmacro); got != 6 {
+			t.Errorf("defmacro line=%d, want 6", got)
+		}
+	})
+
+	t.Run("regular string", func(t *testing.T) {
+		src := "x = \"line one \\\n  continued\"\ndefmacro bar do\nend\n"
+		if got := findLine(t, src, TokDefmacro); got != 3 {
+			t.Errorf("defmacro line=%d, want 3", got)
+		}
+	})
+
+	t.Run("interpolation", func(t *testing.T) {
+		// Escaped newline inside #{} interpolation
+		src := "x = \"hello #{a \\\n  b}\"\ndef foo do\nend\n"
+		if got := findLine(t, src, TokDef); got != 3 {
+			t.Errorf("def line=%d, want 3", got)
+		}
+	})
+
+	t.Run("sigil nested parens", func(t *testing.T) {
+		// ~s(...\\\n...) — lowercase sigil with escaped newline inside parens
+		src := "x = ~s(hello \\\n  world)\ndef foo do\nend\n"
+		if got := findLine(t, src, TokDef); got != 3 {
+			t.Errorf("def line=%d, want 3", got)
+		}
+	})
+
+	t.Run("sigil non-nested slash", func(t *testing.T) {
+		// ~r/...\\\n.../ — lowercase sigil with slash delimiter
+		src := "x = ~r/hello \\\n  world/\ndef foo do\nend\n"
+		if got := findLine(t, src, TokDef); got != 3 {
+			t.Errorf("def line=%d, want 3", got)
+		}
+	})
+
+	t.Run("char literal escaped newline", func(t *testing.T) {
+		// ?\\\n is the char literal for newline (?\n)
+		src := "x = ?\\\ndef foo do\nend\n"
+		if got := findLine(t, src, TokDef); got != 2 {
+			t.Errorf("def line=%d, want 2", got)
+		}
+	})
+
+	t.Run("quoted atom string", func(t *testing.T) {
+		// :"...\\\n..." — escaped newline in quoted atom
+		src := "x = :\"hello \\\n  world\"\ndef foo do\nend\n"
+		if got := findLine(t, src, TokDef); got != 3 {
+			t.Errorf("def line=%d, want 3", got)
+		}
+	})
+
+	t.Run("multiple escaped newlines accumulate", func(t *testing.T) {
+		// 3 escaped newlines should shift the line by 3
+		src := "x = \"a \\\nb \\\nc \\\nd\"\ndef foo do\nend\n"
+		if got := findLine(t, src, TokDef); got != 5 {
+			t.Errorf("def line=%d, want 5", got)
+		}
+	})
+}

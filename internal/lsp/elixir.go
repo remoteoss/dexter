@@ -1,13 +1,125 @@
 package lsp
 
 import (
-	"regexp"
 	"strconv"
 	"strings"
 	"unicode"
 
 	"github.com/remoteoss/dexter/internal/parser"
 )
+
+// TokenizedFile holds pre-tokenized source for efficient multi-operation queries.
+// Use this when multiple tokenizer-based lookups will be performed on the same text.
+type TokenizedFile struct {
+	source []byte
+	tokens []parser.Token
+	n      int
+}
+
+// NewTokenizedFile tokenizes the text once for reuse across multiple queries.
+func NewTokenizedFile(text string) *TokenizedFile {
+	source := []byte(text)
+	tokens := parser.Tokenize(source)
+	return &TokenizedFile{
+		source: source,
+		tokens: tokens,
+		n:      len(tokens),
+	}
+}
+
+// NewTokenizedFileFromCache wraps pre-existing tokens (e.g. from DocumentStore cache).
+func NewTokenizedFileFromCache(tokens []parser.Token, source []byte) *TokenizedFile {
+	return &TokenizedFile{
+		source: source,
+		tokens: tokens,
+		n:      len(tokens),
+	}
+}
+
+// FirstDefmodule returns the first defmodule name found, or "".
+func (tf *TokenizedFile) FirstDefmodule() string {
+	for i := 0; i < tf.n; i++ {
+		if tf.tokens[i].Kind == parser.TokDefmodule {
+			j := tokNextSig(tf.tokens, tf.n, i+1)
+			name, _ := tokCollectModuleName(tf.source, tf.tokens, tf.n, j)
+			if name != "" {
+				return name
+			}
+		}
+	}
+	return ""
+}
+
+// ResolveModuleExpr replaces __MODULE__ in expr with the enclosing module name
+// at the given 0-based line. If targetLine < 0, uses the first defmodule found.
+func (tf *TokenizedFile) ResolveModuleExpr(expr string, targetLine int) string {
+	if !strings.Contains(expr, "__MODULE__") {
+		return expr
+	}
+
+	var moduleName string
+	if targetLine >= 0 {
+		moduleName = extractEnclosingModuleFromTokens(tf.source, tf.tokens, targetLine)
+	}
+	if moduleName == "" {
+		moduleName = tf.FirstDefmodule()
+	}
+
+	if moduleName != "" {
+		return strings.ReplaceAll(expr, "__MODULE__", moduleName)
+	}
+	return expr
+}
+
+// FindFunctionDefinition searches for a def/defp/defmacro/defmacrop or @type/@typep/@opaque
+// matching the given function name. Returns the 1-based line number and true if found.
+func (tf *TokenizedFile) FindFunctionDefinition(functionName string) (int, bool) {
+	for i := 0; i < tf.n; i++ {
+		tok := tf.tokens[i]
+
+		switch tok.Kind {
+		case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
+			parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate:
+			j := tokNextSig(tf.tokens, tf.n, i+1)
+			if j >= tf.n || tf.tokens[j].Kind != parser.TokIdent {
+				continue
+			}
+			if parser.TokenText(tf.source, tf.tokens[j]) == functionName {
+				return tok.Line, true
+			}
+
+		case parser.TokAttrType:
+			j := tokNextSig(tf.tokens, tf.n, i+1)
+			if j >= tf.n || tf.tokens[j].Kind != parser.TokIdent {
+				continue
+			}
+			if parser.TokenText(tf.source, tf.tokens[j]) == functionName {
+				return tok.Line, true
+			}
+		}
+	}
+	return 0, false
+}
+
+// ExtractAliasesInScope parses alias declarations visible at the given 0-based line.
+func (tf *TokenizedFile) ExtractAliasesInScope(targetLine int) map[string]string {
+	return extractAliasesFromTokens(tf.source, tf.tokens, targetLine)
+}
+
+// ExtractImports returns all import declarations from the tokenized file.
+func (tf *TokenizedFile) ExtractImports() []string {
+	var imports []string
+	for i := 0; i < tf.n; i++ {
+		if tf.tokens[i].Kind == parser.TokImport {
+			j := tokNextSig(tf.tokens, tf.n, i+1)
+			mod, _ := tokCollectModuleName(tf.source, tf.tokens, tf.n, j)
+			if mod != "" {
+				imports = append(imports, mod)
+			}
+		}
+	}
+	return imports
+}
 
 func isExprChar(b byte) bool {
 	c := rune(b)
@@ -158,7 +270,7 @@ func ExtractAliasBlockParent(lines []string, targetLine int) (string, bool) {
 	}
 
 	// Quick pre-check: scan backward for an "alias ...{" line without a
-	// matching "}" on the same line.  Pure string ops, no allocations in
+	// matching "}" on the same line. Pure string ops, no allocations in
 	// the fast path, so this is nearly free for the 99% of hover/definition
 	// requests that are not inside an alias block.
 	found := false
@@ -177,61 +289,84 @@ func ExtractAliasBlockParent(lines []string, targetLine int) (string, bool) {
 		return "", false
 	}
 
-	// If the current line is just a closing brace (e.g. "  }"), we're past the block.
-	// But if it has module content before the brace (e.g. "  Services.MakePayment }"),
-	// we're still inside the alias block on the last line.
-	currentLine := strings.TrimSpace(parser.StripCommentsAndStrings(lines[targetLine]))
-	if strings.Contains(currentLine, "}") {
-		withoutBrace := strings.TrimSpace(strings.Replace(currentLine, "}", "", 1))
-		withoutBrace = strings.TrimRight(withoutBrace, ", ")
-		if withoutBrace == "" {
-			return "", false
+	// Use tokenizer for accurate parsing
+	source := []byte(strings.Join(lines, "\n"))
+	tokens := parser.Tokenize(source)
+	n := len(tokens)
+
+	// targetLine is 0-based; token.Line is 1-based
+	targetLine1 := targetLine + 1
+
+	// Find the token position for the target line
+	targetIdx := 0
+	for i, tok := range tokens {
+		if tok.Line >= targetLine1 {
+			targetIdx = i
+			break
 		}
 	}
 
-	// Scan backward from the current line looking for the opening "alias Parent.{"
-	for i := targetLine; i >= 0; i-- {
-		line := lines[i]
-		stripped := strings.TrimSpace(parser.StripCommentsAndStrings(line))
+	// Check if target line has only a closing brace (no module content)
+	hasModuleOnLine := false
+	hasCloseBraceOnLine := false
+	for i := targetIdx; i < n && tokens[i].Line == targetLine1; i++ {
+		if tokens[i].Kind == parser.TokModule {
+			hasModuleOnLine = true
+		}
+		if tokens[i].Kind == parser.TokCloseBrace {
+			hasCloseBraceOnLine = true
+		}
+	}
+	if hasCloseBraceOnLine && !hasModuleOnLine {
+		return "", false
+	}
 
-		// If we encounter a closing brace scanning backward, we're not in an open block
-		if i < targetLine && strings.Contains(stripped, "}") {
+	// Scan backward through tokens looking for "alias Parent.{" without matching "}"
+	for i := targetIdx; i >= 0; i-- {
+		tok := tokens[i]
+
+		// If we see a closing brace before finding alias, we're not in an open block
+		if tok.Kind == parser.TokCloseBrace && tok.Line < targetLine1 {
 			return "", false
 		}
 
-		// Look for "alias Module.{" pattern
-		trimmed := strings.TrimSpace(line)
-		if !strings.HasPrefix(trimmed, "alias ") {
-			// Skip blank/comment lines
-			if stripped == "" {
-				continue
-			}
-			// Any other statement means we've left the alias context
+		if tok.Kind != parser.TokAlias {
 			continue
 		}
 
-		// Found an alias line — check if it opens a brace block
-		afterAlias := strings.TrimSpace(trimmed[6:])
-		moduleName := parser.ScanModuleName(afterAlias)
-		if moduleName == "" {
+		// Found alias — collect the module name
+		j := tokNextSig(tokens, n, i+1)
+		modName, k := tokCollectModuleName(source, tokens, n, j)
+		if modName == "" {
 			return "", false
 		}
-		remaining := afterAlias[len(moduleName):]
-		remainingStripped := strings.TrimSpace(parser.StripCommentsAndStrings(remaining))
 
-		if !strings.HasPrefix(remainingStripped, "{") {
+		// Check for ".{" after module name
+		if k >= n || tokens[k].Kind != parser.TokDot {
 			return "", false
 		}
-		// Has opening { — check that } is NOT on this same line
-		if strings.Contains(remainingStripped, "}") {
+		k++
+		if k >= n || tokens[k].Kind != parser.TokOpenBrace {
 			return "", false
+		}
+		openBraceLine := tokens[k].Line
+
+		// Check that "}" is NOT on the same line as "{"
+		for m := k + 1; m < n; m++ {
+			if tokens[m].Kind == parser.TokCloseBrace {
+				if tokens[m].Line == openBraceLine {
+					return "", false // single-line alias block
+				}
+				break
+			}
 		}
 
 		// We're inside a multi-line alias block — resolve the parent module
-		parent := strings.TrimRight(moduleName, ".")
+		parent := modName
 
-		// Resolve __MODULE__
-		enclosingModule := extractEnclosingModule(lines, i)
+		// Resolve __MODULE__ using enclosing module from token stream
+		aliasLine := tok.Line - 1 // convert to 0-based
+		enclosingModule := extractEnclosingModuleFromTokens(source, tokens, aliasLine)
 		if enclosingModule != "" {
 			parent = strings.ReplaceAll(parent, "__MODULE__", enclosingModule)
 		}
@@ -244,25 +379,28 @@ func ExtractAliasBlockParent(lines []string, targetLine int) (string, bool) {
 	return "", false
 }
 
-// extractEnclosingModule finds the innermost defmodule enclosing the given line.
-func extractEnclosingModule(lines []string, targetLine int) string {
+// extractEnclosingModuleFromTokens finds the innermost defmodule enclosing the given 0-based line.
+func extractEnclosingModuleFromTokens(source []byte, tokens []parser.Token, targetLine int) string {
+	n := len(tokens)
+	targetLine1 := targetLine + 1
+
 	type moduleFrame struct {
 		name  string
 		depth int
 	}
 	var stack []moduleFrame
 	depth := 0
-	inHeredoc := false
 
-	for i := 0; i <= targetLine && i < len(lines); i++ {
-		var skip bool
-		inHeredoc, skip = parser.CheckHeredoc(lines[i], inHeredoc)
-		if skip {
-			continue
+	for i := 0; i < n; i++ {
+		tok := tokens[i]
+		if tok.Line > targetLine1 {
+			break
 		}
-		stripped := strings.TrimSpace(parser.StripCommentsAndStrings(strings.TrimSpace(lines[i])))
 
-		if parser.IsEnd(stripped) {
+		switch tok.Kind {
+		case parser.TokDo, parser.TokFn:
+			depth++
+		case parser.TokEnd:
 			if len(stack) > 0 && stack[len(stack)-1].depth == depth {
 				stack = stack[:len(stack)-1]
 			}
@@ -270,16 +408,26 @@ func extractEnclosingModule(lines []string, targetLine int) string {
 			if depth < 0 {
 				depth = 0
 			}
-		}
-		if parser.OpensBlock(stripped) {
-			depth++
-		}
-		if m := parser.DefmoduleRe.FindStringSubmatch(strings.TrimSpace(lines[i])); m != nil {
-			name := m[1]
+		case parser.TokDefmodule:
+			j := tokNextSig(tokens, n, i+1)
+			name, k := tokCollectModuleName(source, tokens, n, j)
+			if name == "" {
+				continue
+			}
 			if !strings.Contains(name, ".") && len(stack) > 0 {
 				name = stack[len(stack)-1].name + "." + name
 			}
-			stack = append(stack, moduleFrame{name, depth})
+			// Find the do token
+			for pos := k; pos < n; pos++ {
+				if tokens[pos].Kind == parser.TokDo {
+					depth++
+					stack = append(stack, moduleFrame{name, depth})
+					break
+				}
+				if tokens[pos].Kind == parser.TokEOF {
+					break
+				}
+			}
 		}
 	}
 
@@ -287,6 +435,154 @@ func extractEnclosingModule(lines []string, targetLine int) string {
 		return stack[len(stack)-1].name
 	}
 	return ""
+}
+
+// FirstDefmodule returns the first defmodule name found in the text, or "".
+// Uses the tokenizer for accurate parsing.
+func FirstDefmodule(text string) string {
+	source := []byte(text)
+	tokens := parser.Tokenize(source)
+	n := len(tokens)
+
+	for i := 0; i < n; i++ {
+		if tokens[i].Kind == parser.TokDefmodule {
+			j := tokNextSig(tokens, n, i+1)
+			name, _ := tokCollectModuleName(source, tokens, n, j)
+			if name != "" {
+				return name
+			}
+		}
+	}
+	return ""
+}
+
+// ResolveModuleExpr replaces __MODULE__ in expr with the enclosing module name
+// at the given 0-based line. If targetLine < 0, uses the first defmodule found.
+func ResolveModuleExpr(text string, expr string, targetLine int) string {
+	if !strings.Contains(expr, "__MODULE__") {
+		return expr
+	}
+
+	source := []byte(text)
+	tokens := parser.Tokenize(source)
+
+	var moduleName string
+	if targetLine >= 0 {
+		moduleName = extractEnclosingModuleFromTokens(source, tokens, targetLine)
+	}
+	if moduleName == "" {
+		// Fallback to first defmodule
+		n := len(tokens)
+		for i := 0; i < n; i++ {
+			if tokens[i].Kind == parser.TokDefmodule {
+				j := tokNextSig(tokens, n, i+1)
+				moduleName, _ = tokCollectModuleName(source, tokens, n, j)
+				if moduleName != "" {
+					break
+				}
+			}
+		}
+	}
+
+	if moduleName != "" {
+		return strings.ReplaceAll(expr, "__MODULE__", moduleName)
+	}
+	return expr
+}
+
+// IsDefmoduleLine returns true if the given 0-based line contains a defmodule
+// keyword, and returns the module name being defined on that line.
+func IsDefmoduleLine(text string, lineNum int) (string, bool) {
+	// Fast path: check if the line even contains "defmodule"
+	lines := strings.Split(text, "\n")
+	if lineNum < 0 || lineNum >= len(lines) {
+		return "", false
+	}
+	if !strings.Contains(lines[lineNum], "defmodule") {
+		return "", false
+	}
+
+	// Tokenize just that line to extract the module name
+	source := []byte(lines[lineNum])
+	tokens := parser.Tokenize(source)
+	n := len(tokens)
+
+	for i := 0; i < n; i++ {
+		if tokens[i].Kind == parser.TokDefmodule {
+			j := tokNextSig(tokens, n, i+1)
+			name, _ := tokCollectModuleName(source, tokens, n, j)
+			if name != "" {
+				return name, true
+			}
+		}
+	}
+	return "", false
+}
+
+// IsDefinitionLine checks if the given line contains a definition
+// (defmodule, def, defp, defmacro, @type, etc.). Used to find boundaries
+// when extracting documentation.
+func IsDefinitionLine(line string) bool {
+	if len(line) == 0 {
+		return false
+	}
+
+	tokens := parser.Tokenize([]byte(line))
+	for _, tok := range tokens {
+		switch tok.Kind {
+		case parser.TokDefmodule, parser.TokDefprotocol, parser.TokDefimpl,
+			parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
+			parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate,
+			parser.TokAttrType:
+			return true
+		}
+	}
+	return false
+}
+
+// FindModuleAttributeDefinitionTokenized searches for the line where @attr_name
+// is defined (assigned a value, not used). Returns the 1-based line number and
+// true if found. Uses the tokenizer for accurate parsing.
+func FindModuleAttributeDefinitionTokenized(text string, attrName string) (int, bool) {
+	if reservedModuleAttrs[attrName] {
+		return 0, false
+	}
+
+	source := []byte(text)
+	tokens := parser.Tokenize(source)
+	n := len(tokens)
+
+	for i := 0; i < n; i++ {
+		tok := tokens[i]
+		if tok.Kind != parser.TokAttr {
+			continue
+		}
+
+		// TokAttr includes the @ prefix, so extract the name
+		attrText := parser.TokenText(source, tok)
+		if len(attrText) < 2 || attrText[0] != '@' {
+			continue
+		}
+		name := attrText[1:]
+		if name != attrName {
+			continue
+		}
+
+		// Check that it's followed by a value (not just a reference like @attr)
+		j := tokNextSig(tokens, n, i+1)
+		if j >= n {
+			continue
+		}
+
+		// A definition has something after the attribute on the same statement
+		// Skip if followed by another @ (like @attr @other_attr)
+		if tokens[j].Kind == parser.TokAttr {
+			continue
+		}
+
+		return tok.Line, true
+	}
+	return 0, false
 }
 
 // IsPipeContext returns true if the text before prefixStartCol on this line
@@ -315,38 +611,76 @@ type BufferFunction struct {
 // Functions with default parameters emit one entry per callable arity.
 // Private types (@typep) are included since they are accessible within the same file.
 func FindBufferFunctions(text string) []BufferFunction {
+	source := []byte(text)
+	tokens := parser.Tokenize(source)
+	n := len(tokens)
+
 	seen := make(map[string]bool)
 	var results []BufferFunction
-	for _, line := range strings.Split(text, "\n") {
-		if m := parser.FuncDefRe.FindStringSubmatch(line); m != nil {
-			name := m[2]
-			paramContent := parser.FindParamContent(line, name)
-			maxArity := parser.ArityFromParams(paramContent)
-			minArity := maxArity - parser.DefaultsFromParams(paramContent)
-			allParamNames := parser.ExtractParamNames(line, name)
+
+	for i := 0; i < n; i++ {
+		tok := tokens[i]
+
+		switch tok.Kind {
+		case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
+			parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate:
+			kind := parser.TokenText(source, tok)
+			j := tokNextSig(tokens, n, i+1)
+			if j >= n || tokens[j].Kind != parser.TokIdent {
+				continue
+			}
+			name := parser.TokenText(source, tokens[j])
+			j++
+			pj := tokNextSig(tokens, n, j)
+			maxArity := 0
+			defaultCount := 0
+			var paramNames []string
+			if pj < n && tokens[pj].Kind == parser.TokOpenParen {
+				maxArity, defaultCount, paramNames, _ = parser.CollectParams(source, tokens, n, pj)
+				paramNames = parser.FixParamNames(paramNames)
+			}
+			minArity := maxArity - defaultCount
 			for arity := minArity; arity <= maxArity; arity++ {
 				key := name + "/" + strconv.Itoa(arity)
 				if !seen[key] {
 					seen[key] = true
-					results = append(results, BufferFunction{Name: name, Arity: arity, Kind: m[1], Params: parser.JoinParams(allParamNames, arity)})
+					results = append(results, BufferFunction{
+						Name:   name,
+						Arity:  arity,
+						Kind:   kind,
+						Params: parser.JoinParams(paramNames, arity),
+					})
 				}
 			}
-		} else if m := parser.TypeDefRe.FindStringSubmatch(line); m != nil {
-			name := m[2]
-			arity := parser.ExtractArity(line, name)
+
+		case parser.TokAttrType:
+			attrText := parser.TokenText(source, tok)
+			kind := "type"
+			switch attrText {
+			case "@opaque":
+				kind = "opaque"
+			case "@typep":
+				kind = "typep"
+			}
+			j := tokNextSig(tokens, n, i+1)
+			if j >= n || tokens[j].Kind != parser.TokIdent {
+				continue
+			}
+			name := parser.TokenText(source, tokens[j])
+			arity := 0
+			pj := tokNextSig(tokens, n, j+1)
+			if pj < n && tokens[pj].Kind == parser.TokOpenParen {
+				arity, _, _, _ = parser.CollectParams(source, tokens, n, pj)
+			}
 			key := name + "/" + strconv.Itoa(arity)
 			if !seen[key] {
 				seen[key] = true
-				results = append(results, BufferFunction{Name: name, Arity: arity, Kind: m[1]})
+				results = append(results, BufferFunction{Name: name, Arity: arity, Kind: kind})
 			}
 		}
 	}
 	return results
 }
-
-var (
-	moduleAttrDefRe = regexp.MustCompile(`^\s*@([a-z_][a-z0-9_]*)\s+[^@]`)
-)
 
 // ExtractAliases parses all alias declarations from document text.
 // Returns a map of short name -> full module name (not scope-aware).
@@ -367,6 +701,11 @@ func ExtractAliasesInScope(text string, targetLine int) map[string]string {
 func extractAliasesFromText(text string, targetLine int) map[string]string {
 	source := []byte(text)
 	tokens := parser.Tokenize(source)
+	return extractAliasesFromTokens(source, tokens, targetLine)
+}
+
+// extractAliasesFromTokens is the implementation that works with pre-tokenized data.
+func extractAliasesFromTokens(source []byte, tokens []parser.Token, targetLine int) map[string]string {
 	n := len(tokens)
 
 	type moduleFrame struct {
@@ -633,13 +972,14 @@ func parseHelperQuoteBlock(lines []string, helperName string, fileAliases map[st
 		}
 		j := tokNextSig(tokens, n, i+1)
 		if j < n && tokens[j].Kind == parser.TokIdent && txt(tokens[j]) == helperName {
-			// Find the TokDo that opens this function
+			// Find the TokDo that opens this function. Don't stop at TokEOL
+			// because Elixir allows `do` on the next line after multi-line params.
 			for k := j + 1; k < n; k++ {
 				if tokens[k].Kind == parser.TokDo {
 					helperStart = k + 1
 					break
 				}
-				if tokens[k].Kind == parser.TokEOL {
+				if tokens[k].Kind == parser.TokEnd || tokens[k].Kind == parser.TokEOF {
 					break
 				}
 			}
@@ -1555,30 +1895,38 @@ var reservedModuleAttrs = map[string]bool{
 // (assigned a value, not used). Returns the 1-based line number and true if found.
 // Returns false for reserved Elixir module attributes.
 func FindModuleAttributeDefinition(text string, attrName string) (int, bool) {
-	if reservedModuleAttrs[attrName] {
-		return 0, false
-	}
-	for i, line := range strings.Split(text, "\n") {
-		if m := moduleAttrDefRe.FindStringSubmatch(line); m != nil && m[1] == attrName {
-			return i + 1, true
-		}
-	}
-	return 0, false
+	return FindModuleAttributeDefinitionTokenized(text, attrName)
 }
 
 // FindFunctionDefinition searches the document text for a def/defp/defmacro/defmacrop
-// matching the given function name. Returns the 1-based line number and true if found.
+// or @type/@typep/@opaque matching the given function name. Returns the 1-based line
+// number and true if found.
 func FindFunctionDefinition(text string, functionName string) (int, bool) {
-	for i, line := range strings.Split(text, "\n") {
-		if m := parser.FuncDefRe.FindStringSubmatch(line); m != nil {
-			if m[2] == functionName {
-				return i + 1, true
+	source := []byte(text)
+	tokens := parser.Tokenize(source)
+	n := len(tokens)
+
+	for i := 0; i < n; i++ {
+		tok := tokens[i]
+
+		switch tok.Kind {
+		case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
+			parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate:
+			j := tokNextSig(tokens, n, i+1)
+			if j >= n || tokens[j].Kind != parser.TokIdent {
+				continue
 			}
-			continue // FuncDefRe and TypeDefRe match different line prefixes
-		}
-		if m := parser.TypeDefRe.FindStringSubmatch(line); m != nil {
-			if m[2] == functionName {
-				return i + 1, true
+			if parser.TokenText(source, tokens[j]) == functionName {
+				return tok.Line, true
+			}
+
+		case parser.TokAttrType:
+			j := tokNextSig(tokens, n, i+1)
+			if j >= n || tokens[j].Kind != parser.TokIdent {
+				continue
+			}
+			if parser.TokenText(source, tokens[j]) == functionName {
+				return tok.Line, true
 			}
 		}
 	}
@@ -1589,48 +1937,88 @@ func FindFunctionDefinition(text string, functionName string) (int, bool) {
 // including direct calls like functionName(...) and pipe calls like |> functionName.
 // Returns 1-based line numbers. Definition lines are excluded.
 func FindBareFunctionCalls(text string, functionName string) []int {
+	source := []byte(text)
+	tokens := parser.Tokenize(source)
+	n := len(tokens)
+
+	seenLines := make(map[int]bool)
+	defLines := make(map[int]bool)
+
+	// First pass: identify definition lines to exclude
+	for i := 0; i < n; i++ {
+		tok := tokens[i]
+		switch tok.Kind {
+		case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
+			parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate:
+			j := tokNextSig(tokens, n, i+1)
+			if j < n && tokens[j].Kind == parser.TokIdent {
+				if parser.TokenText(source, tokens[j]) == functionName {
+					defLines[tok.Line] = true
+				}
+			}
+		case parser.TokAttrSpec, parser.TokAttrCallback:
+			// Skip @spec and @callback lines that define this function
+			j := tokNextSig(tokens, n, i+1)
+			if j < n && tokens[j].Kind == parser.TokIdent {
+				if parser.TokenText(source, tokens[j]) == functionName {
+					defLines[tok.Line] = true
+				}
+			}
+		}
+	}
+
+	// Second pass: find bare calls
+	for i := 0; i < n; i++ {
+		tok := tokens[i]
+
+		if tok.Kind != parser.TokIdent {
+			continue
+		}
+		if parser.TokenText(source, tok) != functionName {
+			continue
+		}
+		if defLines[tok.Line] {
+			continue
+		}
+
+		// Check this is a bare call (not preceded by dot)
+		if i > 0 && tokens[i-1].Kind == parser.TokDot {
+			continue
+		}
+
+		// Check it's followed by ( or preceded by |>
+		isCall := false
+		j := tokNextSig(tokens, n, i+1)
+		if j < n && tokens[j].Kind == parser.TokOpenParen {
+			isCall = true
+		}
+		// Check for pipe call: |> functionName
+		if !isCall && i > 0 {
+			// Look back for |> (may have EOL/comments between)
+			for k := i - 1; k >= 0; k-- {
+				if tokens[k].Kind == parser.TokPipe {
+					isCall = true
+					break
+				}
+				if tokens[k].Kind != parser.TokEOL && tokens[k].Kind != parser.TokComment {
+					break
+				}
+			}
+		}
+
+		if isCall && !seenLines[tok.Line] {
+			seenLines[tok.Line] = true
+		}
+	}
+
 	var lineNums []int
-	for i, line := range strings.Split(text, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if m := parser.FuncDefRe.FindStringSubmatch(trimmed); m != nil && m[2] == functionName {
-			continue
-		}
-		if strings.HasPrefix(trimmed, "@spec ") || strings.HasPrefix(trimmed, "@callback ") {
-			continue
-		}
-
-		found := false
-
-		// Direct bare call: functionName( — but NOT Module.functionName(
-		for _, col := range findAllTokenColumns(line, functionName) {
-			if col == 0 || line[col-1] != '.' {
-				afterToken := line[col+len(functionName):]
-				afterTrimmed := strings.TrimLeft(afterToken, " \t")
-				if strings.HasPrefix(afterTrimmed, "(") {
-					found = true
-					break
-				}
-			}
-		}
-
-		// Pipe call: |> functionName
-		if !found {
-			for pipeSearch := line; ; {
-				idx := strings.Index(pipeSearch, "|>")
-				if idx < 0 {
-					break
-				}
-				afterPipe := strings.TrimLeft(pipeSearch[idx+2:], " \t")
-				if col := findTokenColumn(afterPipe, functionName); col == 0 {
-					found = true
-					break
-				}
-				pipeSearch = pipeSearch[idx+2:]
-			}
-		}
-
-		if found {
-			lineNums = append(lineNums, i+1)
+	for line := range seenLines {
+		lineNums = append(lineNums, line)
+	}
+	// Sort for deterministic output - use insertion sort since results are typically small
+	for i := 1; i < len(lineNums); i++ {
+		for j := i; j > 0 && lineNums[j-1] > lineNums[j]; j-- {
+			lineNums[j-1], lineNums[j] = lineNums[j], lineNums[j-1]
 		}
 	}
 	return lineNums
@@ -1738,15 +2126,34 @@ func ExtractCallContext(text string, lineNum, col int) (funcExpr string, argInde
 // extractParamNames reads the function definition line at defIdx and returns
 // the parameter names. Falls back to positional names (arg1, arg2, ...) for
 // complex patterns.
-
 func extractParamNames(lines []string, defIdx int) []string {
 	if defIdx < 0 || defIdx >= len(lines) {
 		return nil
 	}
-	line := lines[defIdx]
-	m := parser.FuncDefRe.FindStringSubmatch(line)
-	if m == nil {
-		return nil
+
+	// Tokenize just the single line for efficiency
+	source := []byte(lines[defIdx])
+	tokens := parser.Tokenize(source)
+	n := len(tokens)
+
+	for i := 0; i < n; i++ {
+		tok := tokens[i]
+
+		switch tok.Kind {
+		case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
+			parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate:
+			j := tokNextSig(tokens, n, i+1)
+			if j >= n || tokens[j].Kind != parser.TokIdent {
+				return nil
+			}
+			j++
+			pj := tokNextSig(tokens, n, j)
+			if pj >= n || tokens[pj].Kind != parser.TokOpenParen {
+				return nil
+			}
+			_, _, paramNames, _ := parser.CollectParams(source, tokens, n, pj)
+			return parser.FixParamNames(paramNames)
+		}
 	}
-	return parser.ExtractParamNames(line, m[2])
+	return nil
 }

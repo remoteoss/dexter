@@ -81,6 +81,12 @@ type Token struct {
 // table for O(1) byte-offset-to-column conversion. LineStarts[i] is the byte
 // offset of the first character on line i+1 (0-indexed). Column for a token
 // on line L at byte offset B is: B - LineStarts[L-1].
+//
+// Note: LineStarts only tracks newlines seen by the main tokenizer loop (bare
+// newlines between tokens). Escaped newlines inside strings, heredocs, sigils,
+// and interpolations increment Token.Line correctly but are NOT reflected in
+// LineStarts. Callers needing column info for tokens inside multi-line string
+// literals should compute it from byte offsets directly.
 type TokenResult struct {
 	Tokens     []Token
 	LineStarts []int
@@ -178,6 +184,9 @@ func TokenizeFull(source []byte) TokenResult {
 								i++
 							}
 						} else {
+							if source[i] == '\n' {
+								line++
+							}
 							i++ // single char escape like \n \t \\
 						}
 					}
@@ -553,7 +562,10 @@ func scanStringContent(source []byte, i, line int, delim byte) (int, int) {
 		if ch == '\n' {
 			line++
 			i++
-		} else if ch == '\\' {
+		} else if ch == '\\' && i+1 < len(source) {
+			if source[i+1] == '\n' {
+				line++
+			}
 			i += 2 // skip backslash and next char
 		} else if ch == '#' && i+1 < len(source) && source[i+1] == '{' {
 			i += 2 // consume #{
@@ -579,7 +591,10 @@ func scanInterpolation(source []byte, i, line int) (int, int) {
 		case c == '\n':
 			line++
 			i++
-		case c == '\\':
+		case c == '\\' && i+1 < len(source):
+			if source[i+1] == '\n' {
+				line++
+			}
 			i += 2
 		case c == '"' || c == '\'':
 			innerDelim := c
@@ -588,7 +603,10 @@ func scanInterpolation(source []byte, i, line int) (int, int) {
 		case c == '?' && i+1 < len(source):
 			// Character literal inside interpolation: ?} must not close the interpolation.
 			i++ // consume '?'
-			if source[i] == '\\' {
+			if source[i] == '\\' && i+1 < len(source) {
+				if source[i+1] == '\n' {
+					line++
+				}
 				i += 2 // escape sequence like ?\n
 			} else {
 				i++ // single char like ?} or ?a
@@ -634,7 +652,10 @@ func scanHeredocContent(source []byte, i, line int, delim byte) (int, int) {
 				i = j + 3 // consume closing delimiter
 				return i, line
 			}
-		} else if ch == '\\' {
+		} else if ch == '\\' && i+1 < len(source) {
+			if source[i+1] == '\n' {
+				line++
+			}
 			i += 2
 		} else if ch == '#' && i+1 < len(source) && source[i+1] == '{' {
 			i += 2
@@ -709,6 +730,9 @@ func scanSigilContent(source []byte, i, line int, sigilLetter byte) (int, int) {
 				line++
 				i++
 			} else if escapes && ch == '\\' && i+1 < len(source) {
+				if source[i+1] == '\n' {
+					line++
+				}
 				i += 2
 			} else if ch == openCh {
 				depth++
@@ -727,6 +751,9 @@ func scanSigilContent(source []byte, i, line int, sigilLetter byte) (int, int) {
 				line++
 				i++
 			} else if escapes && ch == '\\' && i+1 < len(source) {
+				if source[i+1] == '\n' {
+					line++
+				}
 				i += 2
 			} else if ch == closeCh {
 				i++ // consume closing delimiter

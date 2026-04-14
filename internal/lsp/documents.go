@@ -5,12 +5,16 @@ import (
 
 	tree_sitter "github.com/tree-sitter/go-tree-sitter"
 	tree_sitter_elixir "github.com/tree-sitter/tree-sitter-elixir/bindings/go"
+
+	"github.com/remoteoss/dexter/internal/parser"
 )
 
 type cachedDoc struct {
-	text string
-	tree *tree_sitter.Tree
-	src  []byte // source bytes the tree references — must stay alive
+	text   string
+	tree   *tree_sitter.Tree
+	src    []byte         // source bytes the tree references — must stay alive
+	tokens []parser.Token // cached tokenizer output
+	tokSrc []byte         // source bytes for tokens
 }
 
 // DocumentStore tracks the text content of open buffers and caches
@@ -88,4 +92,21 @@ func (ds *DocumentStore) GetTree(uri string) (*tree_sitter.Tree, []byte, bool) {
 		doc.tree = ds.parser.Parse(doc.src, nil)
 	}
 	return doc.tree, doc.src, true
+}
+
+// GetTokens returns cached tokenizer output and source bytes for the given URI.
+// Tokenizes on first access and caches the result. The cache is invalidated on
+// the next Set() call.
+func (ds *DocumentStore) GetTokens(uri string) ([]parser.Token, []byte, bool) {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	doc, ok := ds.docs[uri]
+	if !ok {
+		return nil, nil, false
+	}
+	if doc.tokens == nil {
+		doc.tokSrc = []byte(doc.text)
+		doc.tokens = parser.Tokenize(doc.tokSrc)
+	}
+	return doc.tokens, doc.tokSrc, true
 }

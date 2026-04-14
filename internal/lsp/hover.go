@@ -5,7 +5,6 @@ import (
 
 	"go.lsp.dev/protocol"
 
-	"github.com/remoteoss/dexter/internal/parser"
 	"github.com/remoteoss/dexter/internal/store"
 )
 
@@ -96,7 +95,7 @@ func extractDocAbove(lines []string, defIdx int) (doc, spec string) {
 			}
 			continue
 		}
-		if parser.FuncDefRe.MatchString(lines[i]) || parser.DefmoduleRe.MatchString(lines[i]) || parser.TypeDefRe.MatchString(lines[i]) {
+		if IsDefinitionLine(lines[i]) {
 			start = i + 1
 			break
 		}
@@ -159,7 +158,7 @@ func extractDocAbove(lines []string, defIdx int) (doc, spec string) {
 			continue
 		}
 
-		if parser.FuncDefRe.MatchString(lines[i]) || parser.DefmoduleRe.MatchString(lines[i]) || parser.TypeDefRe.MatchString(lines[i]) {
+		if IsDefinitionLine(lines[i]) {
 			currentDoc = ""
 			currentSpec = nil
 		}
