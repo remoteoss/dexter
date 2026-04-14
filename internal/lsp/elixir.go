@@ -558,7 +558,7 @@ func extractEnclosingModuleFromTokens(source []byte, tokens []parser.Token, targ
 			if len(stack) > 0 && stack[len(stack)-1].depth == prevDepth {
 				stack = stack[:len(stack)-1]
 			}
-		case parser.TokDefmodule:
+		case parser.TokDefmodule, parser.TokDefprotocol, parser.TokDefimpl:
 			i = processModuleDef(i+1) - 1 // -1: loop post-increment will advance to the returned position
 			continue
 		}
@@ -924,7 +924,6 @@ func extractAliasesFromTokens(source []byte, tokens []parser.Token, targetLine i
 var (
 	tokNextSig           = parser.NextSigToken
 	tokCollectModuleName = parser.CollectModuleName
-	tokText              = parser.TokenText
 )
 
 // ExtractImports parses all import declarations from document text.
@@ -1205,7 +1204,7 @@ func tokCollectKeywordModuleOpts(source []byte, tokens []parser.Token, n, pos in
 		// Match: ident colon Module
 		if tok.Kind == parser.TokIdent {
 			if i+1 < n && tokens[i+1].Kind == parser.TokColon {
-				key := tokText(source, tok)
+				key := parser.TokenText(source, tok)
 				k := tokNextSig(tokens, n, i+2)
 				if k < n && tokens[k].Kind == parser.TokModule {
 					modName, _ := tokCollectModuleName(source, tokens, n, k)
@@ -1244,28 +1243,11 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 	n := len(tokens)
 
 	nextSig := func(from int) int {
-		for from < n {
-			k := tokens[from].Kind
-			if k != parser.TokEOL && k != parser.TokComment {
-				return from
-			}
-			from++
-		}
-		return n
+		return tokNextSig(tokens, n, from)
 	}
 
 	collectModuleName := func(i int) (string, int) {
-		if i >= n || tokens[i].Kind != parser.TokModule {
-			return "", i
-		}
-		var parts []string
-		parts = append(parts, string(source[tokens[i].Start:tokens[i].End]))
-		i++
-		for i+1 < n && tokens[i].Kind == parser.TokDot && tokens[i+1].Kind == parser.TokModule {
-			parts = append(parts, string(source[tokens[i+1].Start:tokens[i+1].End]))
-			i += 2
-		}
-		return strings.Join(parts, "."), i
+		return tokCollectModuleName(source, tokens, n, i)
 	}
 
 	// Check if this module uses ExUnit.CaseTemplate
@@ -1493,7 +1475,7 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 					}
 					aliases[parser.AliasShortName(childName)] = parent + "." + childName
 				}
-				i = nextPos - 1
+				i = nextPos
 				continue
 			}
 			// alias Module, as: Name
@@ -1502,7 +1484,7 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 					aliases = make(map[string]string)
 				}
 				aliases[asName] = resolveAlias(modName)
-				i = nextPos - 1
+				i = nextPos
 				continue
 			}
 			// Simple alias
