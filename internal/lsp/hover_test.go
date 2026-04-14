@@ -20,8 +20,8 @@ func TestExtractDocAbove_Heredoc(t *testing.T) {
     :ok
   end
 end`
-	lines := strings.Split(src, "\n")
-	doc, spec := extractDocAbove(lines, 6)
+
+	doc, spec := NewTokenizedFile(src).ExtractDocAbove(6)
 
 	if doc == "" {
 		t.Fatal("expected doc, got empty")
@@ -44,8 +44,8 @@ func TestExtractDocAbove_SingleLine(t *testing.T) {
     :ok
   end
 end`
-	lines := strings.Split(src, "\n")
-	doc, _ := extractDocAbove(lines, 2)
+
+	doc, _ := NewTokenizedFile(src).ExtractDocAbove(2)
 
 	if doc != "Creates a new user." {
 		t.Errorf("expected 'Creates a new user.', got %q", doc)
@@ -62,8 +62,8 @@ func TestExtractDocAbove_WithSpec(t *testing.T) {
     :ok
   end
 end`
-	lines := strings.Split(src, "\n")
-	doc, spec := extractDocAbove(lines, 5)
+
+	doc, spec := NewTokenizedFile(src).ExtractDocAbove(5)
 
 	if !strings.Contains(doc, "Creates a new user") {
 		t.Errorf("expected doc content, got %q", doc)
@@ -81,8 +81,8 @@ func TestExtractDocAbove_MultiLineSpec(t *testing.T) {
     :ok
   end
 end`
-	lines := strings.Split(src, "\n")
-	_, spec := extractDocAbove(lines, 3)
+
+	_, spec := NewTokenizedFile(src).ExtractDocAbove(3)
 
 	if !strings.Contains(spec, "@spec create") {
 		t.Errorf("expected spec to contain '@spec create', got %q", spec)
@@ -99,8 +99,8 @@ func TestExtractDocAbove_DocFalse(t *testing.T) {
     :ok
   end
 end`
-	lines := strings.Split(src, "\n")
-	doc, _ := extractDocAbove(lines, 2)
+
+	doc, _ := NewTokenizedFile(src).ExtractDocAbove(2)
 
 	if doc != "" {
 		t.Errorf("expected empty doc for @doc false, got %q", doc)
@@ -113,8 +113,8 @@ func TestExtractDocAbove_NoDoc(t *testing.T) {
     :ok
   end
 end`
-	lines := strings.Split(src, "\n")
-	doc, spec := extractDocAbove(lines, 1)
+
+	doc, spec := NewTokenizedFile(src).ExtractDocAbove(1)
 
 	if doc != "" {
 		t.Errorf("expected no doc, got %q", doc)
@@ -137,8 +137,8 @@ func TestExtractDocAbove_DoesNotLeakFromPreviousFunction(t *testing.T) {
     :ok
   end
 end`
-	lines := strings.Split(src, "\n")
-	doc, _ := extractDocAbove(lines, 8)
+
+	doc, _ := NewTokenizedFile(src).ExtractDocAbove(8)
 
 	if doc != "" {
 		t.Errorf("expected no doc for second function, got %q", doc)
@@ -153,8 +153,8 @@ func TestExtractDocAbove_SpecBeforeDoc(t *testing.T) {
     :ok
   end
 end`
-	lines := strings.Split(src, "\n")
-	doc, spec := extractDocAbove(lines, 3)
+
+	doc, spec := NewTokenizedFile(src).ExtractDocAbove(3)
 
 	if doc != "Creates a user." {
 		t.Errorf("expected doc, got %q", doc)
@@ -176,8 +176,8 @@ func TestExtractModuledoc_Heredoc(t *testing.T) {
     :ok
   end
 end`
-	lines := strings.Split(src, "\n")
-	doc := extractModuledoc(lines, 0)
+
+	doc := NewTokenizedFile(src).ExtractModuledoc(0)
 
 	if !strings.Contains(doc, "Manages user accounts") {
 		t.Errorf("expected moduledoc content, got %q", doc)
@@ -195,8 +195,8 @@ func TestExtractModuledoc_SingleLine(t *testing.T) {
     :ok
   end
 end`
-	lines := strings.Split(src, "\n")
-	doc := extractModuledoc(lines, 0)
+
+	doc := NewTokenizedFile(src).ExtractModuledoc(0)
 
 	if doc != "Manages user accounts." {
 		t.Errorf("expected 'Manages user accounts.', got %q", doc)
@@ -209,8 +209,8 @@ func TestExtractModuledoc_False(t *testing.T) {
 
   def helper(x), do: x
 end`
-	lines := strings.Split(src, "\n")
-	doc := extractModuledoc(lines, 0)
+
+	doc := NewTokenizedFile(src).ExtractModuledoc(0)
 
 	if doc != "" {
 		t.Errorf("expected empty doc for @moduledoc false, got %q", doc)
@@ -230,8 +230,8 @@ func TestExtractModuledoc_AfterUseAndAlias(t *testing.T) {
     Repo.all(User)
   end
 end`
-	lines := strings.Split(src, "\n")
-	doc := extractModuledoc(lines, 0)
+
+	doc := NewTokenizedFile(src).ExtractModuledoc(0)
 
 	if !strings.Contains(doc, "Users context module") {
 		t.Errorf("expected moduledoc after use/alias, got %q", doc)
@@ -244,8 +244,8 @@ func TestExtractModuledoc_None(t *testing.T) {
     :ok
   end
 end`
-	lines := strings.Split(src, "\n")
-	doc := extractModuledoc(lines, 0)
+
+	doc := NewTokenizedFile(src).ExtractModuledoc(0)
 
 	if doc != "" {
 		t.Errorf("expected no moduledoc, got %q", doc)
@@ -574,11 +574,10 @@ func TestHover_TypeDocNotLeakingAcrossTypes(t *testing.T) {
   @type first :: integer()
   @type second :: string()
 end`
-	lines := strings.Split(src, "\n")
 
 	// extractDocAbove for second (line index 3) should find no doc —
 	// the @typedoc belongs to first, not second.
-	doc, _ := extractDocAbove(lines, 3)
+	doc, _ := NewTokenizedFile(src).ExtractDocAbove(3)
 	if doc != "" {
 		t.Errorf("expected no doc for second type, got %q", doc)
 	}
@@ -960,8 +959,8 @@ func TestHover_SigilHeredoc(t *testing.T) {
     :ok
   end
 end`
-	lines := strings.Split(src, "\n")
-	doc, _ := extractDocAbove(lines, 6)
+
+	doc, _ := NewTokenizedFile(src).ExtractDocAbove(6)
 
 	if !strings.Contains(doc, "Creates a user") {
 		t.Errorf("expected doc from sigil heredoc, got %q", doc)

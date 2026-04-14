@@ -3830,6 +3830,84 @@ end
 	}
 }
 
+func TestDocumentSymbol_MisindentedInnerEndDoesNotCloseFunction(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule MyApp do
+  def outer do
+    if true do
+      :ok
+  end
+      :still_in_outer
+      end
+
+  def after_func, do: :ok
+end
+`
+	docURI := "file:///test/misindented_end.ex"
+	server.docs.Set(docURI, content)
+
+	symbols := documentSymbols(t, server, docURI)
+	if len(symbols) != 1 {
+		t.Fatalf("expected 1 top-level symbol, got %d", len(symbols))
+	}
+
+	mod := symbols[0]
+	childNames := collectNames(mod.Children)
+	expectedChildren := []string{"outer/0", "after_func/0"}
+	if len(childNames) != len(expectedChildren) {
+		t.Fatalf("expected %d children of module, got %d: %v", len(expectedChildren), len(childNames), childNames)
+	}
+	for i, name := range expectedChildren {
+		if childNames[i] != name {
+			t.Errorf("child %d: expected %q, got %q", i, name, childNames[i])
+		}
+	}
+
+	outer := findSymbol(mod.Children, "outer/0")
+	if outer == nil {
+		t.Fatal("outer/0 not found")
+	}
+	if outer.Range.End.Line != 6 {
+		t.Errorf("outer end line: expected 6, got %d", outer.Range.End.Line)
+	}
+}
+
+func TestDocumentSymbol_SplitLineDoTracksFunctionBody(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule MyApp do
+  def split(
+        x
+      )
+      do
+    x + 1
+  end
+end
+`
+	docURI := "file:///test/split_line_do.ex"
+	server.docs.Set(docURI, content)
+
+	symbols := documentSymbols(t, server, docURI)
+	if len(symbols) != 1 {
+		t.Fatalf("expected 1 top-level symbol, got %d", len(symbols))
+	}
+
+	mod := symbols[0]
+	split := findSymbol(mod.Children, "split/1")
+	if split == nil {
+		t.Fatal("split/1 not found")
+	}
+	if split.Range.Start.Line != 1 {
+		t.Errorf("split start line: expected 1, got %d", split.Range.Start.Line)
+	}
+	if split.Range.End.Line != 6 {
+		t.Errorf("split end line: expected 6, got %d", split.Range.End.Line)
+	}
+}
+
 // Verify capabilities are advertised
 func TestServer_Capabilities_DocumentSymbolAndWorkspaceSymbol(t *testing.T) {
 	server, cleanup := setupTestServer(t)

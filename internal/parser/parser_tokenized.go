@@ -87,28 +87,17 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 		// depth) so inner `end` did not pop the inner module frame.
 		// Stop at statement-boundary tokens to avoid stealing a later module's TokDo
 		// when the current module uses the `, do:` keyword form.
-		scanPos := j
-		for scanPos < n {
-			switch tokens[scanPos].Kind {
-			case TokDo:
-				depth++
-				scanPos++ // consume TokDo
-				moduleStack = append(moduleStack, moduleFrame{
-					name:           name,
-					depth:          depth,
-					savedAliases:   copyMap(aliases),
-					savedInjectors: copyBoolMap(injectors),
-				})
-				return scanPos
-			case TokEOF, TokEnd,
-				TokDefmodule, TokDefprotocol, TokDefimpl,
-				TokDef, TokDefp, TokDefmacro, TokDefmacrop,
-				TokDefguard, TokDefguardp, TokDefdelegate:
-				return scanPos
-			}
-			scanPos++
+		_, scanPos, hasDo := ScanForwardToBlockDo(tokens, n, j)
+		if hasDo {
+			depth++
+			moduleStack = append(moduleStack, moduleFrame{
+				name:           name,
+				depth:          depth,
+				savedAliases:   copyMap(aliases),
+				savedInjectors: copyBoolMap(injectors),
+			})
 		}
-		return j
+		return scanPos
 	}
 
 	emitModuleRef := func(modName string, line int, kind string) {
@@ -244,20 +233,16 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 	trackLineDepth := func(lineStart, lineEnd int) {
 		for j := lineStart; j < lineEnd; j++ {
 			switch tokens[j].Kind {
-			case TokDo:
-				depth++
-			case TokFn:
-				depth++
+			case TokDo, TokFn:
+				TrackBlockDepth(tokens[j].Kind, &depth)
 			case TokEnd:
-				if len(moduleStack) > 0 && moduleStack[len(moduleStack)-1].depth == depth {
+				prevDepth := depth
+				TrackBlockDepth(tokens[j].Kind, &depth)
+				if len(moduleStack) > 0 && moduleStack[len(moduleStack)-1].depth == prevDepth {
 					frame := moduleStack[len(moduleStack)-1]
 					moduleStack = moduleStack[:len(moduleStack)-1]
 					aliases = frame.savedAliases
 					injectors = frame.savedInjectors
-				}
-				depth--
-				if depth < 0 {
-					depth = 0
 				}
 			}
 		}
@@ -283,29 +268,19 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 			continue
 
 		case TokEnd:
-			if len(moduleStack) > 0 && moduleStack[len(moduleStack)-1].depth == depth {
+			prevDepth := depth
+			TrackBlockDepth(tok.Kind, &depth)
+			if len(moduleStack) > 0 && moduleStack[len(moduleStack)-1].depth == prevDepth {
 				frame := moduleStack[len(moduleStack)-1]
 				moduleStack = moduleStack[:len(moduleStack)-1]
 				aliases = frame.savedAliases
 				injectors = frame.savedInjectors
 			}
-			depth--
-			if depth < 0 {
-				depth = 0
-			}
 			i++
 			continue
 
-		case TokDo:
-			depth++
-			i++
-			continue
-
-		case TokFn:
-			// fn always increments depth; its matching TokEnd will decrement it.
-			// For inline fn..end on the same line, the depth goes up then back down
-			// with net zero effect — matching the old parser's ContainsFn behavior.
-			depth++
+		case TokDo, TokFn:
+			TrackBlockDepth(tok.Kind, &depth)
 			i++
 			continue
 
@@ -415,74 +390,32 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 			cm := currentModule()
 
 			// Multi-alias: alias MyApp.{Users, Accounts}
-			if k < n && tokens[k].Kind == TokDot && k+1 < n && tokens[k+1].Kind == TokOpenBrace {
-				parent := modName
-				parentResolved := resolveModule(parent, cm)
-				k += 2 // skip dot and open brace
-				for k < n && tokens[k].Kind != TokCloseBrace && tokens[k].Kind != TokEOF {
-					k = nextSig(k)
-					if k >= n || tokens[k].Kind == TokCloseBrace {
-						break
-					}
-					childName, newK := collectModuleName(k)
-					if childName != "" {
-						fullChild := parentResolved + "." + childName
-						aliasKey := childName
-						if dot := strings.LastIndexByte(childName, '.'); dot >= 0 {
-							aliasKey = childName[dot+1:]
-						}
-						aliases[aliasKey] = fullChild
-						emitModuleRef(fullChild, aliasLine, "alias")
-					}
-					if newK == k {
-						k++ // ensure forward progress
-					} else {
-						k = newK
-					}
-					if k < n && tokens[k].Kind == TokComma {
-						k++
-					}
+			if children, nextPos, ok := ScanMultiAliasChildren(source, tokens, n, k, false); ok {
+				parentResolved := resolveModule(modName, cm)
+				for _, childName := range children {
+					fullChild := parentResolved + "." + childName
+					aliases[AliasShortName(childName)] = fullChild
+					emitModuleRef(fullChild, aliasLine, "alias")
 				}
-				i = k
-				if i < n && tokens[i].Kind == TokCloseBrace {
-					i++
-				}
+				i = nextPos
 				continue
 			}
 
 			// Alias with as:
-			nk := nextSig(k)
-			if nk < n && tokens[nk].Kind == TokComma {
-				afterComma := nextSig(nk + 1)
-				if afterComma < n && tokens[afterComma].Kind == TokIdent && tokenText(tokens[afterComma]) == "as" {
-					afterAs := nextSig(afterComma + 1)
-					if afterAs < n && tokens[afterAs].Kind == TokColon {
-						afterColon := nextSig(afterAs + 1)
-						if afterColon < n && (tokens[afterColon].Kind == TokModule || tokens[afterColon].Kind == TokIdent) {
-							asName := tokenText(tokens[afterColon])
-							resolved := resolveModule(modName, cm)
-							if !strings.Contains(resolved, "__MODULE__") {
-								aliases[asName] = resolved
-								refs = append(refs, Reference{Module: resolved, Line: aliasLine, FilePath: path, Kind: "alias"})
-							}
-							i = afterColon + 1
-							continue
-						}
-					}
+			if asName, nextPos, ok := ScanKeywordOptionValue(source, tokens, n, k, "as"); ok {
+				resolved := resolveModule(modName, cm)
+				if !strings.Contains(resolved, "__MODULE__") {
+					aliases[asName] = resolved
+					refs = append(refs, Reference{Module: resolved, Line: aliasLine, FilePath: path, Kind: "alias"})
 				}
+				i = nextPos + 1
+				continue
 			}
 
 			// Simple alias
 			{
 				resolved := resolveModule(modName, cm)
-				dot := strings.LastIndexByte(resolved, '.')
-				var shortName string
-				if dot >= 0 {
-					shortName = resolved[dot+1:]
-				} else {
-					shortName = resolved
-				}
-				aliases[shortName] = resolved
+				aliases[AliasShortName(resolved)] = resolved
 				emitModuleRef(resolved, aliasLine, "alias")
 			}
 			i = k
@@ -530,25 +463,14 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 			cm := currentModule()
 
 			// Check for require Module, as: Name
-			nk := nextSig(k)
-			if nk < n && tokens[nk].Kind == TokComma {
-				afterComma := nextSig(nk + 1)
-				if afterComma < n && tokens[afterComma].Kind == TokIdent && tokenText(tokens[afterComma]) == "as" {
-					afterAs := nextSig(afterComma + 1)
-					if afterAs < n && tokens[afterAs].Kind == TokColon {
-						afterColon := nextSig(afterAs + 1)
-						if afterColon < n && (tokens[afterColon].Kind == TokModule || tokens[afterColon].Kind == TokIdent) {
-							asName := tokenText(tokens[afterColon])
-							resolved := resolveModule(modName, cm)
-							if !strings.Contains(resolved, "__MODULE__") {
-								aliases[asName] = resolved
-								refs = append(refs, Reference{Module: resolved, Line: requireLine, FilePath: path, Kind: "require"})
-							}
-							i = afterColon + 1
-							continue
-						}
-					}
+			if asName, nextPos, ok := ScanKeywordOptionValue(source, tokens, n, k, "as"); ok {
+				resolved := resolveModule(modName, cm)
+				if !strings.Contains(resolved, "__MODULE__") {
+					aliases[asName] = resolved
+					refs = append(refs, Reference{Module: resolved, Line: requireLine, FilePath: path, Kind: "require"})
 				}
+				i = nextPos + 1
+				continue
 			}
 
 			// Simple require (no as:) — still emit reference but no alias

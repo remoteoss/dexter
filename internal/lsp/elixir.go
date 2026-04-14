@@ -497,6 +497,20 @@ func ExtractAliasBlockParent(lines []string, targetLine int) (string, bool) {
 	return "", false
 }
 
+func tokParseModuleDef(source []byte, tokens []parser.Token, from int, currentModule string) (name string, nextPos int, hasDo bool) {
+	n := len(tokens)
+	j := tokNextSig(tokens, n, from)
+	name, k := tokCollectModuleName(source, tokens, n, j)
+	if name == "" {
+		return "", from, false
+	}
+	if !strings.Contains(name, ".") && currentModule != "" {
+		name = currentModule + "." + name
+	}
+	_, nextPos, hasDo = parser.ScanForwardToBlockDo(tokens, n, k)
+	return name, nextPos, hasDo
+}
+
 // extractEnclosingModuleFromTokens finds the innermost defmodule enclosing the given 0-based line.
 func extractEnclosingModuleFromTokens(source []byte, tokens []parser.Token, targetLine int) string {
 	n := len(tokens)
@@ -510,32 +524,19 @@ func extractEnclosingModuleFromTokens(source []byte, tokens []parser.Token, targ
 	depth := 0
 
 	processModuleDef := func(i int) int {
-		j := tokNextSig(tokens, n, i)
-		name, k := tokCollectModuleName(source, tokens, n, j)
+		currentModule := ""
+		if len(stack) > 0 {
+			currentModule = stack[len(stack)-1].name
+		}
+		name, nextPos, hasDo := tokParseModuleDef(source, tokens, i, currentModule)
 		if name == "" {
 			return i
 		}
-		if !strings.Contains(name, ".") && len(stack) > 0 {
-			name = stack[len(stack)-1].name + "." + name
+		if hasDo {
+			depth++
+			stack = append(stack, moduleFrame{name, depth})
 		}
-		// Scan forward to consume TokDo. Do not stop at TokEOL because
-		// Elixir allows `defmodule Foo` then `do` on the next line.
-		// Stop at statement-boundary tokens to avoid stealing a later
-		// module's TokDo when the current module uses `, do:` form.
-		for pos := k; pos < n; pos++ {
-			switch tokens[pos].Kind {
-			case parser.TokDo:
-				depth++
-				stack = append(stack, moduleFrame{name, depth})
-				return pos + 1
-			case parser.TokEOF, parser.TokEnd,
-				parser.TokDefmodule, parser.TokDefprotocol, parser.TokDefimpl,
-				parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
-				parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate:
-				return pos
-			}
-		}
-		return k
+		return nextPos
 	}
 
 	for i := 0; i < n; i++ {
@@ -546,14 +547,12 @@ func extractEnclosingModuleFromTokens(source []byte, tokens []parser.Token, targ
 
 		switch tok.Kind {
 		case parser.TokDo, parser.TokFn:
-			depth++
+			parser.TrackBlockDepth(tok.Kind, &depth)
 		case parser.TokEnd:
-			if len(stack) > 0 && stack[len(stack)-1].depth == depth {
+			prevDepth := depth
+			parser.TrackBlockDepth(tok.Kind, &depth)
+			if len(stack) > 0 && stack[len(stack)-1].depth == prevDepth {
 				stack = stack[:len(stack)-1]
-			}
-			depth--
-			if depth < 0 {
-				depth = 0
 			}
 		case parser.TokDefmodule:
 			i = processModuleDef(i+1) - 1 // -1: loop post-increment will advance to the returned position
@@ -818,32 +817,15 @@ func extractAliasesFromTokens(source []byte, tokens []parser.Token, targetLine i
 	}
 
 	processModuleDef := func(i int) int {
-		j := tokNextSig(tokens, n, i)
-		name, k := tokCollectModuleName(source, tokens, n, j)
+		name, nextPos, hasDo := tokParseModuleDef(source, tokens, i, currentModule())
 		if name == "" {
 			return i
 		}
-		if !strings.Contains(name, ".") && currentModule() != "" {
-			name = currentModule() + "." + name
+		if hasDo {
+			depth++
+			stack = append(stack, moduleFrame{name, depth})
 		}
-		// Scan forward to consume TokDo. Do not stop at TokEOL because
-		// Elixir allows `defmodule Foo` then `do` on the next line.
-		// Stop at statement-boundary tokens to avoid stealing a later
-		// module's TokDo when the current module uses `, do:` form.
-		for pos := k; pos < n; pos++ {
-			switch tokens[pos].Kind {
-			case parser.TokDo:
-				depth++
-				stack = append(stack, moduleFrame{name, depth})
-				return pos + 1
-			case parser.TokEOF, parser.TokEnd,
-				parser.TokDefmodule, parser.TokDefprotocol, parser.TokDefimpl,
-				parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
-				parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate:
-				return pos
-			}
-		}
-		return k
+		return nextPos
 	}
 
 	for i := 0; i < n; i++ {
@@ -855,17 +837,13 @@ func extractAliasesFromTokens(source []byte, tokens []parser.Token, targetLine i
 		}
 
 		switch tok.Kind {
-		case parser.TokDo:
-			depth++
-		case parser.TokFn:
-			depth++
+		case parser.TokDo, parser.TokFn:
+			parser.TrackBlockDepth(tok.Kind, &depth)
 		case parser.TokEnd:
-			if len(stack) > 0 && stack[len(stack)-1].depth == depth {
+			prevDepth := depth
+			parser.TrackBlockDepth(tok.Kind, &depth)
+			if len(stack) > 0 && stack[len(stack)-1].depth == prevDepth {
 				stack = stack[:len(stack)-1]
-			}
-			depth--
-			if depth < 0 {
-				depth = 0
 			}
 
 		case parser.TokDefmodule, parser.TokDefprotocol, parser.TokDefimpl:
@@ -881,76 +859,32 @@ func extractAliasesFromTokens(source []byte, tokens []parser.Token, targetLine i
 			}
 
 			// Multi-alias: alias Parent.{A, B, C}
-			if k < n && tokens[k].Kind == parser.TokDot && k+1 < n && tokens[k+1].Kind == parser.TokOpenBrace {
+			if children, nextPos, ok := parser.ScanMultiAliasChildren(source, tokens, n, k, true); ok {
 				base := resolve(modName)
 				if strings.Contains(base, "__MODULE__") {
 					continue
 				}
-				k += 2 // skip .{
-				for k < n && tokens[k].Kind != parser.TokCloseBrace && tokens[k].Kind != parser.TokEOF {
-					k = tokNextSig(tokens, n, k)
-					if k >= n || tokens[k].Kind == parser.TokCloseBrace {
-						break
-					}
-					// Bail out if we hit a new statement keyword inside the braces
-					switch tokens[k].Kind {
-					case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
-						parser.TokDefmodule, parser.TokEnd, parser.TokImport, parser.TokUse, parser.TokAlias:
-						goto bracesDone
-					}
-					child, nk := tokCollectModuleName(source, tokens, n, k)
-					if child != "" {
-						aliasKey := child
-						if dot := strings.LastIndexByte(child, '.'); dot >= 0 {
-							aliasKey = child[dot+1:]
-						}
-						allAliases = append(allAliases, aliasEntry{cm, aliasKey, base + "." + child})
-					}
-					if nk == k {
-						k++ // ensure forward progress
-					} else {
-						k = nk
-					}
-					if k < n && tokens[k].Kind == parser.TokComma {
-						k++
-					}
+				for _, child := range children {
+					allAliases = append(allAliases, aliasEntry{cm, parser.AliasShortName(child), base + "." + child})
 				}
-			bracesDone:
-				if k < n && tokens[k].Kind == parser.TokCloseBrace {
-					k++
-				}
-				i = k - 1
+				i = nextPos - 1
 				continue
 			}
 
 			// Check for alias Module, as: Name
-			nk := tokNextSig(tokens, n, k)
-			if nk < n && tokens[nk].Kind == parser.TokComma {
-				ac := tokNextSig(tokens, n, nk+1)
-				if ac < n && tokens[ac].Kind == parser.TokIdent && tokText(source, tokens[ac]) == "as" {
-					ac2 := tokNextSig(tokens, n, ac+1)
-					if ac2 < n && tokens[ac2].Kind == parser.TokColon {
-						ac3 := tokNextSig(tokens, n, ac2+1)
-						if ac3 < n && (tokens[ac3].Kind == parser.TokModule || tokens[ac3].Kind == parser.TokIdent) {
-							resolved := resolve(modName)
-							if !strings.Contains(resolved, "__MODULE__") {
-								allAliases = append(allAliases, aliasEntry{cm, tokText(source, tokens[ac3]), resolved})
-							}
-							i = ac3
-							continue
-						}
-					}
+			if asName, nextPos, ok := parser.ScanKeywordOptionValue(source, tokens, n, k, "as"); ok {
+				resolved := resolve(modName)
+				if !strings.Contains(resolved, "__MODULE__") {
+					allAliases = append(allAliases, aliasEntry{cm, asName, resolved})
 				}
+				i = nextPos
+				continue
 			}
 
 			// Simple alias
 			resolved := resolve(modName)
 			if !strings.Contains(resolved, "__MODULE__") {
-				short := resolved
-				if dot := strings.LastIndexByte(resolved, '.'); dot >= 0 {
-					short = resolved[dot+1:]
-				}
-				allAliases = append(allAliases, aliasEntry{cm, short, resolved})
+				allAliases = append(allAliases, aliasEntry{cm, parser.AliasShortName(resolved), resolved})
 			}
 			i = k - 1
 
@@ -963,23 +897,13 @@ func extractAliasesFromTokens(source []byte, tokens []parser.Token, targetLine i
 			}
 
 			// Check for require Module, as: Name
-			nk := tokNextSig(tokens, n, k)
-			if nk < n && tokens[nk].Kind == parser.TokComma {
-				ac := tokNextSig(tokens, n, nk+1)
-				if ac < n && tokens[ac].Kind == parser.TokIdent && tokText(source, tokens[ac]) == "as" {
-					ac2 := tokNextSig(tokens, n, ac+1)
-					if ac2 < n && tokens[ac2].Kind == parser.TokColon {
-						ac3 := tokNextSig(tokens, n, ac2+1)
-						if ac3 < n && (tokens[ac3].Kind == parser.TokModule || tokens[ac3].Kind == parser.TokIdent) {
-							resolved := resolve(modName)
-							if !strings.Contains(resolved, "__MODULE__") {
-								allAliases = append(allAliases, aliasEntry{cm, tokText(source, tokens[ac3]), resolved})
-							}
-							i = ac3
-							continue
-						}
-					}
+			if asName, nextPos, ok := parser.ScanKeywordOptionValue(source, tokens, n, k, "as"); ok {
+				resolved := resolve(modName)
+				if !strings.Contains(resolved, "__MODULE__") {
+					allAliases = append(allAliases, aliasEntry{cm, asName, resolved})
 				}
+				i = nextPos
+				continue
 			}
 			i = k - 1
 		}
@@ -1051,14 +975,8 @@ func parseHelperQuoteBlock(lines []string, helperName string, fileAliases map[st
 		if j < n && tokens[j].Kind == parser.TokIdent && txt(tokens[j]) == helperName {
 			// Find the TokDo that opens this function. Don't stop at TokEOL
 			// because Elixir allows `do` on the next line after multi-line params.
-			for k := j + 1; k < n; k++ {
-				if tokens[k].Kind == parser.TokDo {
-					helperStart = k + 1
-					break
-				}
-				if tokens[k].Kind == parser.TokEnd || tokens[k].Kind == parser.TokEOF {
-					break
-				}
+			if _, nextPos, hasDo := parser.ScanForwardToBlockDo(tokens, n, j+1); hasDo {
+				helperStart = nextPos
 			}
 			break
 		}
@@ -1071,13 +989,8 @@ func parseHelperQuoteBlock(lines []string, helperName string, fileAliases map[st
 	quoteBodyStart := -1
 	depth := 1
 	for i := helperStart; i < n && depth > 0; i++ {
+		parser.TrackBlockDepth(tokens[i].Kind, &depth)
 		switch tokens[i].Kind {
-		case parser.TokDo:
-			depth++
-		case parser.TokFn:
-			depth++
-		case parser.TokEnd:
-			depth--
 		case parser.TokIdent:
 			if txt(tokens[i]) == "quote" {
 				j := tokNextSig(tokens, n, i+1)
@@ -1129,13 +1042,8 @@ func parseHelperQuoteBlock(lines []string, helperName string, fileAliases map[st
 	depth = 1
 	for i := quoteBodyStart; i < n && depth > 0; i++ {
 		tok := tokens[i]
+		parser.TrackBlockDepth(tok.Kind, &depth)
 		switch tok.Kind {
-		case parser.TokDo:
-			depth++
-		case parser.TokFn:
-			depth++
-		case parser.TokEnd:
-			depth--
 
 		case parser.TokImport:
 			j := tokNextSig(tokens, n, i+1)
@@ -1158,64 +1066,33 @@ func parseHelperQuoteBlock(lines []string, helperName string, fileAliases map[st
 				continue
 			}
 			// Multi-alias: alias Parent.{A, B}
-			if k < n && tokens[k].Kind == parser.TokDot && k+1 < n && tokens[k+1].Kind == parser.TokOpenBrace {
+			if children, nextPos, ok := parser.ScanMultiAliasChildren(source, tokens, n, k, false); ok {
 				base := resolveAlias(modName)
-				k += 2
-				for k < n && tokens[k].Kind != parser.TokCloseBrace && tokens[k].Kind != parser.TokEOF {
-					k = tokNextSig(tokens, n, k)
-					if k >= n || tokens[k].Kind == parser.TokCloseBrace {
-						break
+				for _, child := range children {
+					if aliases == nil {
+						aliases = make(map[string]string)
 					}
-					child, nk := tokCollectModuleName(source, tokens, n, k)
-					if child != "" {
-						if aliases == nil {
-							aliases = make(map[string]string)
-						}
-						aliasKey := child
-						if dot := strings.LastIndexByte(child, '.'); dot >= 0 {
-							aliasKey = child[dot+1:]
-						}
-						aliases[aliasKey] = base + "." + child
-					}
-					if nk == k {
-						k++ // ensure forward progress
-					} else {
-						k = nk
-					}
-					if k < n && tokens[k].Kind == parser.TokComma {
-						k++
-					}
+					aliases[parser.AliasShortName(child)] = base + "." + child
 				}
+				i = nextPos - 1
 				continue
 			}
 			// alias Module, as: Name
-			nk := tokNextSig(tokens, n, k)
-			if nk < n && tokens[nk].Kind == parser.TokComma {
-				ac := tokNextSig(tokens, n, nk+1)
-				if ac < n && tokens[ac].Kind == parser.TokIdent && txt(tokens[ac]) == "as" {
-					ac2 := tokNextSig(tokens, n, ac+1)
-					if ac2 < n && tokens[ac2].Kind == parser.TokColon {
-						ac3 := tokNextSig(tokens, n, ac2+1)
-						if ac3 < n && (tokens[ac3].Kind == parser.TokModule || tokens[ac3].Kind == parser.TokIdent) {
-							if aliases == nil {
-								aliases = make(map[string]string)
-							}
-							aliases[txt(tokens[ac3])] = resolveAlias(modName)
-							continue
-						}
-					}
+			if asName, nextPos, ok := parser.ScanKeywordOptionValue(source, tokens, n, k, "as"); ok {
+				if aliases == nil {
+					aliases = make(map[string]string)
 				}
+				aliases[asName] = resolveAlias(modName)
+				i = nextPos
+				continue
 			}
 			// Simple alias
 			resolved := resolveAlias(modName)
 			if aliases == nil {
 				aliases = make(map[string]string)
 			}
-			if dot := strings.LastIndexByte(resolved, '.'); dot >= 0 {
-				aliases[resolved[dot+1:]] = resolved
-			} else {
-				aliases[resolved] = resolved
-			}
+			aliases[parser.AliasShortName(resolved)] = resolved
+			i = k - 1
 
 		case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
 			parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate:
@@ -1425,16 +1302,10 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 		if tok.Kind == parser.TokDefmacro {
 			j := nextSig(i + 1)
 			if j < n && tokens[j].Kind == parser.TokIdent && txt(tokens[j]) == "__using__" {
-				// Scan forward to find TokDo, then body starts after it
-				for k := j + 1; k < n; k++ {
-					if tokens[k].Kind == parser.TokDo {
-						usingBodyStart = k + 1
-						usingDepth = 1 // inside the defmacro do..end
-						break
-					}
-					if tokens[k].Kind == parser.TokEOL {
-						break
-					}
+				// Scan forward to find TokDo; Elixir allows split-line heads.
+				if _, nextPos, hasDo := parser.ScanForwardToBlockDo(tokens, n, j+1); hasDo {
+					usingBodyStart = nextPos
+					usingDepth = 1 // inside the defmacro do..end
 				}
 				break
 			}
@@ -1443,15 +1314,9 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 		if usesCaseTemplate && tok.Kind == parser.TokIdent && txt(tok) == "using" {
 			// Must be at statement start
 			if i == 0 || tokens[i-1].Kind == parser.TokEOL {
-				for k := i + 1; k < n; k++ {
-					if tokens[k].Kind == parser.TokDo {
-						usingBodyStart = k + 1
-						usingDepth = 1
-						break
-					}
-					if tokens[k].Kind == parser.TokEOL {
-						break
-					}
+				if _, nextPos, hasDo := parser.ScanForwardToBlockDo(tokens, n, i+1); hasDo {
+					usingBodyStart = nextPos
+					usingDepth = 1
 				}
 				if usingBodyStart >= 0 {
 					break
@@ -1623,14 +1488,8 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 		tok := tokens[i]
 
 		switch tok.Kind {
-		case parser.TokDo:
-			depth++
-			i++
-		case parser.TokFn:
-			depth++
-			i++
-		case parser.TokEnd:
-			depth--
+		case parser.TokDo, parser.TokFn, parser.TokEnd:
+			parser.TrackBlockDepth(tok.Kind, &depth)
 			i++
 		case parser.TokEOL, parser.TokComment, parser.TokString, parser.TokHeredoc,
 			parser.TokSigil, parser.TokAtom, parser.TokNumber, parser.TokCharLiteral,
@@ -1688,71 +1547,32 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 				continue
 			}
 			// Multi-alias: alias Parent.{A, B}
-			if k < n && tokens[k].Kind == parser.TokDot && k+1 < n && tokens[k+1].Kind == parser.TokOpenBrace {
+			if children, nextPos, ok := parser.ScanMultiAliasChildren(source, tokens, n, k, false); ok {
 				parent := resolveAlias(modName)
-				k += 2 // skip .{
-				for k < n && tokens[k].Kind != parser.TokCloseBrace && tokens[k].Kind != parser.TokEOF {
-					k = nextSig(k)
-					if k >= n || tokens[k].Kind == parser.TokCloseBrace {
-						break
+				for _, childName := range children {
+					if aliases == nil {
+						aliases = make(map[string]string)
 					}
-					childName, newK := collectModuleName(k)
-					if childName != "" {
-						if aliases == nil {
-							aliases = make(map[string]string)
-						}
-						aliasKey := childName
-						if dot := strings.LastIndexByte(childName, '.'); dot >= 0 {
-							aliasKey = childName[dot+1:]
-						}
-						aliases[aliasKey] = parent + "." + childName
-					}
-					if newK == k {
-						k++ // ensure forward progress
-					} else {
-						k = newK
-					}
-					if k < n && tokens[k].Kind == parser.TokComma {
-						k++
-					}
+					aliases[parser.AliasShortName(childName)] = parent + "." + childName
 				}
-				if k < n && tokens[k].Kind == parser.TokCloseBrace {
-					k++
-				}
-				i = k
+				i = nextPos
 				continue
 			}
 			// alias Module, as: Name
-			nk := nextSig(k)
-			if nk < n && tokens[nk].Kind == parser.TokComma {
-				afterComma := nextSig(nk + 1)
-				if afterComma < n && tokens[afterComma].Kind == parser.TokIdent && txt(tokens[afterComma]) == "as" {
-					afterAs := nextSig(afterComma + 1)
-					if afterAs < n && tokens[afterAs].Kind == parser.TokColon {
-						afterColon := nextSig(afterAs + 1)
-						if afterColon < n && (tokens[afterColon].Kind == parser.TokModule || tokens[afterColon].Kind == parser.TokIdent) {
-							asName := txt(tokens[afterColon])
-							if aliases == nil {
-								aliases = make(map[string]string)
-							}
-							aliases[asName] = resolveAlias(modName)
-							i = afterColon + 1
-							continue
-						}
-					}
+			if asName, nextPos, ok := parser.ScanKeywordOptionValue(source, tokens, n, k, "as"); ok {
+				if aliases == nil {
+					aliases = make(map[string]string)
 				}
+				aliases[asName] = resolveAlias(modName)
+				i = nextPos + 1
+				continue
 			}
 			// Simple alias
 			resolved := resolveAlias(modName)
 			if aliases == nil {
 				aliases = make(map[string]string)
 			}
-			dot := strings.LastIndexByte(resolved, '.')
-			if dot >= 0 {
-				aliases[resolved[dot+1:]] = resolved
-			} else {
-				aliases[resolved] = resolved
-			}
+			aliases[parser.AliasShortName(resolved)] = resolved
 			i = k
 
 		case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,

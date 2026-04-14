@@ -1814,7 +1814,8 @@ func (s *Server) CompletionResolve(ctx context.Context, params *protocol.Complet
 		return params, nil
 	}
 
-	doc, spec := extractDocAbove(lines, defIdx)
+	tf := NewTokenizedFile(string(fileData))
+	doc, spec := tf.ExtractDocAbove(defIdx)
 	signature := extractSignature(lines, defIdx)
 	content := formatHoverContent(doc, spec, signature)
 
@@ -2168,13 +2169,14 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 
 	type blockFrame struct {
 		name     string
-		indent   int
+		depth    int
 		entryIdx int
 	}
 
 	var entries []symbolEntry
 	var moduleStack []blockFrame
 	var funcStack []blockFrame
+	depth := 0
 
 	currentParentIdx := func() int {
 		if len(funcStack) > 0 {
@@ -2221,41 +2223,25 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 		return true
 	}
 
-	// lineHasTrailingDo checks whether a TokDo appears as the last significant
-	// token on the same line as tokens[startIdx]. Returns the TokDo index or -1.
-	lineHasTrailingDo := func(startIdx int) int {
-		startLine := tokens[startIdx].Line
-		lastDoIdx := -1
-		for j := startIdx; j < n; j++ {
-			k := tokens[j].Kind
-			if k == parser.TokEOL || k == parser.TokEOF {
-				break
-			}
-			if tokens[j].Line != startLine {
-				break
-			}
-			if k == parser.TokDo {
-				lastDoIdx = j
-			}
-		}
-		return lastDoIdx
-	}
-
 	for i := 0; i < n; i++ {
 		tok := tokens[i]
 
 		switch tok.Kind {
 		case parser.TokEnd:
 			if !isLineFirstSignificant(i) {
+				parser.TrackBlockDepth(tok.Kind, &depth)
 				continue
 			}
-			indent := tokCol(tok)
 			lineIdx := tok.Line - 1
 			endPos := protocol.Position{Line: uint32(lineIdx), Character: uint32(lineEndChar(lineIdx))}
-			if len(funcStack) > 0 && funcStack[len(funcStack)-1].indent == indent {
+
+			prevDepth := depth
+			parser.TrackBlockDepth(tok.Kind, &depth)
+
+			if len(funcStack) > 0 && funcStack[len(funcStack)-1].depth == prevDepth {
 				entries[funcStack[len(funcStack)-1].entryIdx].symbol.Range.End = endPos
 				funcStack = funcStack[:len(funcStack)-1]
-			} else if len(moduleStack) > 0 && moduleStack[len(moduleStack)-1].indent == indent {
+			} else if len(moduleStack) > 0 && moduleStack[len(moduleStack)-1].depth == prevDepth {
 				entries[moduleStack[len(moduleStack)-1].entryIdx].symbol.Range.End = endPos
 				moduleStack = moduleStack[:len(moduleStack)-1]
 			}
@@ -2312,7 +2298,12 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 				module:    curMod,
 				parentIdx: moduleParentIdx,
 			})
-			moduleStack = append(moduleStack, blockFrame{name: fullName, indent: indent, entryIdx: entryIdx})
+			_, nextPos, hasDoBlock := parser.ScanForwardToBlockDo(tokens, n, j)
+			if hasDoBlock {
+				depth++
+				moduleStack = append(moduleStack, blockFrame{name: fullName, depth: depth, entryIdx: entryIdx})
+				i = nextPos - 1
+			}
 
 		case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
 			parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate:
@@ -2325,7 +2316,6 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 			}
 			kind := tokText(tok)
 			lineIdx := tok.Line - 1
-			indent := tokCol(tok)
 
 			j := nextSig(i + 1)
 			if j >= n || tokens[j].Kind != parser.TokIdent {
@@ -2337,8 +2327,7 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 			arity, _, _, _ := parser.CollectParams(source, tokens, n, j)
 			nameWithArity := fmt.Sprintf("%s/%d", funcName, arity)
 
-			doIdx := lineHasTrailingDo(i)
-			hasDoBlock := doIdx >= 0
+			_, nextPos, hasDoBlock := parser.ScanForwardToBlockDo(tokens, n, j)
 
 			rangeEnd := protocol.Position{Line: uint32(lineIdx), Character: uint32(lineEndChar(lineIdx))}
 			if hasDoBlock {
@@ -2365,7 +2354,9 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 			})
 
 			if hasDoBlock {
-				funcStack = append(funcStack, blockFrame{indent: indent, entryIdx: entryIdx})
+				depth++
+				funcStack = append(funcStack, blockFrame{depth: depth, entryIdx: entryIdx})
+				i = nextPos - 1
 			}
 
 		case parser.TokDefstruct:
@@ -2539,8 +2530,8 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 			if i+1 < n && tokens[i+1].Kind == parser.TokColon {
 				continue
 			}
-			doIdx := lineHasTrailingDo(i)
-			if doIdx < 0 {
+			doIdx, nextPos, hasDoBlock := parser.ScanForwardToBlockDo(tokens, n, i+1)
+			if !hasDoBlock {
 				continue
 			}
 
@@ -2576,7 +2567,12 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 				module:    curMod,
 				parentIdx: currentParentIdx(),
 			})
-			funcStack = append(funcStack, blockFrame{indent: indent, entryIdx: entryIdx})
+			depth++
+			funcStack = append(funcStack, blockFrame{depth: depth, entryIdx: entryIdx})
+			i = nextPos - 1
+
+		case parser.TokDo, parser.TokFn:
+			parser.TrackBlockDepth(tok.Kind, &depth)
 		}
 	}
 
@@ -2687,11 +2683,13 @@ func (s *Server) FoldingRanges(ctx context.Context, params *protocol.FoldingRang
 			}
 
 		case parser.TokDo, parser.TokFn:
-			depth++
+			parser.TrackBlockDepth(tok.Kind, &depth)
 			stack = append(stack, blockStart{line: tok.Line, depth: depth})
 
 		case parser.TokEnd:
-			if len(stack) > 0 && stack[len(stack)-1].depth == depth {
+			prevDepth := depth
+			parser.TrackBlockDepth(tok.Kind, &depth)
+			if len(stack) > 0 && stack[len(stack)-1].depth == prevDepth {
 				top := stack[len(stack)-1]
 				stack = stack[:len(stack)-1]
 				if tok.Line > top.line {
@@ -2700,10 +2698,6 @@ func (s *Server) FoldingRanges(ctx context.Context, params *protocol.FoldingRang
 						EndLine:   uint32(tok.Line - 1),
 					})
 				}
-			}
-			depth--
-			if depth < 0 {
-				depth = 0
 			}
 		}
 	}
@@ -2804,7 +2798,7 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 			// Current module — hover from the buffer directly
 			if fullModule == currentModule {
 				if line, found := tf.FindFunctionDefinition(functionName); found {
-					return s.hoverFromBuffer(text, line-1)
+					return s.hoverFromBuffer(tf, text, line-1)
 				}
 			}
 
@@ -4432,7 +4426,7 @@ func (s *Server) SignatureHelp(ctx context.Context, params *protocol.SignatureHe
 			if paramNames == nil {
 				return nil, nil
 			}
-			sig := buildSignature(functionName, paramNames, lines, defLine-1)
+			sig := buildSignature(functionName, paramNames, tf, lines, defLine-1)
 			return &protocol.SignatureHelp{
 				Signatures:      []protocol.SignatureInformation{sig},
 				ActiveSignature: 0,
@@ -4480,7 +4474,8 @@ func (s *Server) SignatureHelp(ctx context.Context, params *protocol.SignatureHe
 		return nil, nil
 	}
 
-	sig := buildSignature(functionName, paramNames, fileLines, defIdx)
+	tfDef := NewTokenizedFile(fileText)
+	sig := buildSignature(functionName, paramNames, tfDef, fileLines, defIdx)
 	return &protocol.SignatureHelp{
 		Signatures:      []protocol.SignatureInformation{sig},
 		ActiveSignature: 0,
@@ -4488,7 +4483,7 @@ func (s *Server) SignatureHelp(ctx context.Context, params *protocol.SignatureHe
 	}, nil
 }
 
-func buildSignature(functionName string, paramNames []string, lines []string, defIdx int) protocol.SignatureInformation {
+func buildSignature(functionName string, paramNames []string, tf *TokenizedFile, lines []string, defIdx int) protocol.SignatureInformation {
 	label := functionName + "(" + strings.Join(paramNames, ", ") + ")"
 
 	var params []protocol.ParameterInformation
@@ -4504,7 +4499,7 @@ func buildSignature(functionName string, paramNames []string, lines []string, de
 	}
 
 	// Add @spec and @doc as documentation if present
-	doc, spec := extractDocAbove(lines, defIdx)
+	doc, spec := tf.ExtractDocAbove(defIdx)
 	var docParts []string
 	if spec != "" {
 		docParts = append(docParts, "```elixir\n"+spec+"\n```")
