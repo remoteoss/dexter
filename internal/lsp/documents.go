@@ -10,11 +10,12 @@ import (
 )
 
 type cachedDoc struct {
-	text   string
-	tree   *tree_sitter.Tree
-	src    []byte         // source bytes the tree references — must stay alive
-	tokens []parser.Token // cached tokenizer output
-	tokSrc []byte         // source bytes for tokens
+	text       string
+	tree       *tree_sitter.Tree
+	src        []byte         // source bytes the tree references — must stay alive
+	tokens     []parser.Token // cached tokenizer output
+	tokSrc     []byte         // source bytes for tokens
+	lineStarts []int          // byte offset of each line start (from TokenizeFull)
 }
 
 // DocumentStore tracks the text content of open buffers and caches
@@ -106,7 +107,38 @@ func (ds *DocumentStore) GetTokens(uri string) ([]parser.Token, []byte, bool) {
 	}
 	if doc.tokens == nil {
 		doc.tokSrc = []byte(doc.text)
-		doc.tokens = parser.Tokenize(doc.tokSrc)
+		result := parser.TokenizeFull(doc.tokSrc)
+		doc.tokens = result.Tokens
+		doc.lineStarts = result.LineStarts
 	}
 	return doc.tokens, doc.tokSrc, true
+}
+
+// GetTokensFull returns cached tokenizer output including line starts for
+// efficient (line, col) → byte offset conversion.
+func (ds *DocumentStore) GetTokensFull(uri string) ([]parser.Token, []byte, []int, bool) {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	doc, ok := ds.docs[uri]
+	if !ok {
+		return nil, nil, nil, false
+	}
+	if doc.tokens == nil {
+		doc.tokSrc = []byte(doc.text)
+		result := parser.TokenizeFull(doc.tokSrc)
+		doc.tokens = result.Tokens
+		doc.lineStarts = result.LineStarts
+	}
+	return doc.tokens, doc.tokSrc, doc.lineStarts, true
+}
+
+// GetTokenizedFile returns a cached TokenizedFile for the given URI, or nil
+// if the document is not tracked. This is the preferred way to get a
+// TokenizedFile from the document store.
+func (ds *DocumentStore) GetTokenizedFile(uri string) *TokenizedFile {
+	tokens, src, lineStarts, ok := ds.GetTokensFull(uri)
+	if !ok {
+		return nil
+	}
+	return NewTokenizedFileFromCache(tokens, src, lineStarts)
 }

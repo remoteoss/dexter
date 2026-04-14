@@ -3,117 +3,9 @@ package lsp
 import (
 	"strings"
 	"testing"
+
+	"github.com/remoteoss/dexter/internal/parser"
 )
-
-func TestExtractExpression(t *testing.T) {
-	tests := []struct {
-		name     string
-		line     string
-		col      int
-		expected string
-	}{
-		// Cursor on middle segment → truncate at that segment's end
-		{
-			name:     "cursor on middle module segment",
-			line:     "    Foo.Bar.baz(123)",
-			col:      9,
-			expected: "Foo.Bar",
-		},
-		// Cursor on dot → include next segment
-		{
-			name:     "cursor on dot between segments",
-			line:     "    Foo.Bar.Baz",
-			col:      7,
-			expected: "Foo.Bar",
-		},
-		{
-			name:     "bare function",
-			line:     "    do_something(x)",
-			col:      7,
-			expected: "do_something",
-		},
-		// Cursor on first segment → return only that segment
-		{
-			name:     "cursor at start of expr",
-			line:     "    Foo.bar()",
-			col:      4,
-			expected: "Foo",
-		},
-		// Cursor on last segment → return full expression
-		{
-			name:     "cursor at end of expr",
-			line:     "    Foo.bar()",
-			col:      10,
-			expected: "Foo.bar",
-		},
-		{
-			name:     "function with question mark",
-			line:     "    valid?(x)",
-			col:      6,
-			expected: "valid?",
-		},
-		{
-			name:     "function with bang",
-			line:     "    process!(x)",
-			col:      6,
-			expected: "process!",
-		},
-		// Cursor on first segment of underscore module
-		{
-			name:     "cursor on first segment of underscore module",
-			line:     "    MyApp_Web.Router",
-			col:      8,
-			expected: "MyApp_Web",
-		},
-		// Cursor on last segment → full expr
-		{
-			name:     "cursor on last segment",
-			line:     "    MyApp_Web.Router",
-			col:      16,
-			expected: "MyApp_Web.Router",
-		},
-		{
-			name:     "empty line",
-			line:     "",
-			col:      0,
-			expected: "",
-		},
-		{
-			name:     "cursor on paren",
-			line:     "    Foo.bar()",
-			col:      11,
-			expected: "",
-		},
-		// Three-part expression: cursor on each segment
-		{
-			name:     "three-part: cursor on first",
-			line:     "MyApp.Repo.all",
-			col:      2,
-			expected: "MyApp",
-		},
-		{
-			name:     "three-part: cursor on middle",
-			line:     "MyApp.Repo.all",
-			col:      7,
-			expected: "MyApp.Repo",
-		},
-		{
-			name:     "three-part: cursor on last",
-			line:     "MyApp.Repo.all",
-			col:      11,
-			expected: "MyApp.Repo.all",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := ExtractExpression(tt.line, tt.col)
-			if got != tt.expected {
-				t.Errorf("ExtractExpression(%q, %d) = %q, want %q", tt.line, tt.col, got, tt.expected)
-			}
-		})
-	}
-}
 
 func TestExtractModuleAndFunction(t *testing.T) {
 	tests := []struct {
@@ -176,6 +68,245 @@ func TestExtractModuleAndFunction(t *testing.T) {
 				t.Errorf("function: got %q, want %q", fn, tt.expectedFunc)
 			}
 		})
+	}
+}
+
+func tokenize(code string) ([]parser.Token, []byte, []int) {
+	source := []byte(code)
+	result := parser.TokenizeFull(source)
+	return result.Tokens, source, result.LineStarts
+}
+
+func TestExpressionAtCursor(t *testing.T) {
+	tests := []struct {
+		name     string
+		code     string
+		line     int
+		col      int
+		wantMod  string
+		wantFunc string
+	}{
+		{
+			name:     "cursor on middle module segment",
+			code:     "    Foo.Bar.baz(123)",
+			line:     0,
+			col:      9, // 'a' in Bar
+			wantMod:  "Foo.Bar",
+			wantFunc: "",
+		},
+		{
+			name:     "cursor on function name",
+			code:     "    Foo.Bar.baz(123)",
+			line:     0,
+			col:      12, // 'b' in baz
+			wantMod:  "Foo.Bar",
+			wantFunc: "baz",
+		},
+		{
+			name:     "cursor on first module segment",
+			code:     "    Foo.bar()",
+			line:     0,
+			col:      4, // 'F' in Foo
+			wantMod:  "Foo",
+			wantFunc: "",
+		},
+		{
+			name:     "bare function call",
+			code:     "    do_something(x)",
+			line:     0,
+			col:      7,
+			wantMod:  "",
+			wantFunc: "do_something",
+		},
+		{
+			name:     "cursor on dot includes next segment",
+			code:     "    Foo.Bar.Baz",
+			line:     0,
+			col:      7, // the dot between Foo and Bar
+			wantMod:  "Foo.Bar",
+			wantFunc: "",
+		},
+		{
+			name:     "three-part cursor on last",
+			code:     "MyApp.Repo.all",
+			line:     0,
+			col:      11, // 'a' in all
+			wantMod:  "MyApp.Repo",
+			wantFunc: "all",
+		},
+		{
+			name:     "three-part cursor on middle",
+			code:     "MyApp.Repo.all",
+			line:     0,
+			col:      7, // 'e' in Repo
+			wantMod:  "MyApp.Repo",
+			wantFunc: "",
+		},
+		{
+			name:     "three-part cursor on first",
+			code:     "MyApp.Repo.all",
+			line:     0,
+			col:      2, // 'A' in MyApp
+			wantMod:  "MyApp",
+			wantFunc: "",
+		},
+		{
+			name:     "function with question mark",
+			code:     "    valid?(x)",
+			line:     0,
+			col:      6,
+			wantMod:  "",
+			wantFunc: "valid?",
+		},
+		{
+			name:     "function with bang",
+			code:     "    process!(x)",
+			line:     0,
+			col:      6,
+			wantMod:  "",
+			wantFunc: "process!",
+		},
+		{
+			name:     "empty line",
+			code:     "",
+			line:     0,
+			col:      0,
+			wantMod:  "",
+			wantFunc: "",
+		},
+		{
+			name:     "cursor on paren",
+			code:     "    Foo.bar()",
+			line:     0,
+			col:      11, // the open paren
+			wantMod:  "",
+			wantFunc: "",
+		},
+		// --- Token-aware improvements over char-based version ---
+		{
+			name:     "expression inside string is ignored",
+			code:     `x = "Foo.bar"`,
+			line:     0,
+			col:      7, // 'o' in Foo inside the string
+			wantMod:  "",
+			wantFunc: "",
+		},
+		{
+			name:     "expression inside comment is ignored",
+			code:     "  # Foo.bar is great",
+			line:     0,
+			col:      6, // 'o' in Foo inside comment
+			wantMod:  "",
+			wantFunc: "",
+		},
+		{
+			name:     "expression inside heredoc is ignored",
+			code:     "  \"\"\"\n  Foo.bar\n  \"\"\"",
+			line:     1,
+			col:      4, // 'o' in Foo inside heredoc
+			wantMod:  "",
+			wantFunc: "",
+		},
+		{
+			name:     "multiline: cursor on second line",
+			code:     "defmodule MyApp do\n  Foo.Bar.baz()\nend",
+			line:     1,
+			col:      6, // 'B' in Bar
+			wantMod:  "Foo.Bar",
+			wantFunc: "",
+		},
+		{
+			name:     "module-only expression",
+			code:     "  Foo.Bar.Baz",
+			line:     0,
+			col:      10, // 'B' in Baz
+			wantMod:  "Foo.Bar.Baz",
+			wantFunc: "",
+		},
+		{
+			name:     "pipe into qualified call",
+			code:     "    |> Foo.Bar.transform()",
+			line:     0,
+			col:      15, // 't' in transform
+			wantMod:  "Foo.Bar",
+			wantFunc: "transform",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tokens, source, lineStarts := tokenize(tt.code)
+			ctx := ExpressionAtCursor(tokens, source, lineStarts, tt.line, tt.col)
+			if ctx.ModuleRef != tt.wantMod {
+				t.Errorf("ModuleRef = %q, want %q", ctx.ModuleRef, tt.wantMod)
+			}
+			if ctx.FunctionName != tt.wantFunc {
+				t.Errorf("FunctionName = %q, want %q", ctx.FunctionName, tt.wantFunc)
+			}
+		})
+	}
+}
+
+func TestFullExpressionAtCursor(t *testing.T) {
+	code := "    Foo.Bar.baz(123)"
+	tokens, source, lineStarts := tokenize(code)
+
+	// Cursor on Foo — full returns entire chain
+	ctx := FullExpressionAtCursor(tokens, source, lineStarts, 0, 5)
+	if ctx.ModuleRef != "Foo.Bar" {
+		t.Errorf("ModuleRef = %q, want %q", ctx.ModuleRef, "Foo.Bar")
+	}
+	if ctx.FunctionName != "baz" {
+		t.Errorf("FunctionName = %q, want %q", ctx.FunctionName, "baz")
+	}
+
+	// Truncated version should only return Foo
+	ctx2 := ExpressionAtCursor(tokens, source, lineStarts, 0, 5)
+	if ctx2.ModuleRef != "Foo" {
+		t.Errorf("truncated ModuleRef = %q, want %q", ctx2.ModuleRef, "Foo")
+	}
+	if ctx2.FunctionName != "" {
+		t.Errorf("truncated FunctionName = %q, want %q", ctx2.FunctionName, "")
+	}
+}
+
+func TestExpressionAtCursor_ExprBounds(t *testing.T) {
+	code := "    Foo.Bar.baz(123)"
+	tokens, source, lineStarts := tokenize(code)
+
+	// Cursor on baz: exprStart should be at Foo (col 4), exprEnd after baz
+	ctx := ExpressionAtCursor(tokens, source, lineStarts, 0, 12)
+	if ctx.ExprStart != 4 {
+		t.Errorf("ExprStart = %d, want 4", ctx.ExprStart)
+	}
+	if ctx.ExprEnd != 15 {
+		t.Errorf("ExprEnd = %d, want 15", ctx.ExprEnd)
+	}
+
+	// Cursor on Bar: exprStart at Foo (col 4), exprEnd after Bar
+	ctx2 := ExpressionAtCursor(tokens, source, lineStarts, 0, 9)
+	if ctx2.ExprStart != 4 {
+		t.Errorf("ExprStart = %d, want 4", ctx2.ExprStart)
+	}
+	if ctx2.ExprEnd != 11 {
+		t.Errorf("ExprEnd = %d, want 11", ctx2.ExprEnd)
+	}
+}
+
+func TestCursorContext_Expr(t *testing.T) {
+	tests := []struct {
+		mod, fn, want string
+	}{
+		{"Foo.Bar", "baz", "Foo.Bar.baz"},
+		{"Foo.Bar", "", "Foo.Bar"},
+		{"", "baz", "baz"},
+		{"", "", ""},
+	}
+	for _, tt := range tests {
+		ctx := CursorContext{ModuleRef: tt.mod, FunctionName: tt.fn}
+		if got := ctx.Expr(); got != tt.want {
+			t.Errorf("CursorContext{%q, %q}.Expr() = %q, want %q", tt.mod, tt.fn, got, tt.want)
+		}
 	}
 }
 
@@ -746,6 +877,7 @@ func TestFindFunctionDefinition(t *testing.T) {
   end
 end`
 
+	tf := NewTokenizedFile(text)
 	tests := []struct {
 		name          string
 		functionName  string
@@ -761,7 +893,7 @@ end`
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			line, found := FindFunctionDefinition(text, tt.functionName)
+			line, found := tf.FindFunctionDefinition(tt.functionName)
 			if found != tt.expectedFound {
 				t.Errorf("found: got %v, want %v", found, tt.expectedFound)
 			}
@@ -778,12 +910,13 @@ func TestFindFunctionDefinition_Guards(t *testing.T) {
   defguardp is_active(user) when user.status == :active
 end`
 
-	line, found := FindFunctionDefinition(text, "is_admin")
+	tf := NewTokenizedFile(text)
+	line, found := tf.FindFunctionDefinition("is_admin")
 	if !found || line != 2 {
 		t.Errorf("is_admin: got line %d found %v", line, found)
 	}
 
-	line, found = FindFunctionDefinition(text, "is_active")
+	line, found = tf.FindFunctionDefinition("is_active")
 	if !found || line != 3 {
 		t.Errorf("is_active: got line %d found %v", line, found)
 	}
@@ -794,7 +927,8 @@ func TestFindFunctionDefinition_Delegate(t *testing.T) {
   defdelegate fetch(id), to: MyApp.Repo
 end`
 
-	line, found := FindFunctionDefinition(text, "fetch")
+	tf := NewTokenizedFile(text)
+	line, found := tf.FindFunctionDefinition("fetch")
 	if !found || line != 2 {
 		t.Errorf("fetch: got line %d found %v", line, found)
 	}
@@ -806,25 +940,14 @@ func TestFindFunctionDefinition_InlineDo(t *testing.T) {
   defp secret(x), do: x * 2
 end`
 
-	line, found := FindFunctionDefinition(text, "add")
+	tf := NewTokenizedFile(text)
+	line, found := tf.FindFunctionDefinition("add")
 	if !found || line != 2 {
 		t.Errorf("add: got line %d found %v", line, found)
 	}
-	line, found = FindFunctionDefinition(text, "secret")
+	line, found = tf.FindFunctionDefinition("secret")
 	if !found || line != 3 {
 		t.Errorf("secret: got line %d found %v", line, found)
-	}
-}
-
-func TestExtractExpression_PipeOperator(t *testing.T) {
-	line := "    |> Foo.Bar.transform()"
-	// col=12 is on 'a' of Bar → returns up to and including Bar
-	if got := ExtractExpression(line, 12); got != "Foo.Bar" {
-		t.Errorf("cursor on Bar: got %q, want %q", got, "Foo.Bar")
-	}
-	// col=15 is on 't' of transform → returns full expression
-	if got := ExtractExpression(line, 15); got != "Foo.Bar.transform" {
-		t.Errorf("cursor on transform: got %q, want %q", got, "Foo.Bar.transform")
 	}
 }
 
@@ -866,25 +989,30 @@ func TestExtractModuleAndFunction_QuestionMarkBang(t *testing.T) {
 	}
 }
 
-func TestExtractModuleAttribute(t *testing.T) {
+func TestModuleAttributeAtCursor(t *testing.T) {
 	tests := []struct {
 		name     string
-		line     string
+		text     string
+		line     int
 		col      int
 		expected string
 	}{
-		{"cursor on attr name", "      tags: @open_api_shared_tags,", 18, "open_api_shared_tags"},
-		{"cursor on @", "      tags: @open_api_shared_tags,", 12, "open_api_shared_tags"},
-		{"cursor at end of attr", "      tags: @open_api_shared_tags,", 31, "open_api_shared_tags"},
-		{"not on attr", "      tags: :something,", 10, ""},
-		{"standalone attr", "  @endpoint_scopes %{", 4, "endpoint_scopes"},
+		{"cursor on attr name", "      tags: @open_api_shared_tags,", 0, 18, "open_api_shared_tags"},
+		{"cursor on @", "      tags: @open_api_shared_tags,", 0, 12, "open_api_shared_tags"},
+		{"cursor at end of attr", "      tags: @open_api_shared_tags,", 0, 31, "open_api_shared_tags"},
+		{"not on attr", "      tags: :something,", 0, 10, ""},
+		{"standalone attr", "  @endpoint_scopes %{", 0, 4, "endpoint_scopes"},
+		{"inside string ignored", `  x = "has @fake_attr inside"`, 0, 14, ""},
+		{"inside comment ignored", "  # @fake_attr comment", 0, 5, ""},
+		{"multiline second line", "first_line\n  @my_attr value", 1, 5, "my_attr"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := ExtractModuleAttribute(tt.line, tt.col)
+			tf := NewTokenizedFile(tt.text)
+			got := tf.ModuleAttributeAtCursor(tt.line, tt.col)
 			if got != tt.expected {
-				t.Errorf("ExtractModuleAttribute(%q, %d) = %q, want %q", tt.line, tt.col, got, tt.expected)
+				t.Errorf("ModuleAttributeAtCursor(%d, %d) = %q, want %q", tt.line, tt.col, got, tt.expected)
 			}
 		})
 	}
@@ -1985,7 +2113,7 @@ end`
 	})
 }
 
-func TestExtractCallContext(t *testing.T) {
+func TestCallContextAtCursor(t *testing.T) {
 	tests := []struct {
 		name       string
 		text       string
@@ -1994,6 +2122,7 @@ func TestExtractCallContext(t *testing.T) {
 		wantArgIdx int
 		wantOK     bool
 	}{
+		// Parenthesized calls
 		{
 			name:       "simple call first arg",
 			text:       "foo(x, y)",
@@ -2031,7 +2160,7 @@ func TestExtractCallContext(t *testing.T) {
 			wantOK:     true,
 		},
 		{
-			name:       "multi-line",
+			name:       "multi-line paren call",
 			text:       "defmodule MyApp do\n  def run do\n    foo(x,\n      y)\n  end\nend",
 			line:       3,
 			col:        6,
@@ -2043,16 +2172,327 @@ func TestExtractCallContext(t *testing.T) {
 			name:       "not in call",
 			text:       "x = 1",
 			line:       0,
-			col:        0,
+			col:        4,
 			wantExpr:   "",
 			wantArgIdx: 0,
 			wantOK:     false,
+		},
+		// Paren-less calls
+		{
+			name:       "no-paren qualified call first arg",
+			text:       `IO.puts "hello"`,
+			line:       0,
+			col:        10,
+			wantExpr:   "IO.puts",
+			wantArgIdx: 0,
+			wantOK:     true,
+		},
+		{
+			name:       "no-paren bare call first arg",
+			text:       `import MyApp.Repo`,
+			line:       0,
+			col:        10,
+			wantExpr:   "import",
+			wantArgIdx: 0,
+			wantOK:     true,
+		},
+		{
+			name:       "no-paren two args second",
+			text:       `Enum.each list, fun`,
+			line:       0,
+			col:        18,
+			wantExpr:   "Enum.each",
+			wantArgIdx: 1,
+			wantOK:     true,
+		},
+		{
+			name:       "no-paren inside string not matched",
+			text:       `x = "foo bar"`,
+			line:       0,
+			col:        8,
+			wantExpr:   "",
+			wantArgIdx: 0,
+			wantOK:     false,
+		},
+		// Edge cases: maps, nested calls, keyword lists, tuples
+		{
+			name:       "no-paren map param cursor on key",
+			text:       `IO.inspect %{a: 1, b: 2}`,
+			line:       0,
+			col:        15,
+			wantExpr:   "IO.inspect",
+			wantArgIdx: 0,
+			wantOK:     true,
+		},
+		{
+			name:       "no-paren map param cursor inside map after comma",
+			text:       `IO.inspect %{a: 1, b: 2}`,
+			line:       0,
+			col:        20,
+			wantExpr:   "IO.inspect",
+			wantArgIdx: 0,
+			wantOK:     true,
+		},
+		{
+			name:       "no-paren with nested paren call as arg",
+			text:       `IO.puts String.upcase("hi")`,
+			line:       0,
+			col:        23,
+			wantExpr:   "String.upcase",
+			wantArgIdx: 0,
+			wantOK:     true,
+		},
+		{
+			name:       "no-paren second arg is paren call",
+			text:       `Enum.each list, Enum.count(other)`,
+			line:       0,
+			col:        30,
+			wantExpr:   "Enum.count",
+			wantArgIdx: 0,
+			wantOK:     true,
+		},
+		{
+			name:       "no-paren keyword list arg",
+			text:       `plug :auth, only: [:index]`,
+			line:       0,
+			col:        20,
+			wantExpr:   "plug",
+			wantArgIdx: 1,
+			wantOK:     true,
+		},
+		{
+			name:       "no-paren tuple arg",
+			text:       `send self(), {:ok, result}`,
+			line:       0,
+			col:        20,
+			wantExpr:   "send",
+			wantArgIdx: 1,
+			wantOK:     true,
+		},
+		{
+			name:       "no-paren with paren call as sole arg",
+			text:       `IO.puts inspect(x)`,
+			line:       0,
+			col:        17,
+			wantExpr:   "inspect",
+			wantArgIdx: 0,
+			wantOK:     true,
+		},
+		{
+			name:       "cursor on func name of no-paren call",
+			text:       `IO.puts "hello"`,
+			line:       0,
+			col:        5,
+			wantExpr:   "IO.puts",
+			wantArgIdx: 0,
+			wantOK:     true,
+		},
+		// Pipe operator — cursor inside paren call on RHS
+		{
+			name:       "pipe into paren call",
+			text:       `list |> Enum.map(fn x -> x end)`,
+			line:       0,
+			col:        20,
+			wantExpr:   "Enum.map",
+			wantArgIdx: 0,
+			wantOK:     true,
+		},
+		// Struct as argument
+		{
+			name:       "no-paren struct arg",
+			text:       `Repo.insert %User{name: "joe"}`,
+			line:       0,
+			col:        20,
+			wantExpr:   "Repo.insert",
+			wantArgIdx: 0,
+			wantOK:     true,
+		},
+		// Multi-line no-paren (comma at end of prev line)
+		{
+			name:       "multi-line no-paren call",
+			text:       "use MyApp.Web,\n  controllers: true",
+			line:       1,
+			col:        15,
+			wantExpr:   "use",
+			wantArgIdx: 1,
+			wantOK:     true,
+		},
+		// Nested paren call inside paren call — cursor on outer's second arg
+		{
+			name:       "nested paren call second arg of outer",
+			text:       `Enum.reduce(list, %{}, fn x, acc -> acc end)`,
+			line:       0,
+			col:        18,
+			wantExpr:   "Enum.reduce",
+			wantArgIdx: 1,
+			wantOK:     true,
+		},
+		// Sigil as argument to no-paren call
+		{
+			name:       "no-paren sigil arg",
+			text:       `Regex.compile ~r/foo/`,
+			line:       0,
+			col:        18,
+			wantExpr:   "Regex.compile",
+			wantArgIdx: 0,
+			wantOK:     true,
+		},
+		// Guard clause — cursor inside is_integer(x) call
+		{
+			name:       "inside guard call",
+			text:       `def foo(x) when is_integer(x) do`,
+			line:       0,
+			col:        27,
+			wantExpr:   "is_integer",
+			wantArgIdx: 0,
+			wantOK:     true,
+		},
+		// Capture operator — not a call
+		{
+			name:       "capture operator not a call",
+			text:       `&Enum.map/2`,
+			line:       0,
+			col:        5,
+			wantExpr:   "",
+			wantArgIdx: 0,
+			wantOK:     false,
+		},
+		// Bare assignment — not a call
+		{
+			name:       "assignment not a call",
+			text:       `result = Enum.map(list, fun)`,
+			line:       0,
+			col:        3,
+			wantExpr:   "",
+			wantArgIdx: 0,
+			wantOK:     false,
+		},
+		// Nested map inside paren call
+		{
+			name:       "map inside paren call",
+			text:       `Repo.insert(%{name: "joe", age: 30})`,
+			line:       0,
+			col:        25,
+			wantExpr:   "Repo.insert",
+			wantArgIdx: 0,
+			wantOK:     true,
+		},
+		// Keyword list as last arg in paren call
+		{
+			name:       "keyword list in paren call",
+			text:       `GenServer.call(pid, :msg, timeout: 5000)`,
+			line:       0,
+			col:        35,
+			wantExpr:   "GenServer.call",
+			wantArgIdx: 2,
+			wantOK:     true,
+		},
+		// Empty args — cursor right after open paren
+		{
+			name:       "cursor right after open paren",
+			text:       `foo()`,
+			line:       0,
+			col:        4,
+			wantExpr:   "foo",
+			wantArgIdx: 0,
+			wantOK:     true,
+		},
+		// Cross-line: unrelated expression on previous line should not match
+		{
+			name:       "unrelated line above not matched",
+			text:       "result\n\"hello\"",
+			line:       1,
+			col:        3,
+			wantExpr:   "",
+			wantArgIdx: 0,
+			wantOK:     false,
+		},
+		// def/defp — keyword not treated as call
+		{
+			name:       "def keyword not a call",
+			text:       `def foo(x) do`,
+			line:       0,
+			col:        8,
+			wantExpr:   "foo",
+			wantArgIdx: 0,
+			wantOK:     true,
+		},
+		// Binary <<>> as argument
+		{
+			name:       "no-paren binary arg",
+			text:       `send pid, <<1, 2, 3>>`,
+			line:       0,
+			col:        15,
+			wantExpr:   "send",
+			wantArgIdx: 1,
+			wantOK:     true,
+		},
+		// fn/end block as argument to paren call
+		{
+			name:       "fn end block inside paren call",
+			text:       "Enum.map(list, fn x -> x * 2 end)",
+			line:       0,
+			col:        25,
+			wantExpr:   "Enum.map",
+			wantArgIdx: 1,
+			wantOK:     true,
+		},
+		// Cursor inside fn block body — enclosing call is Task.async
+		{
+			name:       "cursor inside fn block of paren call",
+			text:       "Task.async(fn ->\n  heavy_work()\nend)",
+			line:       1,
+			col:        5,
+			wantExpr:   "Task.async",
+			wantArgIdx: 0,
+			wantOK:     true,
+		},
+		// Pipe chain — cursor on rightmost call
+		{
+			name:       "pipe chain paren call",
+			text:       `list |> Enum.filter(fn x -> x > 0 end) |> Enum.map(fn x -> x * 2 end)`,
+			line:       0,
+			col:        55,
+			wantExpr:   "Enum.map",
+			wantArgIdx: 0,
+			wantOK:     true,
+		},
+		// Anonymous function call var.(arg)
+		{
+			name:       "anonymous function call",
+			text:       `callback.(arg1, arg2)`,
+			line:       0,
+			col:        15,
+			wantExpr:   "callback",
+			wantArgIdx: 1,
+			wantOK:     true,
+		},
+		// Nested keyword default — def foo(opts \\ [key: :val])
+		{
+			name:       "cursor inside default keyword list",
+			text:       `def foo(opts \\ [key: :val]) do`,
+			line:       0,
+			col:        22,
+			wantExpr:   "foo",
+			wantArgIdx: 0,
+			wantOK:     true,
+		},
+		// String interpolation as argument
+		{
+			name:       "string interpolation arg",
+			text:       `Logger.info("User #{name} logged in")`,
+			line:       0,
+			col:        20,
+			wantExpr:   "Logger.info",
+			wantArgIdx: 0,
+			wantOK:     true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			expr, argIdx, ok := ExtractCallContext(tt.text, tt.line, tt.col)
+			tf := NewTokenizedFile(tt.text)
+			expr, argIdx, ok := tf.CallContextAtCursor(tt.line, tt.col)
 			if ok != tt.wantOK {
 				t.Errorf("ok = %v, want %v", ok, tt.wantOK)
 			}

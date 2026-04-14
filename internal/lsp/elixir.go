@@ -11,29 +11,44 @@ import (
 // TokenizedFile holds pre-tokenized source for efficient multi-operation queries.
 // Use this when multiple tokenizer-based lookups will be performed on the same text.
 type TokenizedFile struct {
-	source []byte
-	tokens []parser.Token
-	n      int
+	source     []byte
+	tokens     []parser.Token
+	n          int
+	lineStarts []int
 }
 
 // NewTokenizedFile tokenizes the text once for reuse across multiple queries.
 func NewTokenizedFile(text string) *TokenizedFile {
 	source := []byte(text)
-	tokens := parser.Tokenize(source)
+	result := parser.TokenizeFull(source)
 	return &TokenizedFile{
-		source: source,
-		tokens: tokens,
-		n:      len(tokens),
+		source:     source,
+		tokens:     result.Tokens,
+		n:          len(result.Tokens),
+		lineStarts: result.LineStarts,
 	}
 }
 
 // NewTokenizedFileFromCache wraps pre-existing tokens (e.g. from DocumentStore cache).
-func NewTokenizedFileFromCache(tokens []parser.Token, source []byte) *TokenizedFile {
+func NewTokenizedFileFromCache(tokens []parser.Token, source []byte, lineStarts []int) *TokenizedFile {
 	return &TokenizedFile{
-		source: source,
-		tokens: tokens,
-		n:      len(tokens),
+		source:     source,
+		tokens:     tokens,
+		n:          len(tokens),
+		lineStarts: lineStarts,
 	}
+}
+
+// ExpressionAtCursor extracts the dotted expression at the given 0-based line
+// and col, using the cached token stream.
+func (tf *TokenizedFile) ExpressionAtCursor(line, col int) CursorContext {
+	return ExpressionAtCursor(tf.tokens, tf.source, tf.lineStarts, line, col)
+}
+
+// FullExpressionAtCursor extracts the complete dotted expression at the given
+// 0-based line and col without truncating at the cursor's segment.
+func (tf *TokenizedFile) FullExpressionAtCursor(line, col int) CursorContext {
+	return FullExpressionAtCursor(tf.tokens, tf.source, tf.lineStarts, line, col)
 }
 
 // FirstDefmodule returns the first defmodule name found, or "".
@@ -126,88 +141,191 @@ func isExprChar(b byte) bool {
 	return unicode.IsLetter(c) || unicode.IsDigit(c) || c == '_' || c == '.' || c == '?' || c == '!'
 }
 
-// ExtractExpression returns the dotted expression up to and including the
-// segment the cursor is on. Line is the text content, col is a 0-based
-// character offset.
-//
-// Examples (cursor position marked with |):
-//
-//	"MyApp.Re|po.all"  →  "MyApp.Repo"
-//	"MyApp.Repo.a|ll"  →  "MyApp.Repo.all"
-//	"Ti|ger.Repo.all"  →  "MyApp"
-//	"MyApp|.Repo.all"  →  "MyApp.Repo"   (cursor on dot → include next segment)
-func ExtractExpression(line string, col int) string {
-	expr, _ := extractExpressionBounds(line, col)
-	return expr
+// CursorContext holds the result of token-based expression extraction at a
+// cursor position. It replaces the combination of ExtractExpression +
+// ExtractModuleAndFunction with a single token-aware lookup.
+type CursorContext struct {
+	// ModuleRef is the dot-joined module chain (e.g. "Foo.Bar"). Empty for
+	// bare function calls.
+	ModuleRef string
+	// FunctionName is the lowercase identifier (e.g. "baz"). Empty for
+	// module-only expressions like "Foo.Bar".
+	FunctionName string
+	// ExprStart is the 0-based column of the expression start on its line.
+	ExprStart int
+	// ExprEnd is the 0-based column one past the end of the expression.
+	ExprEnd int
 }
 
-// extractExpressionBounds returns the same expression as ExtractExpression plus
-// the start column (0-based) of that expression within the line. Returns ("", 0)
-// when there is no expression at the cursor position.
-func extractExpressionBounds(line string, col int) (expr string, startCol int) {
-	if len(line) == 0 {
-		return "", 0
+// Expr returns the combined dotted expression string (e.g. "Foo.Bar.baz").
+func (c CursorContext) Expr() string {
+	if c.ModuleRef == "" && c.FunctionName == "" {
+		return ""
 	}
-	if col >= len(line) {
-		col = len(line) - 1
+	if c.ModuleRef == "" {
+		return c.FunctionName
 	}
-	if col < 0 {
-		col = 0
+	if c.FunctionName == "" {
+		return c.ModuleRef
 	}
-	if !isExprChar(line[col]) {
-		return "", 0
-	}
-
-	start := col
-	for start > 0 && isExprChar(line[start-1]) {
-		start--
-	}
-	end := col
-	for end+1 < len(line) && isExprChar(line[end+1]) {
-		end++
-	}
-
-	fullExpr := line[start : end+1]
-	cursorOffset := col - start
-	searchFrom := cursorOffset
-	if fullExpr[searchFrom] == '.' {
-		searchFrom++
-	}
-	nextDot := strings.IndexByte(fullExpr[searchFrom:], '.')
-	if nextDot == -1 {
-		return fullExpr, start
-	}
-	return fullExpr[:searchFrom+nextDot], start
+	return c.ModuleRef + "." + c.FunctionName
 }
 
-// ExtractFullExpression returns the complete dotted expression at the cursor
-// position without truncating at the cursor's segment. Unlike ExtractExpression
-// which returns "DocuSign" when the cursor is on "DocuSign.Client.request",
-// this returns the entire "DocuSign.Client.request".
-func ExtractFullExpression(line string, col int) string {
-	if len(line) == 0 || col < 0 {
-		return ""
+// Empty returns true if no expression was found at the cursor.
+func (c CursorContext) Empty() bool {
+	return c.ModuleRef == "" && c.FunctionName == ""
+}
+
+// isExprToken returns true for token kinds that can be part of a dotted
+// expression chain (Module.function).
+func isExprToken(k parser.TokenKind) bool {
+	return k == parser.TokModule || k == parser.TokIdent
+}
+
+// ExpressionAtCursor extracts the dotted expression at the cursor position
+// using the token stream. Unlike the char-based ExtractExpression, this
+// correctly ignores expressions inside strings, comments, heredocs, sigils,
+// and atoms.
+//
+// The returned expression is truncated to the cursor's segment (matching
+// ExtractExpression behavior): cursor on "Foo" in "Foo.Bar.baz" returns
+// only "Foo" as the module ref.
+//
+// line and col are 0-based.
+func ExpressionAtCursor(tokens []parser.Token, source []byte, lineStarts []int, line, col int) CursorContext {
+	return expressionAtCursorImpl(tokens, source, lineStarts, line, col, false)
+}
+
+// FullExpressionAtCursor is like ExpressionAtCursor but returns the complete
+// dotted chain without truncating at the cursor's segment.
+func FullExpressionAtCursor(tokens []parser.Token, source []byte, lineStarts []int, line, col int) CursorContext {
+	return expressionAtCursorImpl(tokens, source, lineStarts, line, col, true)
+}
+
+func expressionAtCursorImpl(tokens []parser.Token, source []byte, lineStarts []int, line, col int, full bool) CursorContext {
+	offset := parser.LineColToOffset(lineStarts, line, col)
+	if offset < 0 {
+		return CursorContext{}
 	}
-	if col >= len(line) {
-		col = len(line) - 1
+
+	n := len(tokens)
+	idx := parser.TokenAtOffset(tokens, offset)
+
+	// If cursor lands between tokens, try the token just before (handles
+	// cursor immediately after an identifier with no gap).
+	if idx < 0 {
+		idx = parser.TokenAtOffset(tokens, offset-1)
+		if idx < 0 {
+			return CursorContext{}
+		}
 	}
-	if !isExprChar(line[col]) {
-		return ""
+
+	tok := tokens[idx]
+
+	// Cursor on a dot: advance to the next significant token so we include
+	// the segment after the dot (matching old behavior: cursor on dot →
+	// include next segment).
+	if tok.Kind == parser.TokDot {
+		next := idx + 1
+		if next < n && isExprToken(tokens[next].Kind) {
+			idx = next
+			tok = tokens[idx]
+		} else {
+			return CursorContext{}
+		}
 	}
-	// Reuse the same boundary scan as extractExpressionBounds, but pass col
-	// at the end of the expression so no truncation occurs.
-	end := col
-	for end+1 < len(line) && isExprChar(line[end+1]) {
-		end++
+
+	// Reject non-expression tokens (strings, comments, atoms, etc.)
+	if !isExprToken(tok.Kind) {
+		return CursorContext{}
 	}
-	expr, _ := extractExpressionBounds(line, end)
-	return expr
+
+	// cursorIdx is the token the cursor is physically on — used for truncation
+	cursorIdx := idx
+
+	// Walk backward through Dot+Module/Ident chains to find the start
+	startIdx := idx
+	for startIdx >= 2 {
+		dotIdx := startIdx - 1
+		prevIdx := startIdx - 2
+		if tokens[dotIdx].Kind == parser.TokDot && isExprToken(tokens[prevIdx].Kind) {
+			startIdx = prevIdx
+		} else {
+			break
+		}
+	}
+
+	// Walk forward through Dot+Module/Ident chains to find the end
+	endIdx := idx
+	for endIdx+2 < n {
+		dotIdx := endIdx + 1
+		nextIdx := endIdx + 2
+		if tokens[dotIdx].Kind == parser.TokDot && isExprToken(tokens[nextIdx].Kind) {
+			endIdx = nextIdx
+		} else {
+			break
+		}
+	}
+
+	// Determine truncation point: include up to the cursor's segment
+	truncEnd := endIdx
+	if !full {
+		truncEnd = cursorIdx
+	}
+
+	// Build module ref and function name from the token chain
+	lineStart := 0
+	if line < len(lineStarts) {
+		lineStart = lineStarts[line]
+	}
+
+	var moduleParts []string
+	functionName := ""
+
+	for ti := startIdx; ti <= truncEnd; ti += 2 {
+		t := tokens[ti]
+		text := parser.TokenText(source, t)
+		if t.Kind == parser.TokModule {
+			moduleParts = append(moduleParts, text)
+		} else {
+			// TokIdent — this is the function name; stop here
+			functionName = text
+			break
+		}
+	}
+
+	moduleRef := ""
+	if len(moduleParts) > 0 {
+		moduleRef = strings.Join(moduleParts, ".")
+	}
+
+	exprStart := tokens[startIdx].Start - lineStart
+	lastTok := tokens[truncEnd]
+	if functionName != "" {
+		// Find the ident token for end position
+		for ti := startIdx; ti <= truncEnd; ti += 2 {
+			if tokens[ti].Kind == parser.TokIdent {
+				lastTok = tokens[ti]
+				break
+			}
+		}
+	}
+	exprEnd := lastTok.End - lineStart
+
+	return CursorContext{
+		ModuleRef:    moduleRef,
+		FunctionName: functionName,
+		ExprStart:    exprStart,
+		ExprEnd:      exprEnd,
+	}
 }
 
 // ExtractModuleAndFunction splits a dotted expression into module reference and optional function name.
 // Uppercase-starting parts are module segments, the first lowercase part is the function.
 // Returns ("Foo.Bar", "baz") for "Foo.Bar.baz", ("Foo.Bar.Baz", "") for "Foo.Bar.Baz",
 // ("", "do_something") for "do_something".
+//
+// Deprecated: Use ExpressionAtCursor which returns ModuleRef and FunctionName directly.
 func ExtractModuleAndFunction(expr string) (moduleRef string, functionName string) {
 	var moduleParts []string
 	for _, part := range strings.Split(expr, ".") {
@@ -435,59 +553,6 @@ func extractEnclosingModuleFromTokens(source []byte, tokens []parser.Token, targ
 		return stack[len(stack)-1].name
 	}
 	return ""
-}
-
-// FirstDefmodule returns the first defmodule name found in the text, or "".
-// Uses the tokenizer for accurate parsing.
-func FirstDefmodule(text string) string {
-	source := []byte(text)
-	tokens := parser.Tokenize(source)
-	n := len(tokens)
-
-	for i := 0; i < n; i++ {
-		if tokens[i].Kind == parser.TokDefmodule {
-			j := tokNextSig(tokens, n, i+1)
-			name, _ := tokCollectModuleName(source, tokens, n, j)
-			if name != "" {
-				return name
-			}
-		}
-	}
-	return ""
-}
-
-// ResolveModuleExpr replaces __MODULE__ in expr with the enclosing module name
-// at the given 0-based line. If targetLine < 0, uses the first defmodule found.
-func ResolveModuleExpr(text string, expr string, targetLine int) string {
-	if !strings.Contains(expr, "__MODULE__") {
-		return expr
-	}
-
-	source := []byte(text)
-	tokens := parser.Tokenize(source)
-
-	var moduleName string
-	if targetLine >= 0 {
-		moduleName = extractEnclosingModuleFromTokens(source, tokens, targetLine)
-	}
-	if moduleName == "" {
-		// Fallback to first defmodule
-		n := len(tokens)
-		for i := 0; i < n; i++ {
-			if tokens[i].Kind == parser.TokDefmodule {
-				j := tokNextSig(tokens, n, i+1)
-				moduleName, _ = tokCollectModuleName(source, tokens, n, j)
-				if moduleName != "" {
-					break
-				}
-			}
-		}
-	}
-
-	if moduleName != "" {
-		return strings.ReplaceAll(expr, "__MODULE__", moduleName)
-	}
-	return expr
 }
 
 // IsDefmoduleLine returns true if the given 0-based line contains a defmodule
@@ -1848,36 +1913,36 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 // collectParamsFromTokens delegates to the shared parser implementation.
 var collectParamsFromTokens = parser.CollectParams
 
-// ExtractModuleAttribute returns the attribute name if the cursor is on a @attr reference,
-// otherwise returns "". For example, on "@endpoint_scopes" returns "endpoint_scopes".
-func ExtractModuleAttribute(line string, col int) string {
-	if col >= len(line) {
+// ModuleAttributeAtCursor returns the attribute name if the cursor is on a
+// @attr reference, otherwise returns "". For example, on "@endpoint_scopes"
+// returns "endpoint_scopes". Uses the token stream to correctly ignore
+// attributes inside strings, comments, and heredocs.
+func ModuleAttributeAtCursor(tokens []parser.Token, source []byte, lineStarts []int, line, col int) string {
+	offset := parser.LineColToOffset(lineStarts, line, col)
+	if offset < 0 {
 		return ""
 	}
-	// Scan back to find a leading @
-	start := col
-	for start > 0 && (unicode.IsLetter(rune(line[start-1])) || unicode.IsDigit(rune(line[start-1])) || line[start-1] == '_') {
-		start--
-	}
-	if start > 0 && line[start-1] == '@' {
-		start--
-	} else if start < len(line) && line[start] == '@' {
-		// cursor is on the @ itself
-	} else {
+
+	idx := parser.TokenAtOffset(tokens, offset)
+	if idx < 0 {
 		return ""
 	}
-	if start >= len(line) || line[start] != '@' {
+
+	tok := tokens[idx]
+	if tok.Kind != parser.TokAttr {
 		return ""
 	}
-	end := start + 1
-	for end < len(line) && (unicode.IsLetter(rune(line[end])) || unicode.IsDigit(rune(line[end])) || line[end] == '_') {
-		end++
-	}
-	name := line[start+1 : end]
-	if len(name) == 0 {
+
+	text := parser.TokenText(source, tok)
+	if len(text) <= 1 {
 		return ""
 	}
-	return name
+	return text[1:] // strip leading '@'
+}
+
+// ExtractModuleAttribute is the TokenizedFile method version of ModuleAttributeAtCursor.
+func (tf *TokenizedFile) ModuleAttributeAtCursor(line, col int) string {
+	return ModuleAttributeAtCursor(tf.tokens, tf.source, tf.lineStarts, line, col)
 }
 
 // reservedModuleAttrs are Elixir built-in module attributes that are not
@@ -1896,41 +1961,6 @@ var reservedModuleAttrs = map[string]bool{
 // Returns false for reserved Elixir module attributes.
 func FindModuleAttributeDefinition(text string, attrName string) (int, bool) {
 	return FindModuleAttributeDefinitionTokenized(text, attrName)
-}
-
-// FindFunctionDefinition searches the document text for a def/defp/defmacro/defmacrop
-// or @type/@typep/@opaque matching the given function name. Returns the 1-based line
-// number and true if found.
-func FindFunctionDefinition(text string, functionName string) (int, bool) {
-	source := []byte(text)
-	tokens := parser.Tokenize(source)
-	n := len(tokens)
-
-	for i := 0; i < n; i++ {
-		tok := tokens[i]
-
-		switch tok.Kind {
-		case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
-			parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate:
-			j := tokNextSig(tokens, n, i+1)
-			if j >= n || tokens[j].Kind != parser.TokIdent {
-				continue
-			}
-			if parser.TokenText(source, tokens[j]) == functionName {
-				return tok.Line, true
-			}
-
-		case parser.TokAttrType:
-			j := tokNextSig(tokens, n, i+1)
-			if j >= n || tokens[j].Kind != parser.TokIdent {
-				continue
-			}
-			if parser.TokenText(source, tokens[j]) == functionName {
-				return tok.Line, true
-			}
-		}
-	}
-	return 0, false
 }
 
 // FindBareFunctionCalls scans text for unqualified calls to functionName,
@@ -2024,103 +2054,224 @@ func FindBareFunctionCalls(text string, functionName string) []int {
 	return lineNums
 }
 
-// ExtractCallContext scans backward from (lineNum, col) in text to find the
-// innermost open function call. Returns the function expression (e.g.
+// CallContextAtCursor scans backward through the token stream from (lineNum, col)
+// to find the innermost open function call. Returns the function expression (e.g.
 // "Enum.map" or "my_func"), the 0-based argument index, and true if found.
-func ExtractCallContext(text string, lineNum, col int) (funcExpr string, argIndex int, ok bool) {
-	lines := strings.Split(text, "\n")
-	if lineNum >= len(lines) {
+// Handles both parenthesized calls like `Enum.map(list, fun)` and paren-less
+// calls like `IO.puts "hello"` or `import MyApp.Repo`.
+func CallContextAtCursor(tokens []parser.Token, source []byte, lineStarts []int, lineNum, col int) (funcExpr string, argIndex int, ok bool) {
+	offset := parser.LineColToOffset(lineStarts, lineNum, col)
+	if offset < 0 {
 		return "", 0, false
 	}
-	// Clamp col to line length
-	if col > len(lines[lineNum]) {
-		col = len(lines[lineNum])
+
+	startIdx := tokenAtOrBeforeOffset(tokens, offset)
+	if startIdx < 0 {
+		return "", 0, false
 	}
 
-	// Convert (lineNum, col) to a flat byte offset
-	offset := 0
-	for i := 0; i < lineNum; i++ {
-		offset += len(lines[i]) + 1 // +1 for newline
-	}
-	offset += col
-
-	if offset > len(text) {
-		offset = len(text)
+	// If cursor is inside a comment, bail out (strings may be arguments)
+	if tokens[startIdx].Kind == parser.TokComment {
+		return "", 0, false
 	}
 
-	// Scan backward tracking nesting depth
+	// If cursor is exactly on a closing delimiter, step back one token so the
+	// scan sees us as *inside* the call rather than outside the balanced pair.
+	scanIdx := startIdx
+	switch tokens[scanIdx].Kind {
+	case parser.TokCloseParen, parser.TokCloseBracket, parser.TokCloseBrace:
+		if scanIdx > 0 {
+			scanIdx--
+		}
+	}
+
+	// Try parenthesized call first
+	if expr, argIdx, found := callContextParen(tokens, source, scanIdx); found {
+		return expr, argIdx, true
+	}
+
+	// Try paren-less call: scan backward on the same line for
+	// `func_or_module.func arg1, arg2` patterns.
+	return callContextNoParen(tokens, source, startIdx, lineNum)
+}
+
+// tokenAtOrBeforeOffset returns the index of the token at or just before the
+// given byte offset. Returns -1 if no suitable token exists.
+func tokenAtOrBeforeOffset(tokens []parser.Token, offset int) int {
+	idx := parser.TokenAtOffset(tokens, offset)
+	if idx >= 0 {
+		return idx
+	}
+	// Cursor is between tokens — find the last token starting before offset
+	for i := len(tokens) - 1; i >= 0; i-- {
+		if tokens[i].Start < offset {
+			return i
+		}
+	}
+	return -1
+}
+
+// collectDotChain walks backward from tokens[j] collecting a dotted identifier
+// chain (e.g. Module.SubModule.func). Returns the expression string or "".
+func collectDotChain(tokens []parser.Token, source []byte, j int) string {
+	var parts []string
+	for j >= 0 {
+		t := tokens[j]
+		if isCallableToken(t.Kind) {
+			parts = append(parts, parser.TokenText(source, t))
+			if j-1 >= 0 && tokens[j-1].Kind == parser.TokDot {
+				j -= 2
+				continue
+			}
+			break
+		}
+		break
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	for l, r := 0, len(parts)-1; l < r; l, r = l+1, r-1 {
+		parts[l], parts[r] = parts[r], parts[l]
+	}
+	return strings.Join(parts, ".")
+}
+
+// callContextParen scans backward from startIdx looking for an unmatched open
+// paren to identify a parenthesized function call.
+//
+// All bracket types (paren, bracket, brace) are tracked in a unified depth
+// counter so that commas inside nested containers are not counted toward the
+// outer call's argument index.
+func callContextParen(tokens []parser.Token, source []byte, startIdx int) (string, int, bool) {
 	depth := 0
 	commas := 0
-	inString := false
 
-	for i := offset - 1; i >= 0; i-- {
-		ch := text[i]
+	for i := startIdx; i >= 0; i-- {
+		tok := tokens[i]
 
-		// String skip: when we hit a closing ", scan backward to find the opening "
-		if ch == '"' && !inString {
-			inString = true
-			continue
-		}
-		if inString {
-			if ch == '"' {
-				// Count preceding backslashes — an odd number means the quote is escaped
-				backslashes := 0
-				for j := i - 1; j >= 0 && text[j] == '\\'; j-- {
-					backslashes++
-				}
-				if backslashes%2 == 0 {
-					inString = false
-				}
-			}
-			continue
-		}
-
-		switch ch {
-		case ')', ']', '}':
+		switch tok.Kind {
+		case parser.TokCloseParen, parser.TokCloseBracket, parser.TokCloseBrace, parser.TokCloseAngle:
 			depth++
-		case '[', '{':
+		case parser.TokOpenBracket, parser.TokOpenBrace, parser.TokOpenAngle:
 			if depth > 0 {
 				depth--
 			} else {
-				// Inside a list/map/tuple, not a function call
-				return "", 0, false
+				// Unmatched open bracket/brace/angle — we exited a container
+				// that is itself an argument. Reset comma count for this
+				// nesting level and keep scanning for the enclosing call.
+				commas = 0
 			}
-		case '(':
+		case parser.TokOpenParen:
 			if depth > 0 {
 				depth--
 			} else {
-				// Found the opening paren of our call — extract the function name before it
-				// Scan backward from i-1 to find the expression
-				exprEnd := i - 1
-				// Skip whitespace between expression and paren
-				for exprEnd >= 0 && (text[exprEnd] == ' ' || text[exprEnd] == '\t' || text[exprEnd] == '\n' || text[exprEnd] == '\r') {
-					exprEnd--
+				j := i - 1
+				// Anonymous call: callback.(arg) — skip the dot
+				if j >= 0 && tokens[j].Kind == parser.TokDot {
+					j--
 				}
-				if exprEnd < 0 {
+				expr := collectDotChain(tokens, source, j)
+				if expr == "" || parser.IsElixirKeyword(expr) {
 					return "", 0, false
 				}
-				// Find the start of the expression
-				exprStart := exprEnd
-				for exprStart > 0 && isExprChar(text[exprStart-1]) {
-					exprStart--
-				}
-				funcExpr = text[exprStart : exprEnd+1]
-				if funcExpr == "" {
-					return "", 0, false
-				}
-				// Skip Elixir keywords that take parens (if, case, etc.)
-				if parser.IsElixirKeyword(funcExpr) {
-					return "", 0, false
-				}
-				return funcExpr, commas, true
+				return expr, commas, true
 			}
-		case ',':
+		case parser.TokComma:
 			if depth == 0 {
 				commas++
 			}
 		}
 	}
 	return "", 0, false
+}
+
+// isCallableToken returns true if the token kind can be the name of a
+// paren-less function/macro call.
+func isCallableToken(kind parser.TokenKind) bool {
+	switch kind {
+	case parser.TokIdent, parser.TokModule,
+		parser.TokImport, parser.TokAlias, parser.TokUse, parser.TokRequire:
+		return true
+	default:
+		return false
+	}
+}
+
+// isArgStartToken returns true if the token kind can appear as the beginning
+// of a function argument (i.e., it's a value-like token, not an operator).
+func isArgStartToken(kind parser.TokenKind) bool {
+	switch kind {
+	case parser.TokIdent, parser.TokModule, parser.TokNumber,
+		parser.TokString, parser.TokHeredoc, parser.TokSigil,
+		parser.TokAtom, parser.TokCharLiteral,
+		parser.TokOpenParen, parser.TokOpenBracket, parser.TokOpenBrace,
+		parser.TokOpenAngle, parser.TokPercent,
+		parser.TokAttr, parser.TokFn:
+		return true
+	default:
+		return false
+	}
+}
+
+// callContextNoParen detects paren-less function calls by scanning backward
+// for a pattern like `ident arg, arg` or `Module.func arg, arg` where the
+// function name is separated from its arguments by whitespace (no parens).
+//
+// Follows Elixir's own approach (Code.Fragment): if the preceding token is an
+// identifier separated by whitespace from the next token, it's a no-paren call.
+func callContextNoParen(tokens []parser.Token, source []byte, startIdx int, _ int) (string, int, bool) {
+	depth := 0
+	commas := 0
+
+	for i := startIdx; i >= 0; i-- {
+		tok := tokens[i]
+
+		switch tok.Kind {
+		case parser.TokCloseParen, parser.TokCloseBracket, parser.TokCloseBrace, parser.TokCloseAngle:
+			depth++
+		case parser.TokOpenParen:
+			if depth > 0 {
+				depth--
+			} else {
+				return "", 0, false
+			}
+		case parser.TokOpenBracket, parser.TokOpenBrace, parser.TokOpenAngle:
+			if depth > 0 {
+				depth--
+			} else {
+				commas = 0
+			}
+		case parser.TokComma:
+			if depth == 0 {
+				commas++
+			}
+		default:
+			if depth == 0 && isCallableToken(tok.Kind) {
+				if i+1 < len(tokens) {
+					next := tokens[i+1]
+					// Part of a dotted chain — keep scanning
+					if next.Kind == parser.TokDot {
+						continue
+					}
+					// Must be separated by whitespace AND followed by a
+					// value-like token (not an operator like =, ->, etc.)
+					if next.Start > tok.End && isArgStartToken(next.Kind) {
+						expr := collectDotChain(tokens, source, i)
+						if expr == "" {
+							return "", 0, false
+						}
+						return expr, commas, true
+					}
+				}
+			}
+		}
+	}
+	return "", 0, false
+}
+
+// CallContextAtCursor is the TokenizedFile method version.
+func (tf *TokenizedFile) CallContextAtCursor(line, col int) (funcExpr string, argIndex int, ok bool) {
+	return CallContextAtCursor(tf.tokens, tf.source, tf.lineStarts, line, col)
 }
 
 // extractParamNames reads the function definition line at defIdx and returns

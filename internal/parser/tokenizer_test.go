@@ -2,6 +2,7 @@ package parser
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -2072,5 +2073,71 @@ func TestTokenize_EscapedNewlineLineTracking(t *testing.T) {
 		if got := findLine(t, src, TokDef); got != 5 {
 			t.Errorf("def line=%d, want 5", got)
 		}
+	})
+}
+
+func TestLineStartsAccuracy(t *testing.T) {
+	assertLineStarts := func(t *testing.T, src string) {
+		t.Helper()
+		result := TokenizeFull([]byte(src))
+		lineStarts := result.LineStarts
+		lines := strings.Split(src, "\n")
+		if len(lineStarts) != len(lines) {
+			t.Fatalf("lineStarts has %d entries but source has %d lines", len(lineStarts), len(lines))
+		}
+		for i, ls := range lineStarts {
+			if ls > len(src) {
+				t.Errorf("lineStarts[%d] = %d out of range", i, ls)
+				continue
+			}
+			end := ls
+			for end < len(src) && src[end] != '\n' {
+				end++
+			}
+			if got := src[ls:end]; got != lines[i] {
+				t.Errorf("lineStarts[%d] = %d -> %q, want %q", i, ls, got, lines[i])
+			}
+		}
+	}
+
+	assertTokenAt := func(t *testing.T, src string, line0, col int, wantKind TokenKind, wantText string) {
+		t.Helper()
+		result := TokenizeFull([]byte(src))
+		offset := LineColToOffset(result.LineStarts, line0, col)
+		idx := TokenAtOffset(result.Tokens, offset)
+		if idx < 0 {
+			t.Fatalf("no token at line %d col %d (offset %d)", line0, col, offset)
+		}
+		tok := result.Tokens[idx]
+		if tok.Kind != wantKind {
+			t.Errorf("token kind = %d, want %d", tok.Kind, wantKind)
+		}
+		if text := TokenText([]byte(src), tok); text != wantText {
+			t.Errorf("token text = %q, want %q", text, wantText)
+		}
+	}
+
+	t.Run("heredoc", func(t *testing.T) {
+		src := "defmodule MyApp.Example do\n  @moduledoc \"\"\"\n  This is a long\n  multiline heredoc\n  with several lines\n  of documentation.\n  \"\"\"\n\n  @type t :: %__MODULE__{\n          name: String.t(),\n          age: Integer.t()\n        }\n\n  def hello do\n    :world\n  end\nend"
+		assertLineStarts(t, src)
+		assertTokenAt(t, src, 9, 16, TokModule, "String")
+	})
+
+	t.Run("multiline string", func(t *testing.T) {
+		src := "x = \"line one\nline two\nline three\"\ny = Enum.map(list, fn x -> x end)"
+		assertLineStarts(t, src)
+		assertTokenAt(t, src, 3, 4, TokModule, "Enum")
+	})
+
+	t.Run("sigil heredoc", func(t *testing.T) {
+		src := "x = ~s\"\"\"\nline one\nline two\n\"\"\"\ny = MyModule.func()"
+		assertLineStarts(t, src)
+		assertTokenAt(t, src, 4, 4, TokModule, "MyModule")
+	})
+
+	t.Run("multiline interpolation", func(t *testing.T) {
+		src := "x = \"hello #{\n  some_func()\n}\"\ny = String.trim(x)"
+		assertLineStarts(t, src)
+		assertTokenAt(t, src, 3, 4, TokModule, "String")
 	})
 }

@@ -858,6 +858,34 @@ func itoa(n int) string {
 
 // Exported token-walking helpers shared with the LSP package.
 
+// LineColToOffset converts a 0-based (line, col) pair to a byte offset using
+// the LineStarts table from TokenizeFull. Returns -1 if out of range.
+func LineColToOffset(lineStarts []int, line, col int) int {
+	if line < 0 || line >= len(lineStarts) {
+		return -1
+	}
+	return lineStarts[line] + col
+}
+
+// TokenAtOffset returns the index of the token containing byteOffset, or -1
+// if the offset falls in a gap between tokens (whitespace) or is out of range.
+// Uses binary search for O(log n) lookup.
+func TokenAtOffset(tokens []Token, byteOffset int) int {
+	lo, hi := 0, len(tokens)-1
+	for lo <= hi {
+		mid := lo + (hi-lo)/2
+		t := tokens[mid]
+		if byteOffset < t.Start {
+			hi = mid - 1
+		} else if byteOffset >= t.End {
+			lo = mid + 1
+		} else {
+			return mid
+		}
+	}
+	return -1
+}
+
 func TokenText(source []byte, t Token) string {
 	return string(source[t.Start:t.End])
 }

@@ -1394,76 +1394,6 @@ end
 	}
 }
 
-func TestExtractArity(t *testing.T) {
-	tests := []struct {
-		name     string
-		line     string
-		funcName string
-		expected int
-	}{
-		{"no parens", "  def foo, do: :ok", "foo", 0},
-		{"empty parens", "  def foo(), do: :ok", "foo", 0},
-		{"one arg", "  def foo(a), do: :ok", "foo", 1},
-		{"two args", "  def foo(a, b) do", "foo", 2},
-		{"three args", "  def create(name, email, role) do", "create", 3},
-		{"nested map", "  def foo(%{name: name}, opts) do", "foo", 2},
-		{"nested list", "  def foo([head | tail], acc) do", "foo", 2},
-		{"default arg", "  defmacro from(expr, kw \\\\ []) do", "from", 2},
-		{"defguard", "  defguard is_admin(user) when user.role == :admin", "is_admin", 1},
-		{"defdelegate", "  defdelegate create(attrs), to: Create", "create", 1},
-		{"tuple arg", "  def foo({a, b}, c) do", "foo", 2},
-		{"keyword list", "  def foo(a, opts \\\\ [key: :val]) do", "foo", 2},
-		{"pattern match", "  def handle_call(:get, _from, state) do", "handle_call", 3},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := ExtractArity(tt.line, tt.funcName)
-			if got != tt.expected {
-				t.Errorf("ExtractArity(%q, %q) = %d, want %d", tt.line, tt.funcName, got, tt.expected)
-			}
-		})
-	}
-}
-
-func TestExtractParamNames(t *testing.T) {
-	tests := []struct {
-		name     string
-		line     string
-		funcName string
-		expected []string
-	}{
-		{"simple params", "  def create(name, email) do", "create", []string{"name", "email"}},
-		{"default param", `  def fetch(slug, opts \\ []) do`, "fetch", []string{"slug", "opts"}},
-		{"pattern match map", "  def process(%{name: name}, data) do", "process", []string{"arg1", "data"}},
-		{"no params", "  def run do", "run", nil},
-		{"empty parens", "  def run() do", "run", nil},
-		{"single param", "  def get(id) do", "get", []string{"id"}},
-		{"underscore param", "  def handle(_ignored, state) do", "handle", []string{"_ignored", "state"}},
-		{"struct = var", "  def update(%User{} = user, attrs) do", "update", []string{"user", "attrs"}},
-		{"var = struct", "  def update(user = %User{}, attrs) do", "update", []string{"user", "attrs"}},
-		{"tuple pattern", "  def handle_info({:DOWN, _ref, :process, pid, _reason}, state) do", "handle_info", []string{"arg1", "state"}},
-		{"bare underscore", "  def foo(_, b) do", "foo", []string{"arg1", "b"}},
-		{"atom literal", "  def handle_call(:get, _from, state) do", "handle_call", []string{"arg1", "_from", "state"}},
-		{"list pattern = var", "  def process([_ | _] = list, opts) do", "process", []string{"list", "opts"}},
-		{"binary pattern", "  def parse(<<header::16, rest::binary>>) do", "parse", []string{"arg1"}},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := ExtractParamNames(tt.line, tt.funcName)
-			if len(got) != len(tt.expected) {
-				t.Fatalf("ExtractParamNames(%q, %q) = %v, want %v", tt.line, tt.funcName, got, tt.expected)
-			}
-			for i := range got {
-				if got[i] != tt.expected[i] {
-					t.Errorf("param %d: got %q, want %q", i, got[i], tt.expected[i])
-				}
-			}
-		})
-	}
-}
-
 func TestParseFile_DefaultParamExpansion(t *testing.T) {
 	path := writeTempFile(t, `defmodule MyApp.Companies do
   def fetch_company_by_slug(slug, opts \\ []) do
@@ -2676,6 +2606,70 @@ end
 		if r.Kind == "call" && r.Function == "x" {
 			t.Errorf("false positive: x detected as bare macro call: %+v", r)
 		}
+	}
+}
+
+func TestTokenAtOffset(t *testing.T) {
+	source := []byte("defmodule Foo.Bar do\n  def baz(x), do: x\nend\n")
+	tokens := Tokenize(source)
+
+	tests := []struct {
+		name   string
+		offset int
+		want   TokenKind
+	}{
+		{"defmodule keyword", 0, TokDefmodule},
+		{"middle of defmodule", 5, TokDefmodule},
+		{"Foo module", 10, TokModule},
+		{"dot", 13, TokDot},
+		{"Bar module", 14, TokModule},
+		{"do keyword", 18, TokDo},
+		{"def keyword", 23, TokDef},
+		{"baz ident", 27, TokIdent},
+		{"open paren", 30, TokOpenParen},
+		{"x param", 31, TokIdent},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			idx := TokenAtOffset(tokens, tt.offset)
+			if idx < 0 {
+				t.Fatalf("TokenAtOffset(%d) returned -1", tt.offset)
+			}
+			if tokens[idx].Kind != tt.want {
+				t.Errorf("TokenAtOffset(%d) = %v, want %v", tt.offset, tokens[idx].Kind, tt.want)
+			}
+		})
+	}
+
+	// Offset in whitespace (between tokens) should return -1
+	if idx := TokenAtOffset(tokens, 9); idx >= 0 {
+		t.Errorf("expected -1 for whitespace offset 9, got token kind %v", tokens[idx].Kind)
+	}
+}
+
+func TestLineColToOffset(t *testing.T) {
+	source := []byte("defmodule Foo do\n  def bar, do: :ok\nend\n")
+	result := TokenizeFull(source)
+
+	tests := []struct {
+		line, col int
+		wantOff   int
+	}{
+		{0, 0, 0},   // start of file
+		{0, 10, 10}, // "F" in "Foo"
+		{1, 2, 19},  // "d" in "def"
+		{2, 0, 36},  // "e" in "end"
+	}
+	for _, tt := range tests {
+		got := LineColToOffset(result.LineStarts, tt.line, tt.col)
+		if got != tt.wantOff {
+			t.Errorf("LineColToOffset(line=%d, col=%d) = %d, want %d", tt.line, tt.col, got, tt.wantOff)
+		}
+	}
+
+	// Out-of-range line
+	if got := LineColToOffset(result.LineStarts, 99, 0); got != -1 {
+		t.Errorf("expected -1 for out-of-range line, got %d", got)
 	}
 }
 

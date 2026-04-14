@@ -3781,6 +3781,55 @@ end
 	}
 }
 
+func TestDocumentSymbol_ForReduceDoesNotAddDepth(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule MyApp.Chat do
+  defp handle_event(socket, message) do
+    for {_key, %State{} = state} <- socket.assigns,
+        state.topic == message.topic,
+        reduce: socket do
+      socket ->
+        process(socket, state, message)
+    end
+  end
+
+  defp other_func(x) do
+    x + 1
+  end
+end
+`
+	docURI := "file:///test/chat.ex"
+	server.docs.Set(docURI, content)
+
+	symbols := documentSymbols(t, server, docURI)
+
+	if len(symbols) != 1 {
+		t.Fatalf("expected 1 top-level symbol, got %d", len(symbols))
+	}
+
+	mod := symbols[0]
+	childNames := collectNames(mod.Children)
+
+	// Both functions should be direct children of the module, not nested.
+	// The "reduce: socket do" line must NOT be treated as a macro call.
+	expectedChildren := []string{"handle_event/2", "other_func/1"}
+	if len(childNames) != len(expectedChildren) {
+		t.Fatalf("expected %d children of module, got %d: %v", len(expectedChildren), len(childNames), childNames)
+	}
+	for i, name := range expectedChildren {
+		if childNames[i] != name {
+			t.Errorf("child %d: expected %q, got %q", i, name, childNames[i])
+		}
+	}
+
+	// Verify "reduce" is not present as a symbol anywhere
+	if found := findSymbol(symbols, "reduce socket"); found != nil {
+		t.Error("reduce should not appear as a document symbol")
+	}
+}
+
 // Verify capabilities are advertised
 func TestServer_Capabilities_DocumentSymbolAndWorkspaceSymbol(t *testing.T) {
 	server, cleanup := setupTestServer(t)
