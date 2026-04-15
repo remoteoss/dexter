@@ -168,6 +168,25 @@ defmodule Formatter.Loop do
             Process.group_leader(self(), old_gl)
           end
         else
+          sigils =
+            for plugin <- plugins,
+                sigil <- List.wrap(plugin.features(format_opts)[:sigils]),
+                do: {sigil, plugin}
+
+          sigils =
+            sigils
+            |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
+            |> Enum.map(fn {sigil, plugins} ->
+              {sigil,
+               fn input, plugin_opts ->
+                 Enum.reduce(plugins, input, fn plugin, acc ->
+                   plugin.format(acc, plugin_opts ++ opts)
+                 end)
+               end}
+            end)
+
+          opts = Keyword.put(opts, :sigils, sigils)
+
           content |> Code.format_string!(opts) |> IO.iodata_to_binary()
         end
 
