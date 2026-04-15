@@ -31,6 +31,18 @@ func (s *Server) hoverFromFile(function string, result store.LookupResult) (*pro
 	} else {
 		doc, spec = extractDocAbove(lines, defIdx)
 		signature = extractSignature(lines, defIdx)
+
+		// Fallback: if the def has no doc (e.g. inline def injected by a
+		// __using__ macro), look for a @callback with the same name in the
+		// same file and extract its doc/spec instead.
+		if doc == "" && spec == "" {
+			if cbIdx := findCallbackLine(lines, function); cbIdx >= 0 {
+				doc, spec = extractDocAbove(lines, cbIdx)
+				if spec == "" {
+					spec = extractMultiLineAttr(lines, cbIdx)
+				}
+			}
+		}
 	}
 
 	content := formatHoverContent(doc, spec, signature)
@@ -212,6 +224,38 @@ func extractModuledoc(lines []string, moduleIdx int) string {
 	}
 
 	return ""
+}
+
+// findCallbackLine scans for a @callback or @macrocallback line that defines
+// the given function name and returns its 0-based line index, or -1.
+func findCallbackLine(lines []string, function string) int {
+	cbPrefix := "@callback " + function
+	mcbPrefix := "@macrocallback " + function
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, cbPrefix) && (len(trimmed) == len(cbPrefix) || trimmed[len(cbPrefix)] == '(' || trimmed[len(cbPrefix)] == ' ') {
+			return i
+		}
+		if strings.HasPrefix(trimmed, mcbPrefix) && (len(trimmed) == len(mcbPrefix) || trimmed[len(mcbPrefix)] == '(' || trimmed[len(mcbPrefix)] == ' ') {
+			return i
+		}
+	}
+	return -1
+}
+
+// extractMultiLineAttr collects a potentially multi-line module attribute
+// starting at idx (e.g. @callback, @spec). Continuation lines are collected
+// until an empty line, another attribute, or a definition is encountered.
+func extractMultiLineAttr(lines []string, idx int) string {
+	collected := []string{lines[idx]}
+	for i := idx + 1; i < len(lines); i++ {
+		trimmed := strings.TrimSpace(lines[i])
+		if trimmed == "" || strings.HasPrefix(trimmed, "@") || strings.HasPrefix(trimmed, "def") {
+			break
+		}
+		collected = append(collected, lines[i])
+	}
+	return strings.TrimSpace(strings.Join(collected, "\n"))
 }
 
 func extractQuotedString(s string) string {
