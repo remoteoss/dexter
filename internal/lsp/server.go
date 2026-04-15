@@ -438,9 +438,9 @@ func (s *Server) DidOpen(ctx context.Context, params *protocol.DidOpenTextDocume
 	path := uriToPath(params.TextDocument.URI)
 	if path != "" && isFormattableFile(path) && s.isProjectFile(path) && !s.isDepsFile(path) {
 		go func() {
-			if mixRoot := findMixRoot(filepath.Dir(path)); mixRoot != "" {
-				formatterExs := findFormatterConfig(path, mixRoot)
-				_, _ = s.getFormatter(mixRoot, formatterExs)
+			if mixRoot, umbrellaRoot := findMixRoot(filepath.Dir(path)); mixRoot != "" {
+				root, formatterExs := findFormatterConfig(path, mixRoot, umbrellaRoot)
+				_, _ = s.getFormatter(root, formatterExs)
 			}
 		}()
 	}
@@ -738,14 +738,24 @@ func findDexterRoot(path string) string {
 }
 
 // findMixRoot walks up from dir looking for the nearest mix.exs.
-func findMixRoot(dir string) string {
+func findMixRoot(dir string) (appRoot, umbrellaRoot string) {
+	isMixRoot := func(path string) bool {
+		_, err := os.Stat(filepath.Join(path, "mix.exs"))
+		return err == nil
+	}
+
 	for {
-		if _, err := os.Stat(filepath.Join(dir, "mix.exs")); err == nil {
-			return dir
+		if isMixRoot(dir) {
+			// found nearest mix.exs, check if we're in an umbrella app
+			umbrellaRoot = filepath.Dir(filepath.Dir(dir))
+			if isMixRoot(umbrellaRoot) {
+				return dir, umbrellaRoot
+			}
+			return dir, ""
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			return ""
+			return "", ""
 		}
 		dir = parent
 	}
@@ -2584,7 +2594,7 @@ func (s *Server) Formatting(ctx context.Context, params *protocol.DocumentFormat
 		return nil, nil
 	}
 
-	mixRoot := findMixRoot(filepath.Dir(path))
+	mixRoot, umbrellaRoot := findMixRoot(filepath.Dir(path))
 	if mixRoot == "" {
 		return nil, nil
 	}
@@ -2592,7 +2602,7 @@ func (s *Server) Formatting(ctx context.Context, params *protocol.DocumentFormat
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	formatted, err := s.formatContent(ctx, mixRoot, path, text)
+	formatted, err := s.formatContent(ctx, mixRoot, umbrellaRoot, path, text)
 	if err != nil {
 		var formatErr *FormatError
 		if errors.As(err, &formatErr) {

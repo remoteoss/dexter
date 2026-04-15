@@ -2589,21 +2589,21 @@ func TestFindMixRoot(t *testing.T) {
 	}
 
 	t.Run("finds nearest mix.exs from project lib dir", func(t *testing.T) {
-		got := findMixRoot(filepath.Join(myApp, "lib"))
+		got, _ := findMixRoot(filepath.Join(myApp, "lib"))
 		if got != myApp {
 			t.Errorf("expected %s, got %s", myApp, got)
 		}
 	})
 
 	t.Run("finds mix.exs in same directory", func(t *testing.T) {
-		got := findMixRoot(myApp)
+		got, _ := findMixRoot(myApp)
 		if got != myApp {
 			t.Errorf("expected %s, got %s", myApp, got)
 		}
 	})
 
 	t.Run("each project resolves to its own mix root", func(t *testing.T) {
-		got := findMixRoot(filepath.Join(otherProject, "lib"))
+		got, _ := findMixRoot(filepath.Join(otherProject, "lib"))
 		if got != otherProject {
 			t.Errorf("expected %s, got %s", otherProject, got)
 		}
@@ -2611,9 +2611,40 @@ func TestFindMixRoot(t *testing.T) {
 
 	t.Run("returns empty when no mix.exs exists", func(t *testing.T) {
 		empty := t.TempDir()
-		got := findMixRoot(empty)
+		got, _ := findMixRoot(empty)
 		if got != "" {
 			t.Errorf("expected empty string, got %s", got)
+		}
+	})
+}
+
+func TestFindMixUmbrellaRoot(t *testing.T) {
+	root := t.TempDir()
+
+	// Create an umbrella structure (with root mix.exs):
+	//   root/mix.exs
+	//   root/apps/a/mix.exs
+	//   root/apps/a/lib/
+	rootMix := filepath.Join(root, "mix.exs")
+	if err := os.WriteFile(rootMix, []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+	app := filepath.Join(root, "apps", "a")
+	if err := os.MkdirAll(filepath.Join(app, "lib"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	appMix := filepath.Join(app, "mix.exs")
+	if err := os.WriteFile(appMix, []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("finds nearest mix.exs and umbrella mix.exs from project lib dir", func(t *testing.T) {
+		gotApp, gotUmbrella := findMixRoot(filepath.Join(app, "lib"))
+		if gotApp != app {
+			t.Errorf("expected %s, got %s", app, gotApp)
+		}
+		if gotUmbrella != root {
+			t.Errorf("expected %s, got %s", root, gotUmbrella)
 		}
 	})
 }
@@ -2730,8 +2761,8 @@ func TestFormatter_RestartAfterCrash(t *testing.T) {
 	}
 
 	// Kill the persistent process
-	mixRoot := findMixRoot(filepath.Dir(filePath))
-	formatterExs := findFormatterConfig(filePath, mixRoot)
+	mixRoot, umbrellaRoot := findMixRoot(filepath.Dir(filePath))
+	formatterExs, _ := findFormatterConfig(filePath, mixRoot, umbrellaRoot)
 	server.formattersMu.Lock()
 	if fp, ok := server.formatters[formatterExs]; ok {
 		fp.Close()
