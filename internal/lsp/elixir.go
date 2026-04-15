@@ -955,11 +955,15 @@ func skipToEndOfStatement(tokens []parser.Token, n, from int) int {
 		case parser.TokOpenParen, parser.TokOpenBracket, parser.TokOpenBrace, parser.TokOpenAngle:
 			depth++
 		case parser.TokCloseParen, parser.TokCloseBracket, parser.TokCloseBrace, parser.TokCloseAngle:
-			depth--
+			if depth > 0 {
+				depth--
+			}
 		case parser.TokDo, parser.TokFn:
 			blockDepth++
 		case parser.TokEnd:
-			blockDepth--
+			if blockDepth > 0 {
+				blockDepth--
+			}
 		case parser.TokEOL, parser.TokEOF:
 			if depth <= 0 && blockDepth <= 0 {
 				return i
@@ -1298,9 +1302,9 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 		return
 	}
 
-	// Extract file-level aliases for resolution
+	// Extract file-level aliases for resolution (reuse already-tokenized data)
 	lines := strings.Split(text, "\n")
-	fileAliases := extractAliasesFromText(text, -1)
+	fileAliases := extractAliasesFromTokens(source, tokens, -1)
 
 	inlineDefs = make(map[string][]inlineDef)
 
