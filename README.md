@@ -186,18 +186,17 @@ lspconfig.dexter.setup({})
 
 ### Zed
 
-Zed support is available via a dev extension while the official Elixir extension PR is in [review](https://github.com/zed-extensions/elixir/pull/115).
+Zed support is available via a **dev extension** while the update for built-in [extension registry](https://github.com/zed-industries/extensions/pull/5624) and [documentation](https://github.com/zed-industries/zed/pull/53793) is being merged.
 
 To install it:
 
-1. Clone the repo and checkout the branch:
+1. Clone the official extension repo:
    ```bash
-   git clone https://github.com/flowerett/zed-elixir-extensions.git
-   cd zed-elixir-extensions
-   git checkout add-dexter-support
+   git clone https://github.com/zed-extensions/elixir.git
+   cd elixir
    ```
 2. In Zed, open the command palette (`Cmd+Shift+P`) and run **zed: install dev extension**
-3. Select the cloned `zed-elixir-extensions` directory
+3. Select the cloned `elixir` directory
 
 Once installed, enable it in your Zed `settings.json`:
 
