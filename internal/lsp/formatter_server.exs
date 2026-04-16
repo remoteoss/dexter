@@ -144,50 +144,63 @@ defmodule Formatter.Loop do
       opts = if filename != "", do: [file: filename] ++ format_opts, else: format_opts
       ext = Path.extname(filename)
 
-      # Filter plugins to those that handle this file extension
-      applicable_plugins =
-        Enum.filter(plugins, fn plugin ->
+      # Find plugins that handle this file extension or support .ex / .exs sigils
+      {applicable_plugins, sigils} =
+        Enum.reduce(plugins, {[], []}, fn plugin, {acc_plugins, acc_sigils} ->
           features = plugin.features(format_opts)
           extensions = Keyword.get(features, :extensions, [])
+
           # If a plugin declares no extensions, it handles .ex/.exs by default
-          extensions == [] or ext in extensions
+          acc_plugins =
+            if extensions == [] or ext in extensions do
+              acc_plugins ++ [plugin]
+            else
+              acc_plugins
+            end
+
+          sigils =
+            features
+            |> Keyword.get(:sigils)
+            |> List.wrap()
+            |> Enum.map(fn sigil -> {sigil, plugin} end)
+
+          {acc_plugins, acc_sigils ++ sigils}
         end)
 
-      formatted =
-        if applicable_plugins != [] do
-          # Redirect group leader to stderr during plugin calls so any
-          # IO.puts from plugins doesn't corrupt the binary protocol on stdout.
-          old_gl = Process.group_leader()
-          Process.group_leader(self(), Process.whereis(:standard_error))
+      # Redirect group leader to stderr during plugin calls so any
+      # IO.puts from plugins doesn't corrupt the binary protocol on stdout.
+      old_gl = Process.group_leader()
+      Process.group_leader(self(), Process.whereis(:standard_error))
 
-          try do
+      formatted =
+        try do
+          if applicable_plugins != [] do
             Enum.reduce(applicable_plugins, content, fn plugin, acc ->
               plugin.format(acc, opts)
             end)
-          after
-            Process.group_leader(self(), old_gl)
+          else
+            sigils =
+              sigils
+              |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
+              |> Enum.map(fn {sigil, plugins} ->
+                {sigil,
+                fn input, sigil_opts ->
+                  Enum.reduce(plugins, input, fn plugin, acc ->
+                    plugin.format(acc, sigil_opts ++ opts)
+                  end)
+                end}
+              end)
+
+            # `Code.format_string!/2` supports an undocumented `sigils` option
+            # that is passed to the underlying `quoted_to_algebra` and can transform
+            # the contents of a sigil during formatting. See available options in
+            # `Code.Formatter.maybe_sigil_to_algebra/4`.
+            opts = Keyword.put(opts, :sigils, sigils)
+
+            content |> Code.format_string!(opts) |> IO.iodata_to_binary()
           end
-        else
-          sigils =
-            for plugin <- plugins,
-                sigil <- List.wrap(plugin.features(format_opts)[:sigils]),
-                do: {sigil, plugin}
-
-          sigils =
-            sigils
-            |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
-            |> Enum.map(fn {sigil, plugins} ->
-              {sigil,
-               fn input, plugin_opts ->
-                 Enum.reduce(plugins, input, fn plugin, acc ->
-                   plugin.format(acc, plugin_opts ++ opts)
-                 end)
-               end}
-            end)
-
-          opts = Keyword.put(opts, :sigils, sigils)
-
-          content |> Code.format_string!(opts) |> IO.iodata_to_binary()
+        after
+          Process.group_leader(self(), old_gl)
         end
 
       # Ensure trailing newline to match mix format output
