@@ -132,7 +132,7 @@ To enable format-on-save, update your VS Code settings:
   "[elixir]": {
       "editor.formatOnSave": true,
       // you may need to set Dexter as your default Elixir formatter, depending on your setup
-      "editor.defaultFormatter": "remoteoss.dexter-lsp"
+      "editor.defaultFormatter": "remote-com-oss.dexter-lsp"
   },
   "[phoenix-heex]": { "editor.formatOnSave": true }
 }
