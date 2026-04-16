@@ -149,6 +149,7 @@ vim.lsp.config('dexter', {
   filetypes = { 'elixir', 'eelixir', 'heex' },
   init_options = {
     followDelegates = true,  -- jump through defdelegate to the target function
+    -- definitionStyle = "all", -- "all" returns all function heads; "first" jumps to the first one
     -- stdlibPath = "",      -- override Elixir stdlib path (auto-detected)
     -- debug = false,        -- verbose logging to stderr (view with :LspLog)
   },
@@ -227,6 +228,21 @@ To override the binary path manually, add this to your `settings.json`:
       "binary": {
         "path": "/Users/you/.local/share/mise/shims/dexter", // or wherever `which dexter` points to
         "arguments": ["lsp"]
+      }
+    }
+  }
+}
+```
+
+To configure LSP options (see [LSP options](#lsp-options)):
+
+```json
+{
+  "lsp": {
+    "dexter": {
+      "initialization_options": {
+        "followDelegates": true,
+        "definitionStyle": "first"
       }
     }
   }
@@ -478,6 +494,7 @@ If the persistent process can't start, dexter falls back to running `mix format`
 Dexter reads `initializationOptions` from your editor configuration:
 
 - **`followDelegates`** (boolean, default: `true`): follow `defdelegate` targets on lookup.
+- **`definitionStyle`** (string, default: `"all"`): controls how many locations are returned when a function has multiple heads (clauses). `"all"` returns every definition site; `"first"` returns only the first one, which makes editors like Zed jump directly instead of showing a picker.
 - **`stdlibPath`** (string): override the Elixir stdlib directory to index. Defaults to auto-detection; use this if your install is non-standard.
 - **`debug`** (boolean, default: `false`): enable verbose logging to stderr. Logs timing and resolution details for every definition, hover, references, and rename request. Can also be enabled via the `DEXTER_DEBUG=true` environment variable.
 

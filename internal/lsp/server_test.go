@@ -253,6 +253,84 @@ func TestServer_InitializationOptions_FollowDelegates(t *testing.T) {
 	}
 }
 
+func TestServer_InitializationOptions_DefinitionStyle(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Default should be "all"
+	if server.definitionStyle != "all" {
+		t.Errorf("definitionStyle should default to %q, got %q", "all", server.definitionStyle)
+	}
+
+	// Simulate initializationOptions with definitionStyle="first"
+	opts := map[string]interface{}{
+		"definitionStyle": "first",
+	}
+	if v, ok := opts["definitionStyle"].(string); ok {
+		if v == "all" || v == "first" {
+			server.definitionStyle = v
+		}
+	}
+
+	if server.definitionStyle != "first" {
+		t.Errorf("definitionStyle should be %q after setting, got %q", "first", server.definitionStyle)
+	}
+
+	// Invalid value should not change the setting
+	server.definitionStyle = "all"
+	opts = map[string]interface{}{
+		"definitionStyle": "bogus",
+	}
+	if v, ok := opts["definitionStyle"].(string); ok {
+		if v == "all" || v == "first" {
+			server.definitionStyle = v
+		}
+	}
+
+	if server.definitionStyle != "all" {
+		t.Errorf("definitionStyle should remain %q for invalid value, got %q", "all", server.definitionStyle)
+	}
+}
+
+func TestServer_ApplyDefinitionStyle(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	locs := []protocol.Location{
+		{URI: "file:///a.ex", Range: lineRange(0)},
+		{URI: "file:///a.ex", Range: lineRange(5)},
+		{URI: "file:///a.ex", Range: lineRange(9)},
+	}
+
+	// Default "all" returns everything
+	got := server.applyDefinitionStyle(locs)
+	if len(got) != 3 {
+		t.Errorf("expected 3 locations with style %q, got %d", "all", len(got))
+	}
+
+	// "first" returns only the first
+	server.definitionStyle = "first"
+	got = server.applyDefinitionStyle(locs)
+	if len(got) != 1 {
+		t.Errorf("expected 1 location with style %q, got %d", "first", len(got))
+	}
+	if got[0].Range.Start.Line != 0 {
+		t.Errorf("expected first location (line 0), got line %d", got[0].Range.Start.Line)
+	}
+
+	// Single location is unaffected by "first"
+	got = server.applyDefinitionStyle(locs[:1])
+	if len(got) != 1 {
+		t.Errorf("expected 1 location with style %q and single input, got %d", "first", len(got))
+	}
+
+	// Empty slice is unaffected
+	got = server.applyDefinitionStyle(nil)
+	if len(got) != 0 {
+		t.Errorf("expected 0 locations for nil input, got %d", len(got))
+	}
+}
+
 func definitionAt(t *testing.T, server *Server, uri string, line, col uint32) []protocol.Location {
 	t.Helper()
 	result, err := server.Definition(context.Background(), &protocol.DefinitionParams{

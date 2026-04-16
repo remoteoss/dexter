@@ -61,6 +61,7 @@ type Server struct {
 	client          protocol.Client
 	followDelegates bool
 	debug           bool
+	definitionStyle string // "all" (default) or "first": controls multi-head definition results
 	mixBin          string // resolved path to the mix binary
 
 	formatters   map[string]*formatterProcess // formatterExs path → persistent formatter
@@ -102,6 +103,7 @@ func NewServer(s *store.Store, projectRoot string) *Server {
 		projectRoot:     projectRoot,
 		explicitRoot:    projectRoot != "",
 		followDelegates: true,
+		definitionStyle: "all",
 		usingCache:      make(map[string]*usingCacheEntry),
 		depsCache:       make(map[string]bool),
 	}
@@ -297,6 +299,11 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 		}
 		if v, ok := opts["debug"].(bool); ok {
 			s.debug = v
+		}
+		if v, ok := opts["definitionStyle"].(string); ok {
+			if v == "all" || v == "first" {
+				s.definitionStyle = v
+			}
 		}
 	}
 	if os.Getenv("DEXTER_DEBUG") == "true" {
@@ -606,20 +613,20 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		}
 		if err == nil && len(results) > 0 {
 			s.debugf("Definition: found %d result(s) in store for %s.%s", len(results), fullModule, functionName)
-			return storeResultsToLocations(filterOutTypes(results)), nil
+			return s.applyDefinitionStyle(storeResultsToLocations(filterOutTypes(results))), nil
 		}
 
 		// fullModule may not directly define the function — try its use chain
 		// (e.g. `import MyApp.Factory` where MyApp.Factory uses ExMachina).
 		if results := s.lookupThroughUseOf(fullModule, functionName); len(results) > 0 {
 			s.debugf("Definition: found %d result(s) via use chain of %s for %s", len(results), fullModule, functionName)
-			return storeResultsToLocations(filterOutTypes(results)), nil
+			return s.applyDefinitionStyle(storeResultsToLocations(filterOutTypes(results))), nil
 		}
 
 		// Fallback for use-chain inline defs (not stored as module definitions)
 		if results := s.lookupThroughUse(text, functionName, aliases); len(results) > 0 {
 			s.debugf("Definition: found %d result(s) via current file use chain for %s", len(results), functionName)
-			return storeResultsToLocations(filterOutTypes(results)), nil
+			return s.applyDefinitionStyle(storeResultsToLocations(filterOutTypes(results))), nil
 		}
 
 		s.debugf("Definition: no result found for bare function %q in module %q", functionName, fullModule)
@@ -641,13 +648,13 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		}
 		if err == nil && len(results) > 0 {
 			s.debugf("Definition: found %d result(s) in store for %s.%s", len(results), fullModule, functionName)
-			return storeResultsToLocations(filterOutTypes(results)), nil
+			return s.applyDefinitionStyle(storeResultsToLocations(filterOutTypes(results))), nil
 		}
 		// Not directly defined — the function may have been injected by a
 		// `use` macro in fullModule's source (e.g. Oban.Worker injects `new`).
 		if results := s.lookupThroughUseOf(fullModule, functionName); len(results) > 0 {
 			s.debugf("Definition: found %d result(s) via use chain of %s for %s", len(results), fullModule, functionName)
-			return storeResultsToLocations(results), nil
+			return s.applyDefinitionStyle(storeResultsToLocations(results)), nil
 		}
 		s.debugf("Definition: no result for %s.%s", fullModule, functionName)
 	}
@@ -657,7 +664,14 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 	if err != nil || len(results) == 0 {
 		return nil, nil
 	}
-	return storeResultsToLocations(results), nil
+	return s.applyDefinitionStyle(storeResultsToLocations(results)), nil
+}
+
+func (s *Server) applyDefinitionStyle(locations []protocol.Location) []protocol.Location {
+	if s.definitionStyle == "first" && len(locations) > 1 {
+		return locations[:1]
+	}
+	return locations
 }
 
 func storeResultsToLocations(results []store.LookupResult) []protocol.Location {
