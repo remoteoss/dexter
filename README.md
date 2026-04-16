@@ -119,7 +119,7 @@ But if Dexter is not on your `PATH`, set the binary path in your editor settings
 }
 ```
 
-To enable format-on-save, update your VS Code settings:
+To enable format-on-save, update your VS Code/Cursor settings:
 
 ```json
 // global in your editor
@@ -132,7 +132,7 @@ To enable format-on-save, update your VS Code settings:
   "[elixir]": {
       "editor.formatOnSave": true,
       // you may need to set Dexter as your default Elixir formatter, depending on your setup
-      "editor.defaultFormatter": "remote-com-oss.dexter-lsp"
+      "editor.defaultFormatter": "remoteoss.dexter-lsp" // "remote-com-oss.dexter-lsp" for Cursor
   },
   "[phoenix-heex]": { "editor.formatOnSave": true }
 }
