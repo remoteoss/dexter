@@ -438,9 +438,9 @@ func (s *Server) DidOpen(ctx context.Context, params *protocol.DidOpenTextDocume
 	path := uriToPath(params.TextDocument.URI)
 	if path != "" && isFormattableFile(path) && s.isProjectFile(path) && !s.isDepsFile(path) {
 		go func() {
-			if mixRoot, umbrellaRoot := findMixRoot(filepath.Dir(path)); mixRoot != "" {
-				root, formatterExs := findFormatterConfig(path, mixRoot, umbrellaRoot)
-				_, _ = s.getFormatter(root, formatterExs)
+			if mixRoot := findMixRoot(s.projectRoot, filepath.Dir(path)); mixRoot != "" {
+				formatterExs := findFormatterConfig(path, mixRoot)
+				_, _ = s.getFormatter(mixRoot, formatterExs)
 			}
 		}()
 	}
@@ -737,25 +737,16 @@ func findDexterRoot(path string) string {
 	return path
 }
 
-// findMixRoot walks up from dir looking for the nearest mix.exs.
-func findMixRoot(dir string) (appRoot, umbrellaRoot string) {
-	isMixRoot := func(path string) bool {
-		_, err := os.Stat(filepath.Join(path, "mix.exs"))
-		return err == nil
-	}
-
+// findMixRoot walks up from dir looking for the mix.exs closest to the project root.
+// Handles standard apps (single mix.exs), umbrella apps (root-level mix.exs), and monorepos.
+func findMixRoot(projectRoot, dir string) (mixRoot string) {
 	for {
-		if isMixRoot(dir) {
-			// found nearest mix.exs, check if we're in an umbrella app
-			umbrellaRoot = filepath.Dir(filepath.Dir(dir))
-			if isMixRoot(umbrellaRoot) {
-				return dir, umbrellaRoot
-			}
-			return dir, ""
+		if _, err := os.Stat(filepath.Join(dir, "mix.exs")); err == nil {
+			mixRoot = dir
 		}
 		parent := filepath.Dir(dir)
-		if parent == dir {
-			return "", ""
+		if parent == dir || dir == projectRoot {
+			return
 		}
 		dir = parent
 	}
@@ -2594,7 +2585,7 @@ func (s *Server) Formatting(ctx context.Context, params *protocol.DocumentFormat
 		return nil, nil
 	}
 
-	mixRoot, umbrellaRoot := findMixRoot(filepath.Dir(path))
+	mixRoot := findMixRoot(s.projectRoot, filepath.Dir(path))
 	if mixRoot == "" {
 		return nil, nil
 	}
@@ -2602,7 +2593,7 @@ func (s *Server) Formatting(ctx context.Context, params *protocol.DocumentFormat
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	formatted, err := s.formatContent(ctx, mixRoot, umbrellaRoot, path, text)
+	formatted, err := s.formatContent(ctx, mixRoot, path, text)
 	if err != nil {
 		var formatErr *FormatError
 		if errors.As(err, &formatErr) {

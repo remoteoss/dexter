@@ -285,13 +285,12 @@ func (s *Server) getFormatter(mixRoot, formatterExs string) (*formatterProcess, 
 // findFormatterConfig walks from the file's directory up to the mix root,
 // returning the path to the nearest .formatter.exs. This handles subdirectory
 // configs (e.g. config/.formatter.exs with different rules than the root).
-func findFormatterConfig(filePath, mixRoot, umbrellaRoot string) (root, formatterExs string) {
+func findFormatterConfig(filePath, mixRoot string) string {
 	dir := filepath.Dir(filePath)
-
 	for {
 		candidate := filepath.Join(dir, ".formatter.exs")
 		if _, err := os.Stat(candidate); err == nil {
-			return mixRoot, candidate
+			return candidate
 		}
 		if dir == mixRoot {
 			break
@@ -302,15 +301,7 @@ func findFormatterConfig(filePath, mixRoot, umbrellaRoot string) (root, formatte
 		}
 		dir = parent
 	}
-
-	if umbrellaRoot != "" {
-		umbrellaFormatter := filepath.Join(umbrellaRoot, ".formatter.exs")
-		if _, err := os.Stat(umbrellaFormatter); err == nil {
-			return umbrellaRoot, umbrellaFormatter
-		}
-	}
-
-	return mixRoot, filepath.Join(mixRoot, ".formatter.exs")
+	return filepath.Join(mixRoot, ".formatter.exs")
 }
 
 // formatContent tries the persistent formatter, falling back to mix format.
@@ -319,12 +310,12 @@ func findFormatterConfig(filePath, mixRoot, umbrellaRoot string) (root, formatte
 //   - <5s old: wait for the process to become ready, then use it
 //   - 5s–30s old: don't wait, fall back to mix format immediately
 //   - >30s old and still not ready: kill and restart the stuck process
-func (s *Server) formatContent(ctx context.Context, mixRoot, umbrellaRoot, path, content string) (string, error) {
-	root, formatterExs := findFormatterConfig(path, mixRoot, umbrellaRoot)
-	fp, err := s.getFormatter(root, formatterExs)
+func (s *Server) formatContent(ctx context.Context, mixRoot, path, content string) (string, error) {
+	formatterExs := findFormatterConfig(path, mixRoot)
+	fp, err := s.getFormatter(mixRoot, formatterExs)
 	if err != nil {
 		log.Printf("Formatting: persistent formatter unavailable, falling back to mix format: %v", err)
-		return s.formatWithMixFormat(ctx, root, path, content)
+		return s.formatWithMixFormat(ctx, mixRoot, path, content)
 	}
 
 	// Check if already ready (non-blocking)
