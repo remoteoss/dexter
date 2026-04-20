@@ -191,3 +191,196 @@ func TestScanMultiAliasChildren_StopAtStatement(t *testing.T) {
 		t.Fatalf("expected nextPos at TokDef boundary, got nextPos=%d kind=%v", nextPos, tokens[nextPos].Kind)
 	}
 }
+
+// =============================================================================
+// TokenWalker tests
+// =============================================================================
+
+func TestTokenWalker_BasicIteration(t *testing.T) {
+	source := []byte("def foo do\n  :ok\nend")
+	tokens := Tokenize(source)
+	w := NewTokenWalker(source, tokens)
+
+	var kinds []TokenKind
+	for w.More() {
+		kinds = append(kinds, w.CurrentKind())
+		w.Advance()
+	}
+
+	if len(kinds) == 0 {
+		t.Fatal("expected some tokens")
+	}
+	if kinds[0] != TokDef {
+		t.Errorf("first token: got %v, want TokDef", kinds[0])
+	}
+}
+
+func TestTokenWalker_DepthTracking(t *testing.T) {
+	source := []byte("foo(bar(x), [y])")
+	tokens := Tokenize(source)
+	w := NewTokenWalker(source, tokens)
+
+	// Find positions manually
+	maxDepth := 0
+	for w.More() {
+		if w.Depth() > maxDepth {
+			maxDepth = w.Depth()
+		}
+		w.Advance()
+	}
+
+	// Depth should hit 2 for nested parens
+	if maxDepth < 2 {
+		t.Errorf("expected max depth >= 2, got %d", maxDepth)
+	}
+
+	// After full iteration, should be back to 0
+	if w.Depth() != 0 {
+		t.Errorf("final depth: got %d, want 0", w.Depth())
+	}
+}
+
+func TestTokenWalker_BlockDepthTracking(t *testing.T) {
+	source := []byte("def foo do\n  fn -> :ok end\nend")
+	tokens := Tokenize(source)
+	w := NewTokenWalker(source, tokens)
+
+	maxBlockDepth := 0
+	for w.More() {
+		if w.BlockDepth() > maxBlockDepth {
+			maxBlockDepth = w.BlockDepth()
+		}
+		w.Advance()
+	}
+
+	// Block depth should hit 2 (def do + fn)
+	if maxBlockDepth != 2 {
+		t.Errorf("expected max block depth 2, got %d", maxBlockDepth)
+	}
+
+	// After full iteration, should be back to 0
+	if w.BlockDepth() != 0 {
+		t.Errorf("final block depth: got %d, want 0", w.BlockDepth())
+	}
+}
+
+func TestTokenWalker_NegativeDepthClamp(t *testing.T) {
+	// Start mid-expression with unmatched closing bracket
+	source := []byte(") + x")
+	tokens := Tokenize(source)
+	w := NewTokenWalker(source, tokens)
+
+	for w.More() {
+		w.Advance()
+	}
+
+	// Depth should never go negative
+	if w.Depth() < 0 {
+		t.Errorf("depth went negative: %d", w.Depth())
+	}
+}
+
+func TestTokenWalker_SkipToEndOfStatement(t *testing.T) {
+	source := []byte("foo(x,\n  y)\nbar()")
+	tokens := Tokenize(source)
+	w := NewTokenWalker(source, tokens)
+
+	w.SkipToEndOfStatement()
+
+	// Should stop at EOL after the first complete statement
+	if w.CurrentKind() != TokEOL {
+		t.Errorf("expected TokEOL, got %v", w.CurrentKind())
+	}
+}
+
+func TestTokenWalker_EnsureProgress(t *testing.T) {
+	source := []byte("foo bar")
+	tokens := Tokenize(source)
+	w := NewTokenWalker(source, tokens)
+
+	prevPos := w.Pos()
+	// Simulate a function that doesn't advance
+	w.EnsureProgress(prevPos)
+
+	if w.Pos() == prevPos {
+		t.Error("EnsureProgress should have advanced position")
+	}
+}
+
+func TestTokenWalker_CollectModuleName(t *testing.T) {
+	source := []byte("Foo.Bar.Baz")
+	tokens := Tokenize(source)
+	w := NewTokenWalker(source, tokens)
+
+	name := w.CollectModuleName()
+	if name != "Foo.Bar.Baz" {
+		t.Errorf("got %q, want Foo.Bar.Baz", name)
+	}
+}
+
+func TestTokenWalker_ScanForBlockDo(t *testing.T) {
+	t.Run("do on same line", func(t *testing.T) {
+		source := []byte("defmodule Foo do")
+		tokens := Tokenize(source)
+		w := NewTokenWalker(source, tokens)
+		w.Advance() // skip defmodule
+		w.SkipToNextSig()
+		w.CollectModuleName() // skip Foo
+
+		if !w.ScanForBlockDo() {
+			t.Error("expected to find do")
+		}
+		if w.BlockDepth() != 1 {
+			t.Errorf("block depth: got %d, want 1", w.BlockDepth())
+		}
+	})
+
+	t.Run("do on next line", func(t *testing.T) {
+		source := []byte("defmodule Foo\ndo")
+		tokens := Tokenize(source)
+		w := NewTokenWalker(source, tokens)
+		w.Advance() // skip defmodule
+		w.SkipToNextSig()
+		w.CollectModuleName() // skip Foo
+
+		if !w.ScanForBlockDo() {
+			t.Error("expected to find do on next line")
+		}
+	})
+
+	t.Run("inline do: form", func(t *testing.T) {
+		source := []byte("def foo, do: :ok\ndef bar do")
+		tokens := Tokenize(source)
+		w := NewTokenWalker(source, tokens)
+		w.Advance() // skip def
+		w.SkipToNextSig()
+
+		// Should NOT find the do from the next def
+		if w.ScanForBlockDo() {
+			t.Error("should not find block do for inline do: form")
+		}
+	})
+}
+
+func TestTokenWalker_IsModuleDefiningToken(t *testing.T) {
+	tests := []struct {
+		source string
+		want   bool
+	}{
+		{"defmodule Foo do end", true},
+		{"defprotocol P do end", true},
+		{"defimpl P, for: M do end", true},
+		{"def foo do end", false},
+		{"alias Foo", false},
+	}
+
+	for _, tt := range tests {
+		tokens := Tokenize([]byte(tt.source))
+		w := NewTokenWalker([]byte(tt.source), tokens)
+
+		got := w.IsModuleDefiningToken()
+		if got != tt.want {
+			t.Errorf("%q: got %v, want %v", tt.source, got, tt.want)
+		}
+	}
+}

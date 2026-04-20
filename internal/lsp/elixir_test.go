@@ -2854,3 +2854,427 @@ end`, "\n")
 		t.Error("map literal brace should not be detected as alias block")
 	}
 }
+
+func TestSkipToEndOfStatement_NegativeDepthClamp(t *testing.T) {
+	// Regression: skipToEndOfStatement would go negative on unmatched closing
+	// brackets, causing premature termination on the next TokEOL.
+	source := []byte("x = ) + y\nz = 1")
+	tokens := parser.Tokenize(source)
+	n := len(tokens)
+
+	// Start at index 0; the ) at index 2 is unmatched.
+	// Without clamping, depth goes -1, and the function returns at the first EOL.
+	// With clamping, we should reach the EOL at the end of the first line normally.
+	endIdx := skipToEndOfStatement(tokens, n, 0)
+
+	// We expect it to stop at the EOL after "y" (end of first statement)
+	if endIdx >= n {
+		t.Fatalf("expected endIdx < n, got %d", endIdx)
+	}
+	if tokens[endIdx].Kind != parser.TokEOL && tokens[endIdx].Kind != parser.TokEOF {
+		t.Errorf("expected TokEOL or TokEOF at endIdx, got %v", tokens[endIdx].Kind)
+	}
+}
+
+func TestExtractEnclosingModule_DefprotocolAndDefimpl(t *testing.T) {
+	// Regression: extractEnclosingModuleFromTokens only handled TokDefmodule,
+	// missing TokDefprotocol and TokDefimpl.
+	t.Run("defprotocol", func(t *testing.T) {
+		text := `defprotocol MyApp.Printable do
+  def print(data)
+end`
+		tokens := parser.Tokenize([]byte(text))
+		enclosing := extractEnclosingModuleFromTokens([]byte(text), tokens, 1)
+		if enclosing != "MyApp.Printable" {
+			t.Errorf("got %q, want MyApp.Printable", enclosing)
+		}
+	})
+
+	t.Run("defimpl", func(t *testing.T) {
+		text := `defimpl MyApp.Printable, for: MyApp.User do
+  def print(user), do: user.name
+end`
+		tokens := parser.Tokenize([]byte(text))
+		enclosing := extractEnclosingModuleFromTokens([]byte(text), tokens, 1)
+		if enclosing != "MyApp.Printable" {
+			t.Errorf("got %q, want MyApp.Printable", enclosing)
+		}
+	})
+}
+
+func TestExtractAliasesInScope_DefmoduleDoOnNextLine(t *testing.T) {
+	// Regression: when `do` appears on the next line after defmodule,
+	// the module frame was not properly pushed, causing aliases to leak.
+	text := `defmodule MyApp.Outer
+do
+  alias MyApp.OuterOnly
+
+  defmodule Inner do
+    alias MyApp.InnerOnly
+    def run, do: InnerOnly.call()
+  end
+
+  def outer_run, do: OuterOnly.call()
+end`
+
+	// Line 6 is inside Inner — should see InnerOnly but not OuterOnly
+	innerAliases := ExtractAliasesInScope(text, 6)
+	if innerAliases["InnerOnly"] != "MyApp.InnerOnly" {
+		t.Errorf("InnerOnly: got %q, want MyApp.InnerOnly", innerAliases["InnerOnly"])
+	}
+	if _, ok := innerAliases["OuterOnly"]; ok {
+		t.Error("OuterOnly should NOT be visible inside Inner")
+	}
+
+	// Line 9 is inside Outer after Inner ends — should see OuterOnly but not InnerOnly
+	outerAliases := ExtractAliasesInScope(text, 9)
+	if outerAliases["OuterOnly"] != "MyApp.OuterOnly" {
+		t.Errorf("OuterOnly: got %q, want MyApp.OuterOnly", outerAliases["OuterOnly"])
+	}
+	if _, ok := outerAliases["InnerOnly"]; ok {
+		t.Error("InnerOnly should NOT leak to outer scope")
+	}
+}
+
+func TestExtractAliases_MultiAliasUnexpectedTokensForwardProgress(t *testing.T) {
+	// Regression: collectModuleName returning ("", k) without advancing k
+	// caused infinite loops in multi-alias brace scanning.
+	// Note: we test atoms and numbers as unexpected tokens. Maps with braces
+	// are a separate edge case that may confuse brace depth tracking.
+	text := `defmodule MyApp.Web do
+  alias MyApp.{
+    :unexpected_atom,
+    Accounts,
+    123,
+    Users
+  }
+end`
+	aliases := ExtractAliases(text)
+
+	// Should extract valid module names despite unexpected tokens
+	if aliases["Accounts"] != "MyApp.Accounts" {
+		t.Errorf("Accounts: got %q, want MyApp.Accounts", aliases["Accounts"])
+	}
+	if aliases["Users"] != "MyApp.Users" {
+		t.Errorf("Users: got %q, want MyApp.Users", aliases["Users"])
+	}
+}
+
+func TestParseUsingBody_KeywordFetchAndPopBang(t *testing.T) {
+	// Regression: Keyword.fetch! and Keyword.pop! were not handled because
+	// the switch cases only checked "fetch" and "pop", not "fetch!" and "pop!".
+	text := `defmodule MyLib do
+  defmacro __using__(opts) do
+    required_mod = Keyword.fetch!(opts, :required_mod)
+    {optional_mod, opts} = Keyword.pop!(opts, :optional_mod, DefaultMod)
+
+    quote do
+      import unquote(required_mod)
+      use unquote(optional_mod)
+    end
+  end
+end`
+
+	_, _, _, optBindings, _ := parseUsingBody(text)
+
+	foundFetch := false
+	foundPop := false
+	for _, b := range optBindings {
+		if b.optKey == "required_mod" && b.kind == "import" {
+			foundFetch = true
+			if b.defaultMod != "" {
+				t.Errorf("fetch! should have no default, got %q", b.defaultMod)
+			}
+		}
+		if b.optKey == "optional_mod" && b.kind == "use" {
+			foundPop = true
+			if b.defaultMod != "DefaultMod" {
+				t.Errorf("pop! default: want DefaultMod, got %q", b.defaultMod)
+			}
+		}
+	}
+	if !foundFetch {
+		t.Errorf("expected opt binding for required_mod via fetch!, got %v", optBindings)
+	}
+	if !foundPop {
+		t.Errorf("expected opt binding for optional_mod via pop!, got %v", optBindings)
+	}
+}
+
+func TestFindModuleAttributeDefinition_StatementStartCheck(t *testing.T) {
+	// Regression: FindModuleAttributeDefinitionTokenized matched @attr used
+	// as a value reference (not at statement start), jumping to wrong locations.
+	text := `defmodule MyApp.Worker do
+  @config_value %{timeout: 5000}
+
+  def run(job) do
+    process(@config_value)
+    @config_value
+    :ok
+  end
+end`
+
+	line, found := FindModuleAttributeDefinition(text, "config_value")
+	if !found {
+		t.Fatal("expected to find @config_value definition")
+	}
+	// Should find line 2 (the actual definition), not lines 5 or 6 (references)
+	if line != 2 {
+		t.Errorf("expected definition at line 2, got line %d", line)
+	}
+}
+
+func TestCallContextNoParen_KeywordFilter(t *testing.T) {
+	// Regression: callContextNoParen didn't filter Elixir keywords like `if`,
+	// `case`, `cond`, `with`, causing them to be detected as function calls.
+	tests := []struct {
+		name   string
+		text   string
+		line   int
+		col    int
+		wantOK bool
+	}{
+		{"if is not a call", "if true do\n  :ok\nend", 0, 5, false},
+		{"case is not a call", "case x do\n  _ -> :ok\nend", 0, 6, false},
+		{"cond is not a call", "cond do\n  true -> :ok\nend", 0, 3, false},
+		{"with is not a call", "with {:ok, x} <- foo() do\n  x\nend", 0, 10, false},
+		{"unless is not a call", "unless false do\n  :ok\nend", 0, 8, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tf := NewTokenizedFile(tt.text)
+			_, _, ok := tf.CallContextAtCursor(tt.line, tt.col)
+			if ok != tt.wantOK {
+				t.Errorf("got ok=%v, want ok=%v", ok, tt.wantOK)
+			}
+		})
+	}
+}
+
+// =============================================================================
+// Consistency tests - ensure similar functions handle edge cases the same way
+// =============================================================================
+
+// TestModuleScopeConsistency verifies that functions handling module scope
+// produce consistent results for tricky edge cases.
+func TestModuleScopeConsistency(t *testing.T) {
+	// These test cases have historically caused divergence between similar functions
+	testCases := []struct {
+		name           string
+		text           string
+		innerLine      int // line inside inner module
+		outerLine      int // line inside outer module (after inner ends)
+		wantInnerMod   string
+		wantOuterMod   string
+		wantInnerAlias string // alias only visible in inner
+		wantOuterAlias string // alias only visible in outer
+	}{
+		{
+			name: "nested modules basic",
+			text: `defmodule MyApp.Outer do
+  alias MyApp.OuterOnly
+
+  defmodule Inner do
+    alias MyApp.InnerOnly
+    def run, do: :ok
+  end
+
+  def call, do: :ok
+end`,
+			innerLine:      5,
+			outerLine:      8,
+			wantInnerMod:   "MyApp.Outer.Inner",
+			wantOuterMod:   "MyApp.Outer",
+			wantInnerAlias: "InnerOnly",
+			wantOuterAlias: "OuterOnly",
+		},
+		{
+			name: "do on next line",
+			text: `defmodule MyApp.Outer
+do
+  alias MyApp.OuterOnly
+
+  defmodule Inner
+  do
+    alias MyApp.InnerOnly
+    def run, do: :ok
+  end
+
+  def call, do: :ok
+end`,
+			innerLine:      7,
+			outerLine:      10,
+			wantInnerMod:   "MyApp.Outer.Inner",
+			wantOuterMod:   "MyApp.Outer",
+			wantInnerAlias: "InnerOnly",
+			wantOuterAlias: "OuterOnly",
+		},
+		{
+			name: "defprotocol and defimpl",
+			text: `defprotocol MyApp.Printable do
+  alias MyApp.ProtoOnly
+  def print(data)
+end
+
+defimpl MyApp.Printable, for: MyApp.User do
+  alias MyApp.ImplOnly
+  def print(user), do: user.name
+end`,
+			innerLine:      2, // inside protocol
+			outerLine:      7, // inside impl
+			wantInnerMod:   "MyApp.Printable",
+			wantOuterMod:   "MyApp.Printable",
+			wantInnerAlias: "ProtoOnly",
+			wantOuterAlias: "ImplOnly",
+			// Note: protocol and impl are separate top-level constructs,
+			// so their aliases don't leak to each other (both are "" for the other)
+		},
+		{
+			name: "fn...end does not break scope",
+			text: `defmodule MyApp.Worker do
+  alias MyApp.Helper
+
+  def run do
+    handler = fn x ->
+      x * 2
+    end
+    handler.(1)
+  end
+
+  def other, do: Helper.call()
+end`,
+			innerLine:      5,  // inside fn
+			outerLine:      10, // after fn ends
+			wantInnerMod:   "MyApp.Worker",
+			wantOuterMod:   "MyApp.Worker",
+			wantInnerAlias: "Helper",
+			wantOuterAlias: "Helper",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Test extractEnclosingModuleFromTokens
+			source := []byte(tc.text)
+			tokens := parser.Tokenize(source)
+
+			innerMod := extractEnclosingModuleFromTokens(source, tokens, tc.innerLine)
+			if innerMod != tc.wantInnerMod {
+				t.Errorf("enclosing module at inner line %d: got %q, want %q",
+					tc.innerLine, innerMod, tc.wantInnerMod)
+			}
+
+			outerMod := extractEnclosingModuleFromTokens(source, tokens, tc.outerLine)
+			if outerMod != tc.wantOuterMod {
+				t.Errorf("enclosing module at outer line %d: got %q, want %q",
+					tc.outerLine, outerMod, tc.wantOuterMod)
+			}
+
+			// Test ExtractAliasesInScope
+			innerAliases := ExtractAliasesInScope(tc.text, tc.innerLine)
+			if tc.wantInnerAlias != "" {
+				if _, ok := innerAliases[tc.wantInnerAlias]; !ok {
+					t.Errorf("inner line %d: expected alias %q not found, got %v",
+						tc.innerLine, tc.wantInnerAlias, innerAliases)
+				}
+			}
+			// Only check alias leakage if inner and outer are different scopes
+			// (same module name means they're in the same scope or separate top-level modules)
+			if tc.wantOuterAlias != "" && tc.wantOuterAlias != tc.wantInnerAlias && tc.wantInnerMod != tc.wantOuterMod {
+				if _, ok := innerAliases[tc.wantOuterAlias]; ok {
+					t.Errorf("inner line %d: outer alias %q should not be visible",
+						tc.innerLine, tc.wantOuterAlias)
+				}
+			}
+
+			outerAliases := ExtractAliasesInScope(tc.text, tc.outerLine)
+			if tc.wantOuterAlias != "" {
+				if _, ok := outerAliases[tc.wantOuterAlias]; !ok {
+					t.Errorf("outer line %d: expected alias %q not found, got %v",
+						tc.outerLine, tc.wantOuterAlias, outerAliases)
+				}
+			}
+			// Only check alias leakage if inner and outer are different scopes
+			if tc.wantInnerAlias != "" && tc.wantInnerAlias != tc.wantOuterAlias && tc.wantInnerMod != tc.wantOuterMod {
+				if _, ok := outerAliases[tc.wantInnerAlias]; ok {
+					t.Errorf("outer line %d: inner alias %q should not be visible",
+						tc.outerLine, tc.wantInnerAlias)
+				}
+			}
+		})
+	}
+}
+
+// TestDepthTrackingConsistency verifies that all depth-tracking code handles
+// edge cases consistently (especially negative depth clamping).
+func TestDepthTrackingConsistency(t *testing.T) {
+	// Code with unmatched brackets at start (simulates cursor mid-expression)
+	testCases := []struct {
+		name   string
+		text   string
+		line   int
+		wantOK bool // should not crash or return garbage
+	}{
+		{
+			name:   "unmatched close paren",
+			text:   ") + foo(x)\nbar()",
+			line:   1,
+			wantOK: true,
+		},
+		{
+			name:   "unmatched close bracket",
+			text:   "] ++ list\nother()",
+			line:   1,
+			wantOK: true,
+		},
+		{
+			name:   "unmatched end",
+			text:   "end\ndef foo, do: :ok",
+			line:   1,
+			wantOK: true,
+		},
+		{
+			name:   "deeply nested then unmatched",
+			text:   "foo(bar([{x}]))\n))]}\nvalid()",
+			line:   2,
+			wantOK: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// These should not panic
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("panic on %q: %v", tc.name, r)
+				}
+			}()
+
+			// Test various functions that track depth
+			source := []byte(tc.text)
+			tokens := parser.Tokenize(source)
+
+			// extractEnclosingModuleFromTokens
+			_ = extractEnclosingModuleFromTokens(source, tokens, tc.line)
+
+			// ExtractAliasesInScope
+			_ = ExtractAliasesInScope(tc.text, tc.line)
+
+			// skipToEndOfStatement
+			if len(tokens) > 0 {
+				_ = skipToEndOfStatement(tokens, len(tokens), 0)
+			}
+
+			// TokenWalker
+			w := parser.NewTokenWalker(source, tokens)
+			for w.More() {
+				w.Advance()
+			}
+			if w.Depth() < 0 || w.BlockDepth() < 0 {
+				t.Errorf("TokenWalker depth went negative: depth=%d blockDepth=%d",
+					w.Depth(), w.BlockDepth())
+			}
+		})
+	}
+}
