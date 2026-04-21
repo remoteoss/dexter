@@ -1844,7 +1844,7 @@ func CallContextAtCursor(tokens []parser.Token, source []byte, lineStarts []int,
 
 	// Try paren-less call: scan backward on the same line for
 	// `func_or_module.func arg1, arg2` patterns.
-	return callContextNoParen(tokens, source, startIdx, lineNum)
+	return callContextNoParen(tokens, source, startIdx)
 }
 
 // tokenAtOrBeforeOffset returns the index of the token at or just before the
@@ -1971,7 +1971,7 @@ func isArgStartToken(kind parser.TokenKind) bool {
 //
 // Follows Elixir's own approach (Code.Fragment): if the preceding token is an
 // identifier separated by whitespace from the next token, it's a no-paren call.
-func callContextNoParen(tokens []parser.Token, source []byte, startIdx int, _ int) (string, int, bool) {
+func callContextNoParen(tokens []parser.Token, source []byte, startIdx int) (string, int, bool) {
 	depth := 0
 	commas := 0
 
