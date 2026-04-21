@@ -46,6 +46,18 @@ wrong results. The LSP server checks this on startup and triggers a forced rebui
 | `ExtractAliases` | LSP handlers use `ExtractAliasesInScope(text, lineNum)` — scope-aware. Only `Completion` and `CodeAction` use the unscoped `ExtractAliases` intentionally |
 | Any new store query | Add an index if the query will run on hot paths (definition, hover, references) |
 
+## Token walking
+
+Use `parser.TokenWalker` for new code that iterates over tokens. It provides:
+- Consistent depth tracking with automatic clamping (never goes negative)
+- Forward progress guarantees via `EnsureProgress()`
+- Module/function detection helpers
+- Statement boundary handling
+
+See `internal/parser/token_walker.go` for the API and `token_walk_test.go` for examples.
+
+The consistency tests in `elixir_test.go` (`TestModuleScopeConsistency`, `TestDepthTrackingConsistency`) verify that similar functions handle edge cases the same way. Add new edge cases there when fixing scope-related bugs.
+
 ## Common gotchas
 
 - **Nested modules**: `defmodule Inner do` inside `Outer` creates `Outer.Inner` in the store but the raw line only says `Inner`. Use `LookupModulesInFile` / `LookupEnclosingModule` rather than regex-scanning lines for module names.

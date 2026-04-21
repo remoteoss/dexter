@@ -552,13 +552,14 @@ type LookupResult struct {
 	FilePath   string
 	Line       int
 	Kind       string
+	Arity      int
 	DelegateTo string
 	DelegateAs string
 }
 
 func (s *Store) LookupModule(module string) ([]LookupResult, error) {
 	return s.queryLookup(
-		"SELECT file_path, line, kind, delegate_to, delegate_as FROM definitions WHERE module = ? AND function = '' AND kind IN ('module', 'defprotocol', 'defimpl')",
+		"SELECT file_path, line, kind, arity, delegate_to, delegate_as FROM definitions WHERE module = ? AND function = '' AND kind IN ('module', 'defprotocol', 'defimpl')",
 		module,
 	)
 }
@@ -617,7 +618,7 @@ func (s *Store) LookupFunctionInFile(filePath, function string, nearLine int) (s
 
 func (s *Store) LookupFunction(module, function string) ([]LookupResult, error) {
 	return s.queryLookup(
-		"SELECT file_path, line, kind, delegate_to, delegate_as FROM definitions WHERE module = ? AND function = ? AND kind NOT IN ('module', 'defprotocol', 'defimpl', 'callback', 'macrocallback') ORDER BY CASE WHEN kind IN ('type', 'opaque') THEN 1 ELSE 0 END, line",
+		"SELECT file_path, line, kind, arity, delegate_to, delegate_as FROM definitions WHERE module = ? AND function = ? AND kind NOT IN ('module', 'defprotocol', 'defimpl', 'callback', 'macrocallback') ORDER BY CASE WHEN kind IN ('type', 'opaque') THEN 1 ELSE 0 END, line",
 		module, function,
 	)
 }
@@ -769,7 +770,7 @@ func (s *Store) LookupFunctionInModules(modules []string, function string, arity
 	}
 	args = append(args, function)
 
-	query := "SELECT file_path, line, kind, delegate_to, delegate_as FROM definitions WHERE module IN (" +
+	query := "SELECT file_path, line, kind, arity, delegate_to, delegate_as FROM definitions WHERE module IN (" +
 		strings.Join(placeholders, ",") +
 		") AND function = ? AND kind NOT IN ('module', 'defprotocol', 'defimpl', 'callback', 'macrocallback')"
 
@@ -792,7 +793,7 @@ func (s *Store) queryLookup(query string, args ...interface{}) ([]LookupResult, 
 	var results []LookupResult
 	for rows.Next() {
 		var r LookupResult
-		if err := rows.Scan(&r.FilePath, &r.Line, &r.Kind, &r.DelegateTo, &r.DelegateAs); err != nil {
+		if err := rows.Scan(&r.FilePath, &r.Line, &r.Kind, &r.Arity, &r.DelegateTo, &r.DelegateAs); err != nil {
 			return nil, err
 		}
 		results = append(results, r)
@@ -867,7 +868,7 @@ func (s *Store) LookupReferencesByPrefix(prefix string) ([]ModuleReferenceResult
 // Used for bulk module renames to replace N per-module LookupModule calls with one.
 func (s *Store) LookupModulesByPrefix(prefix string) ([]LookupResult, error) {
 	rows, err := s.db.Query(
-		"SELECT module, file_path, line, kind, delegate_to, delegate_as FROM definitions WHERE function = '' AND (module = ? OR module LIKE ?) AND kind IN ('module', 'defprotocol', 'defimpl') ORDER BY module",
+		"SELECT module, file_path, line, kind, arity, delegate_to, delegate_as FROM definitions WHERE function = '' AND (module = ? OR module LIKE ?) AND kind IN ('module', 'defprotocol', 'defimpl') ORDER BY module",
 		prefix, prefix+".%",
 	)
 	if err != nil {
@@ -878,7 +879,7 @@ func (s *Store) LookupModulesByPrefix(prefix string) ([]LookupResult, error) {
 	var results []LookupResult
 	for rows.Next() {
 		var r LookupResult
-		if err := rows.Scan(&r.Module, &r.FilePath, &r.Line, &r.Kind, &r.DelegateTo, &r.DelegateAs); err != nil {
+		if err := rows.Scan(&r.Module, &r.FilePath, &r.Line, &r.Kind, &r.Arity, &r.DelegateTo, &r.DelegateAs); err != nil {
 			return nil, err
 		}
 		results = append(results, r)
@@ -1103,6 +1104,14 @@ func (s *Store) NextFunctionLine(filePath string, startLine int) int {
 }
 
 func (s *Store) LookupFollowDelegate(module, function string) ([]LookupResult, error) {
+	return s.lookupFollowDelegate(module, function, 0)
+}
+
+func (s *Store) lookupFollowDelegate(module, function string, depth int) ([]LookupResult, error) {
+	if depth > 5 {
+		return nil, nil
+	}
+
 	results, err := s.LookupFunction(module, function)
 	if err != nil {
 		return nil, err
@@ -1123,7 +1132,7 @@ func (s *Store) LookupFollowDelegate(module, function string) ([]LookupResult, e
 		if results[0].DelegateAs != "" {
 			targetFunc = results[0].DelegateAs
 		}
-		targetResults, err := s.LookupFunction(targetModule, targetFunc)
+		targetResults, err := s.lookupFollowDelegate(targetModule, targetFunc, depth+1)
 		if err != nil {
 			return nil, err
 		}

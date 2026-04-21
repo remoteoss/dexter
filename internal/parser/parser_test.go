@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -127,6 +128,72 @@ end
 		if d.Function == "inner_func" && d.Module != "MyApp.Outer.Inner" {
 			t.Errorf("inner_func should belong to MyApp.Outer.Inner, got %s", d.Module)
 		}
+	}
+}
+
+func TestParseFile_NestedModuleDoNextLine(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.Outer do
+  defmodule Inner
+  do
+    def inner_func, do: :ok
+  end
+
+  def outer_func, do: :ok
+end
+`)
+
+	defs, _, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var innerMod, innerFunc bool
+	for _, d := range defs {
+		if d.Kind == "module" && d.Module == "MyApp.Outer.Inner" {
+			innerMod = true
+		}
+		if d.Function == "inner_func" {
+			innerFunc = true
+			if d.Module != "MyApp.Outer.Inner" {
+				t.Errorf("inner_func should belong to MyApp.Outer.Inner, got %s", d.Module)
+			}
+		}
+		if d.Function == "outer_func" && d.Module != "MyApp.Outer" {
+			t.Errorf("outer_func should belong to MyApp.Outer, got %s", d.Module)
+		}
+	}
+	if !innerMod {
+		t.Error("missing inner module definition")
+	}
+	if !innerFunc {
+		t.Error("missing inner_func")
+	}
+}
+
+func TestParseFile_InlineDoModule(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.Outer do
+  defmodule Inline, do: (def greet, do: :hi)
+
+  def outer_func, do: :ok
+end
+`)
+
+	defs, _, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var inlineMod bool
+	for _, d := range defs {
+		if d.Kind == "module" && d.Module == "MyApp.Outer.Inline" {
+			inlineMod = true
+		}
+		if d.Function == "outer_func" && d.Module != "MyApp.Outer" {
+			t.Errorf("outer_func should belong to MyApp.Outer, got %s", d.Module)
+		}
+	}
+	if !inlineMod {
+		t.Error("missing MyApp.Outer.Inline module definition from inline do: form")
 	}
 }
 
@@ -1327,103 +1394,6 @@ end
 	}
 }
 
-func TestExtractArity(t *testing.T) {
-	tests := []struct {
-		name     string
-		line     string
-		funcName string
-		expected int
-	}{
-		{"no parens", "  def foo, do: :ok", "foo", 0},
-		{"empty parens", "  def foo(), do: :ok", "foo", 0},
-		{"one arg", "  def foo(a), do: :ok", "foo", 1},
-		{"two args", "  def foo(a, b) do", "foo", 2},
-		{"three args", "  def create(name, email, role) do", "create", 3},
-		{"nested map", "  def foo(%{name: name}, opts) do", "foo", 2},
-		{"nested list", "  def foo([head | tail], acc) do", "foo", 2},
-		{"default arg", "  defmacro from(expr, kw \\\\ []) do", "from", 2},
-		{"defguard", "  defguard is_admin(user) when user.role == :admin", "is_admin", 1},
-		{"defdelegate", "  defdelegate create(attrs), to: Create", "create", 1},
-		{"tuple arg", "  def foo({a, b}, c) do", "foo", 2},
-		{"keyword list", "  def foo(a, opts \\\\ [key: :val]) do", "foo", 2},
-		{"pattern match", "  def handle_call(:get, _from, state) do", "handle_call", 3},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := ExtractArity(tt.line, tt.funcName)
-			if got != tt.expected {
-				t.Errorf("ExtractArity(%q, %q) = %d, want %d", tt.line, tt.funcName, got, tt.expected)
-			}
-		})
-	}
-}
-
-func TestCountDefaultParams(t *testing.T) {
-	tests := []struct {
-		name     string
-		line     string
-		funcName string
-		expected int
-	}{
-		{"no defaults", "  def foo(a, b) do", "foo", 0},
-		{"one default", `  def foo(a, b \\ []) do`, "foo", 1},
-		{"two defaults", `  def foo(a, b \\ nil, c \\ []) do`, "foo", 2},
-		{"no parens", "  def foo, do: :ok", "foo", 0},
-		{"empty parens", "  def foo() do", "foo", 0},
-		{"default with keyword list", `  def foo(a, opts \\ [key: :val]) do`, "foo", 1},
-		{"default in nested not counted", `  def foo(%{a: b \\ c}, d) do`, "foo", 0},
-		{"defmacro default", `  defmacro from(expr, kw \\ []) do`, "from", 1},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := CountDefaultParams(tt.line, tt.funcName)
-			if got != tt.expected {
-				t.Errorf("CountDefaultParams(%q, %q) = %d, want %d", tt.line, tt.funcName, got, tt.expected)
-			}
-		})
-	}
-}
-
-func TestExtractParamNames(t *testing.T) {
-	tests := []struct {
-		name     string
-		line     string
-		funcName string
-		expected []string
-	}{
-		{"simple params", "  def create(name, email) do", "create", []string{"name", "email"}},
-		{"default param", `  def fetch(slug, opts \\ []) do`, "fetch", []string{"slug", "opts"}},
-		{"pattern match map", "  def process(%{name: name}, data) do", "process", []string{"arg1", "data"}},
-		{"no params", "  def run do", "run", nil},
-		{"empty parens", "  def run() do", "run", nil},
-		{"single param", "  def get(id) do", "get", []string{"id"}},
-		{"underscore param", "  def handle(_ignored, state) do", "handle", []string{"_ignored", "state"}},
-		{"struct = var", "  def update(%User{} = user, attrs) do", "update", []string{"user", "attrs"}},
-		{"var = struct", "  def update(user = %User{}, attrs) do", "update", []string{"user", "attrs"}},
-		{"tuple pattern", "  def handle_info({:DOWN, _ref, :process, pid, _reason}, state) do", "handle_info", []string{"arg1", "state"}},
-		{"bare underscore", "  def foo(_, b) do", "foo", []string{"arg1", "b"}},
-		{"atom literal", "  def handle_call(:get, _from, state) do", "handle_call", []string{"arg1", "_from", "state"}},
-		{"list pattern = var", "  def process([_ | _] = list, opts) do", "process", []string{"list", "opts"}},
-		{"binary pattern", "  def parse(<<header::16, rest::binary>>) do", "parse", []string{"arg1"}},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := ExtractParamNames(tt.line, tt.funcName)
-			if len(got) != len(tt.expected) {
-				t.Fatalf("ExtractParamNames(%q, %q) = %v, want %v", tt.line, tt.funcName, got, tt.expected)
-			}
-			for i := range got {
-				if got[i] != tt.expected[i] {
-					t.Errorf("param %d: got %q, want %q", i, got[i], tt.expected[i])
-				}
-			}
-		})
-	}
-}
-
 func TestParseFile_DefaultParamExpansion(t *testing.T) {
 	path := writeTempFile(t, `defmodule MyApp.Companies do
   def fetch_company_by_slug(slug, opts \\ []) do
@@ -2045,5 +2015,686 @@ end
 	}
 	if !refModules["String.t"] {
 		t.Errorf("expected String.t ref from callback type annotation, refs: %v", refs)
+	}
+}
+
+// --- Regression tests for parser edge cases ---
+
+func TestParseFile_CharLiteralDoesNotConfuseStringBlanking(t *testing.T) {
+	// Bug 1: char literal ?" should not eat the module ref on the same line
+	path := writeTempFile(t, "defmodule MyApp.Foo do\n  def bar do\n    x = ?\"\n    Real.Module.call()\n  end\nend\n")
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found := false
+	for _, r := range refs {
+		if r.Module == "Real.Module" && r.Function == "call" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected Real.Module.call ref; got refs: %+v", refs)
+	}
+}
+
+func TestParseFile_InterpolationDoesNotConfuseRefExtraction(t *testing.T) {
+	// Bug 2: string interpolation with nested quotes containing module refs
+	path := writeTempFile(t, "defmodule MyApp.Foo do\n  def bar do\n    x = \"hello #{Real.Module.call(\\\"arg\\\"}\"\n    Other.Module.work()\n  end\nend\n")
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, r := range refs {
+		if r.Module == "Real.Module" {
+			t.Errorf("should not extract refs from inside string interpolation, got %+v", r)
+		}
+	}
+
+	found := false
+	for _, r := range refs {
+		if r.Module == "Other.Module" && r.Function == "work" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected Other.Module.work ref; got refs: %+v", refs)
+	}
+}
+
+func TestParseFile_TripleQuoteInStringDoesNotToggleHeredoc(t *testing.T) {
+	// Bug 3: """ inside a string should not cause subsequent lines to be skipped
+	path := writeTempFile(t, "defmodule MyApp.Foo do\n  def bar do\n    x = \"contains \\\"\\\"\\\" triple quotes\"\n    Real.Module.call()\n  end\nend\n")
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found := false
+	for _, r := range refs {
+		if r.Module == "Real.Module" && r.Function == "call" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("Real.Module.call should be found; got refs: %+v", refs)
+	}
+}
+
+func TestParseText_LineContinuation(t *testing.T) {
+	// Bug 4: backslash at EOL joins with next line.
+	// Use a case where the module name spans the continuation boundary.
+	text := "defmodule MyApp.Foo do\n  alias Some.\\\n    Module\n  def bar, do: Some.Module.call()\nend\n"
+
+	_, refs, err := ParseText("test.ex", text)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found := false
+	for _, r := range refs {
+		if r.Module == "Some.Module" && r.Function == "call" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("Some.Module.call should be resolved after line continuation; got refs: %+v", refs)
+	}
+}
+
+// --- Regression tests for multi-line construct bugs ---
+
+func TestParseFile_MultiLineAliasAs(t *testing.T) {
+	// Bug: alias with multi-line as: was silently lost because the trailing
+	// comma didn't trigger bracket joining and the parser saw two separate lines.
+	path := writeTempFile(t, `defmodule MyApp do
+  alias MyModule.MySubModule,
+    as: Something
+
+  def foo do
+    Something.call()
+  end
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The alias ref should be recorded
+	foundAlias := false
+	for _, r := range refs {
+		if r.Kind == "alias" && r.Module == "MyModule.MySubModule" {
+			foundAlias = true
+		}
+	}
+	if !foundAlias {
+		t.Error("expected alias ref for MyModule.MySubModule")
+	}
+
+	// Something.call() should resolve via the as: alias
+	foundCall := false
+	for _, r := range refs {
+		if r.Kind == "call" && r.Module == "MyModule.MySubModule" && r.Function == "call" {
+			foundCall = true
+		}
+	}
+	if !foundCall {
+		t.Error("expected Something.call() to resolve to MyModule.MySubModule.call via as: alias")
+	}
+}
+
+func TestParseFile_MultiLineAliasAs_Defdelegate(t *testing.T) {
+	// Multi-line alias ... as: must resolve for defdelegate targets too.
+	path := writeTempFile(t, `defmodule MyApp do
+  alias MyApp.Serializer.Date,
+    as: DateSerializer
+
+  defdelegate format(date), to: DateSerializer
+end
+`)
+
+	defs, _, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, d := range defs {
+		if d.Function == "format" {
+			if d.DelegateTo != "MyApp.Serializer.Date" {
+				t.Errorf("expected DelegateTo MyApp.Serializer.Date, got %q", d.DelegateTo)
+			}
+			return
+		}
+	}
+	t.Error("missing defdelegate format")
+}
+
+func TestParseFile_SigilTripleQuoteDoesNotToggleHeredoc(t *testing.T) {
+	// Bug: """ inside ~s(...) toggled heredoc mode on, causing subsequent
+	// lines to be silently skipped by the parser.
+	path := writeTempFile(t, `defmodule MyApp do
+  def foo do
+    x = ~s(this has """ inside parens)
+    Real.Module.call()
+  end
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found := false
+	for _, r := range refs {
+		if r.Module == "Real.Module" && r.Function == "call" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected Real.Module.call ref — triple quote inside sigil may have toggled heredoc")
+	}
+}
+
+func TestParseFile_SigilTripleQuoteDoesNotToggleHeredoc_Bracket(t *testing.T) {
+	// Same bug with ~s[...] delimiter.
+	path := writeTempFile(t, `defmodule MyApp do
+  def foo do
+    x = ~s[this has """ inside brackets]
+    Real.Module.call()
+  end
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found := false
+	for _, r := range refs {
+		if r.Module == "Real.Module" && r.Function == "call" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected Real.Module.call ref")
+	}
+}
+
+func TestParseFile_MultiLineSigilNoFalseRefs(t *testing.T) {
+	// Bug: multi-line sigil content was indexed as real references because the
+	// parser had no "inside sigil" tracking (only heredoc tracking).
+	path := writeTempFile(t, `defmodule MyApp do
+  @doc ~S(
+    Fake.Module.ref() inside sigil
+  )
+  def foo do
+    Real.Module.call()
+  end
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, r := range refs {
+		if r.Module == "Fake.Module" {
+			t.Errorf("should not extract refs from inside multi-line sigil, got %+v", r)
+		}
+	}
+
+	found := false
+	for _, r := range refs {
+		if r.Module == "Real.Module" && r.Function == "call" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected Real.Module.call ref after multi-line sigil")
+	}
+}
+
+func TestParseFile_MultiLineSigilNoFalseDefs(t *testing.T) {
+	// Multi-line sigil should not swallow subsequent function definitions.
+	path := writeTempFile(t, `defmodule MyApp do
+  @doc ~S(
+    multi-line sigil content
+  )
+  def foo do
+    :ok
+  end
+
+  def bar do
+    :ok
+  end
+end
+`)
+
+	defs, _, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	funcs := map[string]bool{}
+	for _, d := range defs {
+		if d.Function != "" {
+			funcs[d.Function] = true
+		}
+	}
+	if !funcs["foo"] {
+		t.Error("missing def foo after multi-line sigil")
+	}
+	if !funcs["bar"] {
+		t.Error("missing def bar after multi-line sigil")
+	}
+}
+
+// --- Additional regression tests for edge cases ---
+
+func TestParseFile_MultiLineUseWithOpts(t *testing.T) {
+	// use with opts spanning multiple lines must produce correct refs
+	path := writeTempFile(t, `defmodule MyApp.Worker do
+  use GenServer,
+    restart: :transient
+
+  def init(state), do: {:ok, state}
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found := false
+	for _, r := range refs {
+		if r.Module == "GenServer" && r.Kind == "use" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected use ref for GenServer; refs: %+v", refs)
+	}
+}
+
+func TestParseFile_MultilineDefWithDefaults(t *testing.T) {
+	// Function head with params spanning lines AND \\\\ defaults
+	path := writeTempFile(t, `defmodule MyApp.Accounts do
+  def fetch(
+    slug,
+    opts \\ []
+  ) do
+    :ok
+  end
+end
+`)
+
+	defs, _, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found := map[string]bool{}
+	for _, d := range defs {
+		if d.Function == "fetch" {
+			found[fmt.Sprintf("fetch/%d", d.Arity)] = true
+		}
+	}
+	if !found["fetch/1"] || !found["fetch/2"] {
+		t.Errorf("expected fetch/1 and fetch/2 from multiline def with defaults; got %v", found)
+	}
+}
+
+func TestParseFile_StringContainingDirectiveComma(t *testing.T) {
+	// A string literal that looks like "alias Foo," must NOT trigger joining
+	path := writeTempFile(t, `defmodule MyApp.Foo do
+  def bar do
+    x = "alias Fake.Module,"
+    Real.Module.call()
+  end
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	foundReal := false
+	for _, r := range refs {
+		if r.Module == "Real.Module" && r.Function == "call" {
+			foundReal = true
+		}
+		if r.Module == "Fake.Module" {
+			t.Errorf("should not extract refs from string content, got %+v", r)
+		}
+	}
+	if !foundReal {
+		t.Errorf("Real.Module.call should be found; refs: %+v", refs)
+	}
+}
+
+func TestParseFile_MultiLineAliasAs_PreservesLineNumber(t *testing.T) {
+	// Verify that joining preserves the original line number for definitions
+	path := writeTempFile(t, `defmodule MyApp.Foo do
+  alias MyModule.MySubModule,
+    as: Something
+
+  def bar do
+    :ok
+  end
+end
+`)
+
+	defs, _, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, d := range defs {
+		if d.Function == "bar" {
+			if d.Line != 5 {
+				t.Errorf("def bar should be on original line 5, got %d", d.Line)
+			}
+		}
+	}
+}
+
+func TestParseFile_SigilContainingDirective(t *testing.T) {
+	// Sigil content containing alias/use keywords should not produce refs
+	path := writeTempFile(t, `defmodule MyApp.Foo do
+  def bar do
+    x = ~s(alias Fake.Module)
+    y = ~s(use Fake.Module, key: val)
+    Real.Module.call()
+  end
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, r := range refs {
+		if r.Module == "Fake.Module" {
+			t.Errorf("should not extract refs from sigil content, got %+v", r)
+		}
+	}
+
+	foundReal := false
+	for _, r := range refs {
+		if r.Module == "Real.Module" && r.Function == "call" {
+			foundReal = true
+		}
+	}
+	if !foundReal {
+		t.Errorf("Real.Module.call should be found; refs: %+v", refs)
+	}
+}
+
+func TestParseFile_TrailingCommaInAliasBlock(t *testing.T) {
+	// Trailing comma after last child in alias block (common formatter output)
+	path := writeTempFile(t, `defmodule MyApp.Web do
+  alias MyApp.{
+    Accounts,
+    Users,
+  }
+
+  def foo do
+    Accounts.list()
+  end
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	aliasRefs := filterRefs(refs, "alias")
+	found := map[string]bool{}
+	for _, r := range aliasRefs {
+		found[r.Module] = true
+	}
+	if !found["MyApp.Accounts"] {
+		t.Error("expected alias ref for MyApp.Accounts from block with trailing comma")
+	}
+	if !found["MyApp.Users"] {
+		t.Error("expected alias ref for MyApp.Users from block with trailing comma")
+	}
+
+	callRefs := filterRefs(refs, "call")
+	foundCall := false
+	for _, r := range callRefs {
+		if r.Module == "MyApp.Accounts" && r.Function == "list" {
+			foundCall = true
+		}
+	}
+	if !foundCall {
+		t.Error("expected Accounts.list() to resolve to MyApp.Accounts.list via alias")
+	}
+}
+
+func TestParseFile_BareMacroCallMultiTokenBeforeDo(t *testing.T) {
+	// Bare macro calls with complex arguments before do must be detected.
+	// These are real patterns from ExUnit (use ExUnit.Case injects setup/test).
+	path := writeTempFile(t, `defmodule MyApp.Test do
+  use ExUnit.Case
+
+  setup %{conn: conn} do
+    {:ok, conn: conn}
+  end
+
+  test "creates user", %{conn: conn} do
+    assert conn
+  end
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	callRefs := filterRefs(refs, "call")
+	foundSetup := false
+	foundTest := false
+	for _, r := range callRefs {
+		if r.Function == "setup" {
+			foundSetup = true
+		}
+		if r.Function == "test" {
+			foundTest = true
+		}
+	}
+	if !foundSetup {
+		t.Errorf("expected bare macro call ref for setup; got refs: %+v", callRefs)
+	}
+	if !foundTest {
+		t.Errorf("expected bare macro call ref for test; got refs: %+v", callRefs)
+	}
+}
+
+func TestParseFile_BareMacroCallDoOnNextLine(t *testing.T) {
+	// do can appear on a separate line from the macro call in valid Elixir.
+	path := writeTempFile(t, `defmodule MyApp.Test do
+  use ExUnit.Case
+
+  setup :ok
+  do
+    :ok
+  end
+
+  setup %{
+    conn: conn
+  } do
+    {:ok, conn: conn}
+  end
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	callRefs := filterRefs(refs, "call")
+	setupCount := 0
+	for _, r := range callRefs {
+		if r.Function == "setup" {
+			setupCount++
+		}
+	}
+	if setupCount < 2 {
+		t.Errorf("expected 2 bare macro call refs for setup, got %d; refs: %+v", setupCount, callRefs)
+	}
+}
+
+func TestTokenize_HeredocInterpolationWithNestedString(t *testing.T) {
+	// #{"}"} inside a heredoc must not close the interpolation prematurely.
+	source := []byte("x = \"\"\"\n#{\"}\"}\n\"\"\"")
+	tokens := Tokenize(source)
+
+	var kinds []TokenKind
+	for _, tok := range tokens {
+		if tok.Kind != TokEOL {
+			kinds = append(kinds, tok.Kind)
+		}
+	}
+	if len(kinds) < 3 {
+		t.Fatalf("expected at least 3 non-EOL tokens, got %d: %v", len(kinds), kinds)
+	}
+	if kinds[2] != TokHeredoc {
+		t.Errorf("expected TokHeredoc at position 2, got %v (tokens: %v)", kinds[2], kinds)
+	}
+	heredocTok := tokens[0]
+	for _, tok := range tokens {
+		if tok.Kind == TokHeredoc {
+			heredocTok = tok
+			break
+		}
+	}
+	content := string(source[heredocTok.Start:heredocTok.End])
+	if !strings.Contains(content, "#{") {
+		t.Errorf("heredoc token should contain interpolation, got: %q", content)
+	}
+}
+
+func TestBareMacroCall_NoFalsePositiveAcrossStatements(t *testing.T) {
+	source := `defmodule Test do
+  use SomeMacroLib
+
+  x = 1
+  if x > 0 do
+    :positive
+  end
+end
+`
+	_, refs, _ := ParseText("test.ex", source)
+	for _, r := range refs {
+		if r.Kind == "call" && r.Function == "x" {
+			t.Errorf("false positive: x detected as bare macro call: %+v", r)
+		}
+	}
+}
+
+func TestTokenAtOffset(t *testing.T) {
+	source := []byte("defmodule Foo.Bar do\n  def baz(x), do: x\nend\n")
+	tokens := Tokenize(source)
+
+	tests := []struct {
+		name   string
+		offset int
+		want   TokenKind
+	}{
+		{"defmodule keyword", 0, TokDefmodule},
+		{"middle of defmodule", 5, TokDefmodule},
+		{"Foo module", 10, TokModule},
+		{"dot", 13, TokDot},
+		{"Bar module", 14, TokModule},
+		{"do keyword", 18, TokDo},
+		{"def keyword", 23, TokDef},
+		{"baz ident", 27, TokIdent},
+		{"open paren", 30, TokOpenParen},
+		{"x param", 31, TokIdent},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			idx := TokenAtOffset(tokens, tt.offset)
+			if idx < 0 {
+				t.Fatalf("TokenAtOffset(%d) returned -1", tt.offset)
+			}
+			if tokens[idx].Kind != tt.want {
+				t.Errorf("TokenAtOffset(%d) = %v, want %v", tt.offset, tokens[idx].Kind, tt.want)
+			}
+		})
+	}
+
+	// Offset in whitespace (between tokens) should return -1
+	if idx := TokenAtOffset(tokens, 9); idx >= 0 {
+		t.Errorf("expected -1 for whitespace offset 9, got token kind %v", tokens[idx].Kind)
+	}
+}
+
+func TestLineColToOffset(t *testing.T) {
+	source := []byte("defmodule Foo do\n  def bar, do: :ok\nend\n")
+	result := TokenizeFull(source)
+
+	tests := []struct {
+		line, col int
+		wantOff   int
+	}{
+		{0, 0, 0},   // start of file
+		{0, 10, 10}, // "F" in "Foo"
+		{1, 2, 19},  // "d" in "def"
+		{2, 0, 36},  // "e" in "end"
+	}
+	for _, tt := range tests {
+		got := LineColToOffset(result.LineStarts, tt.line, tt.col)
+		if got != tt.wantOff {
+			t.Errorf("LineColToOffset(line=%d, col=%d) = %d, want %d", tt.line, tt.col, got, tt.wantOff)
+		}
+	}
+
+	// Out-of-range line
+	if got := LineColToOffset(result.LineStarts, 99, 0); got != -1 {
+		t.Errorf("expected -1 for out-of-range line, got %d", got)
+	}
+}
+
+func TestBareMacroCall_CommentBetweenArgsAndDo(t *testing.T) {
+	source := `defmodule Test do
+  use SomeMacroLib
+
+  setup %{
+    # this sets up the connection
+    conn: conn
+  }
+  # yeah, I know it's odd
+  do
+    :ok
+  end
+end
+`
+	_, refs, _ := ParseText("test.ex", source)
+	found := false
+	for _, r := range refs {
+		if r.Kind == "call" && r.Function == "setup" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected bare macro call ref for setup with comment before do")
 	}
 }

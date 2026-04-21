@@ -20,8 +20,8 @@ func TestExtractDocAbove_Heredoc(t *testing.T) {
     :ok
   end
 end`
-	lines := strings.Split(src, "\n")
-	doc, spec := extractDocAbove(lines, 6)
+
+	doc, spec := NewTokenizedFile(src).ExtractDocAbove(6)
 
 	if doc == "" {
 		t.Fatal("expected doc, got empty")
@@ -44,8 +44,8 @@ func TestExtractDocAbove_SingleLine(t *testing.T) {
     :ok
   end
 end`
-	lines := strings.Split(src, "\n")
-	doc, _ := extractDocAbove(lines, 2)
+
+	doc, _ := NewTokenizedFile(src).ExtractDocAbove(2)
 
 	if doc != "Creates a new user." {
 		t.Errorf("expected 'Creates a new user.', got %q", doc)
@@ -62,8 +62,8 @@ func TestExtractDocAbove_WithSpec(t *testing.T) {
     :ok
   end
 end`
-	lines := strings.Split(src, "\n")
-	doc, spec := extractDocAbove(lines, 5)
+
+	doc, spec := NewTokenizedFile(src).ExtractDocAbove(5)
 
 	if !strings.Contains(doc, "Creates a new user") {
 		t.Errorf("expected doc content, got %q", doc)
@@ -81,8 +81,8 @@ func TestExtractDocAbove_MultiLineSpec(t *testing.T) {
     :ok
   end
 end`
-	lines := strings.Split(src, "\n")
-	_, spec := extractDocAbove(lines, 3)
+
+	_, spec := NewTokenizedFile(src).ExtractDocAbove(3)
 
 	if !strings.Contains(spec, "@spec create") {
 		t.Errorf("expected spec to contain '@spec create', got %q", spec)
@@ -99,8 +99,8 @@ func TestExtractDocAbove_DocFalse(t *testing.T) {
     :ok
   end
 end`
-	lines := strings.Split(src, "\n")
-	doc, _ := extractDocAbove(lines, 2)
+
+	doc, _ := NewTokenizedFile(src).ExtractDocAbove(2)
 
 	if doc != "" {
 		t.Errorf("expected empty doc for @doc false, got %q", doc)
@@ -113,8 +113,8 @@ func TestExtractDocAbove_NoDoc(t *testing.T) {
     :ok
   end
 end`
-	lines := strings.Split(src, "\n")
-	doc, spec := extractDocAbove(lines, 1)
+
+	doc, spec := NewTokenizedFile(src).ExtractDocAbove(1)
 
 	if doc != "" {
 		t.Errorf("expected no doc, got %q", doc)
@@ -137,8 +137,8 @@ func TestExtractDocAbove_DoesNotLeakFromPreviousFunction(t *testing.T) {
     :ok
   end
 end`
-	lines := strings.Split(src, "\n")
-	doc, _ := extractDocAbove(lines, 8)
+
+	doc, _ := NewTokenizedFile(src).ExtractDocAbove(8)
 
 	if doc != "" {
 		t.Errorf("expected no doc for second function, got %q", doc)
@@ -153,8 +153,8 @@ func TestExtractDocAbove_SpecBeforeDoc(t *testing.T) {
     :ok
   end
 end`
-	lines := strings.Split(src, "\n")
-	doc, spec := extractDocAbove(lines, 3)
+
+	doc, spec := NewTokenizedFile(src).ExtractDocAbove(3)
 
 	if doc != "Creates a user." {
 		t.Errorf("expected doc, got %q", doc)
@@ -176,8 +176,8 @@ func TestExtractModuledoc_Heredoc(t *testing.T) {
     :ok
   end
 end`
-	lines := strings.Split(src, "\n")
-	doc := extractModuledoc(lines, 0)
+
+	doc := NewTokenizedFile(src).ExtractModuledoc(0)
 
 	if !strings.Contains(doc, "Manages user accounts") {
 		t.Errorf("expected moduledoc content, got %q", doc)
@@ -195,11 +195,97 @@ func TestExtractModuledoc_SingleLine(t *testing.T) {
     :ok
   end
 end`
-	lines := strings.Split(src, "\n")
-	doc := extractModuledoc(lines, 0)
+
+	doc := NewTokenizedFile(src).ExtractModuledoc(0)
 
 	if doc != "Manages user accounts." {
 		t.Errorf("expected 'Manages user accounts.', got %q", doc)
+	}
+}
+
+func TestExtractModuledoc_SigilHeredoc(t *testing.T) {
+	src := `defmodule MyApp.Users do
+  @moduledoc ~S"""
+  Manages user accounts.
+
+  Keep #{interpolation} literal.
+  """
+
+  def create(attrs) do
+    :ok
+  end
+end`
+
+	doc := NewTokenizedFile(src).ExtractModuledoc(0)
+
+	if !strings.Contains(doc, "Manages user accounts.") {
+		t.Errorf("expected moduledoc content, got %q", doc)
+	}
+	if !strings.Contains(doc, "#{interpolation}") {
+		t.Errorf("expected sigil heredoc content, got %q", doc)
+	}
+}
+
+func TestExtractModuledoc_SigilVariants(t *testing.T) {
+	tests := []struct {
+		name string
+		src  string
+		want string
+	}{
+		{
+			name: "raw pipe delimiter",
+			src: `defmodule MyApp.Users do
+  @moduledoc ~S|Pipe-delimited docs|
+end`,
+			want: "Pipe-delimited docs",
+		},
+		{
+			name: "escaped paren delimiter",
+			src: `defmodule MyApp.Users do
+  @moduledoc ~s(Paren docs)
+end`,
+			want: "Paren docs",
+		},
+		{
+			name: "single quote delimiter",
+			src: `defmodule MyApp.Users do
+  @moduledoc ~s'Single-quoted docs'
+end`,
+			want: "Single-quoted docs",
+		},
+		{
+			name: "delimiter with modifier",
+			src: `defmodule MyApp.Users do
+  @moduledoc ~s|Docs with modifier|m
+end`,
+			want: "Docs with modifier",
+		},
+		{
+			name: "multi-char uppercase sigil",
+			src: `defmodule MyApp.Users do
+  @moduledoc ~HTML|HTML-like docs|
+end`,
+			want: "HTML-like docs",
+		},
+		{
+			name: "single quote heredoc",
+			src: `defmodule MyApp.Users do
+  @moduledoc ~S'''
+  Multi-line docs.
+  Keep #{raw} literal.
+  '''
+end`,
+			want: "Multi-line docs.\nKeep #{raw} literal.",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doc := NewTokenizedFile(tt.src).ExtractModuledoc(0)
+			if doc != tt.want {
+				t.Errorf("ExtractModuledoc() = %q, want %q", doc, tt.want)
+			}
+		})
 	}
 }
 
@@ -209,8 +295,8 @@ func TestExtractModuledoc_False(t *testing.T) {
 
   def helper(x), do: x
 end`
-	lines := strings.Split(src, "\n")
-	doc := extractModuledoc(lines, 0)
+
+	doc := NewTokenizedFile(src).ExtractModuledoc(0)
 
 	if doc != "" {
 		t.Errorf("expected empty doc for @moduledoc false, got %q", doc)
@@ -230,8 +316,8 @@ func TestExtractModuledoc_AfterUseAndAlias(t *testing.T) {
     Repo.all(User)
   end
 end`
-	lines := strings.Split(src, "\n")
-	doc := extractModuledoc(lines, 0)
+
+	doc := NewTokenizedFile(src).ExtractModuledoc(0)
 
 	if !strings.Contains(doc, "Users context module") {
 		t.Errorf("expected moduledoc after use/alias, got %q", doc)
@@ -244,8 +330,8 @@ func TestExtractModuledoc_None(t *testing.T) {
     :ok
   end
 end`
-	lines := strings.Split(src, "\n")
-	doc := extractModuledoc(lines, 0)
+
+	doc := NewTokenizedFile(src).ExtractModuledoc(0)
 
 	if doc != "" {
 		t.Errorf("expected no moduledoc, got %q", doc)
@@ -574,11 +660,10 @@ func TestHover_TypeDocNotLeakingAcrossTypes(t *testing.T) {
   @type first :: integer()
   @type second :: string()
 end`
-	lines := strings.Split(src, "\n")
 
 	// extractDocAbove for second (line index 3) should find no doc —
 	// the @typedoc belongs to first, not second.
-	doc, _ := extractDocAbove(lines, 3)
+	doc, _ := NewTokenizedFile(src).ExtractDocAbove(3)
 	if doc != "" {
 		t.Errorf("expected no doc for second type, got %q", doc)
 	}
@@ -960,8 +1045,8 @@ func TestHover_SigilHeredoc(t *testing.T) {
     :ok
   end
 end`
-	lines := strings.Split(src, "\n")
-	doc, _ := extractDocAbove(lines, 6)
+
+	doc, _ := NewTokenizedFile(src).ExtractDocAbove(6)
 
 	if !strings.Contains(doc, "Creates a user") {
 		t.Errorf("expected doc from sigil heredoc, got %q", doc)
@@ -1025,4 +1110,120 @@ end`
 	if !strings.Contains(hover.Contents.Value, "MyApp.Accounts.User") {
 		t.Errorf("expected submodule in hover, got %q", hover.Contents.Value)
 	}
+}
+
+func TestHover_MultiLineAliasBlock(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", `defmodule MyApp.Accounts do
+  @moduledoc "The Accounts context."
+  def list, do: []
+end
+`)
+
+	indexFile(t, server.store, server.projectRoot, "lib/users.ex", `defmodule MyApp.Users do
+  @moduledoc "User management."
+  def get(id), do: nil
+end
+`)
+
+	src := `defmodule MyApp.Web do
+  alias MyApp.{
+    Accounts,
+    Users
+  }
+
+  def run, do: Accounts.list()
+end`
+	uri := "file:///test.ex"
+	server.docs.Set(uri, src)
+
+	// Hover on "Accounts" inside the multi-line alias block (line 2, col 4)
+	hover := hoverAt(t, server, uri, 2, 4)
+	if hover == nil {
+		t.Fatal("expected hover for Accounts inside multi-line alias block")
+	}
+	if !strings.Contains(hover.Contents.Value, "The Accounts context") {
+		t.Errorf("expected moduledoc in hover, got %q", hover.Contents.Value)
+	}
+
+	// Hover on "Users" inside the multi-line alias block (line 3, col 4)
+	hover = hoverAt(t, server, uri, 3, 4)
+	if hover == nil {
+		t.Fatal("expected hover for Users inside multi-line alias block")
+	}
+	if !strings.Contains(hover.Contents.Value, "User management") {
+		t.Errorf("expected moduledoc in hover, got %q", hover.Contents.Value)
+	}
+
+	// Trailing brace on content line: alias MyApp.{ Users }
+	src2 := `defmodule MyApp.Web do
+  alias MyApp.{
+    Accounts }
+end`
+	uri2 := "file:///test2.ex"
+	server.docs.Set(uri2, src2)
+
+	hover = hoverAt(t, server, uri2, 2, 6)
+	if hover == nil {
+		t.Fatal("expected hover for module on line with trailing brace")
+	}
+	if !strings.Contains(hover.Contents.Value, "The Accounts context") {
+		t.Errorf("expected moduledoc in hover, got %q", hover.Contents.Value)
+	}
+}
+
+func TestHover_UseInjectedMultilineAlias(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/helpers.ex", `defmodule MyApp.Helpers do
+  @moduledoc "Helper utilities."
+  def help, do: :ok
+end
+`)
+
+	// Module with __using__ that has a multiline alias ... as:
+	// AND uses the alias in an import within the same quote block.
+	indexFile(t, server.store, server.projectRoot, "lib/base.ex", `defmodule MyApp.Base do
+  defmacro __using__(_opts) do
+    quote do
+      alias MyApp.Helpers,
+        as: H
+
+      import H
+    end
+  end
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyApp.Consumer do
+  use MyApp.Base
+
+  def run, do: help()
+end`)
+
+	// help() should resolve via import H → MyApp.Helpers
+	hover := hoverAt(t, server, uri, 3, 15)
+	if hover == nil {
+		t.Fatal("expected hover for help() injected via multiline alias + import in __using__")
+	}
+	if !strings.Contains(hover.Contents.Value, "def help") {
+		t.Errorf("expected help signature in hover, got %q", hover.Contents.Value)
+	}
+}
+
+func TestHover_DefKeywordNoCrash(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyApp.Foo do
+  def bar, do: :ok
+end`)
+
+	hover := hoverAt(t, server, uri, 1, 3)
+	_ = hover
 }
