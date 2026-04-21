@@ -408,7 +408,7 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 					aliases[asName] = resolved
 					refs = append(refs, Reference{Module: resolved, Line: aliasLine, FilePath: path, Kind: "alias"})
 				}
-				i = nextPos + 1
+				i = nextPos
 				continue
 			}
 
@@ -469,7 +469,7 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 					aliases[asName] = resolved
 					refs = append(refs, Reference{Module: resolved, Line: requireLine, FilePath: path, Kind: "require"})
 				}
-				i = nextPos + 1
+				i = nextPos
 				continue
 			}
 

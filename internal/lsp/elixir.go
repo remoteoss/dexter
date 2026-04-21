@@ -1488,7 +1488,7 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 					aliases = make(map[string]string)
 				}
 				aliases[asName] = resolveAlias(modName)
-				i = nextPos
+				i = nextPos - 1
 				continue
 			}
 			// Simple alias

@@ -859,7 +859,7 @@ end
 	})
 	t.Run("alias and require as on same line with semicolon", func(t *testing.T) {
 		// Regression: after `alias Mod, as: Name` / `require Mod, as: Name`, the token
-		// walker must resume at the value token (ScanKeywordOptionValue's nextPos) so the
+		// walker must resume past the value token (ScanKeywordOptionValue's nextPos) so the
 		// for-loop post-increment does not skip the next statement on the same line.
 		text := `defmodule MyApp.Outer do
   alias MyApp.Foo, as: MyFoo; alias MyApp.Bar, as: MyBar

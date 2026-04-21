@@ -56,7 +56,7 @@ func AliasShortName(name string) string {
 
 // ScanKeywordOptionValue scans for `key: Value` immediately after the token at
 // from (typically the position after a parsed module expression) and returns the
-// Value token text when present.
+// Value token text when present. nextPos points one past the Value token.
 func ScanKeywordOptionValue(source []byte, tokens []Token, n, from int, key string) (value string, nextPos int, ok bool) {
 	nk := NextSigToken(tokens, n, from)
 	if nk >= n || tokens[nk].Kind != TokComma {
@@ -77,7 +77,7 @@ func ScanKeywordOptionValue(source []byte, tokens []Token, n, from int, key stri
 	if tokens[afterColon].Kind != TokModule && tokens[afterColon].Kind != TokIdent {
 		return "", from, false
 	}
-	return TokenText(source, tokens[afterColon]), afterColon, true
+	return TokenText(source, tokens[afterColon]), afterColon + 1, true
 }
 
 // ScanMultiAliasChildren collects child module names from `alias Parent.{A, B}`.
