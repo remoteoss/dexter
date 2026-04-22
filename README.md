@@ -13,9 +13,14 @@ A fast, full-featured Elixir LSP optimized for large Elixir codebases.
   - [VS Code / Cursor](#vs-code--cursor)
     - [Configuration](#configuration)
   - [Neovim (0.11+)](#neovim-011)
+    - [Configuring format on save](#configuring-format-on-save)
   - [Neovim (with nvim-lspconfig — \< 0.11)](#neovim-with-nvim-lspconfig---011)
   - [Zed](#zed)
   - [Emacs](#emacs)
+    - [Eglot](#eglot)
+      - [Emacs version \>= 30](#emacs-version--30)
+      - [Emacs version \<= 29](#emacs-version--29)
+    - [lsp-mode](#lsp-mode)
   - [Helix](#helix)
 - [Why build another LSP?](#why-build-another-lsp)
 - [Performance](#performance)
@@ -157,7 +162,7 @@ vim.lsp.config('dexter', {
 vim.lsp.enable 'dexter'
 ```
 
-That's it. Go-to-definition (`gd`, `<C-]>`, or whatever you have mapped to `vim.lsp.buf.definition()`) will now use dexter alongside any other attached LSP servers. Formatting happens automatically on save — no `BufWritePre` autocommand needed.
+That's it. Go-to-definition (`gd`, `<C-]>`, or whatever you have mapped to `vim.lsp.buf.definition()`) will now use dexter alongside any other attached LSP servers.
 
 If you want a dedicated binding just for dexter:
 
@@ -165,6 +170,34 @@ If you want a dedicated binding just for dexter:
 vim.keymap.set("n", "<leader>va", function()
   vim.lsp.buf.definition({ filter = function(client) return client.name == "dexter" end })
 end)
+```
+
+#### Configuring format on save
+
+If you want formatting on save, you'll need to configure a `PreWrite` autocmd. You can do something like this:
+
+```lua
+vim.api.nvim_create_autocmd('LspAttach', {
+  group = vim.api.nvim_create_augroup('my.lsp', {}),
+
+  callback = function(args)
+    local opts = { remap = false }
+    local client = assert(vim.lsp.get_client_by_id(args.data.client_id))
+    local builtin = require("telescope.builtin")
+
+    -- along with your other config
+
+    if client:supports_method('textDocument/formatting') then
+      -- the most important part
+      vim.api.nvim_create_autocmd('BufWritePre', {
+        buffer = args.buf,
+        callback = function()
+          vim.lsp.buf.format({ bufnr = args.buf, id = client.id, timeout_ms = 5000 })
+        end,
+      })
+    end
+  end
+})
 ```
 
 ### Neovim (with nvim-lspconfig — < 0.11)
@@ -183,6 +216,7 @@ configs.dexter = {
 
 lspconfig.dexter.setup({})
 ```
+
 
 ### Zed
 
