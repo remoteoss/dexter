@@ -73,8 +73,13 @@ func Open(projectRoot string) (*Store, error) {
 	if err := migrateLegacyLayout(projectRoot); err != nil {
 		return nil, fmt.Errorf("migrate legacy layout: %w", err)
 	}
-	if err := os.MkdirAll(DBDir(projectRoot), 0o755); err != nil {
+	dexterDir := DBDir(projectRoot)
+	if err := os.MkdirAll(dexterDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create dexter dir: %w", err)
+	}
+	gitignorePath := filepath.Join(dexterDir, ".gitignore")
+	if _, err := os.Stat(gitignorePath); os.IsNotExist(err) {
+		_ = os.WriteFile(gitignorePath, []byte("*\n"), 0o644)
 	}
 
 	dbPath := DBPath(projectRoot)

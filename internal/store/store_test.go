@@ -1013,6 +1013,13 @@ func TestOpen_CreatesDexterFolder(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, ".dexter", "dexter.db")); err != nil {
 		t.Errorf(".dexter/dexter.db was not created: %v", err)
 	}
+	gitignore := filepath.Join(dir, ".dexter", ".gitignore")
+	content, err := os.ReadFile(gitignore)
+	if err != nil {
+		t.Errorf(".dexter/.gitignore was not created: %v", err)
+	} else if string(content) != "*\n" {
+		t.Errorf(".dexter/.gitignore content = %q, want %q", string(content), "*\n")
+	}
 }
 
 func TestOpen_MigratesLegacyLayout(t *testing.T) {
