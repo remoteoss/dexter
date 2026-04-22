@@ -1,6 +1,6 @@
 package version
 
-const Version = "0.5.3"
+const Version = "0.6.0"
 
 // IndexVersion is incremented whenever the index schema or parser changes in a
 // way that requires a full rebuild. Bump this alongside Version when releasing

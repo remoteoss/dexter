@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.6.0] - 2026-04-22
+
+### Added
+
+- **Tokenizer-based parser** — replaced the regex-over-joined-lines parser with a single-pass tokenizer and token walker; geomean throughput on real `.ex` files improved from 84 MB/s to 231 MB/s (#22). But most importantly, this change fixes a ton of edge-case bugs in parsing due to improved consistency.
+- **Homebrew tap support** — Dexter can now be installed via `brew install remoteoss/tap/dexter`; the release workflow automatically updates the formula on each tagged release (#14)
+
+### Changed
+
+- **Index database moved to `.dexter/` folder** — the SQLite index now lives at `<project>/.dexter/dexter.db` instead of `<project>/.dexter.db`; existing databases are migrated automatically on next startup (legacy files are deleted and a fresh index is built); update your `.gitignore` to include `.dexter/` instead of `.dexter.db` (#46)
+- **Removed periodic reindexing** — eliminated the 30-second full-project reindex that caused CPU spikes (~25%) and unnecessary file I/O; the index now stays current via editor file-watcher events and startup scans (#16)
+
+### Fixed
+
+The tokenizer change in #22 fixed a ton of edge-case bugs. Here are some of them:
+
+- **Heredoc comment misparse** — `#` inside heredoc markdown links was misread as a comment, which cascaded into line merges that swallowed entire `defmacro __using__` bodies and broke use-chain resolution in some modules (#22)
+- **Multi-line bracket expressions** — missed references and incorrect line numbers when expressions spanned multiple lines (#22)
+- **`require` alias registration** — `require Module, as: Name` now registers aliases for go-to-definition (#22)
+- **Multi-hop `defdelegate` chains** — chains like A → B → C now resolve to the final target instead of stopping at the intermediate delegate (recursive up to depth 5) (#22)
+- **Multi-line alias blocks** — `alias Parent.{ Child, Other }` blocks now resolve correctly in go-to-definition, hover, references, and completion (#22)
+- **Multi-line `use` opts** — `use Module, opts` spanning multiple lines now parses the opts correctly (#22)
+
 ## [0.5.3] - 2026-04-09
 
 ### Added
