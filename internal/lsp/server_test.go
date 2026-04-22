@@ -2862,21 +2862,21 @@ func TestFindMixRoot(t *testing.T) {
 	}
 
 	t.Run("finds nearest mix.exs from project lib dir", func(t *testing.T) {
-		got := findMixRoot(filepath.Join(myApp, "lib"))
+		got := findMixRoot(root, filepath.Join(myApp, "lib"))
 		if got != myApp {
 			t.Errorf("expected %s, got %s", myApp, got)
 		}
 	})
 
 	t.Run("finds mix.exs in same directory", func(t *testing.T) {
-		got := findMixRoot(myApp)
+		got := findMixRoot(root, myApp)
 		if got != myApp {
 			t.Errorf("expected %s, got %s", myApp, got)
 		}
 	})
 
 	t.Run("each project resolves to its own mix root", func(t *testing.T) {
-		got := findMixRoot(filepath.Join(otherProject, "lib"))
+		got := findMixRoot(root, filepath.Join(otherProject, "lib"))
 		if got != otherProject {
 			t.Errorf("expected %s, got %s", otherProject, got)
 		}
@@ -2884,9 +2884,37 @@ func TestFindMixRoot(t *testing.T) {
 
 	t.Run("returns empty when no mix.exs exists", func(t *testing.T) {
 		empty := t.TempDir()
-		got := findMixRoot(empty)
+		got := findMixRoot(root, empty)
 		if got != "" {
 			t.Errorf("expected empty string, got %s", got)
+		}
+	})
+}
+
+func TestFindMixUmbrellaRoot(t *testing.T) {
+	root := t.TempDir()
+
+	// Create an umbrella structure (with root mix.exs):
+	//   root/mix.exs
+	//   root/apps/a/mix.exs
+	//   root/apps/a/lib/
+	rootMix := filepath.Join(root, "mix.exs")
+	if err := os.WriteFile(rootMix, []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+	app := filepath.Join(root, "apps", "a")
+	if err := os.MkdirAll(filepath.Join(app, "lib"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	appMix := filepath.Join(app, "mix.exs")
+	if err := os.WriteFile(appMix, []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("finds nearest-to-root mix.exs from project lib dir", func(t *testing.T) {
+		got := findMixRoot(root, filepath.Join(app, "lib"))
+		if got != root {
+			t.Errorf("expected %s, got %s", root, got)
 		}
 	})
 }
@@ -3003,7 +3031,7 @@ func TestFormatter_RestartAfterCrash(t *testing.T) {
 	}
 
 	// Kill the persistent process
-	mixRoot := findMixRoot(filepath.Dir(filePath))
+	mixRoot := findMixRoot(server.projectRoot, filepath.Dir(filePath))
 	formatterExs := findFormatterConfig(filePath, mixRoot)
 	server.formattersMu.Lock()
 	if fp, ok := server.formatters[formatterExs]; ok {

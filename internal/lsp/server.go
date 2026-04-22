@@ -438,7 +438,7 @@ func (s *Server) DidOpen(ctx context.Context, params *protocol.DidOpenTextDocume
 	path := uriToPath(params.TextDocument.URI)
 	if path != "" && isFormattableFile(path) && s.isProjectFile(path) && !s.isDepsFile(path) {
 		go func() {
-			if mixRoot := findMixRoot(filepath.Dir(path)); mixRoot != "" {
+			if mixRoot := findMixRoot(s.projectRoot, filepath.Dir(path)); mixRoot != "" {
 				formatterExs := findFormatterConfig(path, mixRoot)
 				_, _ = s.getFormatter(mixRoot, formatterExs)
 			}
@@ -740,15 +740,16 @@ func findDexterRoot(path string) string {
 	return path
 }
 
-// findMixRoot walks up from dir looking for the nearest mix.exs.
-func findMixRoot(dir string) string {
+// findMixRoot walks up from dir looking for the mix.exs closest to the project root.
+// Handles standard apps (single mix.exs), umbrella apps (root-level mix.exs), and monorepos.
+func findMixRoot(projectRoot, dir string) (mixRoot string) {
 	for {
 		if _, err := os.Stat(filepath.Join(dir, "mix.exs")); err == nil {
-			return dir
+			mixRoot = dir
 		}
 		parent := filepath.Dir(dir)
-		if parent == dir {
-			return ""
+		if parent == dir || dir == projectRoot {
+			return
 		}
 		dir = parent
 	}
@@ -2717,7 +2718,7 @@ func (s *Server) Formatting(ctx context.Context, params *protocol.DocumentFormat
 		return nil, nil
 	}
 
-	mixRoot := findMixRoot(filepath.Dir(path))
+	mixRoot := findMixRoot(s.projectRoot, filepath.Dir(path))
 	if mixRoot == "" {
 		return nil, nil
 	}
