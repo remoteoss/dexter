@@ -623,6 +623,21 @@ func (s *Store) LookupFunction(module, function string) ([]LookupResult, error) 
 	)
 }
 
+// LookupFunctionByArity returns definitions for a function name, optionally
+// filtered by arity. When arity < 0, behavior matches LookupFunction (all
+// arities returned). When arity >= 0, results are filtered to exact matches,
+// preventing callers from getting e.g. `foo/1` and `foo/2` rows for a call
+// that only uses one of them.
+func (s *Store) LookupFunctionByArity(module, function string, arity int) ([]LookupResult, error) {
+	if arity < 0 {
+		return s.LookupFunction(module, function)
+	}
+	return s.queryLookup(
+		"SELECT file_path, line, kind, arity, delegate_to, delegate_as FROM definitions WHERE module = ? AND function = ? AND arity = ? AND kind NOT IN ('module', 'defprotocol', 'defimpl', 'callback', 'macrocallback') ORDER BY CASE WHEN kind IN ('type', 'opaque') THEN 1 ELSE 0 END, line",
+		module, function, arity,
+	)
+}
+
 // CallbackResult holds a @callback or @macrocallback definition with its arity.
 type CallbackResult struct {
 	FilePath string
@@ -1104,42 +1119,68 @@ func (s *Store) NextFunctionLine(filePath string, startLine int) int {
 }
 
 func (s *Store) LookupFollowDelegate(module, function string) ([]LookupResult, error) {
-	return s.lookupFollowDelegate(module, function, 0)
+	return s.LookupFollowDelegateByArity(module, function, -1)
 }
 
-func (s *Store) lookupFollowDelegate(module, function string, depth int) ([]LookupResult, error) {
+// LookupFollowDelegateByArity is like LookupFollowDelegate but filters by
+// arity when arity >= 0. Delegate-following is partitioned per arity, so a
+// module that mixes `defdelegate foo/1, to: X` with `def foo/2` still follows
+// the /1 delegate for a /1 call without being blocked by the non-delegate /2
+// row.
+func (s *Store) LookupFollowDelegateByArity(module, function string, arity int) ([]LookupResult, error) {
+	return s.lookupFollowDelegate(module, function, arity, 0)
+}
+
+func (s *Store) lookupFollowDelegate(module, function string, arity, depth int) ([]LookupResult, error) {
 	if depth > 5 {
 		return nil, nil
 	}
 
-	results, err := s.LookupFunction(module, function)
+	results, err := s.LookupFunctionByArity(module, function, arity)
 	if err != nil {
 		return nil, err
 	}
+	if len(results) == 0 {
+		return nil, nil
+	}
 
-	// If all results are defdelegates, follow them to the target
-	allDelegates := len(results) > 0
+	// Group by arity. Within each arity group, follow if every row is a
+	// delegate. This handles the defdelegate/1 + def/2 mix correctly.
+	byArity := make(map[int][]LookupResult, len(results))
+	order := make([]int, 0, len(results))
 	for _, r := range results {
-		if r.Kind != "defdelegate" || r.DelegateTo == "" {
-			allDelegates = false
-			break
+		if _, seen := byArity[r.Arity]; !seen {
+			order = append(order, r.Arity)
 		}
+		byArity[r.Arity] = append(byArity[r.Arity], r)
 	}
 
-	if allDelegates {
-		targetModule := results[0].DelegateTo
-		targetFunc := function
-		if results[0].DelegateAs != "" {
-			targetFunc = results[0].DelegateAs
+	var out []LookupResult
+	for _, a := range order {
+		group := byArity[a]
+		allDelegates := true
+		for _, r := range group {
+			if r.Kind != "defdelegate" || r.DelegateTo == "" {
+				allDelegates = false
+				break
+			}
 		}
-		targetResults, err := s.lookupFollowDelegate(targetModule, targetFunc, depth+1)
-		if err != nil {
-			return nil, err
+		if allDelegates {
+			targetModule := group[0].DelegateTo
+			targetFunc := function
+			if group[0].DelegateAs != "" {
+				targetFunc = group[0].DelegateAs
+			}
+			targetResults, err := s.lookupFollowDelegate(targetModule, targetFunc, a, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			if len(targetResults) > 0 {
+				out = append(out, targetResults...)
+				continue
+			}
 		}
-		if len(targetResults) > 0 {
-			return targetResults, nil
-		}
+		out = append(out, group...)
 	}
-
-	return results, nil
+	return out, nil
 }

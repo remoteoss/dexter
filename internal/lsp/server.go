@@ -556,6 +556,7 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 
 	expr := tf.ResolveModuleExpr(exprCtx.Expr(), lineNum)
 	moduleRef, functionName := ExtractModuleAndFunction(expr)
+	callArity := tf.ArityAtCallsite(lineNum, exprCtx.ExprStart, exprCtx.ExprEnd)
 
 	if moduleRef != "" {
 		if aliasParent, inBlock := ExtractAliasBlockParent(lines, lineNum); inBlock {
@@ -565,7 +566,7 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 
 	aliases := tf.ExtractAliasesInScope(lineNum)
 	s.mergeAliasesFromUse(text, aliases)
-	s.debugf("Definition: expr=%q module=%q function=%q", expr, moduleRef, functionName)
+	s.debugf("Definition: expr=%q module=%q function=%q arity=%d", expr, moduleRef, functionName, callArity)
 
 	// Bare identifier — check variable first (cheap tree-sitter lookup), then functions
 	if moduleRef == "" {
@@ -607,9 +608,9 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		var results []store.LookupResult
 		var err error
 		if s.followDelegates {
-			results, err = s.store.LookupFollowDelegate(fullModule, functionName)
+			results, err = s.store.LookupFollowDelegateByArity(fullModule, functionName, callArity)
 		} else {
-			results, err = s.store.LookupFunction(fullModule, functionName)
+			results, err = s.store.LookupFunctionByArity(fullModule, functionName, callArity)
 		}
 		if err == nil && len(results) > 0 {
 			s.debugf("Definition: found %d result(s) in store for %s.%s", len(results), fullModule, functionName)
@@ -642,9 +643,9 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		var results []store.LookupResult
 		var err error
 		if s.followDelegates {
-			results, err = s.store.LookupFollowDelegate(fullModule, functionName)
+			results, err = s.store.LookupFollowDelegateByArity(fullModule, functionName, callArity)
 		} else {
-			results, err = s.store.LookupFunction(fullModule, functionName)
+			results, err = s.store.LookupFunctionByArity(fullModule, functionName, callArity)
 		}
 		if err == nil && len(results) > 0 {
 			s.debugf("Definition: found %d result(s) in store for %s.%s", len(results), fullModule, functionName)
