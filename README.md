@@ -7,14 +7,23 @@ A fast, full-featured Elixir LSP optimized for large Elixir codebases.
 ## Table of contents
 
 - [Features](#features)
-- [Why build another LSP?](#why-build-another-lsp)
-- [Performance](#performance)
 - [Quick start](#quick-start)
+  - [Install via mise or asdf](#install-via-mise-or-asdf)
 - [Editor setup](#editor-setup)
   - [VS Code / Cursor](#vs-code--cursor)
+    - [Configuration](#configuration)
   - [Neovim (0.11+)](#neovim-011)
+    - [Configuring format on save](#configuring-format-on-save)
   - [Neovim (with nvim-lspconfig — \< 0.11)](#neovim-with-nvim-lspconfig---011)
   - [Zed](#zed)
+  - [Emacs](#emacs)
+    - [Eglot](#eglot)
+      - [Emacs version \>= 30](#emacs-version--30)
+      - [Emacs version \<= 29](#emacs-version--29)
+    - [lsp-mode](#lsp-mode)
+  - [Helix](#helix)
+- [Why build another LSP?](#why-build-another-lsp)
+- [Performance](#performance)
 - [CLI usage](#cli-usage)
   - [Index a project](#index-a-project)
   - [Look up definitions](#look-up-definitions)
@@ -37,11 +46,11 @@ A fast, full-featured Elixir LSP optimized for large Elixir codebases.
 
 ## Features
 
-- **Fast indexing** — cold index completes in ~11s on a 57k-file Elixir monorepo, ~93ms on Oban, ~90ms on the Elixir standard library (measured on an M1 MacBook Pro). After your first index, incremental indexing makes sure that you never have to reindex the whole codebase again.
+- **Fast indexing** — cold index completes in ~11s on a 57k-file Elixir monorepo, ~100ms on Oban, ~300ms on the Elixir standard library (measured on an M1 MacBook Pro). After your first index, incremental indexing makes sure that you never have to reindex the whole codebase again.
 - **Go-to-definition** — jump to any module, function, type, or variable definition. Resolves aliases, imports, `defdelegate` chains, `use` injections, and the Elixir stdlib. Handles all definition forms: `def`, `defp`, `defmacro`, `defprotocol`, `defimpl`, `defstruct`, and more.
 - **Go-to-references** — find all usages of a function or module across the codebase, including through `import`, `use` chains, and `defdelegate`.
 - **Hover documentation** — `@doc`, `@moduledoc`, `@typedoc`, and `@spec` annotations rendered as Markdown when you hover over a symbol.
-- **Autocompletion** — modules, functions, types, and variables with full snippet support. Resolves through aliases, imports, `use` injections, and the Elixir stdlib. Works for qualified calls (`MyApp.Repo.|`), bare function calls, and module prefixes.
+- **Autocompletion** — modules, functions, types, and variables with full snippet support. Resolves through aliases, imports, `use` injections, and the Elixir stdlib. Works for qualified calls (`MyApp.Accounts.|`), bare function calls, and module prefixes.
 - **Rename** — rename modules, functions, and variables with automatic file renaming when the convention is followed.
 - **No compilation required** — the index is built by parsing source files directly, not by compiling your project. Dexter works immediately on any codebase, even ones that don't compile.
 - **Monorepo and umbrella support** — a single index at the repository root covers all apps and shared libraries. Go-to-definition, find references, and rename work cross-project out of the box.
@@ -59,7 +68,7 @@ A fast, full-featured Elixir LSP optimized for large Elixir codebases.
 <details>
 <summary>More features</summary>
 
-- **Delegate following** — `defdelegate fetch(id), to: MyApp.Repo` jumps to `MyApp.Repo.fetch`, respecting `as:` renames.
+- **Delegate following** — `defdelegate fetch_user(id), to: MyApp.Accounts.Finders.FetchUser, as: :find` jumps to `MyApp.Accounts.Finders.FetchUser.find`, respecting `as:` renames.
 - **Alias resolution** — `alias MyApp.Handlers.Foo`, `alias MyApp.Handlers.Foo, as: Cool`, `alias MyApp.Handlers.{Foo, Bar}`.
 - **Import resolution** — bare function calls resolved through `import` declarations.
 - **Type definitions** — `@type` and `@opaque` are indexed for go-to-definition and hover.
@@ -69,24 +78,6 @@ A fast, full-featured Elixir LSP optimized for large Elixir codebases.
 - **Module nesting** — correctly tracks `end` keywords to attribute functions to the right module.
 
 </details>
-
-## Why build another LSP?
-
-Remote has one of the largest Elixir codebases in existence (at least that we're aware of), now around 57k files. As our codebase has grown, we've had more and more struggles with language servers. We had found that they simply couldn't keep up with such a large codebase. On large codebases like ours, existing LSPs take hours to index, and even after indexing, operations like go-to-definition and go-to-references are still slow. On top of that, changing branches means a whole new round of indexing. The result has been frustration. Many of us on the engineering team had all but given up on the idea of ever having a working LSP.
-
-Dexter is designed with speed and efficiency as core guiding principles. It takes a different approach from other Elixir LSPs, parsing source files directly as text and storing everything in SQLite so lookups are fast. The speed difference is noticeable on codebases of all sizes. Although Dexter isn't fully aware of the compiled state of the code like compilation-based LSPs, some clever parsing and deferring complex macro following to runtime allow it to get very close. In fact, you probably wouldn't even notice this limitation if you weren't reading this.
-
-## Performance
-
-Measured on a 57k-file Elixir monorepo (330k definitions, 2.7M references) on a 32GB M1 MacBook Pro:
-
-| Operation | Time |
-|-----------|------|
-| Full init | ~11s |
-| Lookup (LSP or CLI) | ~10ms |
-| Single file reindex (on save) | ~10ms |
-| Full reindex (no changes) | ~2s |
-| Format on save | <1ms |
 
 ## Quick start
 
@@ -130,7 +121,7 @@ But if Dexter is not on your `PATH`, set the binary path in your editor settings
 }
 ```
 
-To enable format-on-save, update your VS Code settings:
+To enable format-on-save, update your VS Code/Cursor settings:
 
 ```json
 // global in your editor
@@ -140,7 +131,11 @@ To enable format-on-save, update your VS Code settings:
 
 // or, for Elixir specifically
 {
-  "[elixir]": { "editor.formatOnSave": true },
+  "[elixir]": {
+      "editor.formatOnSave": true,
+      // you may need to set Dexter as your default Elixir formatter, depending on your setup
+      "editor.defaultFormatter": "remoteoss.dexter-lsp" // "remote-com-oss.dexter-lsp" for Cursor
+  },
   "[phoenix-heex]": { "editor.formatOnSave": true }
 }
 ```
@@ -164,7 +159,7 @@ vim.lsp.config('dexter', {
 vim.lsp.enable 'dexter'
 ```
 
-That's it. Go-to-definition (`gd`, `<C-]>`, or whatever you have mapped to `vim.lsp.buf.definition()`) will now use dexter alongside any other attached LSP servers. Formatting happens automatically on save — no `BufWritePre` autocommand needed.
+That's it. Go-to-definition (`gd`, `<C-]>`, or whatever you have mapped to `vim.lsp.buf.definition()`) will now use dexter alongside any other attached LSP servers.
 
 If you want a dedicated binding just for dexter:
 
@@ -172,6 +167,34 @@ If you want a dedicated binding just for dexter:
 vim.keymap.set("n", "<leader>va", function()
   vim.lsp.buf.definition({ filter = function(client) return client.name == "dexter" end })
 end)
+```
+
+#### Configuring format on save
+
+If you want formatting on save, you'll need to configure a `PreWrite` autocmd. You can do something like this:
+
+```lua
+vim.api.nvim_create_autocmd('LspAttach', {
+  group = vim.api.nvim_create_augroup('my.lsp', {}),
+
+  callback = function(args)
+    local opts = { remap = false }
+    local client = assert(vim.lsp.get_client_by_id(args.data.client_id))
+    local builtin = require("telescope.builtin")
+
+    -- along with your other config
+
+    if client:supports_method('textDocument/formatting') then
+      -- the most important part
+      vim.api.nvim_create_autocmd('BufWritePre', {
+        buffer = args.buf,
+        callback = function()
+          vim.lsp.buf.format({ bufnr = args.buf, id = client.id, timeout_ms = 5000 })
+        end,
+      })
+    end
+  end
+})
 ```
 
 ### Neovim (with nvim-lspconfig — < 0.11)
@@ -191,15 +214,42 @@ configs.dexter = {
 lspconfig.dexter.setup({})
 ```
 
+
 ### Zed
 
-Install the [dexter-zed](https://github.com/remoteoss/dexter-zed) extension:
+Zed support is available via a **dev extension** while the update for built-in [extension registry](https://github.com/zed-industries/extensions/pull/5624) and [documentation](https://github.com/zed-industries/zed/pull/53793) is being merged.
 
-1. Clone the extension: `git clone https://github.com/remoteoss/dexter-zed.git`
-2. In Zed, open the command palette (`Cmd+Shift+P`) and run **"zed: install dev extension"**
-3. Select the `dexter-zed/` directory
+To install it:
 
-Configure the binary path in Zed's `settings.json`:
+1. Clone the official extension repo:
+   ```bash
+   git clone https://github.com/zed-extensions/elixir.git
+   cd elixir
+   ```
+2. In Zed, open the command palette (`Cmd+Shift+P`) and run **zed: install dev extension**
+3. Select the cloned `elixir` directory
+
+Once installed, enable it in your Zed `settings.json`:
+
+```json
+{
+  "languages": {
+    "Elixir": {
+      "language_servers": ["dexter", "!elixir-ls", "!expert"]
+    },
+    "EEx": {
+      "language_servers": ["dexter", "!elixir-ls", "!expert"]
+    },
+    "HEEx": {
+      "language_servers": ["dexter", "!elixir-ls", "!expert"]
+    }
+  }
+}
+```
+
+If you already have Dexter installed via [mise](https://mise.jdx.dev/), the extension will use your local binary from PATH instead of downloading.
+
+To override the binary path manually, add this to your `settings.json`:
 
 ```json
 {
@@ -207,12 +257,97 @@ Configure the binary path in Zed's `settings.json`:
     "dexter": {
       "binary": {
         "path": "/Users/you/.local/share/mise/shims/dexter", // or wherever `which dexter` points to
-        "arguments": ["lsp"],
+        "arguments": ["lsp"]
       }
     }
   }
 }
 ```
+
+### Emacs
+
+The emacs instructions assume you're using **use-package**.
+
+#### Eglot
+
+##### Emacs version >= 30
+
+```emacs-lisp
+(use-package eglot
+  :ensure t
+
+  :config
+  (setf (alist-get '(elixir-mode elixir-ts-mode heex-ts-mode)
+                   eglot-server-programs
+                   nil nil #'equal)
+        '("/path/to/dexter" "lsp")) ;; wherever `which dexter` points to
+
+  ;; other config
+  )
+```
+
+##### Emacs version <= 29
+
+```emacs-lisp
+(use-package eglot
+  :ensure t
+
+  :config
+  (setf (alist-get 'elixir-mode eglot-server-programs)
+        '("/path/to/dexter" "lsp")) ;; wherever `which dexter` points to
+
+  ;; other config
+  )
+```
+
+#### lsp-mode
+
+```emacs-lisp
+(use-package lsp-mode
+  :ensure t
+  :hook ((elixir-mode elixir-ts-mode heex-ts-mode) . lsp-deferred)
+  :config
+  (add-to-list 'lsp-disabled-clients 'elixir-ls)
+
+  (lsp-register-client
+   (make-lsp-client
+    :new-connection (lsp-stdio-connection
+                     '("/path/to/dexter" "lsp")) ;; wherever `which dexter` points to
+    :activation-fn (lsp-activate-on "elixir")
+    :server-id 'dexter-elixir)))
+```
+
+### Helix
+
+Add to your LSP configuration in `~/.config/helix/languages.toml`:
+
+```toml
+[language-server.dexter]
+command = "dexter"
+args = ["lsp"]
+
+[[language]]
+name = "elixir"
+language-servers = ["dexter"]
+```
+
+## Why build another LSP?
+
+Remote has one of the largest Elixir codebases in existence (at least that we're aware of), now around 57k files. As our codebase has grown, we've had more and more struggles with language servers. We had found that they simply couldn't keep up with such a large codebase. On large codebases like ours, existing LSPs take hours to index, and even after indexing, operations like go-to-definition and go-to-references are still slow. On top of that, changing branches means a whole new round of indexing. The result has been frustration. Many of us on the engineering team had all but given up on the idea of ever having a working LSP.
+
+Dexter is designed with speed and efficiency as core guiding principles. It takes a different approach from other Elixir LSPs, parsing source files directly as text and storing everything in SQLite so lookups are fast. The speed difference is noticeable on codebases of all sizes. Although Dexter isn't fully aware of the compiled state of the code like compilation-based LSPs, some clever parsing and deferring complex macro following to runtime allow it to get very close. In fact, you probably wouldn't even notice this limitation if you weren't reading this.
+
+## Performance
+
+Measured on a 57k-file Elixir monorepo (330k definitions, 2.7M references) on a 32GB M1 MacBook Pro:
+
+| Operation                     | Time  |
+| ----------------------------- | ----- |
+| Cold first-time index         | ~11s  |
+| Lookup (LSP or CLI)           | ~10ms |
+| Single file reindex (on save) | ~10ms |
+| Full reindex (no changes)     | ~2s   |
+| Format on save                | <1ms  |
 
 ## CLI usage
 
@@ -241,19 +376,19 @@ export DEXTER_ELIXIR_LIB_ROOT="/path/to/elixir/lib"
 
 ```sh
 # Find where a module is defined
-dexter lookup MyApp.Repo
-# => /path/to/lib/my_app/repo.ex:1
+dexter lookup MyApp.Accounts
+# => /path/to/lib/my_app/accounts.ex:1
 
 # Find where a function is defined (follows defdelegates by default)
-dexter lookup MyApp.Repo get
-# => /path/to/lib/my_app/repo.ex:15
+dexter lookup MyApp.Accounts fetch_user
+# => /path/to/lib/my_app/accounts/finders/fetch_user.ex:8
 
 # Don't follow defdelegates
-dexter lookup --no-follow-delegates MyApp.Accounts fetch
+dexter lookup --no-follow-delegates MyApp.Accounts fetch_user
 # => /path/to/lib/my_app/accounts.ex:5
 
 # Strict mode — exit 1 if exact function not found (no fallback to module)
-dexter lookup --strict MyApp.Repo nonexistent
+dexter lookup --strict MyApp.Accounts nonexistent
 # => (exit code 1)
 ```
 
@@ -261,13 +396,13 @@ dexter lookup --strict MyApp.Repo nonexistent
 
 ```sh
 # Find all usages of a module
-dexter references MyApp.Repo
-# => /path/to/lib/my_app/accounts.ex:12
-# => /path/to/lib/my_app/posts.ex:8
+dexter references MyApp.Accounts
+# => /path/to/lib/my_app_web/user_controller.ex:12
+# => /path/to/lib/my_app/auth.ex:8
 
 # Find all usages of a specific function
-dexter references MyApp.Repo get
-# => /path/to/lib/my_app/accounts.ex:45
+dexter references MyApp.Accounts fetch_user
+# => /path/to/lib/my_app_web/user_controller.ex:45
 ```
 
 Exits 1 with a message to stderr if no references are found.
@@ -278,7 +413,7 @@ The LSP does this for you automatically, but if for some reason you need to, you
 
 ```sh
 # Re-index a single file (~10ms)
-dexter reindex /path/to/lib/my_app/repo.ex
+dexter reindex /path/to/lib/my_app/accounts.ex
 
 # Re-index the whole project (only re-parses changed files)
 dexter reindex ~/code/my-elixir-project
@@ -289,7 +424,6 @@ When running as an LSP server, dexter automatically:
 - Reindexes files on save (`textDocument/didSave`)
 - Runs an incremental reindex on startup
 - Watches `.git/HEAD` for branch switches and reindexes when detected
-- Periodically reindexes every 30 seconds
 
 ## Hover documentation
 
@@ -308,11 +442,11 @@ Fetches a user by ID. Options are passed to the underlying query.
 
 Dexter resolves hover (and go-to-definition) based on which segment of a dotted expression your cursor is on:
 
-| Cursor position | Expression | Resolves to |
-|-----------------|------------|-------------|
-| On `Repo` in `MyApp.Repo.all` | `MyApp.Repo` | The `MyApp.Repo` module |
-| On `all` in `MyApp.Repo.all` | `MyApp.Repo.all` | The `all` function |
-| On `MyApp` in `MyApp.Repo.all` | `MyApp` | The `MyApp` module |
+| Cursor position                              | Expression                  | Resolves to                  |
+| -------------------------------------------- | --------------------------- | ---------------------------- |
+| On `Accounts` in `MyApp.Accounts.list_users` | `MyApp.Accounts`            | The `MyApp.Accounts` module  |
+| On `list_users` in `MyApp.Accounts.list_users` | `MyApp.Accounts.list_users` | The `list_users` function  |
+| On `MyApp` in `MyApp.Accounts.list_users`    | `MyApp`                     | The `MyApp` module           |
 
 ## Rename
 
@@ -320,23 +454,25 @@ Dexter supports renaming modules, functions, and variables across the codebase v
 
 ### Modules
 
-Place your cursor on any segment of a module name and invoke rename. Dexter highlights just the last segment for editing — the parent namespace is preserved automatically. For example, renaming `Repo` in `MyApp.Repo` to `Repository` renames the module to `MyApp.Repository`.
+Place your cursor on any segment of a module name and invoke rename. Dexter highlights just the last segment for editing — the parent namespace is preserved automatically. For example, renaming `Accounts` in `MyApp.Accounts` to `Users` renames the module to `MyApp.Users`.
 
 **What gets updated:**
+
 - The `defmodule` declaration
 - All aliases, imports, and uses referencing the module
 - All call sites
 - All submodules (renaming `MyApp.Foo` also renames `MyApp.Foo.Bar`, `MyApp.Foo.Baz`, etc.)
 
-**File renaming after a module rename:** If the source file follows the Elixir naming convention (module `MyApp.SomeRepo` → file `some_repo.ex`), dexter renames the file alongside the module. For submodules, the containing directory segment is also renamed to match (e.g., renaming `MyApp.Companies` to `MyApp.Clients` moves `lib/companies/services/do_something.ex` → `lib/clients/services/do_something.ex`). After the rename, dexter opens the new file automatically if your editor supports `window/showDocument`.
+**File renaming after a module rename:** If the source file follows the Elixir naming convention (module `MyApp.Accounts` → file `accounts.ex`), dexter renames the file alongside the module. For submodules, the containing directory segment is also renamed to match (e.g., renaming `MyApp.Companies` to `MyApp.Clients` moves `lib/companies/services/do_something.ex` → `lib/clients/services/do_something.ex`). After the rename, dexter opens the new file automatically if your editor supports `window/showDocument`.
 
-**When path renaming won't happen:** If the file name doesn't match the snake_case form of the module's last segment — for example, a file named `my_custom_name.ex` that defines `MyModule.SomeRepo` — the file stays in place and only the contents are updated.
+**When path renaming won't happen:** If the file name doesn't match the snake_case form of the module's last segment — for example, a file named `my_custom_name.ex` that defines `MyApp.Accounts` — the file stays in place and only the contents are updated.
 
 Files not open in the editor are written directly to disk; open buffers receive edits via the LSP workspace edit response.
 
 ### Functions
 
 Place your cursor on a function name (qualified or bare) and invoke rename. Dexter updates:
+
 - All `def`/`defp`/`defmacro`/`defguard`/etc. clauses
 - `@spec` and `@callback` annotations
 - Direct calls and pipe calls (`|> function_name`)
@@ -417,6 +553,7 @@ If the issue persists, enable debug mode to get verbose logs. You can do this in
 Debug mode logs timing and resolution details for every definition, hover, references, and rename request to stderr. In Neovim you can usually view these at `~/.local/state/nvim/lsp.log`. In VS Code, you can see them in Output > Dexter.
 
 When [filing an issue](https://github.com/remoteoss/dexter/issues/new), please include:
+
 - Your Dexter version (`dexter --version`)
 - Your Elixir version (`elixir --version`)
 - The debug logs from the failing operation

@@ -255,19 +255,6 @@ func (s *Server) watchGitHead() {
 	}()
 }
 
-// periodicReindex runs backgroundReindex on a fixed interval to catch files
-// created or deleted outside the editor.
-func (s *Server) periodicReindex() {
-	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-
-		for range ticker.C {
-			s.backgroundReindex()
-		}
-	}()
-}
-
 // notifyOTPMismatch checks stderr output for an OTP version mismatch and
 // sends a one-time warning to the editor so the user doesn't have to dig
 // through logs.
@@ -359,7 +346,6 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 		s.initialized = true
 		s.backgroundReindex()
 		s.watchGitHead()
-		s.periodicReindex()
 	}
 
 	if params.Capabilities.Window != nil && params.Capabilities.Window.ShowDocument != nil {
@@ -543,8 +529,14 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		return nil, nil
 	}
 
+	// Get cached tokens for efficient multi-query operations
+	tf := s.docs.GetTokenizedFile(docURI)
+	if tf == nil {
+		tf = NewTokenizedFile(text)
+	}
+
 	// Check for @module_attribute reference first
-	if attrName := ExtractModuleAttribute(lines[lineNum], col); attrName != "" {
+	if attrName := tf.ModuleAttributeAtCursor(lineNum, col); attrName != "" {
 		if line, found := FindModuleAttributeDefinition(text, attrName); found {
 			return []protocol.Location{{
 				URI:   params.TextDocument.URI,
@@ -554,24 +546,21 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		return nil, nil
 	}
 
-	expr := ExtractExpression(lines[lineNum], col)
-	if expr == "" {
+	exprCtx := tf.ExpressionAtCursor(lineNum, col)
+	if exprCtx.Empty() {
 		return nil, nil
 	}
 
-	// Substitute __MODULE__ with the actual module name so that expressions
-	// like __MODULE__.User resolve correctly through normal alias/module paths.
-	if strings.Contains(expr, "__MODULE__") {
-		for _, l := range lines {
-			if m := parser.DefmoduleRe.FindStringSubmatch(l); m != nil {
-				expr = strings.ReplaceAll(expr, "__MODULE__", m[1])
-				break
-			}
+	expr := tf.ResolveModuleExpr(exprCtx.Expr(), lineNum)
+	moduleRef, functionName := ExtractModuleAndFunction(expr)
+
+	if moduleRef != "" {
+		if aliasParent, inBlock := ExtractAliasBlockParent(lines, lineNum); inBlock {
+			moduleRef = aliasParent + "." + moduleRef
 		}
 	}
 
-	moduleRef, functionName := ExtractModuleAndFunction(expr)
-	aliases := ExtractAliasesInScope(text, lineNum)
+	aliases := tf.ExtractAliasesInScope(lineNum)
 	s.mergeAliasesFromUse(text, aliases)
 	s.debugf("Definition: expr=%q module=%q function=%q", expr, moduleRef, functionName)
 
@@ -593,7 +582,7 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 			}
 		}
 
-		currentModule := firstDefmodule(lines)
+		currentModule := tf.FirstDefmodule()
 		fullModule := s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, lines, lineNum, functionName, aliases)
 		s.debugf("Definition: resolved bare %q -> %q", functionName, fullModule)
 		if fullModule == "" {
@@ -603,7 +592,7 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 
 		// Current module — return buffer location directly (works before indexing)
 		if fullModule == currentModule {
-			if line, found := FindFunctionDefinition(text, functionName); found {
+			if line, found := tf.FindFunctionDefinition(functionName); found {
 				return []protocol.Location{{
 					URI:   params.TextDocument.URI,
 					Range: lineRange(line - 1),
@@ -778,17 +767,22 @@ func (s *Server) CodeAction(ctx context.Context, params *protocol.CodeActionPara
 	// Find the full dotted expression at the cursor so that "DocuSign.Client.request"
 	// gives us the complete module reference, not just the segment under the cursor.
 	col := int(params.Range.Start.Character)
-	fullExpr := ExtractFullExpression(lines[lineNum], col)
-	if fullExpr == "" {
+	tf := s.docs.GetTokenizedFile(docURI)
+	if tf == nil {
+		tf = NewTokenizedFile(text)
+	}
+
+	exprCtx := tf.FullExpressionAtCursor(lineNum, col)
+	if exprCtx.Empty() {
 		return nil, nil
 	}
 
-	moduleRef, _ := ExtractModuleAndFunction(fullExpr)
+	moduleRef := exprCtx.ModuleRef
 	if moduleRef == "" {
 		return nil, nil
 	}
 
-	aliases := ExtractAliasesInScope(text, lineNum)
+	aliases := tf.ExtractAliasesInScope(lineNum)
 	s.mergeAliasesFromUse(text, aliases)
 
 	// Check if the first segment is already aliased — if so, the reference
@@ -811,11 +805,7 @@ func (s *Server) CodeAction(ctx context.Context, params *protocol.CodeActionPara
 			lastSegment := moduleLastSegment(moduleRef)
 			aliasText := indent + "alias " + moduleRef + "\n"
 
-			// Replace the module part of the expression on the current line
-			// with just the last segment (e.g. "MyApp.RandomAPI.Client" → "Client").
-			// Use the expression start column rather than strings.Index so that
-			// duplicate module references on the same line are not misidentified.
-			_, exprStart := extractExpressionBounds(lines[lineNum], col)
+			exprStart := exprCtx.ExprStart
 			var edits []protocol.TextEdit
 			// Insert the alias line
 			edits = append(edits, protocol.TextEdit{
@@ -948,6 +938,46 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 	}
 
 	prefix, afterDot, prefixStartCol := ExtractCompletionContext(lines[lineNum], col)
+
+	// Inside a multi-line alias block: complete child module segments under the parent.
+	if aliasParent, inBlock := ExtractAliasBlockParent(lines, lineNum); inBlock {
+		searchParent := aliasParent
+		segmentPrefix := prefix
+		labelPrefix := ""
+
+		if afterDot && prefix != "" {
+			searchParent = aliasParent + "." + prefix
+			segmentPrefix = ""
+			labelPrefix = prefix + "."
+		} else if prefix != "" {
+			if dotIdx := strings.LastIndexByte(prefix, '.'); dotIdx >= 0 {
+				searchParent = aliasParent + "." + prefix[:dotIdx]
+				segmentPrefix = prefix[dotIdx+1:]
+				labelPrefix = prefix[:dotIdx+1]
+			}
+		}
+
+		segments, err := s.store.SearchSubmoduleSegments(searchParent, segmentPrefix)
+		if err != nil {
+			return nil, nil
+		}
+		var items []protocol.CompletionItem
+		for _, segment := range segments {
+			items = append(items, protocol.CompletionItem{
+				Label:  labelPrefix + segment,
+				Kind:   protocol.CompletionItemKindModule,
+				Detail: searchParent + "." + segment,
+			})
+		}
+		if len(items) == 0 {
+			return nil, nil
+		}
+		return &protocol.CompletionList{
+			IsIncomplete: len(items) >= 100,
+			Items:        items,
+		}, nil
+	}
+
 	if prefix == "" && !afterDot {
 		return nil, nil
 	}
@@ -961,6 +991,12 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 
 	moduleRef, funcPrefix := ExtractModuleAndFunction(prefix)
 	inPipe := IsPipeContext(lines[lineNum], prefixStartCol)
+
+	// "Module.func." or "variable." — dot after a function call result or
+	// map/struct field access. We have no type info to complete the result.
+	if afterDot && (funcPrefix != "" || moduleRef == "") {
+		return nil, nil
+	}
 
 	var items []protocol.CompletionItem
 
@@ -1525,16 +1561,6 @@ func (s *Server) addCompletionsFromUsing(moduleName, funcPrefix string, seen map
 	}
 }
 
-// firstDefmodule returns the first defmodule name found in the file, or "".
-func firstDefmodule(lines []string) string {
-	for _, l := range lines {
-		if m := parser.DefmoduleRe.FindStringSubmatch(l); m != nil {
-			return m[1]
-		}
-	}
-	return ""
-}
-
 // resolveBareFunctionModule finds the module that defines a bare function name.
 // Mirrors the go-to-definition priority: current file modules → imports → use chains → Kernel.
 // Callers should pass pre-computed aliases to avoid redundant ExtractAliases scans.
@@ -1773,7 +1799,8 @@ func (s *Server) CompletionResolve(ctx context.Context, params *protocol.Complet
 		return params, nil
 	}
 
-	doc, spec := extractDocAbove(lines, defIdx)
+	tf := NewTokenizedFile(string(fileData))
+	doc, spec := tf.ExtractDocAbove(defIdx)
 	signature := extractSignature(lines, defIdx)
 	content := formatHoverContent(doc, spec, signature)
 
@@ -1820,12 +1847,16 @@ func (s *Server) Declaration(ctx context.Context, params *protocol.DeclarationPa
 		arity = ar
 	}
 	if functionName == "" {
-		expr := ExtractExpression(lines[lineNum], col)
-		if expr == "" {
+		tf := s.docs.GetTokenizedFile(docURI)
+		if tf == nil {
+			tf = NewTokenizedFile(text)
+		}
+		exprCtx := tf.ExpressionAtCursor(lineNum, col)
+		if exprCtx.Empty() {
 			s.debugf("Declaration: no expression at cursor")
 			return nil, nil
 		}
-		_, functionName = ExtractModuleAndFunction(expr)
+		functionName = exprCtx.FunctionName
 		if functionName == "" {
 			s.debugf("Declaration: no function name in expression")
 			return nil, nil
@@ -2039,21 +2070,18 @@ func (s *Server) DocumentHighlight(ctx context.Context, params *protocol.Documen
 		return highlights, nil
 	}
 
-	// Extract the cursor's line without splitting the entire document
-	line, ok := nthLine(text, lineNum)
-	if !ok || line == "" {
+	tf := s.docs.GetTokenizedFile(docURI)
+	if tf == nil {
+		tf = NewTokenizedFile(text)
+	}
+	curCtx := tf.ExpressionAtCursor(lineNum, col)
+	if curCtx.Empty() {
 		return nil, nil
 	}
 
-	expr := ExtractExpression(line, col)
-	if expr == "" {
-		return nil, nil
-	}
-
-	moduleRef, functionName := ExtractModuleAndFunction(expr)
-	token := functionName
+	token := curCtx.FunctionName
 	if token == "" {
-		token = moduleLastSegment(moduleRef)
+		token = moduleLastSegment(curCtx.ModuleRef)
 	}
 	if token == "" {
 		return nil, nil
@@ -2090,28 +2118,51 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 		return nil, nil
 	}
 
+	var tokens []parser.Token
+	var source []byte
+	if cachedTokens, cachedSrc, ok := s.docs.GetTokens(docURI); ok {
+		tokens = cachedTokens
+		source = cachedSrc
+	} else {
+		source = []byte(text)
+		tokens = parser.Tokenize(source)
+	}
+
 	lines := strings.Split(text, "\n")
 	lastLine := len(lines) - 1
+	n := len(tokens)
+
+	tokText := func(t parser.Token) string { return string(source[t.Start:t.End]) }
+
+	// tokCol returns the 0-based column of token t within its line.
+	tokCol := func(t parser.Token) int {
+		lineStart := t.Start
+		for lineStart > 0 && source[lineStart-1] != '\n' {
+			lineStart--
+		}
+		return t.Start - lineStart
+	}
+
+	// nextSig returns the index of the next significant (non-EOL, non-comment) token.
+	nextSig := func(from int) int { return parser.NextSigToken(tokens, n, from) }
 
 	type symbolEntry struct {
 		symbol    protocol.DocumentSymbol
-		module    string // owning module name (empty for top-level modules)
-		parentIdx int    // index of parent entry (-1 for top-level)
+		module    string
+		parentIdx int
 	}
 
 	type blockFrame struct {
-		name     string // module full name, or "" for functions
-		indent   int
-		entryIdx int // index into entries slice
+		name     string
+		depth    int
+		entryIdx int
 	}
 
 	var entries []symbolEntry
-	var moduleStack []blockFrame // defmodule/defprotocol/defimpl
-	var funcStack []blockFrame   // def/defp/defmacro/describe/test/etc with do...end bodies
-	inHeredoc := false
+	var moduleStack []blockFrame
+	var funcStack []blockFrame
+	depth := 0
 
-	// currentParentIdx returns the index of the innermost enclosing block.
-	// funcStack entries (describe blocks) take priority over moduleStack.
 	currentParentIdx := func() int {
 		if len(funcStack) > 0 {
 			return funcStack[len(funcStack)-1].entryIdx
@@ -2122,321 +2173,398 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 		return -1
 	}
 
-	for lineIdx, line := range lines {
-		if strings.IndexByte(line, '"') >= 0 {
-			quoteCount := strings.Count(line, `"""`)
-			if quoteCount > 0 {
-				if quoteCount >= 2 {
-					continue
-				}
-				inHeredoc = !inHeredoc
-				continue
-			}
-		}
-		if strings.IndexByte(line, '\'') >= 0 {
-			quoteCount := strings.Count(line, `'''`)
-			if quoteCount > 0 {
-				if quoteCount >= 2 {
-					continue
-				}
-				inHeredoc = !inHeredoc
-				continue
-			}
-		}
-		if inHeredoc {
-			continue
-		}
-
-		trimStart := 0
-		for trimStart < len(line) && (line[trimStart] == ' ' || line[trimStart] == '\t') {
-			trimStart++
-		}
-		if trimStart >= len(line) {
-			continue
-		}
-		first := line[trimStart]
-		rest := line[trimStart:]
-
-		// Fast first-character dispatch
-		if first != 'd' && first != 'e' && first != '@' && (first < 'a' || first > 'z') {
-			continue
-		}
-
-		// 'e' — pop stacks on "end"
-		if first == 'e' {
-			if len(rest) >= 3 && rest[0] == 'e' && rest[1] == 'n' && rest[2] == 'd' &&
-				(len(rest) == 3 || rest[3] == ' ' || rest[3] == '\t' || rest[3] == '\r') {
-				trimmedEnd := strings.TrimRight(rest, " \t\r")
-				if trimmedEnd == "end" {
-					endPos := protocol.Position{Line: uint32(lineIdx), Character: uint32(len(line))}
-					if len(funcStack) > 0 && funcStack[len(funcStack)-1].indent == trimStart {
-						entries[funcStack[len(funcStack)-1].entryIdx].symbol.Range.End = endPos
-						funcStack = funcStack[:len(funcStack)-1]
-					} else if len(moduleStack) > 0 && moduleStack[len(moduleStack)-1].indent == trimStart {
-						entries[moduleStack[len(moduleStack)-1].entryIdx].symbol.Range.End = endPos
-						moduleStack = moduleStack[:len(moduleStack)-1]
-					}
-				}
-			}
-			continue
-		}
-
-		currentModule := ""
+	currentModule := func() string {
 		if len(moduleStack) > 0 {
-			currentModule = moduleStack[len(moduleStack)-1].name
+			return moduleStack[len(moduleStack)-1].name
 		}
+		return ""
+	}
 
-		// 'd' — defmodule/defprotocol/defimpl/def*/defstruct/defexception
-		if first == 'd' && strings.HasPrefix(rest, "def") {
-
-			// Try module-level keywords first, ordered by frequency
-			var matchedKeyword string
-			switch {
-			case strings.HasPrefix(rest, "defmodule") && len(rest) > 9 && (rest[9] == ' ' || rest[9] == '\t'):
-				matchedKeyword = "defmodule"
-			case strings.HasPrefix(rest, "defimpl") && len(rest) > 7 && (rest[7] == ' ' || rest[7] == '\t'):
-				matchedKeyword = "defimpl"
-			case strings.HasPrefix(rest, "defprotocol") && len(rest) > 11 && (rest[11] == ' ' || rest[11] == '\t'):
-				matchedKeyword = "defprotocol"
-			}
-			if matchedKeyword != "" {
-				after := strings.TrimLeft(rest[len(matchedKeyword)+1:], " \t")
-				name := parser.ScanModuleName(after)
-				if name != "" {
-					fullName := name
-					if !strings.Contains(name, ".") && currentModule != "" {
-						fullName = currentModule + "." + name
-					}
-
-					kind := defKindToSymbolKind(matchedKeyword)
-					if matchedKeyword == "defmodule" {
-						kind = defKindToSymbolKind("module")
-					}
-
-					nameCol := strings.Index(line, name)
-					if nameCol < 0 {
-						nameCol = trimStart
-					}
-
-					entryIdx := len(entries)
-					moduleParentIdx := -1
-					if len(moduleStack) > 0 {
-						moduleParentIdx = moduleStack[len(moduleStack)-1].entryIdx
-					}
-					entries = append(entries, symbolEntry{
-						symbol: protocol.DocumentSymbol{
-							Name:   name,
-							Detail: matchedKeyword,
-							Kind:   kind,
-							Range: protocol.Range{
-								Start: protocol.Position{Line: uint32(lineIdx), Character: 0},
-								End:   protocol.Position{Line: uint32(lastLine), Character: 0},
-							},
-							SelectionRange: protocol.Range{
-								Start: protocol.Position{Line: uint32(lineIdx), Character: uint32(nameCol)},
-								End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(nameCol + len(name))},
-							},
-						},
-						module:    currentModule,
-						parentIdx: moduleParentIdx,
-					})
-					moduleStack = append(moduleStack, blockFrame{name: fullName, indent: trimStart, entryIdx: entryIdx})
-					continue
-				}
-			}
-
-			// Function/macro/guard/delegate definitions
-			if currentModule != "" {
-				if kind, funcName, ok := parser.ScanFuncDef(rest); ok {
-					arity := parser.ExtractArity(line, funcName)
-					nameWithArity := fmt.Sprintf("%s/%d", funcName, arity)
-
-					nameCol := strings.Index(line, funcName)
-					if nameCol < 0 {
-						nameCol = trimStart
-					}
-
-					hasDoBlock := false
-					trimmedRight := strings.TrimRight(rest, " \t\r")
-					if strings.HasSuffix(trimmedRight, " do") || strings.HasSuffix(trimmedRight, "\tdo") {
-						hasDoBlock = true
-					}
-
-					rangeEnd := protocol.Position{Line: uint32(lineIdx), Character: uint32(len(line))}
-					if hasDoBlock {
-						rangeEnd = protocol.Position{Line: uint32(lastLine), Character: 0}
-					}
-
-					entryIdx := len(entries)
-					entries = append(entries, symbolEntry{
-						symbol: protocol.DocumentSymbol{
-							Name:   nameWithArity,
-							Detail: kind,
-							Kind:   defKindToSymbolKind(kind),
-							Range: protocol.Range{
-								Start: protocol.Position{Line: uint32(lineIdx), Character: 0},
-								End:   rangeEnd,
-							},
-							SelectionRange: protocol.Range{
-								Start: protocol.Position{Line: uint32(lineIdx), Character: uint32(nameCol)},
-								End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(nameCol + len(funcName))},
-							},
-						},
-						module:    currentModule,
-						parentIdx: currentParentIdx(),
-					})
-
-					if hasDoBlock {
-						funcStack = append(funcStack, blockFrame{indent: trimStart, entryIdx: entryIdx})
-					}
-				} else if strings.HasPrefix(rest, "defstruct ") || strings.HasPrefix(rest, "defstruct\t") {
-					entries = append(entries, symbolEntry{
-						symbol: protocol.DocumentSymbol{
-							Name:   "defstruct",
-							Detail: "defstruct",
-							Kind:   defKindToSymbolKind("defstruct"),
-							Range: protocol.Range{
-								Start: protocol.Position{Line: uint32(lineIdx), Character: 0},
-								End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(len(line))},
-							},
-							SelectionRange: protocol.Range{
-								Start: protocol.Position{Line: uint32(lineIdx), Character: uint32(trimStart)},
-								End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(trimStart + 9)},
-							},
-						},
-						module:    currentModule,
-						parentIdx: currentParentIdx(),
-					})
-				} else if strings.HasPrefix(rest, "defexception ") || strings.HasPrefix(rest, "defexception\t") {
-					entries = append(entries, symbolEntry{
-						symbol: protocol.DocumentSymbol{
-							Name:   "defexception",
-							Detail: "defexception",
-							Kind:   defKindToSymbolKind("defexception"),
-							Range: protocol.Range{
-								Start: protocol.Position{Line: uint32(lineIdx), Character: 0},
-								End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(len(line))},
-							},
-							SelectionRange: protocol.Range{
-								Start: protocol.Position{Line: uint32(lineIdx), Character: uint32(trimStart)},
-								End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(trimStart + 12)},
-							},
-						},
-						module:    currentModule,
-						parentIdx: currentParentIdx(),
-					})
-				}
-			}
-			continue
+	// lineEndChar returns the character length of the given 0-based line index.
+	lineEndChar := func(lineIdx int) int {
+		if lineIdx >= 0 && lineIdx < len(lines) {
+			return len(lines[lineIdx])
 		}
+		return 0
+	}
 
-		// '@' — type definitions and @behaviour refs
-		if first == '@' {
-			if currentModule == "" {
+	// isLineFirstSignificant returns true if tokens[i] is the first
+	// non-EOL/comment token on its line.
+	isLineFirstSignificant := func(i int) bool {
+		tokLine := tokens[i].Line
+		for j := i - 1; j >= 0; j-- {
+			k := tokens[j].Kind
+			if k == parser.TokEOL || k == parser.TokEOF {
+				return true
+			}
+			if k == parser.TokComment {
 				continue
 			}
-			var kind string
-			var afterKw string
-			if strings.HasPrefix(rest, "@typep") && len(rest) > 6 && (rest[6] == ' ' || rest[6] == '\t') {
-				kind = "typep"
-				afterKw = strings.TrimLeft(rest[6:], " \t")
-			} else if strings.HasPrefix(rest, "@type") && len(rest) > 5 && (rest[5] == ' ' || rest[5] == '\t') {
-				kind = "type"
-				afterKw = strings.TrimLeft(rest[5:], " \t")
-			} else if strings.HasPrefix(rest, "@opaque") && len(rest) > 7 && (rest[7] == ' ' || rest[7] == '\t') {
-				kind = "opaque"
-				afterKw = strings.TrimLeft(rest[7:], " \t")
-			} else if strings.HasPrefix(rest, "@macrocallback") && len(rest) > 14 && (rest[14] == ' ' || rest[14] == '\t') {
-				kind = "macrocallback"
-				afterKw = strings.TrimLeft(rest[14:], " \t")
-			} else if strings.HasPrefix(rest, "@callback") && len(rest) > 9 && (rest[9] == ' ' || rest[9] == '\t') {
-				kind = "callback"
-				afterKw = strings.TrimLeft(rest[9:], " \t")
+			if tokens[j].Line == tokLine {
+				return false
 			}
-			if kind != "" {
-				name := parser.ScanFuncName(afterKw)
-				if name != "" {
-					arity := parser.ExtractArity(line, name)
-					nameWithArity := fmt.Sprintf("%s/%d", name, arity)
-
-					nameCol := strings.Index(line, name)
-					if nameCol < 0 {
-						nameCol = trimStart
-					}
-
-					entries = append(entries, symbolEntry{
-						symbol: protocol.DocumentSymbol{
-							Name:   nameWithArity,
-							Detail: "@" + kind,
-							Kind:   defKindToSymbolKind(kind),
-							Range: protocol.Range{
-								Start: protocol.Position{Line: uint32(lineIdx), Character: 0},
-								End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(len(line))},
-							},
-							SelectionRange: protocol.Range{
-								Start: protocol.Position{Line: uint32(lineIdx), Character: uint32(nameCol)},
-								End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(nameCol + len(name))},
-							},
-						},
-						module:    currentModule,
-						parentIdx: currentParentIdx(),
-					})
-				}
-			}
-			continue
+			return true
 		}
+		return true
+	}
 
-		// Bare macro calls with do blocks (describe, test, setup, etc.)
-		if currentModule != "" && first >= 'a' && first <= 'z' {
-			trimmedRight := strings.TrimRight(rest, " \t\r")
-			if strings.HasSuffix(trimmedRight, " do") || strings.HasSuffix(trimmedRight, "\tdo") {
-				macroName := parser.ScanFuncName(rest)
-				if macroName != "" && !parser.IsElixirKeyword(macroName) {
-					afterName := rest[len(macroName):]
-					doIdx := strings.LastIndex(trimmedRight, " do")
-					if doIdx < 0 {
-						doIdx = strings.LastIndex(trimmedRight, "\tdo")
-					}
-					label := macroName
-					if doIdx > len(macroName) {
-						arg := strings.TrimSpace(afterName[:doIdx-len(macroName)])
-						if len(arg) >= 2 && arg[0] == '"' && arg[len(arg)-1] == '"' {
-							arg = arg[1 : len(arg)-1]
-						}
-						if arg != "" {
-							label = macroName + " " + arg
-						}
-					}
+	for i := 0; i < n; i++ {
+		tok := tokens[i]
 
-					entryIdx := len(entries)
-					entries = append(entries, symbolEntry{
-						symbol: protocol.DocumentSymbol{
-							Name:   label,
-							Detail: macroName,
-							Kind:   protocol.SymbolKindFunction,
-							Range: protocol.Range{
-								Start: protocol.Position{Line: uint32(lineIdx), Character: 0},
-								End:   protocol.Position{Line: uint32(lastLine), Character: 0},
-							},
-							SelectionRange: protocol.Range{
-								Start: protocol.Position{Line: uint32(lineIdx), Character: uint32(trimStart)},
-								End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(trimStart + len(macroName))},
-							},
-						},
-						module:    currentModule,
-						parentIdx: currentParentIdx(),
-					})
-					funcStack = append(funcStack, blockFrame{indent: trimStart, entryIdx: entryIdx})
-				}
+		switch tok.Kind {
+		case parser.TokEnd:
+			if !isLineFirstSignificant(i) {
+				parser.TrackBlockDepth(tok.Kind, &depth)
+				continue
 			}
+			lineIdx := tok.Line - 1
+			endPos := protocol.Position{Line: uint32(lineIdx), Character: uint32(lineEndChar(lineIdx))}
+
+			prevDepth := depth
+			parser.TrackBlockDepth(tok.Kind, &depth)
+
+			if len(funcStack) > 0 && funcStack[len(funcStack)-1].depth == prevDepth {
+				entries[funcStack[len(funcStack)-1].entryIdx].symbol.Range.End = endPos
+				funcStack = funcStack[:len(funcStack)-1]
+			} else if len(moduleStack) > 0 && moduleStack[len(moduleStack)-1].depth == prevDepth {
+				entries[moduleStack[len(moduleStack)-1].entryIdx].symbol.Range.End = endPos
+				moduleStack = moduleStack[:len(moduleStack)-1]
+			}
+
+		case parser.TokDefmodule, parser.TokDefprotocol, parser.TokDefimpl:
+			if !isLineFirstSignificant(i) {
+				continue
+			}
+			keyword := tokText(tok)
+			lineIdx := tok.Line - 1
+			indent := tokCol(tok)
+
+			j := nextSig(i + 1)
+			name, _ := parser.CollectModuleName(source, tokens, n, j)
+			if name == "" {
+				continue
+			}
+
+			curMod := currentModule()
+			fullName := name
+			if !strings.Contains(name, ".") && curMod != "" {
+				fullName = curMod + "." + name
+			}
+
+			kind := defKindToSymbolKind(keyword)
+			if keyword == "defmodule" {
+				kind = defKindToSymbolKind("module")
+			}
+
+			nameCol := strings.Index(lines[lineIdx], name)
+			if nameCol < 0 {
+				nameCol = indent
+			}
+
+			entryIdx := len(entries)
+			moduleParentIdx := -1
+			if len(moduleStack) > 0 {
+				moduleParentIdx = moduleStack[len(moduleStack)-1].entryIdx
+			}
+			entries = append(entries, symbolEntry{
+				symbol: protocol.DocumentSymbol{
+					Name:   name,
+					Detail: keyword,
+					Kind:   kind,
+					Range: protocol.Range{
+						Start: protocol.Position{Line: uint32(lineIdx), Character: 0},
+						End:   protocol.Position{Line: uint32(lastLine), Character: 0},
+					},
+					SelectionRange: protocol.Range{
+						Start: protocol.Position{Line: uint32(lineIdx), Character: uint32(nameCol)},
+						End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(nameCol + len(name))},
+					},
+				},
+				module:    curMod,
+				parentIdx: moduleParentIdx,
+			})
+			_, nextPos, hasDoBlock := parser.ScanForwardToBlockDo(tokens, n, j)
+			if hasDoBlock {
+				depth++
+				moduleStack = append(moduleStack, blockFrame{name: fullName, depth: depth, entryIdx: entryIdx})
+				i = nextPos - 1
+			}
+
+		case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
+			parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate:
+			if !isLineFirstSignificant(i) {
+				continue
+			}
+			curMod := currentModule()
+			if curMod == "" {
+				continue
+			}
+			kind := tokText(tok)
+			lineIdx := tok.Line - 1
+
+			j := nextSig(i + 1)
+			if j >= n || tokens[j].Kind != parser.TokIdent {
+				continue
+			}
+			funcName := tokText(tokens[j])
+			nameCol := tokCol(tokens[j])
+			j = nextSig(j + 1)
+			arity, _, _, _ := parser.CollectParams(source, tokens, n, j)
+			nameWithArity := fmt.Sprintf("%s/%d", funcName, arity)
+
+			_, nextPos, hasDoBlock := parser.ScanForwardToBlockDo(tokens, n, j)
+
+			rangeEnd := protocol.Position{Line: uint32(lineIdx), Character: uint32(lineEndChar(lineIdx))}
+			if hasDoBlock {
+				rangeEnd = protocol.Position{Line: uint32(lastLine), Character: 0}
+			}
+
+			entryIdx := len(entries)
+			entries = append(entries, symbolEntry{
+				symbol: protocol.DocumentSymbol{
+					Name:   nameWithArity,
+					Detail: kind,
+					Kind:   defKindToSymbolKind(kind),
+					Range: protocol.Range{
+						Start: protocol.Position{Line: uint32(lineIdx), Character: 0},
+						End:   rangeEnd,
+					},
+					SelectionRange: protocol.Range{
+						Start: protocol.Position{Line: uint32(lineIdx), Character: uint32(nameCol)},
+						End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(nameCol + len(funcName))},
+					},
+				},
+				module:    curMod,
+				parentIdx: currentParentIdx(),
+			})
+
+			if hasDoBlock {
+				depth++
+				funcStack = append(funcStack, blockFrame{depth: depth, entryIdx: entryIdx})
+				i = nextPos - 1
+			}
+
+		case parser.TokDefstruct:
+			if !isLineFirstSignificant(i) {
+				continue
+			}
+			curMod := currentModule()
+			if curMod == "" {
+				continue
+			}
+			lineIdx := tok.Line - 1
+			indent := tokCol(tok)
+			entries = append(entries, symbolEntry{
+				symbol: protocol.DocumentSymbol{
+					Name:   "defstruct",
+					Detail: "defstruct",
+					Kind:   defKindToSymbolKind("defstruct"),
+					Range: protocol.Range{
+						Start: protocol.Position{Line: uint32(lineIdx), Character: 0},
+						End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(lineEndChar(lineIdx))},
+					},
+					SelectionRange: protocol.Range{
+						Start: protocol.Position{Line: uint32(lineIdx), Character: uint32(indent)},
+						End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(indent + 9)},
+					},
+				},
+				module:    curMod,
+				parentIdx: currentParentIdx(),
+			})
+
+		case parser.TokDefexception:
+			if !isLineFirstSignificant(i) {
+				continue
+			}
+			curMod := currentModule()
+			if curMod == "" {
+				continue
+			}
+			lineIdx := tok.Line - 1
+			indent := tokCol(tok)
+			entries = append(entries, symbolEntry{
+				symbol: protocol.DocumentSymbol{
+					Name:   "defexception",
+					Detail: "defexception",
+					Kind:   defKindToSymbolKind("defexception"),
+					Range: protocol.Range{
+						Start: protocol.Position{Line: uint32(lineIdx), Character: 0},
+						End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(lineEndChar(lineIdx))},
+					},
+					SelectionRange: protocol.Range{
+						Start: protocol.Position{Line: uint32(lineIdx), Character: uint32(indent)},
+						End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(indent + 12)},
+					},
+				},
+				module:    curMod,
+				parentIdx: currentParentIdx(),
+			})
+
+		case parser.TokAttrType:
+			if !isLineFirstSignificant(i) {
+				continue
+			}
+			curMod := currentModule()
+			if curMod == "" {
+				continue
+			}
+			attrText := tokText(tok)
+			var kind string
+			switch attrText {
+			case "@typep":
+				kind = "typep"
+			case "@type":
+				kind = "type"
+			case "@opaque":
+				kind = "opaque"
+			default:
+				continue
+			}
+			lineIdx := tok.Line - 1
+
+			j := nextSig(i + 1)
+			if j >= n || tokens[j].Kind != parser.TokIdent {
+				continue
+			}
+			name := tokText(tokens[j])
+			nameCol := tokCol(tokens[j])
+			j = nextSig(j + 1)
+			arity, _, _, _ := parser.CollectParams(source, tokens, n, j)
+			nameWithArity := fmt.Sprintf("%s/%d", name, arity)
+
+			entries = append(entries, symbolEntry{
+				symbol: protocol.DocumentSymbol{
+					Name:   nameWithArity,
+					Detail: "@" + kind,
+					Kind:   defKindToSymbolKind(kind),
+					Range: protocol.Range{
+						Start: protocol.Position{Line: uint32(lineIdx), Character: 0},
+						End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(lineEndChar(lineIdx))},
+					},
+					SelectionRange: protocol.Range{
+						Start: protocol.Position{Line: uint32(lineIdx), Character: uint32(nameCol)},
+						End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(nameCol + len(name))},
+					},
+				},
+				module:    curMod,
+				parentIdx: currentParentIdx(),
+			})
+
+		case parser.TokAttrCallback:
+			if !isLineFirstSignificant(i) {
+				continue
+			}
+			curMod := currentModule()
+			if curMod == "" {
+				continue
+			}
+			attrText := tokText(tok)
+			var kind string
+			switch attrText {
+			case "@callback":
+				kind = "callback"
+			case "@macrocallback":
+				kind = "macrocallback"
+			default:
+				continue
+			}
+			lineIdx := tok.Line - 1
+
+			j := nextSig(i + 1)
+			if j >= n || tokens[j].Kind != parser.TokIdent {
+				continue
+			}
+			name := tokText(tokens[j])
+			nameCol := tokCol(tokens[j])
+			j = nextSig(j + 1)
+			arity, _, _, _ := parser.CollectParams(source, tokens, n, j)
+			nameWithArity := fmt.Sprintf("%s/%d", name, arity)
+
+			entries = append(entries, symbolEntry{
+				symbol: protocol.DocumentSymbol{
+					Name:   nameWithArity,
+					Detail: "@" + kind,
+					Kind:   defKindToSymbolKind(kind),
+					Range: protocol.Range{
+						Start: protocol.Position{Line: uint32(lineIdx), Character: 0},
+						End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(lineEndChar(lineIdx))},
+					},
+					SelectionRange: protocol.Range{
+						Start: protocol.Position{Line: uint32(lineIdx), Character: uint32(nameCol)},
+						End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(nameCol + len(name))},
+					},
+				},
+				module:    curMod,
+				parentIdx: currentParentIdx(),
+			})
+
+		case parser.TokIdent:
+			// Bare macro calls with do blocks (describe, test, setup, etc.)
+			curMod := currentModule()
+			if curMod == "" {
+				continue
+			}
+			if !isLineFirstSignificant(i) {
+				continue
+			}
+			macroName := tokText(tok)
+			if parser.IsElixirKeyword(macroName) {
+				continue
+			}
+			// Skip keyword keys like "reduce:" — the token after the ident is TokColon
+			if i+1 < n && tokens[i+1].Kind == parser.TokColon {
+				continue
+			}
+			doIdx, nextPos, hasDoBlock := parser.ScanForwardToBlockDo(tokens, n, i+1)
+			if !hasDoBlock {
+				continue
+			}
+
+			lineIdx := tok.Line - 1
+			indent := tokCol(tok)
+
+			// Extract the argument between the macro name and `do` from source bytes
+			label := macroName
+			argBytes := source[tok.End:tokens[doIdx].Start]
+			arg := strings.TrimSpace(string(argBytes))
+			if len(arg) >= 2 && arg[0] == '"' && arg[len(arg)-1] == '"' {
+				arg = arg[1 : len(arg)-1]
+			}
+			if arg != "" {
+				label = macroName + " " + arg
+			}
+
+			entryIdx := len(entries)
+			entries = append(entries, symbolEntry{
+				symbol: protocol.DocumentSymbol{
+					Name:   label,
+					Detail: macroName,
+					Kind:   protocol.SymbolKindFunction,
+					Range: protocol.Range{
+						Start: protocol.Position{Line: uint32(lineIdx), Character: 0},
+						End:   protocol.Position{Line: uint32(lastLine), Character: 0},
+					},
+					SelectionRange: protocol.Range{
+						Start: protocol.Position{Line: uint32(lineIdx), Character: uint32(indent)},
+						End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(indent + len(macroName))},
+					},
+				},
+				module:    curMod,
+				parentIdx: currentParentIdx(),
+			})
+			depth++
+			funcStack = append(funcStack, blockFrame{depth: depth, entryIdx: entryIdx})
+			i = nextPos - 1
+
+		case parser.TokDo, parser.TokFn:
+			parser.TrackBlockDepth(tok.Kind, &depth)
 		}
 	}
 
 	// Build hierarchical tree using parentIdx references.
-	// Process in reverse so children are attached before their parents are read.
 	type symNode struct {
 		sym      protocol.DocumentSymbol
-		children []int // indices of child entries
+		children []int
 	}
 	nodes := make([]symNode, len(entries))
 	for i, e := range entries {
@@ -2496,72 +2624,63 @@ func (s *Server) FoldingRanges(ctx context.Context, params *protocol.FoldingRang
 		return nil, nil
 	}
 
-	lines := strings.Split(text, "\n")
-	var ranges []protocol.FoldingRange
-	inHeredoc := false
-	heredocStart := 0
+	// Use cached tokens if available
+	var tokens []parser.Token
+	var source []byte
+	if cachedTokens, cachedSrc, ok := s.docs.GetTokens(docURI); ok {
+		tokens = cachedTokens
+		source = cachedSrc
+	} else {
+		source = []byte(text)
+		tokens = parser.Tokenize(source)
+	}
+	n := len(tokens)
 
+	var ranges []protocol.FoldingRange
+
+	// Track do/fn..end blocks by depth
 	type blockStart struct {
-		line   int
-		indent int
+		line  int
+		depth int
 	}
 	var stack []blockStart
+	depth := 0
 
-	for i, line := range lines {
-		// Track heredoc boundaries as foldable regions (""" and ''')
-		isHeredocDelimiter := false
-		if strings.Contains(line, `"""`) {
-			if strings.Count(line, `"""`) < 2 {
-				isHeredocDelimiter = true
-			}
-		} else if strings.Contains(line, `'''`) {
-			if strings.Count(line, `'''`) < 2 {
-				isHeredocDelimiter = true
-			}
-		}
-		if isHeredocDelimiter {
-			if !inHeredoc {
-				inHeredoc = true
-				heredocStart = i
-			} else {
-				inHeredoc = false
-				if i > heredocStart {
-					ranges = append(ranges, protocol.FoldingRange{
-						StartLine: uint32(heredocStart),
-						EndLine:   uint32(i),
-					})
+	for i := 0; i < n; i++ {
+		tok := tokens[i]
+
+		switch tok.Kind {
+		case parser.TokHeredoc:
+			// Heredocs are single tokens spanning multiple lines — fold them
+			// Find the end line by scanning for last newline in the token
+			startLine := tok.Line
+			endLine := startLine
+			for j := tok.Start; j < tok.End; j++ {
+				if source[j] == '\n' {
+					endLine++
 				}
 			}
-			continue
-		}
-		if inHeredoc {
-			continue
-		}
+			if endLine > startLine {
+				ranges = append(ranges, protocol.FoldingRange{
+					StartLine: uint32(startLine - 1), // convert to 0-based
+					EndLine:   uint32(endLine - 1),
+				})
+			}
 
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" {
-			continue
-		}
-		indent := len(line) - len(strings.TrimLeft(line, " \t"))
+		case parser.TokDo, parser.TokFn:
+			parser.TrackBlockDepth(tok.Kind, &depth)
+			stack = append(stack, blockStart{line: tok.Line, depth: depth})
 
-		// Strip strings/comments for block detection so content like
-		// `x = "foo do"` doesn't create a false folding range.
-		stripped := strings.TrimSpace(parser.StripCommentsAndStrings(trimmed))
-
-		if parser.OpensBlock(stripped) {
-			stack = append(stack, blockStart{line: i, indent: indent})
-			continue
-		}
-
-		// Pop on "end" at matching indent
-		if parser.IsEnd(stripped) && len(stack) > 0 {
-			top := stack[len(stack)-1]
-			if indent == top.indent {
+		case parser.TokEnd:
+			prevDepth := depth
+			parser.TrackBlockDepth(tok.Kind, &depth)
+			if len(stack) > 0 && stack[len(stack)-1].depth == prevDepth {
+				top := stack[len(stack)-1]
 				stack = stack[:len(stack)-1]
-				if i > top.line {
+				if tok.Line > top.line {
 					ranges = append(ranges, protocol.FoldingRange{
-						StartLine: uint32(top.line),
-						EndLine:   uint32(i),
+						StartLine: uint32(top.line - 1), // convert to 0-based
+						EndLine:   uint32(tok.Line - 1),
 					})
 				}
 			}
@@ -2627,22 +2746,29 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 		return nil, nil
 	}
 
-	expr := ExtractExpression(lines[lineNum], col)
-	if expr == "" {
+	// Get cached tokens for efficient multi-query operations
+	tf := s.docs.GetTokenizedFile(docURI)
+	if tf == nil {
+		tf = NewTokenizedFile(text)
+	}
+
+	exprCtx := tf.ExpressionAtCursor(lineNum, col)
+	if exprCtx.Empty() {
 		return nil, nil
 	}
 
-	if strings.Contains(expr, "__MODULE__") {
-		for _, l := range lines {
-			if m := parser.DefmoduleRe.FindStringSubmatch(l); m != nil {
-				expr = strings.ReplaceAll(expr, "__MODULE__", m[1])
-				break
-			}
+	expr := tf.ResolveModuleExpr(exprCtx.Expr(), lineNum)
+	moduleRef, functionName := ExtractModuleAndFunction(expr)
+
+	// Inside a multi-line alias block like "alias MyModule.{ Something }",
+	// prepend the parent so "Something" resolves to "MyModule.Something".
+	if moduleRef != "" {
+		if aliasParent, inBlock := ExtractAliasBlockParent(lines, lineNum); inBlock {
+			moduleRef = aliasParent + "." + moduleRef
 		}
 	}
 
-	moduleRef, functionName := ExtractModuleAndFunction(expr)
-	aliases := ExtractAliasesInScope(text, lineNum)
+	aliases := tf.ExtractAliasesInScope(lineNum)
 	s.mergeAliasesFromUse(text, aliases)
 
 	if moduleRef == "" {
@@ -2650,14 +2776,14 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 			return nil, nil
 		}
 
-		currentModule := firstDefmodule(lines)
+		currentModule := tf.FirstDefmodule()
 		fullModule := s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, lines, lineNum, functionName, aliases)
 
 		if fullModule != "" {
 			// Current module — hover from the buffer directly
 			if fullModule == currentModule {
-				if line, found := FindFunctionDefinition(text, functionName); found {
-					return s.hoverFromBuffer(text, line-1)
+				if line, found := tf.FindFunctionDefinition(functionName); found {
+					return s.hoverFromBuffer(tf, text, line-1)
 				}
 			}
 
@@ -2724,11 +2850,12 @@ func (s *Server) Implementation(ctx context.Context, params *protocol.Implementa
 		return nil, nil
 	}
 
-	expr := ExtractExpression(lines[lineNum], col)
-	if expr == "" {
-		return nil, nil
+	tf := s.docs.GetTokenizedFile(docURI)
+	if tf == nil {
+		tf = NewTokenizedFile(text)
 	}
-	_, functionName := ExtractModuleAndFunction(expr)
+	exprCtx := tf.ExpressionAtCursor(lineNum, col)
+	functionName := exprCtx.FunctionName
 	if functionName == "" {
 		return nil, nil
 	}
@@ -2789,11 +2916,13 @@ func (s *Server) PrepareRename(ctx context.Context, params *protocol.PrepareRena
 		return nil, nil
 	}
 
-	expr, exprStart := extractExpressionBounds(lines[lineNum], col)
-	moduleRef, functionName := "", ""
-	if expr != "" {
-		moduleRef, functionName = ExtractModuleAndFunction(expr)
+	tf := s.docs.GetTokenizedFile(docURI)
+	if tf == nil {
+		tf = NewTokenizedFile(text)
 	}
+	exprCtx := tf.ExpressionAtCursor(lineNum, col)
+	moduleRef, functionName := exprCtx.ModuleRef, exprCtx.FunctionName
+	exprStart := exprCtx.ExprStart
 
 	// For bare identifiers (no module qualifier), check tree-sitter variables
 	// first — a local variable shadows a same-named function in Elixir.
@@ -2817,7 +2946,7 @@ func (s *Server) PrepareRename(ctx context.Context, params *protocol.PrepareRena
 	}
 
 	// Try module/function rename via the index
-	if expr != "" {
+	if !exprCtx.Empty() {
 		aliases := ExtractAliasesInScope(text, lineNum)
 
 		// Detect `as:` aliases — these are file-local renames, not module renames.
@@ -2933,48 +3062,52 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 		return nil, nil
 	}
 
-	expr := ExtractExpression(lines[lineNum], col)
-	if expr == "" {
+	// Get cached tokens for efficient multi-query operations
+	tf := s.docs.GetTokenizedFile(docURI)
+	if tf == nil {
+		tf = NewTokenizedFile(text)
+	}
+
+	cursorCtx := tf.ExpressionAtCursor(lineNum, col)
+	if cursorCtx.Empty() {
 		s.debugf("References: no expression at cursor")
 		return nil, nil
 	}
 
 	// Special case: cursor on defmacro __using__ — find all `use ModuleName` sites.
-	if expr == "__using__" {
-		for _, l := range lines {
-			if m := parser.DefmoduleRe.FindStringSubmatch(l); m != nil {
-				s.debugf("References: __using__ in module %s — looking up use sites", m[1])
-				allRefs, err := s.store.LookupReferences(m[1], "")
-				if err != nil {
-					return nil, nil
-				}
-				var locations []protocol.Location
-				for _, r := range allRefs {
-					if r.Kind == "use" {
-						locations = append(locations, protocol.Location{
-							URI:   uri.File(r.FilePath),
-							Range: lineRange(r.Line - 1),
-						})
-					}
-				}
-				s.debugf("References: returning %d use sites", len(locations))
-				return locations, nil
+	if cursorCtx.Expr() == "__using__" {
+		moduleName := tf.FirstDefmodule()
+		if moduleName != "" {
+			s.debugf("References: __using__ in module %s — looking up use sites", moduleName)
+			allRefs, err := s.store.LookupReferences(moduleName, "")
+			if err != nil {
+				return nil, nil
 			}
+			var locations []protocol.Location
+			for _, r := range allRefs {
+				if r.Kind == "use" {
+					locations = append(locations, protocol.Location{
+						URI:   uri.File(r.FilePath),
+						Range: lineRange(r.Line - 1),
+					})
+				}
+			}
+			s.debugf("References: returning %d use sites", len(locations))
+			return locations, nil
 		}
 		return nil, nil
 	}
 
-	if strings.Contains(expr, "__MODULE__") {
-		for _, l := range lines {
-			if m := parser.DefmoduleRe.FindStringSubmatch(l); m != nil {
-				expr = strings.ReplaceAll(expr, "__MODULE__", m[1])
-				break
-			}
+	expr := tf.ResolveModuleExpr(cursorCtx.Expr(), lineNum)
+	moduleRef, functionName := ExtractModuleAndFunction(expr)
+
+	if moduleRef != "" {
+		if aliasParent, inBlock := ExtractAliasBlockParent(lines, lineNum); inBlock {
+			moduleRef = aliasParent + "." + moduleRef
 		}
 	}
 
-	moduleRef, functionName := ExtractModuleAndFunction(expr)
-	aliases := ExtractAliasesInScope(text, lineNum)
+	aliases := tf.ExtractAliasesInScope(lineNum)
 	s.mergeAliasesFromUse(text, aliases)
 	s.debugf("References: expr=%q module=%q function=%q", expr, moduleRef, functionName)
 
@@ -3019,7 +3152,7 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 		// When cursor is on a defmodule line, use the store's fully-qualified
 		// name directly — the user is asking about the module being defined,
 		// not a reference that might be shadowed by an alias with the same name.
-		if m := parser.DefmoduleRe.FindStringSubmatch(lines[lineNum]); m != nil {
+		if _, isDefmod := IsDefmoduleLine(text, lineNum); isDefmod {
 			if enclosing := s.store.LookupEnclosingModule(uriToPath(params.TextDocument.URI), lineNum+1); enclosing != "" {
 				fullModule = enclosing
 			} else {
@@ -3171,6 +3304,7 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 	s.debugf("References: returning %d locations", len(locations))
 	return locations, nil
 }
+
 func (s *Server) Rename(ctx context.Context, params *protocol.RenameParams) (*protocol.WorkspaceEdit, error) {
 	docURI := string(params.TextDocument.URI)
 	text, ok := s.docs.Get(docURI)
@@ -3185,11 +3319,12 @@ func (s *Server) Rename(ctx context.Context, params *protocol.RenameParams) (*pr
 		return nil, nil
 	}
 
-	expr, _ := extractExpressionBounds(lines[lineNum], col)
-	moduleRef, functionName := "", ""
-	if expr != "" {
-		moduleRef, functionName = ExtractModuleAndFunction(expr)
+	tf := s.docs.GetTokenizedFile(docURI)
+	if tf == nil {
+		tf = NewTokenizedFile(text)
 	}
+	renameCtx := tf.ExpressionAtCursor(lineNum, col)
+	moduleRef, functionName := renameCtx.ModuleRef, renameCtx.FunctionName
 
 	// For bare identifiers, check tree-sitter variables first — a local
 	// variable shadows a same-named function in Elixir.
@@ -3215,7 +3350,7 @@ func (s *Server) Rename(ctx context.Context, params *protocol.RenameParams) (*pr
 	}
 
 	// Try module/function rename via the index
-	if expr != "" {
+	if !renameCtx.Empty() {
 		aliases := ExtractAliasesInScope(text, lineNum)
 
 		// Detect `as:` aliases — file-local rename of the alias name, not
@@ -4008,6 +4143,7 @@ func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string) *
 	applyTokenEdits := func(origLines []string, fileSites []renameSite) []string {
 		lines := make([]string, len(origLines))
 		copy(lines, origLines)
+
 		for _, site := range fileSites {
 			if site.line-1 >= len(lines) {
 				continue
@@ -4240,7 +4376,13 @@ func (s *Server) SignatureHelp(ctx context.Context, params *protocol.SignatureHe
 	lineNum := int(params.Position.Line)
 	col := int(params.Position.Character)
 
-	funcExpr, argIndex, found := ExtractCallContext(text, lineNum, col)
+	// Get cached tokens for efficient multi-query operations
+	tf := s.docs.GetTokenizedFile(docURI)
+	if tf == nil {
+		tf = NewTokenizedFile(text)
+	}
+
+	funcExpr, argIndex, found := tf.CallContextAtCursor(lineNum, col)
 	if !found {
 		return nil, nil
 	}
@@ -4250,7 +4392,7 @@ func (s *Server) SignatureHelp(ctx context.Context, params *protocol.SignatureHe
 		return nil, nil
 	}
 
-	aliases := ExtractAliasesInScope(text, lineNum)
+	aliases := tf.ExtractAliasesInScope(lineNum)
 	s.mergeAliasesFromUse(text, aliases)
 	lines := strings.Split(text, "\n")
 
@@ -4263,13 +4405,13 @@ func (s *Server) SignatureHelp(ctx context.Context, params *protocol.SignatureHe
 		}
 	} else {
 		// Bare function — check buffer, imports, use chains, Kernel
-		if defLine, found := FindFunctionDefinition(text, functionName); found {
+		if defLine, found := tf.FindFunctionDefinition(functionName); found {
 			// Build signature from buffer
 			paramNames := extractParamNames(lines, defLine-1)
 			if paramNames == nil {
 				return nil, nil
 			}
-			sig := buildSignature(functionName, paramNames, lines, defLine-1)
+			sig := buildSignature(functionName, paramNames, tf, lines, defLine-1)
 			return &protocol.SignatureHelp{
 				Signatures:      []protocol.SignatureInformation{sig},
 				ActiveSignature: 0,
@@ -4277,7 +4419,7 @@ func (s *Server) SignatureHelp(ctx context.Context, params *protocol.SignatureHe
 			}, nil
 		}
 
-		for _, mod := range ExtractImports(text) {
+		for _, mod := range tf.ExtractImports() {
 			if results, err := s.store.LookupFunction(mod, functionName); err == nil && len(results) > 0 {
 				result = &results[0]
 				break
@@ -4317,7 +4459,8 @@ func (s *Server) SignatureHelp(ctx context.Context, params *protocol.SignatureHe
 		return nil, nil
 	}
 
-	sig := buildSignature(functionName, paramNames, fileLines, defIdx)
+	tfDef := NewTokenizedFile(fileText)
+	sig := buildSignature(functionName, paramNames, tfDef, fileLines, defIdx)
 	return &protocol.SignatureHelp{
 		Signatures:      []protocol.SignatureInformation{sig},
 		ActiveSignature: 0,
@@ -4325,7 +4468,7 @@ func (s *Server) SignatureHelp(ctx context.Context, params *protocol.SignatureHe
 	}, nil
 }
 
-func buildSignature(functionName string, paramNames []string, lines []string, defIdx int) protocol.SignatureInformation {
+func buildSignature(functionName string, paramNames []string, tf *TokenizedFile, lines []string, defIdx int) protocol.SignatureInformation {
 	label := functionName + "(" + strings.Join(paramNames, ", ") + ")"
 
 	var params []protocol.ParameterInformation
@@ -4341,7 +4484,7 @@ func buildSignature(functionName string, paramNames []string, lines []string, de
 	}
 
 	// Add @spec and @doc as documentation if present
-	doc, spec := extractDocAbove(lines, defIdx)
+	doc, spec := tf.ExtractDocAbove(defIdx)
 	var docParts []string
 	if spec != "" {
 		docParts = append(docParts, "```elixir\n"+spec+"\n```")
@@ -4404,19 +4547,19 @@ func (s *Server) TypeDefinition(ctx context.Context, params *protocol.TypeDefini
 		return nil, nil
 	}
 
-	expr := ExtractExpression(lines[lineNum], col)
-	if expr == "" {
-		return nil, nil
+	tf := s.docs.GetTokenizedFile(docURI)
+	if tf == nil {
+		tf = NewTokenizedFile(text)
 	}
-
-	moduleRef, typeName := ExtractModuleAndFunction(expr)
+	typeCtx := tf.ExpressionAtCursor(lineNum, col)
+	typeName := typeCtx.FunctionName
 	if typeName == "" {
 		return nil, nil
 	}
 
-	aliases := ExtractAliasesInScope(text, lineNum)
+	aliases := tf.ExtractAliasesInScope(lineNum)
 	s.mergeAliasesFromUse(text, aliases)
-	fullModule := s.resolveModuleWithNesting(moduleRef, aliases, uriToPath(protocol.DocumentURI(docURI)), lineNum)
+	fullModule := s.resolveModuleWithNesting(typeCtx.ModuleRef, aliases, uriToPath(protocol.DocumentURI(docURI)), lineNum)
 
 	results, err := s.store.LookupFunction(fullModule, typeName)
 	if err != nil {
@@ -4477,21 +4620,21 @@ func (s *Server) PrepareCallHierarchy(ctx context.Context, params *protocol.Call
 		return nil, nil
 	}
 
-	expr := ExtractExpression(lines[lineNum], col)
-	if expr == "" {
-		return nil, nil
+	tf := s.docs.GetTokenizedFile(docURI)
+	if tf == nil {
+		tf = NewTokenizedFile(text)
 	}
-
-	moduleRef, functionName := ExtractModuleAndFunction(expr)
+	callCtx := tf.ExpressionAtCursor(lineNum, col)
+	functionName := callCtx.FunctionName
 	if functionName == "" {
 		return nil, nil
 	}
 
-	aliases := ExtractAliasesInScope(text, lineNum)
+	aliases := tf.ExtractAliasesInScope(lineNum)
 	s.mergeAliasesFromUse(text, aliases)
 	var fullModule string
-	if moduleRef != "" {
-		fullModule = resolveModule(moduleRef, aliases)
+	if callCtx.ModuleRef != "" {
+		fullModule = resolveModule(callCtx.ModuleRef, aliases)
 	} else {
 		fullModule = s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, lines, lineNum, functionName, aliases)
 	}
@@ -4513,7 +4656,7 @@ func (s *Server) PrepareCallHierarchy(ctx context.Context, params *protocol.Call
 	}
 
 	item := protocol.CallHierarchyItem{
-		Name:   fmt.Sprintf("%s.%s/%d", fullModule, functionName, parser.ExtractArity(lines[lineNum], functionName)),
+		Name:   fmt.Sprintf("%s.%s/%d", fullModule, functionName, r.Arity),
 		Kind:   protocol.SymbolKindFunction,
 		Detail: r.Kind,
 		URI:    protocol.DocumentURI(uri.File(r.FilePath)),

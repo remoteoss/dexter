@@ -752,6 +752,130 @@ end`)
 	}
 }
 
+func TestCompletion_AliasBlock_SimplePrefix(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/services.ex", `defmodule MyApp.Services.Accounts do
+end
+
+defmodule MyApp.Services.Analytics do
+end
+
+defmodule MyApp.Services.Billing do
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyModule do
+  alias MyApp.Services.{
+    Ac
+  }
+end`)
+
+	// cursor at "Ac" → line 2, col 6
+	items := completionAt(t, server, uri, 2, 6)
+	if !hasCompletionItem(items, "Accounts") {
+		t.Error("expected 'Accounts' in alias block completions")
+	}
+	if hasCompletionItem(items, "Analytics") {
+		t.Error("should not include 'Analytics' — doesn't match prefix 'Ac'")
+	}
+	if hasCompletionItem(items, "Billing") {
+		t.Error("should not include 'Billing' — doesn't match prefix 'Ac'")
+	}
+}
+
+func TestCompletion_AliasBlock_DottedPrefix(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/ecto.ex", `defmodule MyApp.Ecto.Paginator do
+end
+
+defmodule MyApp.Ecto.ChangesetHelpers do
+end
+
+defmodule MyApp.Accounts do
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyModule do
+  alias MyApp.{
+    Ecto.
+  }
+end`)
+
+	// cursor after "Ecto." → line 2, col 9
+	items := completionAt(t, server, uri, 2, 9)
+	if !hasCompletionItem(items, "Ecto.Paginator") {
+		t.Error("expected 'Ecto.Paginator' in alias block completions")
+	}
+	if !hasCompletionItem(items, "Ecto.ChangesetHelpers") {
+		t.Error("expected 'Ecto.ChangesetHelpers' in alias block completions")
+	}
+	if hasCompletionItem(items, "Accounts") {
+		t.Error("should not include 'Accounts' — not a child of MyApp.Ecto")
+	}
+}
+
+func TestCompletion_AliasBlock_DottedPrefixWithPartial(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/ecto.ex", `defmodule MyApp.Ecto.Paginator do
+end
+
+defmodule MyApp.Ecto.ChangesetHelpers do
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyModule do
+  alias MyApp.{
+    Ecto.Pag
+  }
+end`)
+
+	// cursor at "Ecto.Pag" → line 2, col 12
+	items := completionAt(t, server, uri, 2, 12)
+	if !hasCompletionItem(items, "Ecto.Paginator") {
+		t.Error("expected 'Ecto.Paginator' in alias block completions")
+	}
+	if hasCompletionItem(items, "Ecto.ChangesetHelpers") {
+		t.Error("should not include 'Ecto.ChangesetHelpers' — doesn't match prefix 'Pag'")
+	}
+}
+
+func TestCompletion_AliasBlock_EmptyPrefix(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/services.ex", `defmodule MyApp.Accounts do
+end
+
+defmodule MyApp.Billing do
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyModule do
+  alias MyApp.{
+
+  }
+end`)
+
+	// cursor on blank line inside the block → line 2, col 4
+	items := completionAt(t, server, uri, 2, 4)
+	if !hasCompletionItem(items, "Accounts") {
+		t.Error("expected 'Accounts' in alias block completions with empty prefix")
+	}
+	if !hasCompletionItem(items, "Billing") {
+		t.Error("expected 'Billing' in alias block completions with empty prefix")
+	}
+}
+
 func TestCompletion_ImportedFunctions(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
@@ -944,6 +1068,46 @@ func TestCompletion_NoResults(t *testing.T) {
 	items := completionAt(t, server, uri, 0, 2)
 	if len(items) != 0 {
 		t.Errorf("expected no completions on whitespace, got %d", len(items))
+	}
+}
+
+func TestCompletion_FunctionResultDotNoResults(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", `defmodule MyApp.Accounts do
+  def list, do: []
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyApp.Web do
+  alias MyApp.Accounts
+  Accounts.list.
+end`)
+
+	// col 16 = right after "Accounts.list." on line 2
+	items := completionAt(t, server, uri, 2, 16)
+	if len(items) != 0 {
+		t.Errorf("expected no completions after function result dot, got %d: %v", len(items), items)
+	}
+}
+
+func TestCompletion_VariableDotNoResults(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyApp.Web do
+  def run(config) do
+    config.
+  end
+end`)
+
+	// col 11 = right after "config." on line 2
+	items := completionAt(t, server, uri, 2, 11)
+	if len(items) != 0 {
+		t.Errorf("expected no completions after variable dot, got %d: %v", len(items), items)
 	}
 }
 
@@ -1254,6 +1418,47 @@ end`)
 	items = completionAt(t, server, uri, 3, 4)
 	if !hasCompletionItem(items, "triple") {
 		t.Error("expected 'triple' in completions from use-injected inline def")
+	}
+}
+
+func TestCompletion_MultilineUseOpts(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/custom_mock.ex", `defmodule MyApp.CustomMock do
+  def mock_func, do: :ok
+end
+`)
+
+	indexFile(t, server.store, server.projectRoot, "lib/mox_base.ex", `defmodule MyApp.MoxBase do
+  defmacro __using__(opts) do
+    mod = Keyword.get(opts, :mod, MyApp.DefaultMod)
+    quote do
+      import unquote(mod)
+    end
+  end
+end
+`)
+
+	uri := "file:///test.ex"
+	src := `defmodule MyApp.Test do
+  use MyApp.MoxBase,
+    mod: MyApp.CustomMock
+
+  def test, do: mock_func()
+end`
+	server.docs.Set(uri, src)
+
+	aliases := map[string]string{}
+	calls := ExtractUsesWithOpts(src, aliases)
+	found := false
+	for _, c := range calls {
+		if c.Module == "MyApp.MoxBase" && c.Opts["mod"] == "MyApp.CustomMock" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected use MyApp.MoxBase with mod: MyApp.CustomMock; got %+v", calls)
 	}
 }
 
@@ -1625,6 +1830,74 @@ end`
 	}
 	if hover == nil {
 		t.Fatal("expected hover result for Meta.source resolved via use-injected alias, got nil")
+	}
+}
+
+func TestDefinition_AliasInjectedByUse_MultiAliasUnexpectedTokens_NoHang(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Regression: malformed tokens inside a multi-alias brace list must not hang
+	// alias parsing, and valid children in the same list should still resolve.
+	schemaSrc := `defmodule MyApp.Schema do
+  defmacro __using__(_opts) do
+    quote do
+      alias MyApp.{:unexpected, Meta, 42}
+    end
+  end
+end`
+	metaSrc := `defmodule MyApp.Meta do
+  def source(x), do: x
+end`
+	callerSrc := `defmodule MyApp.MyCheck do
+  use MyApp.Schema
+
+  def run do
+    Meta.source(:foo)
+  end
+end`
+
+	indexFile(t, server.store, server.projectRoot, "lib/schema.ex", schemaSrc)
+	indexFile(t, server.store, server.projectRoot, "lib/meta.ex", metaSrc)
+
+	callerURI := "file://" + filepath.Join(server.projectRoot, "lib/my_check.ex")
+	server.docs.Set(callerURI, callerSrc)
+
+	type definitionResult struct {
+		locs []protocol.Location
+		err  error
+	}
+	done := make(chan definitionResult, 1)
+	go func() {
+		locs, err := server.Definition(context.Background(), &protocol.DefinitionParams{
+			TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+				TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(callerURI)},
+				Position:     protocol.Position{Line: 4, Character: 4},
+			},
+		})
+		done <- definitionResult{locs: locs, err: err}
+	}()
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		if len(got.locs) == 0 {
+			t.Fatal("expected definition for Meta from use-injected alias")
+		}
+		foundMeta := false
+		for _, loc := range got.locs {
+			if strings.Contains(string(loc.URI), "meta.ex") {
+				foundMeta = true
+				break
+			}
+		}
+		if !foundMeta {
+			t.Fatalf("expected definition location in meta.ex, got %v", got.locs)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("definition timed out; possible infinite loop in multi-alias brace scanning")
 	}
 }
 
@@ -3508,6 +3781,133 @@ end
 	}
 }
 
+func TestDocumentSymbol_ForReduceDoesNotAddDepth(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule MyApp.Chat do
+  defp handle_event(socket, message) do
+    for {_key, %State{} = state} <- socket.assigns,
+        state.topic == message.topic,
+        reduce: socket do
+      socket ->
+        process(socket, state, message)
+    end
+  end
+
+  defp other_func(x) do
+    x + 1
+  end
+end
+`
+	docURI := "file:///test/chat.ex"
+	server.docs.Set(docURI, content)
+
+	symbols := documentSymbols(t, server, docURI)
+
+	if len(symbols) != 1 {
+		t.Fatalf("expected 1 top-level symbol, got %d", len(symbols))
+	}
+
+	mod := symbols[0]
+	childNames := collectNames(mod.Children)
+
+	// Both functions should be direct children of the module, not nested.
+	// The "reduce: socket do" line must NOT be treated as a macro call.
+	expectedChildren := []string{"handle_event/2", "other_func/1"}
+	if len(childNames) != len(expectedChildren) {
+		t.Fatalf("expected %d children of module, got %d: %v", len(expectedChildren), len(childNames), childNames)
+	}
+	for i, name := range expectedChildren {
+		if childNames[i] != name {
+			t.Errorf("child %d: expected %q, got %q", i, name, childNames[i])
+		}
+	}
+
+	// Verify "reduce" is not present as a symbol anywhere
+	if found := findSymbol(symbols, "reduce socket"); found != nil {
+		t.Error("reduce should not appear as a document symbol")
+	}
+}
+
+func TestDocumentSymbol_MisindentedInnerEndDoesNotCloseFunction(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule MyApp do
+  def outer do
+    if true do
+      :ok
+  end
+      :still_in_outer
+      end
+
+  def after_func, do: :ok
+end
+`
+	docURI := "file:///test/misindented_end.ex"
+	server.docs.Set(docURI, content)
+
+	symbols := documentSymbols(t, server, docURI)
+	if len(symbols) != 1 {
+		t.Fatalf("expected 1 top-level symbol, got %d", len(symbols))
+	}
+
+	mod := symbols[0]
+	childNames := collectNames(mod.Children)
+	expectedChildren := []string{"outer/0", "after_func/0"}
+	if len(childNames) != len(expectedChildren) {
+		t.Fatalf("expected %d children of module, got %d: %v", len(expectedChildren), len(childNames), childNames)
+	}
+	for i, name := range expectedChildren {
+		if childNames[i] != name {
+			t.Errorf("child %d: expected %q, got %q", i, name, childNames[i])
+		}
+	}
+
+	outer := findSymbol(mod.Children, "outer/0")
+	if outer == nil {
+		t.Fatal("outer/0 not found")
+	}
+	if outer.Range.End.Line != 6 {
+		t.Errorf("outer end line: expected 6, got %d", outer.Range.End.Line)
+	}
+}
+
+func TestDocumentSymbol_SplitLineDoTracksFunctionBody(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule MyApp do
+  def split(
+        x
+      )
+      do
+    x + 1
+  end
+end
+`
+	docURI := "file:///test/split_line_do.ex"
+	server.docs.Set(docURI, content)
+
+	symbols := documentSymbols(t, server, docURI)
+	if len(symbols) != 1 {
+		t.Fatalf("expected 1 top-level symbol, got %d", len(symbols))
+	}
+
+	mod := symbols[0]
+	split := findSymbol(mod.Children, "split/1")
+	if split == nil {
+		t.Fatal("split/1 not found")
+	}
+	if split.Range.Start.Line != 1 {
+		t.Errorf("split start line: expected 1, got %d", split.Range.Start.Line)
+	}
+	if split.Range.End.Line != 6 {
+		t.Errorf("split end line: expected 6, got %d", split.Range.End.Line)
+	}
+}
+
 // Verify capabilities are advertised
 func TestServer_Capabilities_DocumentSymbolAndWorkspaceSymbol(t *testing.T) {
 	server, cleanup := setupTestServer(t)
@@ -4182,5 +4582,49 @@ end`)
 	}
 	if !hasReplacement {
 		t.Error("expected an edit replacing the module ref with 'Client'")
+	}
+}
+
+func TestDefinition_RequireWithAs(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	snapshotSrc := `defmodule MyApp.Snapshots.ContractSnapshotSchema do
+  defmacro snapshot_fields do
+    quote do
+      field(:snapshot_data, :map)
+    end
+  end
+end`
+
+	contractSrc := `defmodule MyApp.Contract do
+  require MyApp.Snapshots.ContractSnapshotSchema, as: ContractSnapshotSchema
+
+  schema "contracts" do
+    ContractSnapshotSchema.snapshot_fields()
+  end
+end`
+
+	indexFile(t, server.store, server.projectRoot, "lib/snapshots/contract_snapshot_schema.ex", snapshotSrc)
+	snapshotURI := "file://" + filepath.Join(server.projectRoot, "lib/snapshots/contract_snapshot_schema.ex")
+	server.docs.Set(snapshotURI, snapshotSrc)
+
+	contractURI := "file://" + filepath.Join(server.projectRoot, "lib/contract.ex")
+	server.docs.Set(contractURI, contractSrc)
+
+	// line 4 (0-indexed): `    ContractSnapshotSchema.snapshot_fields()` — col 4 is on ContractSnapshotSchema
+	locs := definitionAt(t, server, contractURI, 4, 4)
+	if len(locs) == 0 {
+		t.Fatal("expected go-to-definition for ContractSnapshotSchema resolved via require with as:")
+	}
+
+	found := false
+	for _, loc := range locs {
+		if strings.Contains(string(loc.URI), "contract_snapshot_schema.ex") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected definition location in contract_snapshot_schema.ex, got %v", locs)
 	}
 }

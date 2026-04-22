@@ -83,3 +83,22 @@ jobs:
             --generate-notes \
             artifacts/*.tar.gz \
             artifacts/checksums.txt
+
+  update-homebrew:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: dexter-*
+          merge-multiple: true
+      - name: Update Homebrew formula
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ env.RELEASE_TAG }}
+          ARTIFACTS_DIR: artifacts
+        run: scripts/update-homebrew-formula.sh

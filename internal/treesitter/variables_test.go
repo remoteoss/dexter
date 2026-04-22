@@ -1358,3 +1358,25 @@ end`)
 		t.Fatalf("expected 1 occurrence of 'process' (not atom), got %d: %+v", len(occs), occs)
 	}
 }
+
+func TestFindVariableOccurrences_DefpLine(t *testing.T) {
+	src := []byte(`defmodule MyApp.Worker do
+  def enqueue(resource) do
+    %{
+      resource_type: resource_type(resource)
+    }
+  end
+
+  defp resource_type(%{type: t}), do: t
+end`)
+
+	// Line 7 is "defp resource_type(%{type: t}), do: t"
+	// Col 7 is on the 'r' in 'resource_type'
+	occs := FindVariableOccurrences(src, 7, 7)
+	if occs != nil {
+		t.Errorf("expected nil on defp line, got %d occurrences", len(occs))
+		for _, occ := range occs {
+			t.Logf("  Line %d, col %d-%d", occ.Line, occ.StartCol, occ.EndCol)
+		}
+	}
+}
