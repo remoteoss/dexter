@@ -286,6 +286,11 @@ func (e *FormatError) Error() string {
 }
 
 func (bp *beamProcess) Close() {
+	// Acquire mu to wait for any in-flight request to finish before killing
+	// the process — prevents broken pipe errors on concurrent format + close.
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
+
 	select {
 	case <-bp.closed:
 	default:
