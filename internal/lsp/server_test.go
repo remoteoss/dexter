@@ -4628,3 +4628,105 @@ end`
 		t.Errorf("expected definition location in contract_snapshot_schema.ex, got %v", locs)
 	}
 }
+
+func TestDefinition_ErlangAtomModule(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyModule do
+  def run do
+    :code.all_loaded()
+  end
+end`)
+
+	// col=5 on ":code" — should take the Erlang path and return nil
+	// (no BEAM process in test, so no result — but must not crash or
+	// fall through to Elixir resolution)
+	locs := definitionAt(t, server, uri, 2, 5)
+	if len(locs) != 0 {
+		t.Errorf("expected no definition without BEAM process, got %v", locs)
+	}
+
+	// col=10 on "all_loaded" function
+	locs = definitionAt(t, server, uri, 2, 10)
+	if len(locs) != 0 {
+		t.Errorf("expected no definition without BEAM process, got %v", locs)
+	}
+}
+
+func TestDefinition_ErlangAtomDoesNotAffectElixir(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", `defmodule MyApp.Accounts do
+  def create(attrs), do: :ok
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyModule do
+  alias MyApp.Accounts
+  Accounts.create(attrs)
+end`)
+
+	// Normal Elixir go-to-definition still works
+	locs := definitionAt(t, server, uri, 2, 13)
+	if len(locs) == 0 {
+		t.Fatal("expected Elixir definition to still work")
+	}
+	if !strings.Contains(string(locs[0].URI), "accounts.ex") {
+		t.Errorf("expected accounts.ex, got %s", locs[0].URI)
+	}
+}
+
+func TestHover_ErlangAtomModule(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyModule do
+  def run do
+    :lists.flatten(data)
+  end
+end`)
+
+	// col=5 on ":lists" — should take the Erlang path and return nil
+	// (no BEAM process in test)
+	hover := hoverAt(t, server, uri, 2, 5)
+	if hover != nil {
+		t.Errorf("expected no hover without BEAM process, got %v", hover)
+	}
+
+	// col=12 on "flatten"
+	hover = hoverAt(t, server, uri, 2, 12)
+	if hover != nil {
+		t.Errorf("expected no hover without BEAM process, got %v", hover)
+	}
+}
+
+func TestHover_ErlangAtomDoesNotAffectElixir(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", `defmodule MyApp.Accounts do
+  @doc "Creates a new account."
+  def create(attrs), do: :ok
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyModule do
+  alias MyApp.Accounts
+  Accounts.create(attrs)
+end`)
+
+	// Normal Elixir hover still works
+	hover := hoverAt(t, server, uri, 2, 13)
+	if hover == nil {
+		t.Fatal("expected Elixir hover to still work")
+	}
+	if !strings.Contains(hover.Contents.Value, "Creates a new account") {
+		t.Errorf("expected doc content, got %q", hover.Contents.Value)
+	}
+}

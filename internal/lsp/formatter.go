@@ -21,17 +21,21 @@ import (
 	"go.lsp.dev/protocol"
 )
 
-//go:embed formatter_server.exs
-var formatterScript string
+//go:embed beam_server.exs
+var beamServerScript string
 
 const (
-	// How long to wait for the persistent formatter to become ready before
+	// How long to wait for the persistent BEAM to become ready before
 	// falling back to mix format on a given request.
 	formatterWaitTimeout = 5 * time.Second
-	// How long a not-ready formatter process is allowed to live before being
+	// How long a not-ready BEAM process is allowed to live before being
 	// killed and restarted. Also used as the hard cap inside the startup
 	// goroutine to prevent leaked goroutines.
 	formatterStuckTimeout = 30 * time.Second
+
+	// Service tags for the BEAM server protocol
+	serviceFormatter byte = 0x00
+	serviceCodeIntel byte = 0x01
 )
 
 type formatterProcess struct {
@@ -82,6 +86,7 @@ func (fp *formatterProcess) Format(ctx context.Context, content, filename string
 	filenameBytes := []byte(filename)
 	contentBytes := []byte(content)
 	var req bytes.Buffer
+	req.WriteByte(serviceFormatter) // service tag
 	_ = binary.Write(&req, binary.BigEndian, uint16(len(filenameBytes)))
 	req.Write(filenameBytes)
 	_ = binary.Write(&req, binary.BigEndian, uint32(len(contentBytes)))
@@ -130,6 +135,144 @@ func (fp *formatterProcess) Format(ctx context.Context, content, filename string
 	}
 }
 
+// ErlangSourceResult holds the resolved source location for an Erlang function.
+type ErlangSourceResult struct {
+	File string
+	Line int
+}
+
+// ErlangSource asks the BEAM's CodeIntel service to resolve an Erlang module/function
+// to its source file and line number.
+func (fp *formatterProcess) ErlangSource(ctx context.Context, module, function string, arity int) (*ErlangSourceResult, error) {
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+
+	moduleBytes := []byte(module)
+	functionBytes := []byte(function)
+	arityByte := byte(255) // 255 = unspecified
+	if arity >= 0 && arity < 255 {
+		arityByte = byte(arity)
+	}
+
+	var req bytes.Buffer
+	req.WriteByte(serviceCodeIntel) // service tag
+	req.WriteByte(0)                // op: erlang_source
+	_ = binary.Write(&req, binary.BigEndian, uint16(len(moduleBytes)))
+	req.Write(moduleBytes)
+	_ = binary.Write(&req, binary.BigEndian, uint16(len(functionBytes)))
+	req.Write(functionBytes)
+	req.WriteByte(arityByte)
+	if _, err := fp.stdin.Write(req.Bytes()); err != nil {
+		return nil, fmt.Errorf("write code_intel request: %w", err)
+	}
+
+	type readResult struct {
+		result *ErlangSourceResult
+		err    error
+	}
+	ch := make(chan readResult, 1)
+	go func() {
+		var status byte
+		if err := binary.Read(fp.stdout, binary.BigEndian, &status); err != nil {
+			ch <- readResult{err: fmt.Errorf("read status: %w", err)}
+			return
+		}
+		var fileLen uint16
+		if err := binary.Read(fp.stdout, binary.BigEndian, &fileLen); err != nil {
+			ch <- readResult{err: fmt.Errorf("read file length: %w", err)}
+			return
+		}
+		fileBuf := make([]byte, fileLen)
+		if _, err := io.ReadFull(fp.stdout, fileBuf); err != nil {
+			ch <- readResult{err: fmt.Errorf("read file: %w", err)}
+			return
+		}
+		var line uint32
+		if err := binary.Read(fp.stdout, binary.BigEndian, &line); err != nil {
+			ch <- readResult{err: fmt.Errorf("read line: %w", err)}
+			return
+		}
+		if status != 0 {
+			ch <- readResult{err: fmt.Errorf("erlang source not found")}
+			return
+		}
+		ch <- readResult{result: &ErlangSourceResult{File: string(fileBuf), Line: int(line)}}
+	}()
+
+	select {
+	case r := <-ch:
+		return r.result, r.err
+	case <-ctx.Done():
+		_ = fp.cmd.process.Kill()
+		<-ch
+		return nil, ctx.Err()
+	}
+}
+
+// ErlangDocs asks the BEAM's CodeIntel service for the documentation of an
+// Erlang module or function. Returns pre-formatted markdown, or empty string
+// if no docs are available (e.g. OTP < 24 or undocumented function).
+func (fp *formatterProcess) ErlangDocs(ctx context.Context, module, function string, arity int) (string, error) {
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+
+	moduleBytes := []byte(module)
+	functionBytes := []byte(function)
+	arityByte := byte(255)
+	if arity >= 0 && arity < 255 {
+		arityByte = byte(arity)
+	}
+
+	var req bytes.Buffer
+	req.WriteByte(serviceCodeIntel)
+	req.WriteByte(1) // op: erlang_docs
+	_ = binary.Write(&req, binary.BigEndian, uint16(len(moduleBytes)))
+	req.Write(moduleBytes)
+	_ = binary.Write(&req, binary.BigEndian, uint16(len(functionBytes)))
+	req.Write(functionBytes)
+	req.WriteByte(arityByte)
+	if _, err := fp.stdin.Write(req.Bytes()); err != nil {
+		return "", fmt.Errorf("write code_intel request: %w", err)
+	}
+
+	type readResult struct {
+		doc string
+		err error
+	}
+	ch := make(chan readResult, 1)
+	go func() {
+		var status byte
+		if err := binary.Read(fp.stdout, binary.BigEndian, &status); err != nil {
+			ch <- readResult{err: fmt.Errorf("read status: %w", err)}
+			return
+		}
+		var docLen uint32
+		if err := binary.Read(fp.stdout, binary.BigEndian, &docLen); err != nil {
+			ch <- readResult{err: fmt.Errorf("read doc length: %w", err)}
+			return
+		}
+		docBuf := make([]byte, docLen)
+		if _, err := io.ReadFull(fp.stdout, docBuf); err != nil {
+			ch <- readResult{err: fmt.Errorf("read doc: %w", err)}
+			return
+		}
+		if status != 0 {
+			ch <- readResult{doc: ""}
+			return
+		}
+		ch <- readResult{doc: string(docBuf)}
+	}()
+
+	select {
+	case r := <-ch:
+		return r.doc, r.err
+	case <-ctx.Done():
+		_ = fp.cmd.process.Kill()
+		<-ch
+		return "", ctx.Err()
+	}
+}
+
 // FormatError represents a formatting failure (e.g. syntax error in the source).
 // The persistent process is still alive — this is not a protocol/crash error.
 type FormatError struct {
@@ -159,10 +302,10 @@ func (s *Server) startFormatterProcess(mixRoot, formatterExs string) (*formatter
 	if err := os.MkdirAll(scriptDir, 0755); err != nil {
 		return nil, fmt.Errorf("create script dir: %w", err)
 	}
-	scriptPath := filepath.Join(scriptDir, "formatter_server.exs")
-	if existing, err := os.ReadFile(scriptPath); err != nil || string(existing) != formatterScript {
-		if err := os.WriteFile(scriptPath, []byte(formatterScript), 0644); err != nil {
-			return nil, fmt.Errorf("write formatter script: %w", err)
+	scriptPath := filepath.Join(scriptDir, "beam_server.exs")
+	if existing, err := os.ReadFile(scriptPath); err != nil || string(existing) != beamServerScript {
+		if err := os.WriteFile(scriptPath, []byte(beamServerScript), 0644); err != nil {
+			return nil, fmt.Errorf("write beam server script: %w", err)
 		}
 	}
 
@@ -382,6 +525,28 @@ func (s *Server) evictFormatter(formatterExs string, fp *formatterProcess) {
 	}
 	s.formattersMu.Unlock()
 	fp.Close()
+}
+
+// getBeamProcess returns any alive and ready BEAM process for code intel queries.
+// Since all BEAM processes have the CodeIntel service, any one will do.
+func (s *Server) getBeamProcess(ctx context.Context) *formatterProcess {
+	s.formattersMu.Lock()
+	defer s.formattersMu.Unlock()
+
+	for _, fp := range s.formatters {
+		if !fp.alive() {
+			continue
+		}
+		// Non-blocking ready check
+		select {
+		case <-fp.ready:
+			if fp.startErr == nil {
+				return fp
+			}
+		default:
+		}
+	}
+	return nil
 }
 
 func (s *Server) formatWithMixFormat(ctx context.Context, mixRoot, path, content string) (string, error) {

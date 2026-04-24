@@ -551,6 +551,14 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		return nil, nil
 	}
 
+	// Erlang module atom (e.g. :code.all_loaded) — resolve via BEAM process.
+	// Check before ExtractModuleAndFunction which doesn't handle atom-prefixed modules.
+	if strings.HasPrefix(exprCtx.ModuleRef, ":") {
+		erlModule := exprCtx.ModuleRef[1:] // strip the : prefix
+		s.debugf("Definition: Erlang module %q function=%q", erlModule, exprCtx.FunctionName)
+		return s.erlangDefinition(ctx, erlModule, exprCtx.FunctionName)
+	}
+
 	expr := tf.ResolveModuleExpr(exprCtx.Expr(), lineNum)
 	moduleRef, functionName := ExtractModuleAndFunction(expr)
 
@@ -698,6 +706,53 @@ func filterOutTypes(results []store.LookupResult) []store.LookupResult {
 		return nonTypes
 	}
 	return results
+}
+
+// erlangHover fetches documentation for an Erlang module/function via the
+// BEAM process's CodeIntel service.
+func (s *Server) erlangHover(ctx context.Context, module, function string) (*protocol.Hover, error) {
+	fp := s.getBeamProcess(ctx)
+	if fp == nil {
+		return nil, nil
+	}
+
+	doc, err := fp.ErlangDocs(ctx, module, function, -1)
+	if err != nil || doc == "" {
+		return nil, nil
+	}
+
+	return &protocol.Hover{
+		Contents: protocol.MarkupContent{
+			Kind:  protocol.Markdown,
+			Value: doc,
+		},
+	}, nil
+}
+
+// erlangDefinition resolves an Erlang module/function to its .erl source via
+// the BEAM process's CodeIntel service.
+func (s *Server) erlangDefinition(ctx context.Context, module, function string) ([]protocol.Location, error) {
+	fp := s.getBeamProcess(ctx)
+	if fp == nil {
+		s.debugf("Definition: no BEAM process available for Erlang resolution")
+		return nil, nil
+	}
+
+	result, err := fp.ErlangSource(ctx, module, function, -1)
+	if err != nil {
+		s.debugf("Definition: Erlang source lookup failed: %v", err)
+		return nil, nil
+	}
+
+	line := result.Line
+	if line > 0 {
+		line-- // convert 1-based to 0-based for LSP
+	}
+
+	return []protocol.Location{{
+		URI:   uri.File(result.File),
+		Range: lineRange(line),
+	}}, nil
 }
 
 func lineRange(line int) protocol.Range {
@@ -2755,6 +2810,11 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 	exprCtx := tf.ExpressionAtCursor(lineNum, col)
 	if exprCtx.Empty() {
 		return nil, nil
+	}
+
+	// Erlang module atom (e.g. :lists.flatten) — fetch docs via BEAM process
+	if strings.HasPrefix(exprCtx.ModuleRef, ":") {
+		return s.erlangHover(ctx, exprCtx.ModuleRef[1:], exprCtx.FunctionName)
 	}
 
 	expr := tf.ResolveModuleExpr(exprCtx.Expr(), lineNum)

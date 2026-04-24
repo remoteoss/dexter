@@ -231,6 +231,39 @@ func TestExpressionAtCursor(t *testing.T) {
 			wantMod:  "Foo.Bar",
 			wantFunc: "transform",
 		},
+		// --- Erlang atom module support ---
+		{
+			name:     "erlang atom module with function",
+			code:     "    :code.all_loaded()",
+			line:     0,
+			col:      11, // 'a' in all_loaded
+			wantMod:  ":code",
+			wantFunc: "all_loaded",
+		},
+		{
+			name:     "erlang atom module cursor on atom",
+			code:     "    :code.all_loaded()",
+			line:     0,
+			col:      6, // 'o' in code
+			wantMod:  ":code",
+			wantFunc: "",
+		},
+		{
+			name:     "erlang atom :lists.flatten",
+			code:     ":lists.flatten(data)",
+			line:     0,
+			col:      7, // 'f' in flatten
+			wantMod:  ":lists",
+			wantFunc: "flatten",
+		},
+		{
+			name:     "erlang atom piped",
+			code:     "    |> :lists.flatten()",
+			line:     0,
+			col:      13, // 'f' in flatten
+			wantMod:  ":lists",
+			wantFunc: "flatten",
+		},
 	}
 
 	for _, tt := range tests {

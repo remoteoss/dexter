@@ -178,9 +178,9 @@ func (c CursorContext) Empty() bool {
 }
 
 // isExprToken returns true for token kinds that can be part of a dotted
-// expression chain (Module.function).
+// expression chain (Module.function or :atom.function).
 func isExprToken(k parser.TokenKind) bool {
-	return k == parser.TokModule || k == parser.TokIdent
+	return k == parser.TokModule || k == parser.TokIdent || k == parser.TokAtom
 }
 
 // ExpressionAtCursor extracts the dotted expression at the cursor position
@@ -286,11 +286,14 @@ func expressionAtCursorImpl(tokens []parser.Token, source []byte, lineStarts []i
 	for ti := startIdx; ti <= truncEnd; ti += 2 {
 		t := tokens[ti]
 		text := parser.TokenText(source, t)
-		if t.Kind == parser.TokModule {
+		switch t.Kind {
+		case parser.TokModule, parser.TokAtom:
 			moduleParts = append(moduleParts, text)
-		} else {
+		default:
 			// TokIdent — this is the function name; stop here
 			functionName = text
+		}
+		if functionName != "" {
 			break
 		}
 	}
