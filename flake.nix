@@ -9,27 +9,19 @@
   outputs = { self, nixpkgs, flake-utils }:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        pkgs = import nixpkgs {
-          inherit system;
-        };
+        pkgs = import nixpkgs { inherit system; };
       in
       {
         packages.default = pkgs.buildGoModule {
           pname = "dexter";
           version = "0.6.0";
-
           src = ./.;
-
-          nativeBuildInputs = with pkgs; [
-            pkg-config
-          ];
-
-          buildInputs = with pkgs; [
-          ];
-
-          go = pkgs.go_1_26;
-
+          nativeBuildInputs = with pkgs; [ pkg-config ];
           vendorHash = "sha256-18Cuyn9BhoGPVzElUGmE4GUKybm1qV/lA0nVpiGyOOY=";
+
+          postInstall = ''
+            mv $out/bin/cmd $out/bin/dexter
+          '';
 
           overrideModAttrs = old: {
             postBuild = (old.postBuild or "") + ''
