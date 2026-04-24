@@ -435,23 +435,6 @@ func (s *Server) getBeamProcess(ctx context.Context, buildRoot string) *beamProc
 	return bp
 }
 
-// getAnyBeamProcess returns any alive and ready BEAM process. Used for code
-// intel queries (like Erlang go-to-def) where OTP is the same regardless of
-// build root. Falls back to starting one for the project root if none exists.
-func (s *Server) getAnyBeamProcess(ctx context.Context) *beamProcess {
-	s.beamMu.Lock()
-	for _, bp := range s.beams {
-		if bp.alive() {
-			s.beamMu.Unlock()
-			return bp
-		}
-	}
-	s.beamMu.Unlock()
-
-	// No existing process — start one for the project root
-	return s.getBeamProcess(ctx, s.projectRoot)
-}
-
 // findFormatterConfig walks from the file's directory up to the project root,
 // returning the path to the nearest .formatter.exs. This handles subdirectory
 // configs (e.g. config/.formatter.exs with different rules than the root) and

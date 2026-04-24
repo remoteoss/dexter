@@ -465,7 +465,25 @@ func (s *Server) DidClose(ctx context.Context, params *protocol.DidCloseTextDocu
 
 func (s *Server) DidSave(ctx context.Context, params *protocol.DidSaveTextDocumentParams) error {
 	path := uriToPath(params.TextDocument.URI)
-	if path == "" || !parser.IsElixirFile(path) {
+	if path == "" {
+		return nil
+	}
+
+	// Restart the BEAM process when .formatter.exs changes so the new
+	// config is picked up on the next format request.
+	if filepath.Base(path) == ".formatter.exs" {
+		buildRoot := s.findBuildRoot(filepath.Dir(path))
+		s.beamMu.Lock()
+		if bp, ok := s.beams[buildRoot]; ok {
+			delete(s.beams, buildRoot)
+			bp.Close()
+			log.Printf("BEAM: restarting for %s (.formatter.exs changed)", buildRoot)
+		}
+		s.beamMu.Unlock()
+		return nil
+	}
+
+	if !parser.IsElixirFile(path) {
 		return nil
 	}
 
@@ -554,7 +572,7 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 	if strings.HasPrefix(exprCtx.ModuleRef, ":") {
 		erlModule := exprCtx.ModuleRef[1:] // strip the : prefix
 		s.debugf("Definition: Erlang module %q function=%q", erlModule, exprCtx.FunctionName)
-		return s.erlangDefinition(ctx, erlModule, exprCtx.FunctionName)
+		return s.erlangDefinition(ctx, uriToPath(params.TextDocument.URI), erlModule, exprCtx.FunctionName)
 	}
 
 	expr := tf.ResolveModuleExpr(exprCtx.Expr(), lineNum)
@@ -708,8 +726,9 @@ func filterOutTypes(results []store.LookupResult) []store.LookupResult {
 
 // erlangHover fetches documentation for an Erlang module/function via the
 // BEAM process's CodeIntel service.
-func (s *Server) erlangHover(ctx context.Context, module, function string) (*protocol.Hover, error) {
-	bp := s.getAnyBeamProcess(ctx)
+func (s *Server) erlangHover(ctx context.Context, filePath, module, function string) (*protocol.Hover, error) {
+	buildRoot := s.findBuildRoot(filepath.Dir(filePath))
+	bp := s.getBeamProcess(ctx, buildRoot)
 	if bp == nil {
 		return nil, nil
 	}
@@ -732,8 +751,9 @@ func (s *Server) erlangHover(ctx context.Context, module, function string) (*pro
 
 // erlangDefinition resolves an Erlang module/function to its .erl source via
 // the BEAM process's CodeIntel service.
-func (s *Server) erlangDefinition(ctx context.Context, module, function string) ([]protocol.Location, error) {
-	bp := s.getAnyBeamProcess(ctx)
+func (s *Server) erlangDefinition(ctx context.Context, filePath, module, function string) ([]protocol.Location, error) {
+	buildRoot := s.findBuildRoot(filepath.Dir(filePath))
+	bp := s.getBeamProcess(ctx, buildRoot)
 	if bp == nil {
 		s.debugf("Definition: no BEAM process available for Erlang resolution")
 		return nil, nil
@@ -2819,7 +2839,7 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 
 	// Erlang module atom (e.g. :lists.flatten) — fetch docs via BEAM process
 	if strings.HasPrefix(exprCtx.ModuleRef, ":") {
-		return s.erlangHover(ctx, exprCtx.ModuleRef[1:], exprCtx.FunctionName)
+		return s.erlangHover(ctx, uriToPath(params.TextDocument.URI), exprCtx.ModuleRef[1:], exprCtx.FunctionName)
 	}
 
 	expr := tf.ResolveModuleExpr(exprCtx.Expr(), lineNum)
