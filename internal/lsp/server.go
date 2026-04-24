@@ -63,7 +63,7 @@ type Server struct {
 	debug           bool
 	mixBin          string // resolved path to the mix binary
 
-	beam   *beamProcess // single persistent BEAM process for formatting + code intel
+	beams  map[string]*beamProcess // build root → persistent BEAM process
 	beamMu sync.Mutex
 
 	usingCache   map[string]*usingCacheEntry // module name → parsed __using__ result
@@ -423,7 +423,7 @@ func (s *Server) Initialized(ctx context.Context, params *protocol.InitializedPa
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
-	s.closeBeam()
+	s.closeBeams()
 	return nil
 }
 
@@ -442,7 +442,8 @@ func (s *Server) DidOpen(ctx context.Context, params *protocol.DidOpenTextDocume
 	path := uriToPath(params.TextDocument.URI)
 	if path != "" && isFormattableFile(path) && s.isProjectFile(path) && !s.isDepsFile(path) {
 		go func() {
-			_ = s.getBeamProcess(context.Background())
+			buildRoot := s.findBuildRoot(filepath.Dir(path))
+			_ = s.getBeamProcess(context.Background(), buildRoot)
 		}()
 	}
 
@@ -708,7 +709,7 @@ func filterOutTypes(results []store.LookupResult) []store.LookupResult {
 // erlangHover fetches documentation for an Erlang module/function via the
 // BEAM process's CodeIntel service.
 func (s *Server) erlangHover(ctx context.Context, module, function string) (*protocol.Hover, error) {
-	bp := s.getBeamProcess(ctx)
+	bp := s.getAnyBeamProcess(ctx)
 	if bp == nil {
 		return nil, nil
 	}
@@ -732,7 +733,7 @@ func (s *Server) erlangHover(ctx context.Context, module, function string) (*pro
 // erlangDefinition resolves an Erlang module/function to its .erl source via
 // the BEAM process's CodeIntel service.
 func (s *Server) erlangDefinition(ctx context.Context, module, function string) ([]protocol.Location, error) {
-	bp := s.getBeamProcess(ctx)
+	bp := s.getAnyBeamProcess(ctx)
 	if bp == nil {
 		s.debugf("Definition: no BEAM process available for Erlang resolution")
 		return nil, nil

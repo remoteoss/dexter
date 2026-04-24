@@ -295,10 +295,10 @@ func (bp *beamProcess) Close() {
 	_ = bp.cmd.process.Kill()
 }
 
-// startBeamProcess launches the single BEAM process and returns immediately.
-// The returned process may not be ready yet — callers must check bp.Ready()
-// before sending requests.
-func (s *Server) startBeamProcess() (*beamProcess, error) {
+// startBeamProcess launches a BEAM process for the given build root and returns
+// immediately. The returned process may not be ready yet — callers must check
+// bp.Ready() before sending requests.
+func (s *Server) startBeamProcess(buildRoot string) (*beamProcess, error) {
 	scriptDir := filepath.Join(os.TempDir(), "dexter")
 	if err := os.MkdirAll(scriptDir, 0755); err != nil {
 		return nil, fmt.Errorf("create script dir: %w", err)
@@ -311,8 +311,8 @@ func (s *Server) startBeamProcess() (*beamProcess, error) {
 	}
 
 	elixirBin := filepath.Join(filepath.Dir(s.mixBin), "elixir")
-	cmd := exec.Command(elixirBin, scriptPath, s.projectRoot)
-	cmd.Dir = s.projectRoot
+	cmd := exec.Command(elixirBin, scriptPath, buildRoot)
+	cmd.Dir = buildRoot
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -389,26 +389,67 @@ func (s *Server) startBeamProcess() (*beamProcess, error) {
 	return bp, nil
 }
 
-// getBeamProcess returns the single BEAM process, starting it if needed.
-func (s *Server) getBeamProcess(ctx context.Context) *beamProcess {
+// findBuildRoot walks up from dir looking for a _build directory, bounded by
+// projectRoot. Returns the directory containing _build, or projectRoot if none
+// is found.
+func (s *Server) findBuildRoot(dir string) string {
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "_build")); err == nil {
+			return dir
+		}
+		if dir == s.projectRoot {
+			break
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return s.projectRoot
+}
+
+// getBeamProcess returns a BEAM process for the given build root, starting one
+// if needed. Files sharing the same _build share the same BEAM process.
+func (s *Server) getBeamProcess(ctx context.Context, buildRoot string) *beamProcess {
 	s.beamMu.Lock()
 	defer s.beamMu.Unlock()
 
-	if s.beam != nil && s.beam.alive() {
-		return s.beam
+	if bp, ok := s.beams[buildRoot]; ok && bp.alive() {
+		return bp
 	}
 
 	if s.mixBin == "" {
 		return nil
 	}
 
-	bp, err := s.startBeamProcess()
+	bp, err := s.startBeamProcess(buildRoot)
 	if err != nil {
-		log.Printf("BEAM: failed to start: %v", err)
+		log.Printf("BEAM: failed to start for %s: %v", buildRoot, err)
 		return nil
 	}
-	s.beam = bp
+	if s.beams == nil {
+		s.beams = make(map[string]*beamProcess)
+	}
+	s.beams[buildRoot] = bp
 	return bp
+}
+
+// getAnyBeamProcess returns any alive and ready BEAM process. Used for code
+// intel queries (like Erlang go-to-def) where OTP is the same regardless of
+// build root. Falls back to starting one for the project root if none exists.
+func (s *Server) getAnyBeamProcess(ctx context.Context) *beamProcess {
+	s.beamMu.Lock()
+	for _, bp := range s.beams {
+		if bp.alive() {
+			s.beamMu.Unlock()
+			return bp
+		}
+	}
+	s.beamMu.Unlock()
+
+	// No existing process — start one for the project root
+	return s.getBeamProcess(ctx, s.projectRoot)
 }
 
 // findFormatterConfig walks from the file's directory up to the project root,
@@ -443,7 +484,8 @@ func findFormatterConfig(filePath, projectRoot string) string {
 //   - >30s old and still not ready: kill and restart the stuck process
 func (s *Server) formatContent(ctx context.Context, mixRoot, path, content string) (string, error) {
 	formatterExs := findFormatterConfig(path, s.projectRoot)
-	bp := s.getBeamProcess(ctx)
+	buildRoot := s.findBuildRoot(filepath.Dir(path))
+	bp := s.getBeamProcess(ctx, buildRoot)
 	if bp == nil {
 		log.Printf("Formatting: BEAM process unavailable, falling back to mix format")
 		return s.formatWithMixFormat(ctx, mixRoot, path, content)
@@ -505,8 +547,11 @@ func (s *Server) formatContent(ctx context.Context, mixRoot, path, content strin
 
 func (s *Server) evictBeam(bp *beamProcess) {
 	s.beamMu.Lock()
-	if s.beam == bp {
-		s.beam = nil
+	for key, b := range s.beams {
+		if b == bp {
+			delete(s.beams, key)
+			break
+		}
 	}
 	s.beamMu.Unlock()
 	bp.Close()
@@ -683,11 +728,11 @@ func computeMinimalEdits(original, formatted string) []protocol.TextEdit {
 	}
 }
 
-func (s *Server) closeBeam() {
+func (s *Server) closeBeams() {
 	s.beamMu.Lock()
 	defer s.beamMu.Unlock()
-	if s.beam != nil {
-		s.beam.Close()
-		s.beam = nil
+	for _, bp := range s.beams {
+		bp.Close()
 	}
+	s.beams = nil
 }

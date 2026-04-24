@@ -3002,11 +3002,11 @@ func TestFormatter_RestartAfterCrash(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Kill the persistent BEAM process
+	// Kill all persistent BEAM processes
 	server.beamMu.Lock()
-	if server.beam != nil {
-		server.beam.Close()
-		server.beam = nil
+	for key, bp := range server.beams {
+		bp.Close()
+		delete(server.beams, key)
 	}
 	server.beamMu.Unlock()
 
@@ -3080,11 +3080,11 @@ func TestFormatter_DidOpen_SkipsDepsFiles(t *testing.T) {
 	})
 
 	server.beamMu.Lock()
-	hasBeam := server.beam != nil
+	beamCount := len(server.beams)
 	server.beamMu.Unlock()
 
-	if hasBeam {
-		t.Errorf("expected no BEAM process for dep file, got one")
+	if beamCount != 0 {
+		t.Errorf("expected no BEAM processes for dep file, got %d", beamCount)
 	}
 }
 
