@@ -432,3 +432,51 @@ func TestComputeMinimalEdits(t *testing.T) {
 		}
 	})
 }
+
+func TestFindFormatterConfig_UmbrellaRootOnly(t *testing.T) {
+	// Simulate an umbrella where only the root has .formatter.exs
+	//   root/
+	//     .formatter.exs
+	//     apps/
+	//       my_app/
+	//         mix.exs
+	//         lib/
+	//           foo.ex
+	root := t.TempDir()
+	appDir := filepath.Join(root, "apps", "my_app", "lib")
+	if err := os.MkdirAll(appDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	rootFormatter := filepath.Join(root, ".formatter.exs")
+	if err := os.WriteFile(rootFormatter, []byte("[]"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	filePath := filepath.Join(appDir, "foo.ex")
+	got := findFormatterConfig(filePath, root)
+	if got != rootFormatter {
+		t.Errorf("expected %s, got %s", rootFormatter, got)
+	}
+}
+
+func TestFindFormatterConfig_PerAppOverridesRoot(t *testing.T) {
+	// Both root and app have .formatter.exs — the app's should win
+	root := t.TempDir()
+	appDir := filepath.Join(root, "apps", "my_app")
+	if err := os.MkdirAll(filepath.Join(appDir, "lib"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".formatter.exs"), []byte("[]"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	appFormatter := filepath.Join(appDir, ".formatter.exs")
+	if err := os.WriteFile(appFormatter, []byte("[]"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	filePath := filepath.Join(appDir, "lib", "foo.ex")
+	got := findFormatterConfig(filePath, root)
+	if got != appFormatter {
+		t.Errorf("expected app-level %s, got %s", appFormatter, got)
+	}
+}

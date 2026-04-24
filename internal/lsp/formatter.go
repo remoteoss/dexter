@@ -27,27 +27,26 @@ var beamServerScript string
 const (
 	// How long to wait for the persistent BEAM to become ready before
 	// falling back to mix format on a given request.
-	formatterWaitTimeout = 5 * time.Second
+	beamWaitTimeout = 5 * time.Second
 	// How long a not-ready BEAM process is allowed to live before being
 	// killed and restarted. Also used as the hard cap inside the startup
 	// goroutine to prevent leaked goroutines.
-	formatterStuckTimeout = 30 * time.Second
+	beamStuckTimeout = 30 * time.Second
 
 	// Service tags for the BEAM server protocol
 	serviceFormatter byte = 0x00
 	serviceCodeIntel byte = 0x01
 )
 
-type formatterProcess struct {
-	cmd            *commandHandle
-	stdin          io.WriteCloser
-	stdout         io.ReadCloser
-	mu             sync.Mutex
-	formatterMtime time.Time     // mtime of .formatter.exs when process started
-	startedAt      time.Time     // when the process was launched
-	ready          chan struct{} // closed when the BEAM has sent the ready signal
-	startErr       error         // non-nil if startup failed; set before ready is closed
-	closed         chan struct{} // closed by Close(); makes alive() return false immediately
+type beamProcess struct {
+	cmd       *commandHandle
+	stdin     io.WriteCloser
+	stdout    io.ReadCloser
+	mu        sync.Mutex
+	startedAt time.Time     // when the process was launched
+	ready     chan struct{} // closed when the BEAM has sent the ready signal
+	startErr  error         // non-nil if startup failed; set before ready is closed
+	closed    chan struct{} // closed by Close(); makes alive() return false immediately
 }
 
 // commandHandle wraps the process so we can check liveness.
@@ -56,11 +55,11 @@ type commandHandle struct {
 	done    chan struct{}
 }
 
-func (fp *formatterProcess) alive() bool {
+func (bp *beamProcess) alive() bool {
 	select {
-	case <-fp.cmd.done:
+	case <-bp.cmd.done:
 		return false
-	case <-fp.closed:
+	case <-bp.closed:
 		return false
 	default:
 		return true
@@ -69,29 +68,34 @@ func (fp *formatterProcess) alive() bool {
 
 // Ready blocks until the process has finished startup. Returns startErr if
 // the BEAM failed to initialize, or ctx.Err() if the caller gives up first.
-func (fp *formatterProcess) Ready(ctx context.Context) error {
+func (bp *beamProcess) Ready(ctx context.Context) error {
 	select {
-	case <-fp.ready:
-		return fp.startErr
+	case <-bp.ready:
+		return bp.startErr
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 }
 
-func (fp *formatterProcess) Format(ctx context.Context, content, filename string) (string, error) {
-	fp.mu.Lock()
-	defer fp.mu.Unlock()
+// Format sends a format request to the BEAM process. The formatterExs path
+// tells the BEAM which .formatter.exs config to use (starting a new formatter
+// child if needed).
+func (bp *beamProcess) Format(ctx context.Context, content, filename, formatterExs string) (string, error) {
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
 
-	// Build the entire request as a single buffer to avoid partial writes
+	configPathBytes := []byte(formatterExs)
 	filenameBytes := []byte(filename)
 	contentBytes := []byte(content)
 	var req bytes.Buffer
-	req.WriteByte(serviceFormatter) // service tag
+	req.WriteByte(serviceFormatter)
+	_ = binary.Write(&req, binary.BigEndian, uint16(len(configPathBytes)))
+	req.Write(configPathBytes)
 	_ = binary.Write(&req, binary.BigEndian, uint16(len(filenameBytes)))
 	req.Write(filenameBytes)
 	_ = binary.Write(&req, binary.BigEndian, uint32(len(contentBytes)))
 	req.Write(contentBytes)
-	if _, err := fp.stdin.Write(req.Bytes()); err != nil {
+	if _, err := bp.stdin.Write(req.Bytes()); err != nil {
 		return "", fmt.Errorf("write request: %w", err)
 	}
 
@@ -102,17 +106,17 @@ func (fp *formatterProcess) Format(ctx context.Context, content, filename string
 	ch := make(chan readResult, 1)
 	go func() {
 		var status byte
-		if err := binary.Read(fp.stdout, binary.BigEndian, &status); err != nil {
+		if err := binary.Read(bp.stdout, binary.BigEndian, &status); err != nil {
 			ch <- readResult{err: fmt.Errorf("read status: %w", err)}
 			return
 		}
 		var respLen uint32
-		if err := binary.Read(fp.stdout, binary.BigEndian, &respLen); err != nil {
+		if err := binary.Read(bp.stdout, binary.BigEndian, &respLen); err != nil {
 			ch <- readResult{err: fmt.Errorf("read length: %w", err)}
 			return
 		}
 		buf := make([]byte, respLen)
-		if _, err := io.ReadFull(fp.stdout, buf); err != nil {
+		if _, err := io.ReadFull(bp.stdout, buf); err != nil {
 			ch <- readResult{err: fmt.Errorf("read data: %w", err)}
 			return
 		}
@@ -127,9 +131,7 @@ func (fp *formatterProcess) Format(ctx context.Context, content, filename string
 	case r := <-ch:
 		return r.text, r.err
 	case <-ctx.Done():
-		// Kill the process to unblock the reader goroutine — the pipe reads
-		// will fail once the process exits, preventing a leaked goroutine.
-		_ = fp.cmd.process.Kill()
+		_ = bp.cmd.process.Kill()
 		<-ch
 		return "", ctx.Err()
 	}
@@ -143,9 +145,9 @@ type ErlangSourceResult struct {
 
 // ErlangSource asks the BEAM's CodeIntel service to resolve an Erlang module/function
 // to its source file and line number.
-func (fp *formatterProcess) ErlangSource(ctx context.Context, module, function string, arity int) (*ErlangSourceResult, error) {
-	fp.mu.Lock()
-	defer fp.mu.Unlock()
+func (bp *beamProcess) ErlangSource(ctx context.Context, module, function string, arity int) (*ErlangSourceResult, error) {
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
 
 	moduleBytes := []byte(module)
 	functionBytes := []byte(function)
@@ -162,7 +164,7 @@ func (fp *formatterProcess) ErlangSource(ctx context.Context, module, function s
 	_ = binary.Write(&req, binary.BigEndian, uint16(len(functionBytes)))
 	req.Write(functionBytes)
 	req.WriteByte(arityByte)
-	if _, err := fp.stdin.Write(req.Bytes()); err != nil {
+	if _, err := bp.stdin.Write(req.Bytes()); err != nil {
 		return nil, fmt.Errorf("write code_intel request: %w", err)
 	}
 
@@ -173,22 +175,22 @@ func (fp *formatterProcess) ErlangSource(ctx context.Context, module, function s
 	ch := make(chan readResult, 1)
 	go func() {
 		var status byte
-		if err := binary.Read(fp.stdout, binary.BigEndian, &status); err != nil {
+		if err := binary.Read(bp.stdout, binary.BigEndian, &status); err != nil {
 			ch <- readResult{err: fmt.Errorf("read status: %w", err)}
 			return
 		}
 		var fileLen uint16
-		if err := binary.Read(fp.stdout, binary.BigEndian, &fileLen); err != nil {
+		if err := binary.Read(bp.stdout, binary.BigEndian, &fileLen); err != nil {
 			ch <- readResult{err: fmt.Errorf("read file length: %w", err)}
 			return
 		}
 		fileBuf := make([]byte, fileLen)
-		if _, err := io.ReadFull(fp.stdout, fileBuf); err != nil {
+		if _, err := io.ReadFull(bp.stdout, fileBuf); err != nil {
 			ch <- readResult{err: fmt.Errorf("read file: %w", err)}
 			return
 		}
 		var line uint32
-		if err := binary.Read(fp.stdout, binary.BigEndian, &line); err != nil {
+		if err := binary.Read(bp.stdout, binary.BigEndian, &line); err != nil {
 			ch <- readResult{err: fmt.Errorf("read line: %w", err)}
 			return
 		}
@@ -203,7 +205,7 @@ func (fp *formatterProcess) ErlangSource(ctx context.Context, module, function s
 	case r := <-ch:
 		return r.result, r.err
 	case <-ctx.Done():
-		_ = fp.cmd.process.Kill()
+		_ = bp.cmd.process.Kill()
 		<-ch
 		return nil, ctx.Err()
 	}
@@ -212,9 +214,9 @@ func (fp *formatterProcess) ErlangSource(ctx context.Context, module, function s
 // ErlangDocs asks the BEAM's CodeIntel service for the documentation of an
 // Erlang module or function. Returns pre-formatted markdown, or empty string
 // if no docs are available (e.g. OTP < 24 or undocumented function).
-func (fp *formatterProcess) ErlangDocs(ctx context.Context, module, function string, arity int) (string, error) {
-	fp.mu.Lock()
-	defer fp.mu.Unlock()
+func (bp *beamProcess) ErlangDocs(ctx context.Context, module, function string, arity int) (string, error) {
+	bp.mu.Lock()
+	defer bp.mu.Unlock()
 
 	moduleBytes := []byte(module)
 	functionBytes := []byte(function)
@@ -231,7 +233,7 @@ func (fp *formatterProcess) ErlangDocs(ctx context.Context, module, function str
 	_ = binary.Write(&req, binary.BigEndian, uint16(len(functionBytes)))
 	req.Write(functionBytes)
 	req.WriteByte(arityByte)
-	if _, err := fp.stdin.Write(req.Bytes()); err != nil {
+	if _, err := bp.stdin.Write(req.Bytes()); err != nil {
 		return "", fmt.Errorf("write code_intel request: %w", err)
 	}
 
@@ -242,17 +244,17 @@ func (fp *formatterProcess) ErlangDocs(ctx context.Context, module, function str
 	ch := make(chan readResult, 1)
 	go func() {
 		var status byte
-		if err := binary.Read(fp.stdout, binary.BigEndian, &status); err != nil {
+		if err := binary.Read(bp.stdout, binary.BigEndian, &status); err != nil {
 			ch <- readResult{err: fmt.Errorf("read status: %w", err)}
 			return
 		}
 		var docLen uint32
-		if err := binary.Read(fp.stdout, binary.BigEndian, &docLen); err != nil {
+		if err := binary.Read(bp.stdout, binary.BigEndian, &docLen); err != nil {
 			ch <- readResult{err: fmt.Errorf("read doc length: %w", err)}
 			return
 		}
 		docBuf := make([]byte, docLen)
-		if _, err := io.ReadFull(fp.stdout, docBuf); err != nil {
+		if _, err := io.ReadFull(bp.stdout, docBuf); err != nil {
 			ch <- readResult{err: fmt.Errorf("read doc: %w", err)}
 			return
 		}
@@ -267,7 +269,7 @@ func (fp *formatterProcess) ErlangDocs(ctx context.Context, module, function str
 	case r := <-ch:
 		return r.doc, r.err
 	case <-ctx.Done():
-		_ = fp.cmd.process.Kill()
+		_ = bp.cmd.process.Kill()
 		<-ch
 		return "", ctx.Err()
 	}
@@ -283,21 +285,20 @@ func (e *FormatError) Error() string {
 	return e.Message
 }
 
-func (fp *formatterProcess) Close() {
+func (bp *beamProcess) Close() {
 	select {
-	case <-fp.closed:
+	case <-bp.closed:
 	default:
-		close(fp.closed)
+		close(bp.closed)
 	}
-	_ = fp.stdin.Close()
-	_ = fp.cmd.process.Kill()
+	_ = bp.stdin.Close()
+	_ = bp.cmd.process.Kill()
 }
 
-// startFormatterProcess launches the BEAM process and returns immediately.
-// The returned process may not be ready yet — callers must check fp.Ready()
-// before calling fp.Format(). Returns error only for immediate launch failures
-// (missing binary, can't create pipes).
-func (s *Server) startFormatterProcess(mixRoot, formatterExs string) (*formatterProcess, error) {
+// startBeamProcess launches the single BEAM process and returns immediately.
+// The returned process may not be ready yet — callers must check bp.Ready()
+// before sending requests.
+func (s *Server) startBeamProcess() (*beamProcess, error) {
 	scriptDir := filepath.Join(os.TempDir(), "dexter")
 	if err := os.MkdirAll(scriptDir, 0755); err != nil {
 		return nil, fmt.Errorf("create script dir: %w", err)
@@ -309,14 +310,9 @@ func (s *Server) startFormatterProcess(mixRoot, formatterExs string) (*formatter
 		}
 	}
 
-	var mtime time.Time
-	if info, err := os.Stat(formatterExs); err == nil {
-		mtime = info.ModTime()
-	}
-
 	elixirBin := filepath.Join(filepath.Dir(s.mixBin), "elixir")
-	cmd := exec.Command(elixirBin, scriptPath, mixRoot, formatterExs, s.projectRoot)
-	cmd.Dir = mixRoot
+	cmd := exec.Command(elixirBin, scriptPath, s.projectRoot)
+	cmd.Dir = s.projectRoot
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -330,7 +326,7 @@ func (s *Server) startFormatterProcess(mixRoot, formatterExs string) (*formatter
 	cmd.Stderr = io.MultiWriter(os.Stderr, &stderrBuf)
 
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start formatter: %w", err)
+		return nil, fmt.Errorf("start BEAM: %w", err)
 	}
 
 	done := make(chan struct{})
@@ -341,18 +337,15 @@ func (s *Server) startFormatterProcess(mixRoot, formatterExs string) (*formatter
 
 	handle := &commandHandle{process: cmd.Process, done: done}
 
-	fp := &formatterProcess{
-		cmd:            handle,
-		stdin:          stdin,
-		stdout:         stdout,
-		formatterMtime: mtime,
-		startedAt:      time.Now(),
-		ready:          make(chan struct{}),
-		closed:         make(chan struct{}),
+	bp := &beamProcess{
+		cmd:       handle,
+		stdin:     stdin,
+		stdout:    stdout,
+		startedAt: time.Now(),
+		ready:     make(chan struct{}),
+		closed:    make(chan struct{}),
 	}
 
-	// Wait for the BEAM's ready signal asynchronously. Callers use fp.Ready()
-	// to wait with their own timeout
 	go func() {
 		type readyResult struct {
 			status byte
@@ -376,66 +369,61 @@ func (s *Server) startFormatterProcess(mixRoot, formatterExs string) (*formatter
 		select {
 		case r := <-readyCh:
 			if r.err != nil {
-				fp.startErr = fmt.Errorf("formatter ready: %w", r.err)
+				bp.startErr = fmt.Errorf("BEAM ready: %w", r.err)
 				_ = cmd.Process.Kill()
-				<-done // wait for cmd.Wait() to finish copying stderr
+				<-done
 				s.notifyOTPMismatch(stderrBuf.String())
 			} else if r.status != 0 {
-				fp.startErr = fmt.Errorf("formatter failed to initialize (status %d)", r.status)
+				bp.startErr = fmt.Errorf("BEAM failed to initialize (status %d)", r.status)
 				_ = cmd.Process.Kill()
 			} else {
-				log.Printf("Formatter: started persistent process for %s (pid %d)", formatterExs, cmd.Process.Pid)
+				log.Printf("BEAM: started persistent process (pid %d)", cmd.Process.Pid)
 			}
-		case <-time.After(formatterStuckTimeout):
-			fp.startErr = fmt.Errorf("formatter startup timed out")
+		case <-time.After(beamStuckTimeout):
+			bp.startErr = fmt.Errorf("BEAM startup timed out")
 			_ = cmd.Process.Kill()
 		}
-		close(fp.ready)
+		close(bp.ready)
 	}()
 
-	return fp, nil
+	return bp, nil
 }
 
-// getFormatter returns a cached formatter process (which may still be starting
-// up). If none exists, it launches one and caches it immediately. The mutex is
-// only held briefly — the slow BEAM startup happens asynchronously. Callers
-// must call fp.Ready() before fp.Format() to wait for the process to be usable.
-func (s *Server) getFormatter(mixRoot, formatterExs string) (*formatterProcess, error) {
-	s.formattersMu.Lock()
-	defer s.formattersMu.Unlock()
+// getBeamProcess returns the single BEAM process, starting it if needed.
+func (s *Server) getBeamProcess(ctx context.Context) *beamProcess {
+	s.beamMu.Lock()
+	defer s.beamMu.Unlock()
 
-	if fp, ok := s.formatters[formatterExs]; ok && fp.alive() {
-		// Restart if .formatter.exs has changed
-		if info, err := os.Stat(formatterExs); err == nil && info.ModTime().After(fp.formatterMtime) {
-			fp.Close()
-			delete(s.formatters, formatterExs)
-		} else {
-			return fp, nil
-		}
+	if s.beam != nil && s.beam.alive() {
+		return s.beam
 	}
 
-	fp, err := s.startFormatterProcess(mixRoot, formatterExs)
+	if s.mixBin == "" {
+		return nil
+	}
+
+	bp, err := s.startBeamProcess()
 	if err != nil {
-		return nil, err
+		log.Printf("BEAM: failed to start: %v", err)
+		return nil
 	}
-	if s.formatters == nil {
-		s.formatters = make(map[string]*formatterProcess)
-	}
-	s.formatters[formatterExs] = fp
-	return fp, nil
+	s.beam = bp
+	return bp
 }
 
-// findFormatterConfig walks from the file's directory up to the mix root,
+// findFormatterConfig walks from the file's directory up to the project root,
 // returning the path to the nearest .formatter.exs. This handles subdirectory
-// configs (e.g. config/.formatter.exs with different rules than the root).
-func findFormatterConfig(filePath, mixRoot string) string {
+// configs (e.g. config/.formatter.exs with different rules than the root) and
+// umbrella projects where .formatter.exs lives at the umbrella root above the
+// app's mix root.
+func findFormatterConfig(filePath, projectRoot string) string {
 	dir := filepath.Dir(filePath)
 	for {
 		candidate := filepath.Join(dir, ".formatter.exs")
 		if _, err := os.Stat(candidate); err == nil {
 			return candidate
 		}
-		if dir == mixRoot {
+		if dir == projectRoot {
 			break
 		}
 		parent := filepath.Dir(dir)
@@ -444,54 +432,51 @@ func findFormatterConfig(filePath, mixRoot string) string {
 		}
 		dir = parent
 	}
-	return filepath.Join(mixRoot, ".formatter.exs")
+	return filepath.Join(projectRoot, ".formatter.exs")
 }
 
-// formatContent tries the persistent formatter, falling back to mix format.
+// formatContent tries the persistent BEAM process, falling back to mix format.
 //
 // Startup-age policy:
 //   - <5s old: wait for the process to become ready, then use it
 //   - 5s–30s old: don't wait, fall back to mix format immediately
 //   - >30s old and still not ready: kill and restart the stuck process
 func (s *Server) formatContent(ctx context.Context, mixRoot, path, content string) (string, error) {
-	formatterExs := findFormatterConfig(path, mixRoot)
-	fp, err := s.getFormatter(mixRoot, formatterExs)
-	if err != nil {
-		log.Printf("Formatting: persistent formatter unavailable, falling back to mix format: %v", err)
+	formatterExs := findFormatterConfig(path, s.projectRoot)
+	bp := s.getBeamProcess(ctx)
+	if bp == nil {
+		log.Printf("Formatting: BEAM process unavailable, falling back to mix format")
 		return s.formatWithMixFormat(ctx, mixRoot, path, content)
 	}
 
 	// Check if already ready (non-blocking)
 	select {
-	case <-fp.ready:
-		if fp.startErr != nil {
-			s.evictFormatter(formatterExs, fp)
-			log.Printf("Formatting: persistent formatter failed to start, falling back to mix format: %v", fp.startErr)
+	case <-bp.ready:
+		if bp.startErr != nil {
+			s.evictBeam(bp)
+			log.Printf("Formatting: BEAM process failed to start, falling back to mix format: %v", bp.startErr)
 			return s.formatWithMixFormat(ctx, mixRoot, path, content)
 		}
 	default:
 		// Not ready yet — decide based on how long it's been starting
-		age := time.Since(fp.startedAt)
+		age := time.Since(bp.startedAt)
 		switch {
-		case age > formatterStuckTimeout:
-			// Stuck — kill and restart so the next request gets a fresh process
-			log.Printf("Formatting: persistent formatter stuck (started %s ago), restarting", age.Truncate(time.Second))
-			s.evictFormatter(formatterExs, fp)
+		case age > beamStuckTimeout:
+			log.Printf("Formatting: BEAM process stuck (started %s ago), restarting", age.Truncate(time.Second))
+			s.evictBeam(bp)
 			return s.formatWithMixFormat(ctx, mixRoot, path, content)
 
-		case age > formatterWaitTimeout:
-			// Taking too long — fall back without waiting
-			log.Printf("Formatting: persistent formatter not ready after %s, falling back to mix format", age.Truncate(time.Millisecond))
+		case age > beamWaitTimeout:
+			log.Printf("Formatting: BEAM process not ready after %s, falling back to mix format", age.Truncate(time.Millisecond))
 			return s.formatWithMixFormat(ctx, mixRoot, path, content)
 
 		default:
-			// Recently started — wait for it
-			if err := fp.Ready(ctx); err != nil {
+			if err := bp.Ready(ctx); err != nil {
 				if ctx.Err() != nil {
 					return "", err
 				}
-				s.evictFormatter(formatterExs, fp)
-				log.Printf("Formatting: persistent formatter failed to start, falling back to mix format: %v", err)
+				s.evictBeam(bp)
+				log.Printf("Formatting: BEAM process failed to start, falling back to mix format: %v", err)
 				return s.formatWithMixFormat(ctx, mixRoot, path, content)
 			}
 		}
@@ -502,14 +487,14 @@ func (s *Server) formatContent(ctx context.Context, mixRoot, path, content strin
 	}
 
 	start := time.Now()
-	result, err := fp.Format(ctx, content, path)
+	result, err := bp.Format(ctx, content, path, formatterExs)
 	if err != nil {
 		var formatErr *FormatError
 		if errors.As(err, &formatErr) {
 			log.Printf("Formatting: %s failed: %s", path, formatErr.Message)
 		} else {
-			s.evictFormatter(formatterExs, fp)
-			log.Printf("Formatting: persistent formatter crashed: %v", err)
+			s.evictBeam(bp)
+			log.Printf("Formatting: BEAM process crashed: %v", err)
 		}
 		return "", err
 	}
@@ -518,35 +503,13 @@ func (s *Server) formatContent(ctx context.Context, mixRoot, path, content strin
 	return result, nil
 }
 
-func (s *Server) evictFormatter(formatterExs string, fp *formatterProcess) {
-	s.formattersMu.Lock()
-	if s.formatters[formatterExs] == fp {
-		delete(s.formatters, formatterExs)
+func (s *Server) evictBeam(bp *beamProcess) {
+	s.beamMu.Lock()
+	if s.beam == bp {
+		s.beam = nil
 	}
-	s.formattersMu.Unlock()
-	fp.Close()
-}
-
-// getBeamProcess returns any alive and ready BEAM process for code intel queries.
-// Since all BEAM processes have the CodeIntel service, any one will do.
-func (s *Server) getBeamProcess(ctx context.Context) *formatterProcess {
-	s.formattersMu.Lock()
-	defer s.formattersMu.Unlock()
-
-	for _, fp := range s.formatters {
-		if !fp.alive() {
-			continue
-		}
-		// Non-blocking ready check
-		select {
-		case <-fp.ready:
-			if fp.startErr == nil {
-				return fp
-			}
-		default:
-		}
-	}
-	return nil
+	s.beamMu.Unlock()
+	bp.Close()
 }
 
 func (s *Server) formatWithMixFormat(ctx context.Context, mixRoot, path, content string) (string, error) {
@@ -720,11 +683,11 @@ func computeMinimalEdits(original, formatted string) []protocol.TextEdit {
 	}
 }
 
-func (s *Server) closeFormatters() {
-	s.formattersMu.Lock()
-	defer s.formattersMu.Unlock()
-	for _, fp := range s.formatters {
-		fp.Close()
+func (s *Server) closeBeam() {
+	s.beamMu.Lock()
+	defer s.beamMu.Unlock()
+	if s.beam != nil {
+		s.beam.Close()
+		s.beam = nil
 	}
-	s.formatters = nil
 }

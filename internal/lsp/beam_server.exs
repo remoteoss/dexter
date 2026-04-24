@@ -1,22 +1,21 @@
 # Persistent BEAM server for Dexter LSP.
 #
-# Boots a Supervisor with two children:
-#   1. Formatter  — loads .formatter.exs once and caches formatter options
-#   2. CodeIntel  — resolves Erlang module source locations via :code/:beam_lib
+# Single process that hosts:
+#   - Multiple formatter instances (one per .formatter.exs, started on demand)
+#   - A singleton CodeIntel service for Erlang source/docs lookups
 #
-# Both services share a single BEAM process (one startup cost).
 # Communication is via stdin/stdout with binary framing:
 #
 # Request envelope:  1-byte service tag + service-specific payload
-# Response envelope: service-specific (formatter and code_intel share the same
-#                    status + length + body format)
+# Response envelope: service-specific (see below)
 #
 # Service tags:
 #   0x00 = Formatter
 #   0x01 = CodeIntel
 #
 # Formatter protocol (after service tag):
-#   Request:  2-byte filename length (big-endian) + filename +
+#   Request:  2-byte formatter_exs path length (big-endian) + formatter_exs path +
+#             2-byte filename length (big-endian) + filename +
 #             4-byte content length (big-endian) + content
 #   Response: 1-byte status (0=ok, 1=error) +
 #             4-byte result length (big-endian) + result
@@ -44,26 +43,24 @@
 # corrupting our binary protocol framing.
 :io.setopts(:standard_io, encoding: :latin1)
 
-[mix_root, formatter_exs_path, project_root_arg] = System.argv()
+[project_root_arg] = System.argv()
 
 # In umbrella apps, _build and deps live at the umbrella root, not in
-# individual app directories. Walk up from mix_root (bounded by the project
-# root) to find the nearest ancestor that contains a _build directory.
-expanded_mix_root = Path.expand(mix_root)
-expanded_boundary = Path.expand(project_root_arg)
+# individual app directories. Walk up from project_root (bounded to 20 levels)
+# to find the nearest ancestor that contains a _build directory.
+expanded_project_root = Path.expand(project_root_arg)
 
-project_root =
-  Enum.reduce_while(1..20, expanded_mix_root, fn _, dir ->
+build_root =
+  Enum.reduce_while(1..20, expanded_project_root, fn _, dir ->
     cond do
       File.dir?(Path.join(dir, "_build")) ->
         {:halt, dir}
-      dir == expanded_boundary ->
-        {:halt, expanded_mix_root}
+
       true ->
         parent = Path.dirname(dir)
 
         if parent == dir do
-          {:halt, expanded_mix_root}
+          {:halt, expanded_project_root}
         else
           {:cont, parent}
         end
@@ -72,96 +69,121 @@ project_root =
 
 # Add the project's compiled deps to the code path so plugins are available
 # without needing Mix.install
-project_root
+build_root
 |> Path.join("_build/dev/lib/*/ebin")
 |> Path.wildcard()
 |> Enum.each(&Code.prepend_path/1)
 
-# Read .formatter.exs
-raw_opts =
-  if File.regular?(formatter_exs_path) do
-    {result, _} = Code.eval_file(formatter_exs_path)
-    if is_list(result), do: result, else: []
-  else
-    []
+# Formatter Service
+
+defmodule Dexter.Formatter do
+  use GenServer
+
+  def start_link(formatter_exs_path) do
+    GenServer.start_link(__MODULE__, formatter_exs_path, name: via(formatter_exs_path))
   end
 
-plugins = Keyword.get(raw_opts, :plugins, [])
+  def format(formatter_exs_path, content, filename) do
+    GenServer.call(via(formatter_exs_path), {:format, content, filename}, :infinity)
+  end
 
-# Resolve locals_without_parens from import_deps by reading each dep's exported
-# formatter config. Mix does this automatically in mix format, but we must
-# replicate it here since we eval .formatter.exs directly.
-import_deps_locals =
-  raw_opts
-  |> Keyword.get(:import_deps, [])
-  |> Enum.flat_map(fn dep ->
-    dep_formatter = Path.join([project_root, "deps", to_string(dep), ".formatter.exs"])
+  defp via(formatter_exs_path) do
+    {:via, Registry, {Dexter.FormatterRegistry, formatter_exs_path}}
+  end
 
-    if File.regular?(dep_formatter) do
-      {dep_opts, _} = Code.eval_file(dep_formatter)
+  @impl true
+  def init(formatter_exs_path) do
+    {format_opts, active_plugins} = load_formatter_config(formatter_exs_path)
+    {:ok, %{format_opts: format_opts, plugins: active_plugins, path: formatter_exs_path}}
+  end
 
-      if is_list(dep_opts) do
-        dep_opts
-        |> Keyword.get(:export, [])
-        |> Keyword.get(:locals_without_parens, [])
+  @impl true
+  def handle_call({:format, content, filename}, _from, state) do
+    result = do_format(content, filename, state.format_opts, state.plugins)
+    {:reply, result, state}
+  end
+
+  defp load_formatter_config(formatter_exs_path) do
+    # Find the build root by looking for _build from the formatter's directory
+    formatter_dir = Path.dirname(formatter_exs_path)
+
+    project_root =
+      Enum.reduce_while(1..20, formatter_dir, fn _, dir ->
+        cond do
+          File.dir?(Path.join(dir, "_build")) -> {:halt, dir}
+          true ->
+            parent = Path.dirname(dir)
+            if parent == dir, do: {:halt, formatter_dir}, else: {:cont, parent}
+        end
+      end)
+
+    # Ensure compiled deps are on the code path so plugins can be loaded
+    project_root
+    |> Path.join("_build/dev/lib/*/ebin")
+    |> Path.wildcard()
+    |> Enum.each(&Code.prepend_path/1)
+
+    raw_opts =
+      if File.regular?(formatter_exs_path) do
+        {result, _} = Code.eval_file(formatter_exs_path)
+        if is_list(result), do: result, else: []
       else
         []
       end
-    else
-      []
+
+    plugins = Keyword.get(raw_opts, :plugins, [])
+
+    # Resolve locals_without_parens from import_deps
+    import_deps_locals =
+      raw_opts
+      |> Keyword.get(:import_deps, [])
+      |> Enum.flat_map(fn dep ->
+        dep_formatter = Path.join([project_root, "deps", to_string(dep), ".formatter.exs"])
+
+        if File.regular?(dep_formatter) do
+          {dep_opts, _} = Code.eval_file(dep_formatter)
+
+          if is_list(dep_opts) do
+            dep_opts
+            |> Keyword.get(:export, [])
+            |> Keyword.get(:locals_without_parens, [])
+          else
+            []
+          end
+        else
+          []
+        end
+      end)
+
+    explicit_locals = Keyword.get(raw_opts, :locals_without_parens, [])
+    all_locals_without_parens = Enum.uniq(import_deps_locals ++ explicit_locals)
+
+    format_opts =
+      raw_opts
+      |> Keyword.take([
+        :line_length,
+        :normalize_bitstring_modifiers,
+        :normalize_charlists_as_sigils,
+        :force_do_end_blocks
+      ])
+      |> Keyword.put(:locals_without_parens, all_locals_without_parens)
+
+    active_plugins = Enum.filter(plugins, &Code.ensure_loaded?/1)
+
+    missing_plugins = plugins -- active_plugins
+
+    if missing_plugins != [] do
+      IO.puts(:stderr, "Formatter: WARNING: could not load plugins: #{Enum.map_join(missing_plugins, ", ", &inspect/1)} (not compiled in _build?). Falling back to standard formatter.")
     end
-  end)
 
-explicit_locals = Keyword.get(raw_opts, :locals_without_parens, [])
-all_locals_without_parens = Enum.uniq(import_deps_locals ++ explicit_locals)
-
-# Extract formatting options
-format_opts =
-  raw_opts
-  |> Keyword.take([
-    :line_length,
-    :normalize_bitstring_modifiers,
-    :normalize_charlists_as_sigils,
-    :force_do_end_blocks
-  ])
-  |> Keyword.put(:locals_without_parens, all_locals_without_parens)
-
-# Resolve which plugins are actually loaded
-active_plugins = Enum.filter(plugins, &Code.ensure_loaded?/1)
-
-missing_plugins = plugins -- active_plugins
-
-if missing_plugins != [] do
-  IO.puts(:stderr, "Formatter: WARNING: could not load plugins: #{Enum.map_join(missing_plugins, ", ", &inspect/1)} (not compiled in _build?). Falling back to standard formatter.")
-end
-
-if active_plugins != [] do
-  IO.puts(:stderr, "Formatter: plugins loaded: #{Enum.map_join(active_plugins, ", ", &inspect/1)}")
-else
-  IO.puts(:stderr, "Formatter: no plugins")
-end
-
-# ── Formatter Service ──────────────────────────────────────────────────────
-
-defmodule Dexter.Formatter do
-  def handle_request(format_opts, plugins) do
-    case IO.binread(:stdio, 2) do
-      <<filename_len::unsigned-big-16>> ->
-        filename = if filename_len > 0, do: IO.binread(:stdio, filename_len), else: ""
-        <<content_len::unsigned-big-32>> = IO.binread(:stdio, 4)
-        content = IO.binread(:stdio, content_len)
-
-        {status, result} = format(content, filename, format_opts, plugins)
-        size = byte_size(result)
-        IO.binwrite(:stdio, <<status::8, size::unsigned-big-32, result::binary>>)
-        :ok
-
-      _ ->
-        :eof
+    if active_plugins != [] do
+      IO.puts(:stderr, "Formatter: plugins loaded for #{formatter_exs_path}: #{Enum.map_join(active_plugins, ", ", &inspect/1)}")
     end
+
+    {format_opts, active_plugins}
   end
 
-  defp format(content, filename, format_opts, plugins) when is_binary(content) do
+  defp do_format(content, filename, format_opts, plugins) when is_binary(content) do
     try do
       opts = if filename != "", do: [file: filename] ++ format_opts, else: format_opts
       ext = Path.extname(filename)
@@ -171,7 +193,6 @@ defmodule Dexter.Formatter do
         Enum.filter(plugins, fn plugin ->
           features = plugin.features(format_opts)
           extensions = Keyword.get(features, :extensions, [])
-          # If a plugin declares no extensions, it handles .ex/.exs by default
           extensions == [] or ext in extensions
         end)
 
@@ -207,10 +228,10 @@ defmodule Dexter.Formatter do
     end
   end
 
-  defp format(_, _, _, _), do: {1, "invalid input"}
+  defp do_format(_, _, _, _), do: {1, "invalid input"}
 end
 
-# ── CodeIntel Service ──────────────────────────────────────────────────────
+# CodeIntel Service
 
 defmodule Dexter.CodeIntel do
   @op_erlang_source 0
@@ -305,7 +326,6 @@ defmodule Dexter.CodeIntel do
   end
 
   defp find_function_in_forms(forms, function_atom, 255 = _unspecified) do
-    # No arity specified — find the first clause with matching name
     Enum.find_value(forms, 0, fn
       {:function, anno, ^function_atom, _arity, _clauses} ->
         anno_line(anno)
@@ -316,7 +336,6 @@ defmodule Dexter.CodeIntel do
   end
 
   defp find_function_in_forms(forms, function_atom, arity) do
-    # Exact arity match
     exact =
       Enum.find_value(forms, nil, fn
         {:function, anno, ^function_atom, ^arity, _clauses} ->
@@ -326,7 +345,6 @@ defmodule Dexter.CodeIntel do
           nil
       end)
 
-    # Fall back to first matching name if exact arity not found
     exact || find_function_in_forms(forms, function_atom, 255)
   end
 
@@ -352,7 +370,7 @@ defmodule Dexter.CodeIntel do
     end
   end
 
-  # ── Erlang Docs ──────────────────────────────────────────────────────────
+  # Erlang Docs
 
   defp handle_erlang_docs do
     <<module_len::unsigned-big-16>> = IO.binread(:stdio, 2)
@@ -375,7 +393,6 @@ defmodule Dexter.CodeIntel do
     case Code.fetch_docs(module_atom) do
       {:docs_v1, _, :erlang, _format, module_doc, _metadata, docs} ->
         if function_name == "" do
-          # Module-level docs
           case extract_doc_text(module_doc) do
             nil -> {1, nil}
             text -> {0, text}
@@ -391,7 +408,6 @@ defmodule Dexter.CodeIntel do
   end
 
   defp find_function_doc(docs, function_atom, arity) do
-    # Find matching function docs — prefer exact arity match
     candidates =
       Enum.filter(docs, fn
         {{:function, ^function_atom, _arity}, _anno, _sig, _doc, _meta} -> true
@@ -442,26 +458,25 @@ defmodule Dexter.CodeIntel do
   defp extract_doc_text(_), do: nil
 end
 
-# ── Main IO Loop ───────────────────────────────────────────────────────────
+# Main IO Loop
 
 defmodule Dexter.Loop do
   @service_formatter 0
   @service_code_intel 1
 
-  def run(format_opts, plugins, first_call?) do
-    # Signal ready if first call: status=0, length=0
+  def run(first_call?) do
     if first_call?, do: IO.binwrite(:stdio, <<0, 0, 0, 0, 0>>)
 
     case IO.binread(:stdio, 1) do
       <<@service_formatter>> ->
-        case Dexter.Formatter.handle_request(format_opts, plugins) do
-          :ok -> run(format_opts, plugins, false)
+        case handle_format_request() do
+          :ok -> run(false)
           :eof -> :ok
         end
 
       <<@service_code_intel>> ->
         case Dexter.CodeIntel.handle_request() do
-          :ok -> run(format_opts, plugins, false)
+          :ok -> run(false)
           :eof -> :ok
         end
 
@@ -469,10 +484,54 @@ defmodule Dexter.Loop do
         :ok
     end
   end
+
+  defp handle_format_request do
+    case IO.binread(:stdio, 2) do
+      <<config_path_len::unsigned-big-16>> ->
+        config_path = if config_path_len > 0, do: IO.binread(:stdio, config_path_len), else: ""
+        <<filename_len::unsigned-big-16>> = IO.binread(:stdio, 2)
+        filename = if filename_len > 0, do: IO.binread(:stdio, filename_len), else: ""
+        <<content_len::unsigned-big-32>> = IO.binread(:stdio, 4)
+        content = IO.binread(:stdio, content_len)
+
+        # Start a formatter for this config if we haven't seen it before
+        ensure_formatter(config_path)
+
+        {status, result} = Dexter.Formatter.format(config_path, content, filename)
+        size = byte_size(result)
+        IO.binwrite(:stdio, <<status::8, size::unsigned-big-32, result::binary>>)
+        :ok
+
+      _ ->
+        :eof
+    end
+  end
+
+  defp ensure_formatter(config_path) do
+    case Registry.lookup(Dexter.FormatterRegistry, config_path) do
+      [{_pid, _}] ->
+        :ok
+
+      [] ->
+        DynamicSupervisor.start_child(
+          Dexter.FormatterSup,
+          {Dexter.Formatter, config_path}
+        )
+
+        :ok
+    end
+  end
 end
 
+# Boot
+
+{:ok, _} = Registry.start_link(keys: :unique, name: Dexter.FormatterRegistry)
+{:ok, _} = DynamicSupervisor.start_link(strategy: :one_for_one, name: Dexter.FormatterSup)
+
+IO.puts(:stderr, "Dexter BEAM: started (pid #{System.pid()})")
+
 try do
-  Dexter.Loop.run(format_opts, active_plugins, true)
+  Dexter.Loop.run(true)
 rescue
   e ->
     IO.puts(:stderr, "Dexter BEAM: crash in loop: #{Exception.message(e)}")

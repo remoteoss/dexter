@@ -3002,14 +3002,13 @@ func TestFormatter_RestartAfterCrash(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Kill the persistent process
-	mixRoot := findMixRoot(filepath.Dir(filePath))
-	formatterExs := findFormatterConfig(filePath, mixRoot)
-	server.formattersMu.Lock()
-	if fp, ok := server.formatters[formatterExs]; ok {
-		fp.Close()
+	// Kill the persistent BEAM process
+	server.beamMu.Lock()
+	if server.beam != nil {
+		server.beam.Close()
+		server.beam = nil
 	}
-	server.formattersMu.Unlock()
+	server.beamMu.Unlock()
 
 	// Next format should recover (restart or fall back)
 	server.docs.Set(docURI, "defmodule   Test2   do\nend\n")
@@ -3080,12 +3079,12 @@ func TestFormatter_DidOpen_SkipsDepsFiles(t *testing.T) {
 		},
 	})
 
-	server.formattersMu.Lock()
-	count := len(server.formatters)
-	server.formattersMu.Unlock()
+	server.beamMu.Lock()
+	hasBeam := server.beam != nil
+	server.beamMu.Unlock()
 
-	if count != 0 {
-		t.Errorf("expected no formatter processes for dep file, got %d", count)
+	if hasBeam {
+		t.Errorf("expected no BEAM process for dep file, got one")
 	}
 }
 
@@ -4640,18 +4639,23 @@ func TestDefinition_ErlangAtomModule(t *testing.T) {
   end
 end`)
 
-	// col=5 on ":code" — should take the Erlang path and return nil
-	// (no BEAM process in test, so no result — but must not crash or
-	// fall through to Elixir resolution)
+	// col=5 on ":code" — should take the Erlang path, not fall through
+	// to Elixir resolution. If a BEAM process is available, we get a result
+	// pointing to the .erl source; if not, we get nil. Either way, it must
+	// not crash or produce an Elixir result.
 	locs := definitionAt(t, server, uri, 2, 5)
-	if len(locs) != 0 {
-		t.Errorf("expected no definition without BEAM process, got %v", locs)
+	for _, loc := range locs {
+		if !strings.HasSuffix(string(loc.URI), ".erl") {
+			t.Errorf("expected .erl file or no result, got %s", loc.URI)
+		}
 	}
 
 	// col=10 on "all_loaded" function
 	locs = definitionAt(t, server, uri, 2, 10)
-	if len(locs) != 0 {
-		t.Errorf("expected no definition without BEAM process, got %v", locs)
+	for _, loc := range locs {
+		if !strings.HasSuffix(string(loc.URI), ".erl") {
+			t.Errorf("expected .erl file or no result, got %s", loc.URI)
+		}
 	}
 }
 
@@ -4691,17 +4695,19 @@ func TestHover_ErlangAtomModule(t *testing.T) {
   end
 end`)
 
-	// col=5 on ":lists" — should take the Erlang path and return nil
-	// (no BEAM process in test)
+	// col=5 on ":lists" — should take the Erlang path. If a BEAM process
+	// is available, we get Erlang docs; if not, nil. Must not crash.
 	hover := hoverAt(t, server, uri, 2, 5)
-	if hover != nil {
-		t.Errorf("expected no hover without BEAM process, got %v", hover)
+	if hover != nil && hover.Contents.Kind != protocol.Markdown {
+		t.Errorf("expected markdown or nil, got %v", hover.Contents.Kind)
 	}
 
 	// col=12 on "flatten"
 	hover = hoverAt(t, server, uri, 2, 12)
 	if hover != nil {
-		t.Errorf("expected no hover without BEAM process, got %v", hover)
+		if !strings.Contains(hover.Contents.Value, "flatten") {
+			t.Errorf("expected hover about flatten, got %q", hover.Contents.Value)
+		}
 	}
 }
 
