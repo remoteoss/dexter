@@ -231,6 +231,39 @@ func TestExpressionAtCursor(t *testing.T) {
 			wantMod:  "Foo.Bar",
 			wantFunc: "transform",
 		},
+		// --- Erlang atom module support ---
+		{
+			name:     "erlang atom module with function",
+			code:     "    :code.all_loaded()",
+			line:     0,
+			col:      11, // 'a' in all_loaded
+			wantMod:  ":code",
+			wantFunc: "all_loaded",
+		},
+		{
+			name:     "erlang atom module cursor on atom",
+			code:     "    :code.all_loaded()",
+			line:     0,
+			col:      6, // 'o' in code
+			wantMod:  ":code",
+			wantFunc: "",
+		},
+		{
+			name:     "erlang atom :lists.flatten",
+			code:     ":lists.flatten(data)",
+			line:     0,
+			col:      7, // 'f' in flatten
+			wantMod:  ":lists",
+			wantFunc: "flatten",
+		},
+		{
+			name:     "erlang atom piped",
+			code:     "    |> :lists.flatten()",
+			line:     0,
+			col:      13, // 'f' in flatten
+			wantMod:  ":lists",
+			wantFunc: "flatten",
+		},
 	}
 
 	for _, tt := range tests {
@@ -1216,6 +1249,34 @@ func TestExtractCompletionContext(t *testing.T) {
 			line:         "  Enum.map_reduce",
 			col:          10,
 			wantPrefix:   "Enum.map",
+			wantAfterDot: false,
+		},
+		{
+			name:         "erlang module prefix",
+			line:         "  :lis",
+			col:          6,
+			wantPrefix:   ":lis",
+			wantAfterDot: false,
+		},
+		{
+			name:         "erlang module dot",
+			line:         "  :lists.",
+			col:          9,
+			wantPrefix:   ":lists",
+			wantAfterDot: true,
+		},
+		{
+			name:         "erlang module function prefix",
+			line:         "  :lists.fla",
+			col:          12,
+			wantPrefix:   ":lists.fla",
+			wantAfterDot: false,
+		},
+		{
+			name:         "bare colon — no completion",
+			line:         "  :",
+			col:          3,
+			wantPrefix:   "",
 			wantAfterDot: false,
 		},
 	}

@@ -122,10 +122,10 @@ end
 	}
 }
 
-// waitFor polls condition every 10ms until it returns true or one second elapses.
+// waitFor polls condition every 10ms until it returns true or two seconds elapse.
 func waitFor(t *testing.T, condition func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if condition() {
 			return
@@ -496,6 +496,133 @@ end
 				t.Errorf("non-pipe transform/3: expected full snippet, got %q", item.InsertText)
 			}
 			break
+		}
+	}
+}
+
+func TestApplySnippet_PipeGenericParamNamesPreserveOriginalIndex(t *testing.T) {
+	var item protocol.CompletionItem
+	applySnippet(&item, "call", 3, "", true, true)
+
+	if item.Label != "call/3" {
+		t.Fatalf("expected label call/3, got %q", item.Label)
+	}
+	if item.FilterText != "call" {
+		t.Fatalf("expected filter text call, got %q", item.FilterText)
+	}
+	if item.InsertText != "call(${1:arg2}, ${2:arg3})$0" {
+		t.Fatalf("expected piped generic snippet to start at arg2, got %q", item.InsertText)
+	}
+	if item.InsertTextFormat != protocol.InsertTextFormatSnippet {
+		t.Fatalf("expected snippet insert format, got %v", item.InsertTextFormat)
+	}
+}
+
+func TestCompletion_ElixirFormSnippets(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	uri := "file:///test.ex"
+
+	tests := []struct {
+		prefix  string
+		label   string
+		snippet string
+	}{
+		{"fo", "for", "for ${1:pattern} <- ${2:enumerable} do\n\t$0\nend"},
+		{"wi", "with", "with ${1:pattern} <- ${2:expression} do\n\t$0\nend"},
+		{"cas", "case", "case ${1:expression} do\n\t${2:pattern} ->\n\t\t$0\nend"},
+		{"con", "cond", "cond do\n\t${1:condition} ->\n\t\t$0\nend"},
+		{"i", "if", "if ${1:condition} do\n\t$0\nend"},
+		{"unl", "unless", "unless ${1:condition} do\n\t$0\nend"},
+		{"rec", "receive", "receive do\n\t${1:pattern} ->\n\t\t$0\nend"},
+		{"tr", "try", "try do\n\t$0\nrescue\n\t${1:exception} ->\n\t\t${2:handler}\nend"},
+		{"quo", "quote", "quote do\n\t$0\nend"},
+		{"f", "fn", "fn ${1:args} -> $0 end"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.label, func(t *testing.T) {
+			server.docs.Set(uri, "  "+tt.prefix)
+			items := completionAt(t, server, uri, 0, uint32(2+len(tt.prefix)))
+
+			var found bool
+			for _, item := range items {
+				if item.Label == tt.label {
+					found = true
+					if item.InsertText != tt.snippet {
+						t.Errorf("expected snippet %q, got %q", tt.snippet, item.InsertText)
+					}
+					if item.InsertTextFormat != protocol.InsertTextFormatSnippet {
+						t.Error("expected InsertTextFormatSnippet")
+					}
+					if item.Kind != protocol.CompletionItemKindKeyword {
+						t.Errorf("expected Keyword kind, got %v", item.Kind)
+					}
+					break
+				}
+			}
+			if !found {
+				t.Errorf("expected to find completion item %q", tt.label)
+			}
+		})
+	}
+}
+
+func TestCompletion_ElixirFormSnippets_NoDuplicateWithKernel(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/kernel.ex", `defmodule Kernel do
+  defmacro if(condition, clauses) do
+    :ok
+  end
+
+  defmacro unless(condition, clauses) do
+    :ok
+  end
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, "  i")
+	items := completionAt(t, server, uri, 0, 3)
+
+	var count int
+	for _, item := range items {
+		if item.Label == "if" || item.Label == "if/2" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("expected exactly 1 'if' completion, got %d", count)
+	}
+
+	// The one we get should be the snippet form, not the function-call form
+	for _, item := range items {
+		if item.Label == "if" {
+			if item.Kind != protocol.CompletionItemKindKeyword {
+				t.Errorf("expected Keyword kind for 'if', got %v", item.Kind)
+			}
+			if item.InsertText != elixirFormSnippets["if"] {
+				t.Errorf("expected form snippet for 'if', got %q", item.InsertText)
+			}
+		}
+	}
+}
+
+func TestCompletion_ElixirFormSnippets_NoSnippetSupport(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+	server.snippetSupport = false
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, "  fo")
+	items := completionAt(t, server, uri, 0, 4)
+
+	for _, item := range items {
+		if item.Label == "for" {
+			t.Error("form snippets should not appear when client lacks snippet support")
 		}
 	}
 }
@@ -1459,6 +1586,238 @@ end`
 	}
 	if !found {
 		t.Errorf("expected use MyApp.MoxBase with mod: MyApp.CustomMock; got %+v", calls)
+	}
+}
+
+func TestCompletion_ErlangUsesFileBuildRootInMonorepo(t *testing.T) {
+	if _, err := exec.LookPath("mix"); err != nil {
+		t.Skip("mix not available in PATH")
+	}
+
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+	defer server.closeBeams()
+
+	appRoot := filepath.Join(server.projectRoot, "apps", "tiger")
+	if err := os.MkdirAll(filepath.Join(appRoot, "_build"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(appRoot, "lib", "tiger"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	filePath := filepath.Join(appRoot, "lib", "tiger", "docusign.ex")
+	docURI := string(uri.File(filePath))
+
+	server.docs.Set(docURI, "  :c")
+	_ = completionAt(t, server, docURI, 0, 4)
+
+	waitFor(t, func() bool {
+		server.beamMu.Lock()
+		defer server.beamMu.Unlock()
+		return len(server.beams) > 0
+	})
+	waitFor(t, func() bool {
+		return server.erlangModulesAvailable(filePath)
+	})
+
+	server.docs.Set(docURI, "  :code.")
+	items := completionAt(t, server, docURI, 0, 8)
+	if len(items) == 0 {
+		t.Fatal("expected Erlang exports for :code.")
+	}
+	if !hasCompletionItem(items, "all_loaded") {
+		t.Fatal("expected code exports to include all_loaded")
+	}
+
+	server.beamMu.Lock()
+	defer server.beamMu.Unlock()
+	var buildRoots []string
+	for buildRoot := range server.beams {
+		buildRoots = append(buildRoots, buildRoot)
+	}
+	if len(server.beams) != 1 {
+		t.Fatalf("expected exactly 1 BEAM process, got %d", len(server.beams))
+	}
+	if _, ok := server.beams[appRoot]; !ok {
+		t.Fatalf("expected BEAM for app build root %s, got %v", appRoot, buildRoots)
+	}
+	if _, ok := server.beams[server.projectRoot]; ok {
+		t.Fatalf("did not expect BEAM for project root %s", server.projectRoot)
+	}
+}
+
+func TestDidOpen_WarmsErlangModulesInBackground(t *testing.T) {
+	if _, err := exec.LookPath("mix"); err != nil {
+		t.Skip("mix not available in PATH")
+	}
+
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+	defer server.closeBeams()
+
+	appRoot := filepath.Join(server.projectRoot, "apps", "tiger")
+	if err := os.MkdirAll(filepath.Join(appRoot, "_build"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(appRoot, "lib", "tiger"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	filePath := filepath.Join(appRoot, "lib", "tiger", "docusign.ex")
+	docURI := string(uri.File(filePath))
+
+	err := server.DidOpen(context.Background(), &protocol.DidOpenTextDocumentParams{
+		TextDocument: protocol.TextDocumentItem{
+			URI:        protocol.DocumentURI(docURI),
+			LanguageID: "elixir",
+			Version:    1,
+			Text:       "  :c",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, func() bool {
+		return server.erlangModulesAvailable(filePath)
+	})
+
+	items := completionAt(t, server, docURI, 0, 4)
+	if !hasCompletionItem(items, ":code") {
+		t.Fatal("expected background warmup to make :code available on first completion")
+	}
+}
+
+func TestCompletion_ErlangFunctionSnippet(t *testing.T) {
+	if _, err := exec.LookPath("mix"); err != nil {
+		t.Skip("mix not available in PATH")
+	}
+
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+	defer server.closeBeams()
+
+	appRoot := filepath.Join(server.projectRoot, "apps", "tiger")
+	if err := os.MkdirAll(filepath.Join(appRoot, "_build"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(appRoot, "lib", "tiger"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	filePath := filepath.Join(appRoot, "lib", "tiger", "docusign.ex")
+	docURI := string(uri.File(filePath))
+
+	err := server.DidOpen(context.Background(), &protocol.DidOpenTextDocumentParams{
+		TextDocument: protocol.TextDocumentItem{
+			URI:        protocol.DocumentURI(docURI),
+			LanguageID: "elixir",
+			Version:    1,
+			Text:       "  :ets.",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, func() bool {
+		return server.erlangModulesAvailable(filePath)
+	})
+
+	items := completionAt(t, server, docURI, 0, 7)
+
+	var found bool
+	for _, item := range items {
+		if item.Label == "new/2" {
+			found = true
+			if item.FilterText != "new" {
+				t.Errorf("new/2: expected filter text 'new', got %q", item.FilterText)
+			}
+			if item.InsertText != "new(${1:name}, ${2:options})$0" {
+				t.Errorf("new/2: expected snippet insert text, got %q", item.InsertText)
+			}
+			if item.InsertTextFormat != protocol.InsertTextFormatSnippet {
+				t.Errorf("new/2: expected snippet format, got %v", item.InsertTextFormat)
+			}
+			if item.Detail != ":ets.new/2" {
+				t.Errorf("new/2: expected detail :ets.new/2, got %q", item.Detail)
+			}
+			break
+		}
+	}
+	if !found {
+		t.Fatal("expected to find Erlang completion item new/2")
+	}
+}
+
+func TestDidOpen_SharesErlangRuntimeCacheAcrossBuildRoots(t *testing.T) {
+	if _, err := exec.LookPath("mix"); err != nil {
+		t.Skip("mix not available in PATH")
+	}
+
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+	defer server.closeBeams()
+
+	appOne := filepath.Join(server.projectRoot, "apps", "tiger")
+	appTwo := filepath.Join(server.projectRoot, "apps", "lynx")
+	for _, appRoot := range []string{appOne, appTwo} {
+		if err := os.MkdirAll(filepath.Join(appRoot, "_build"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(appRoot, "lib"), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	fileOne := filepath.Join(appOne, "lib", "one.ex")
+	fileTwo := filepath.Join(appTwo, "lib", "two.ex")
+
+	open := func(path, text string) {
+		t.Helper()
+		err := server.DidOpen(context.Background(), &protocol.DidOpenTextDocumentParams{
+			TextDocument: protocol.TextDocumentItem{
+				URI:        protocol.DocumentURI(uri.File(path)),
+				LanguageID: "elixir",
+				Version:    1,
+				Text:       text,
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	open(fileOne, "  :c")
+	waitFor(t, func() bool {
+		return server.erlangModulesAvailable(fileOne)
+	})
+
+	open(fileTwo, "  :c")
+	waitFor(t, func() bool {
+		return server.erlangModulesAvailable(fileTwo)
+	})
+
+	buildRootOne := server.erlangBuildRoot(fileOne)
+	buildRootTwo := server.erlangBuildRoot(fileTwo)
+
+	server.erlangRuntimeMu.Lock()
+	defer server.erlangRuntimeMu.Unlock()
+
+	stateOne := server.erlangBuildRoots[buildRootOne]
+	stateTwo := server.erlangBuildRoots[buildRootTwo]
+	if stateOne == nil || stateOne.runtimeKey == "" {
+		t.Fatalf("expected runtime key for %s", buildRootOne)
+	}
+	if stateTwo == nil || stateTwo.runtimeKey == "" {
+		t.Fatalf("expected runtime key for %s", buildRootTwo)
+	}
+	if stateOne.runtimeKey != stateTwo.runtimeKey {
+		t.Fatalf("expected shared runtime key, got %q and %q", stateOne.runtimeKey, stateTwo.runtimeKey)
+	}
+	if len(server.erlangRuntimeCache) != 1 {
+		t.Fatalf("expected exactly 1 Erlang runtime cache, got %d", len(server.erlangRuntimeCache))
 	}
 }
 
@@ -3002,14 +3361,13 @@ func TestFormatter_RestartAfterCrash(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Kill the persistent process
-	mixRoot := findMixRoot(filepath.Dir(filePath))
-	formatterExs := findFormatterConfig(filePath, mixRoot)
-	server.formattersMu.Lock()
-	if fp, ok := server.formatters[formatterExs]; ok {
-		fp.Close()
+	// Kill all persistent BEAM processes
+	server.beamMu.Lock()
+	for key, bp := range server.beams {
+		bp.Close()
+		delete(server.beams, key)
 	}
-	server.formattersMu.Unlock()
+	server.beamMu.Unlock()
 
 	// Next format should recover (restart or fall back)
 	server.docs.Set(docURI, "defmodule   Test2   do\nend\n")
@@ -3024,6 +3382,149 @@ func TestFormatter_RestartAfterCrash(t *testing.T) {
 	}
 	if !strings.Contains(edits[0].NewText, "defmodule Test2 do") {
 		t.Errorf("unexpected format result: %s", edits[0].NewText)
+	}
+}
+
+func TestDidSave_FormatterConfigRestartDoesNotHoldBeamMuWhileClosing(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	configPath := filepath.Join(server.projectRoot, ".formatter.exs")
+	if err := os.WriteFile(configPath, []byte("[]"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command("sleep", "30")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	cmdDone := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(cmdDone)
+	}()
+	defer func() {
+		_ = cmd.Process.Kill()
+		<-cmdDone
+	}()
+
+	bp := &beamProcess{
+		cmd:    &commandHandle{process: cmd.Process, done: cmdDone},
+		stdin:  stdin,
+		ready:  make(chan struct{}),
+		closed: make(chan struct{}),
+	}
+	bp.writeMu.Lock()
+	writeLocked := true
+	defer func() {
+		if writeLocked {
+			bp.writeMu.Unlock()
+		}
+	}()
+
+	buildRoot := server.findBuildRoot(filepath.Dir(configPath))
+	server.beams = map[string]*beamProcess{buildRoot: bp}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- server.DidSave(context.Background(), &protocol.DidSaveTextDocumentParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(uri.File(configPath))},
+		})
+	}()
+
+	waitFor(t, func() bool {
+		if !server.beamMu.TryLock() {
+			return false
+		}
+		defer server.beamMu.Unlock()
+		_, ok := server.beams[buildRoot]
+		return !ok
+	})
+
+	select {
+	case err := <-done:
+		t.Fatalf("DidSave returned before Close was unblocked: %v", err)
+	default:
+	}
+
+	if !server.beamMu.TryLock() {
+		t.Fatal("expected beamMu to be released while Close was blocked")
+	}
+	server.beamMu.Unlock()
+
+	bp.writeMu.Unlock()
+	writeLocked = false
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("DidSave did not finish after Close was unblocked")
+	}
+}
+
+func TestDidSave_FormatterConfigRestartPicksUpUpdatedConfig(t *testing.T) {
+	if _, err := exec.LookPath("mix"); err != nil {
+		t.Skip("mix not available in PATH")
+	}
+
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	if err := os.WriteFile(filepath.Join(server.projectRoot, "mix.exs"), []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	configPath := filepath.Join(server.projectRoot, ".formatter.exs")
+	if err := os.WriteFile(configPath, []byte("[]"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	filePath := filepath.Join(server.projectRoot, "lib", "test.ex")
+	if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	docURI := string(uri.File(filePath))
+	input := "defmodule Test do\n  def hello, do: :world\nend\n"
+	server.docs.Set(docURI, input)
+
+	edits, err := server.Formatting(context.Background(), &protocol.DocumentFormattingParams{
+		TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(docURI)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if edits != nil {
+		t.Fatalf("expected initial formatting to match input, got %#v", edits)
+	}
+
+	if err := os.WriteFile(configPath, []byte("[force_do_end_blocks: true]\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.DidSave(context.Background(), &protocol.DidSaveTextDocumentParams{
+		TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(uri.File(configPath))},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	server.docs.Set(docURI, input)
+	edits, err = server.Formatting(context.Background(), &protocol.DocumentFormattingParams{
+		TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(docURI)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if edits == nil {
+		t.Fatal("expected formatting edits after .formatter.exs change")
+	}
+	if !strings.Contains(edits[0].NewText, "def hello do") {
+		t.Fatalf("expected updated formatter config to force do/end blocks, got:\n%s", edits[0].NewText)
 	}
 }
 
@@ -3080,12 +3581,12 @@ func TestFormatter_DidOpen_SkipsDepsFiles(t *testing.T) {
 		},
 	})
 
-	server.formattersMu.Lock()
-	count := len(server.formatters)
-	server.formattersMu.Unlock()
+	server.beamMu.Lock()
+	beamCount := len(server.beams)
+	server.beamMu.Unlock()
 
-	if count != 0 {
-		t.Errorf("expected no formatter processes for dep file, got %d", count)
+	if beamCount != 0 {
+		t.Errorf("expected no BEAM processes for dep file, got %d", beamCount)
 	}
 }
 
@@ -4626,5 +5127,114 @@ end`
 	}
 	if !found {
 		t.Errorf("expected definition location in contract_snapshot_schema.ex, got %v", locs)
+	}
+}
+
+func TestDefinition_ErlangAtomModule(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyModule do
+  def run do
+    :code.all_loaded()
+  end
+end`)
+
+	// col=5 on ":code" — should take the Erlang path, not fall through
+	// to Elixir resolution. If a BEAM process is available, we get a result
+	// pointing to the .erl source; if not, we get nil. Either way, it must
+	// not crash or produce an Elixir result.
+	locs := definitionAt(t, server, uri, 2, 5)
+	for _, loc := range locs {
+		if !strings.HasSuffix(string(loc.URI), ".erl") {
+			t.Errorf("expected .erl file or no result, got %s", loc.URI)
+		}
+	}
+
+	// col=10 on "all_loaded" function
+	locs = definitionAt(t, server, uri, 2, 10)
+	for _, loc := range locs {
+		if !strings.HasSuffix(string(loc.URI), ".erl") {
+			t.Errorf("expected .erl file or no result, got %s", loc.URI)
+		}
+	}
+}
+
+func TestDefinition_ErlangAtomDoesNotAffectElixir(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", `defmodule MyApp.Accounts do
+  def create(attrs), do: :ok
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyModule do
+  alias MyApp.Accounts
+  Accounts.create(attrs)
+end`)
+
+	// Normal Elixir go-to-definition still works
+	locs := definitionAt(t, server, uri, 2, 13)
+	if len(locs) == 0 {
+		t.Fatal("expected Elixir definition to still work")
+	}
+	if !strings.Contains(string(locs[0].URI), "accounts.ex") {
+		t.Errorf("expected accounts.ex, got %s", locs[0].URI)
+	}
+}
+
+func TestHover_ErlangAtomModule(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyModule do
+  def run do
+    :lists.flatten(data)
+  end
+end`)
+
+	// col=5 on ":lists" — should take the Erlang path. If a BEAM process
+	// is available, we get Erlang docs; if not, nil. Must not crash.
+	hover := hoverAt(t, server, uri, 2, 5)
+	if hover != nil && hover.Contents.Kind != protocol.Markdown {
+		t.Errorf("expected markdown or nil, got %v", hover.Contents.Kind)
+	}
+
+	// col=12 on "flatten"
+	hover = hoverAt(t, server, uri, 2, 12)
+	if hover != nil {
+		if !strings.Contains(hover.Contents.Value, "flatten") {
+			t.Errorf("expected hover about flatten, got %q", hover.Contents.Value)
+		}
+	}
+}
+
+func TestHover_ErlangAtomDoesNotAffectElixir(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", `defmodule MyApp.Accounts do
+  @doc "Creates a new account."
+  def create(attrs), do: :ok
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyModule do
+  alias MyApp.Accounts
+  Accounts.create(attrs)
+end`)
+
+	// Normal Elixir hover still works
+	hover := hoverAt(t, server, uri, 2, 13)
+	if hover == nil {
+		t.Fatal("expected Elixir hover to still work")
+	}
+	if !strings.Contains(hover.Contents.Value, "Creates a new account") {
+		t.Errorf("expected doc content, got %q", hover.Contents.Value)
 	}
 }

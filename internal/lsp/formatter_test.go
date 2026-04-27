@@ -1,13 +1,18 @@
 package lsp
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
@@ -57,6 +62,70 @@ func setupTestServerForFixture(t *testing.T, mixRoot string) (*Server, func()) {
 	return server, func() {
 		_ = s.Close()
 	}
+}
+
+func newTestBeamProcess(stdin io.WriteCloser, stdout io.ReadCloser, notify func(beamNotification)) *beamProcess {
+	bp := &beamProcess{
+		cmd: &commandHandle{
+			process: &os.Process{Pid: os.Getpid()},
+			done:    make(chan struct{}),
+		},
+		stdin:   stdin,
+		stdout:  stdout,
+		stderr:  &bytes.Buffer{},
+		pending: make(map[uint32]chan beamResponse),
+		ready:   make(chan struct{}),
+		closed:  make(chan struct{}),
+		notify:  notify,
+	}
+	bp.finishStartup(nil)
+	return bp
+}
+
+func writeTestResponseFrame(t *testing.T, w io.Writer, reqID uint32, status byte, payload []byte) {
+	t.Helper()
+	var frame bytes.Buffer
+	frame.WriteByte(frameResponse)
+	if err := binary.Write(&frame, binary.BigEndian, reqID); err != nil {
+		t.Fatal(err)
+	}
+	frame.WriteByte(status)
+	if err := binary.Write(&frame, binary.BigEndian, uint32(len(payload))); err != nil {
+		t.Fatal(err)
+	}
+	frame.Write(payload)
+	if _, err := w.Write(frame.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeTestNotificationFrame(t *testing.T, w io.Writer, op byte, payload []byte) {
+	t.Helper()
+	var frame bytes.Buffer
+	frame.WriteByte(frameNotification)
+	frame.WriteByte(op)
+	if err := binary.Write(&frame, binary.BigEndian, uint32(len(payload))); err != nil {
+		t.Fatal(err)
+	}
+	frame.Write(payload)
+	if _, err := w.Write(frame.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func encodeTestModuleNamesPayload(t *testing.T, names []string) []byte {
+	t.Helper()
+	var payload bytes.Buffer
+	if err := binary.Write(&payload, binary.BigEndian, uint16(len(names))); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range names {
+		if err := binary.Write(&payload, binary.BigEndian, uint16(len(name))); err != nil {
+			t.Fatal(err)
+		}
+		payload.WriteString(name)
+	}
+	return payload.Bytes()
 }
 
 func TestFormatterServer_WithStylerPlugin(t *testing.T) {
@@ -431,4 +500,257 @@ func TestComputeMinimalEdits(t *testing.T) {
 			t.Errorf("unexpected new text: %q", edits[0].NewText)
 		}
 	})
+}
+
+func TestFindFormatterConfig_UmbrellaRootOnly(t *testing.T) {
+	// Simulate an umbrella where only the root has .formatter.exs
+	//   root/
+	//     .formatter.exs
+	//     apps/
+	//       my_app/
+	//         mix.exs
+	//         lib/
+	//           foo.ex
+	root := t.TempDir()
+	appDir := filepath.Join(root, "apps", "my_app", "lib")
+	if err := os.MkdirAll(appDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	rootFormatter := filepath.Join(root, ".formatter.exs")
+	if err := os.WriteFile(rootFormatter, []byte("[]"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	filePath := filepath.Join(appDir, "foo.ex")
+	got := findFormatterConfig(filePath, root)
+	if got != rootFormatter {
+		t.Errorf("expected %s, got %s", rootFormatter, got)
+	}
+}
+
+func TestFindFormatterConfig_PerAppOverridesRoot(t *testing.T) {
+	// Both root and app have .formatter.exs — the app's should win
+	root := t.TempDir()
+	appDir := filepath.Join(root, "apps", "my_app")
+	if err := os.MkdirAll(filepath.Join(appDir, "lib"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".formatter.exs"), []byte("[]"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	appFormatter := filepath.Join(appDir, ".formatter.exs")
+	if err := os.WriteFile(appFormatter, []byte("[]"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	filePath := filepath.Join(appDir, "lib", "foo.ex")
+	got := findFormatterConfig(filePath, root)
+	if got != appFormatter {
+		t.Errorf("expected app-level %s, got %s", appFormatter, got)
+	}
+}
+
+func TestBeamProcess_DoRequestHandlesNotificationBeforeResponse(t *testing.T) {
+	reqReader, reqWriter := io.Pipe()
+	respReader, respWriter := io.Pipe()
+
+	notifications := make(chan beamNotification, 1)
+	bp := newTestBeamProcess(reqWriter, respReader, func(notification beamNotification) {
+		notifications <- notification
+	})
+
+	readLoopDone := make(chan struct{})
+	go func() {
+		bp.readLoop()
+		close(readLoopDone)
+	}()
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+
+		frameType, err := readByte(reqReader)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if frameType != frameRequest {
+			t.Errorf("expected request frame, got %d", frameType)
+			return
+		}
+
+		reqID, err := readUint32(reqReader)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+
+		header := make([]byte, 6)
+		if _, err := io.ReadFull(reqReader, header); err != nil {
+			t.Error(err)
+			return
+		}
+		if header[0] != serviceCodeIntel || header[1] != codeIntelOpRuntimeInfo {
+			t.Errorf("unexpected request header service=%d op=%d", header[0], header[1])
+			return
+		}
+		payloadLen := binary.BigEndian.Uint32(header[2:])
+		if payloadLen != 0 {
+			t.Errorf("expected empty payload, got %d bytes", payloadLen)
+			return
+		}
+
+		writeTestNotificationFrame(t, respWriter, beamNotificationOTPModulesReady, encodeTestModuleNamesPayload(t, []string{"code"}))
+		writeTestResponseFrame(t, respWriter, reqID, 0, []byte("ok"))
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	var gotResponse string
+	if err := bp.doRequest(ctx, serviceCodeIntel, codeIntelOpRuntimeInfo, nil, func(status byte, payload []byte) error {
+		if status != 0 {
+			t.Fatalf("expected success status, got %d", status)
+		}
+		gotResponse = string(payload)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if gotResponse != "ok" {
+		t.Fatalf("expected response payload %q, got %q", "ok", gotResponse)
+	}
+
+	select {
+	case notification := <-notifications:
+		if notification.op != beamNotificationOTPModulesReady {
+			t.Fatalf("expected otp_modules_ready notification, got %d", notification.op)
+		}
+		names, err := decodeErlangModuleNames(notification.payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(names) != 1 || names[0] != "code" {
+			t.Fatalf("unexpected notification payload: %v", names)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for notification")
+	}
+
+	<-serverDone
+	_ = reqWriter.Close()
+	_ = reqReader.Close()
+	_ = respWriter.Close()
+	<-readLoopDone
+}
+
+func TestBeamProcess_CanceledRequestDoesNotBlockSubsequentResponses(t *testing.T) {
+	reqReader, reqWriter := io.Pipe()
+	respReader, respWriter := io.Pipe()
+
+	bp := newTestBeamProcess(reqWriter, respReader, nil)
+
+	readLoopDone := make(chan struct{})
+	go func() {
+		bp.readLoop()
+		close(readLoopDone)
+	}()
+
+	firstRead := make(chan uint32, 1)
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+
+		readRequest := func() (uint32, byte, error) {
+			frameType, err := readByte(reqReader)
+			if err != nil {
+				return 0, 0, err
+			}
+			if frameType != frameRequest {
+				return 0, 0, fmt.Errorf("unexpected frame type %d", frameType)
+			}
+			reqID, err := readUint32(reqReader)
+			if err != nil {
+				return 0, 0, err
+			}
+			header := make([]byte, 6)
+			if _, err := io.ReadFull(reqReader, header); err != nil {
+				return 0, 0, err
+			}
+			payloadLen := binary.BigEndian.Uint32(header[2:])
+			if payloadLen > 0 {
+				if _, err := io.CopyN(io.Discard, reqReader, int64(payloadLen)); err != nil {
+					return 0, 0, err
+				}
+			}
+			return reqID, header[1], nil
+		}
+
+		firstReqID, firstOp, err := readRequest()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if firstOp != 0x11 {
+			t.Errorf("expected first op 0x11, got %d", firstOp)
+			return
+		}
+		firstRead <- firstReqID
+
+		secondReqID, secondOp, err := readRequest()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if secondOp != 0x12 {
+			t.Errorf("expected second op 0x12, got %d", secondOp)
+			return
+		}
+
+		writeTestResponseFrame(t, respWriter, secondReqID, 0, []byte("second"))
+		writeTestResponseFrame(t, respWriter, firstReqID, 0, []byte("first"))
+	}()
+
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	firstErrCh := make(chan error, 1)
+	go func() {
+		firstErrCh <- bp.doRequest(firstCtx, serviceCodeIntel, 0x11, nil, func(status byte, payload []byte) error {
+			return fmt.Errorf("canceled request should not receive a response: status=%d payload=%q", status, string(payload))
+		})
+	}()
+
+	firstReqID := <-firstRead
+	if firstReqID == 0 {
+		t.Fatal("expected non-zero first request id")
+	}
+	cancelFirst()
+
+	secondCtx, cancelSecond := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelSecond()
+
+	var gotSecond string
+	if err := bp.doRequest(secondCtx, serviceCodeIntel, 0x12, nil, func(status byte, payload []byte) error {
+		if status != 0 {
+			t.Fatalf("expected success status, got %d", status)
+		}
+		gotSecond = string(payload)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if gotSecond != "second" {
+		t.Fatalf("expected second response payload %q, got %q", "second", gotSecond)
+	}
+
+	if err := <-firstErrCh; err != context.Canceled {
+		t.Fatalf("expected first request to return context.Canceled, got %v", err)
+	}
+
+	<-serverDone
+	_ = reqWriter.Close()
+	_ = reqReader.Close()
+	_ = respWriter.Close()
+	<-readLoopDone
 }
