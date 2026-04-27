@@ -36,17 +36,51 @@ const (
 	// Service tags for the BEAM server protocol
 	serviceFormatter byte = 0x00
 	serviceCodeIntel byte = 0x01
+
+	// Frame types for the multiplexed BEAM protocol
+	frameRequest      byte = 0x00
+	frameResponse     byte = 0x01
+	frameNotification byte = 0x02
+	frameReady        byte = 0x03
+
+	formatterOpFormat byte = 0x00
+
+	codeIntelOpErlangSource   byte = 0x00
+	codeIntelOpErlangDocs     byte = 0x01
+	codeIntelOpWarmOTPModules byte = 0x02
+	codeIntelOpErlangExports  byte = 0x03
+	codeIntelOpRuntimeInfo    byte = 0x04
+
+	beamNotificationOTPModulesReady  byte = 0x00
+	beamNotificationOTPModulesFailed byte = 0x01
 )
 
 type beamProcess struct {
 	cmd       *commandHandle
 	stdin     io.WriteCloser
 	stdout    io.ReadCloser
-	mu        sync.Mutex
+	stderr    *bytes.Buffer // rolling stderr capture for crash diagnostics
+	writeMu   sync.Mutex
+	pendingMu sync.Mutex
+	pending   map[uint32]chan beamResponse
+	nextReqID uint32
 	startedAt time.Time     // when the process was launched
 	ready     chan struct{} // closed when the BEAM has sent the ready signal
 	startErr  error         // non-nil if startup failed; set before ready is closed
+	startOnce sync.Once
 	closed    chan struct{} // closed by Close(); makes alive() return false immediately
+	notify    func(beamNotification)
+}
+
+type beamResponse struct {
+	status  byte
+	payload []byte
+	err     error
+}
+
+type beamNotification struct {
+	op      byte
+	payload []byte
 }
 
 // commandHandle wraps the process so we can check liveness.
@@ -66,6 +100,33 @@ func (bp *beamProcess) alive() bool {
 	}
 }
 
+// recentStderr returns the tail of the captured stderr buffer (up to 512 bytes)
+// for inclusion in error messages when the BEAM process crashes.
+func (bp *beamProcess) recentStderr() string {
+	if bp.stderr == nil {
+		return ""
+	}
+	b := bp.stderr.Bytes()
+	if len(b) > 512 {
+		b = b[len(b)-512:]
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// wrapError annotates a read/write error with recent stderr output if the
+// BEAM process has died, making crash diagnostics visible in log messages.
+func (bp *beamProcess) wrapError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if !bp.alive() {
+		if stderr := bp.recentStderr(); stderr != "" {
+			return fmt.Errorf("%w\nBEAM stderr:\n%s", err, stderr)
+		}
+	}
+	return err
+}
+
 // Ready blocks until the process has finished startup. Returns startErr if
 // the BEAM failed to initialize, or ctx.Err() if the caller gives up first.
 func (bp *beamProcess) Ready(ctx context.Context) error {
@@ -77,64 +138,253 @@ func (bp *beamProcess) Ready(ctx context.Context) error {
 	}
 }
 
+func (bp *beamProcess) finishStartup(err error) {
+	bp.startOnce.Do(func() {
+		bp.startErr = err
+		close(bp.ready)
+	})
+}
+
+func (bp *beamProcess) addPending() (uint32, chan beamResponse) {
+	bp.pendingMu.Lock()
+	defer bp.pendingMu.Unlock()
+
+	bp.nextReqID++
+	reqID := bp.nextReqID
+	respCh := make(chan beamResponse, 1)
+	if bp.pending == nil {
+		bp.pending = make(map[uint32]chan beamResponse)
+	}
+	bp.pending[reqID] = respCh
+	return reqID, respCh
+}
+
+func (bp *beamProcess) removePending(reqID uint32) chan beamResponse {
+	bp.pendingMu.Lock()
+	defer bp.pendingMu.Unlock()
+
+	respCh := bp.pending[reqID]
+	delete(bp.pending, reqID)
+	return respCh
+}
+
+func (bp *beamProcess) failPending(err error) {
+	err = bp.wrapError(err)
+
+	bp.pendingMu.Lock()
+	pending := bp.pending
+	bp.pending = make(map[uint32]chan beamResponse)
+	bp.pendingMu.Unlock()
+
+	for _, respCh := range pending {
+		respCh <- beamResponse{err: err}
+	}
+}
+
+func readByte(r io.Reader) (byte, error) {
+	var value [1]byte
+	if _, err := io.ReadFull(r, value[:]); err != nil {
+		return 0, err
+	}
+	return value[0], nil
+}
+
+func readUint32(r io.Reader) (uint32, error) {
+	var value uint32
+	if err := binary.Read(r, binary.BigEndian, &value); err != nil {
+		return 0, err
+	}
+	return value, nil
+}
+
+func readPayload(r io.Reader, size uint32) ([]byte, error) {
+	buf := make([]byte, size)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
+func readStatusPayload(r io.Reader) (byte, []byte, error) {
+	status, err := readByte(r)
+	if err != nil {
+		return 0, nil, err
+	}
+	size, err := readUint32(r)
+	if err != nil {
+		return 0, nil, err
+	}
+	payload, err := readPayload(r, size)
+	if err != nil {
+		return 0, nil, err
+	}
+	return status, payload, nil
+}
+
+func (bp *beamProcess) readLoop() {
+	for {
+		frameType, err := readByte(bp.stdout)
+		if err != nil {
+			if !errors.Is(err, io.EOF) && !errors.Is(err, os.ErrClosed) {
+				err = fmt.Errorf("read frame type: %w", err)
+			}
+			bp.finishStartup(fmt.Errorf("BEAM read loop: %w", err))
+			bp.failPending(err)
+			return
+		}
+
+		switch frameType {
+		case frameReady:
+			status, payload, err := readStatusPayload(bp.stdout)
+			if err != nil {
+				startErr := fmt.Errorf("read ready frame: %w", err)
+				bp.finishStartup(startErr)
+				bp.failPending(startErr)
+				return
+			}
+			if status != 0 {
+				msg := "BEAM failed to initialize"
+				if len(payload) > 0 {
+					msg = fmt.Sprintf("%s: %s", msg, strings.TrimSpace(string(payload)))
+				}
+				startErr := errors.New(msg)
+				bp.finishStartup(startErr)
+				bp.failPending(startErr)
+				return
+			}
+			log.Printf("BEAM: started persistent process (pid %d)", bp.cmd.process.Pid)
+			bp.finishStartup(nil)
+
+		case frameResponse:
+			reqID, err := readUint32(bp.stdout)
+			if err != nil {
+				respErr := fmt.Errorf("read response request id: %w", err)
+				bp.finishStartup(respErr)
+				bp.failPending(respErr)
+				return
+			}
+			status, payload, err := readStatusPayload(bp.stdout)
+			if err != nil {
+				respErr := fmt.Errorf("read response payload: %w", err)
+				bp.finishStartup(respErr)
+				bp.failPending(respErr)
+				return
+			}
+			if respCh := bp.removePending(reqID); respCh != nil {
+				respCh <- beamResponse{status: status, payload: payload}
+			}
+
+		case frameNotification:
+			op, err := readByte(bp.stdout)
+			if err != nil {
+				notifErr := fmt.Errorf("read notification op: %w", err)
+				bp.finishStartup(notifErr)
+				bp.failPending(notifErr)
+				return
+			}
+			size, err := readUint32(bp.stdout)
+			if err != nil {
+				notifErr := fmt.Errorf("read notification payload length: %w", err)
+				bp.finishStartup(notifErr)
+				bp.failPending(notifErr)
+				return
+			}
+			payload, err := readPayload(bp.stdout, size)
+			if err != nil {
+				notifErr := fmt.Errorf("read notification payload: %w", err)
+				bp.finishStartup(notifErr)
+				bp.failPending(notifErr)
+				return
+			}
+			if bp.notify != nil {
+				bp.notify(beamNotification{op: op, payload: payload})
+			}
+
+		default:
+			protocolErr := fmt.Errorf("unexpected BEAM frame type: %d", frameType)
+			bp.finishStartup(protocolErr)
+			bp.failPending(protocolErr)
+			return
+		}
+	}
+}
+
+// doRequest sends a framed request to the BEAM and waits for the matching
+// response. The permanent read loop demultiplexes responses by request ID and
+// routes notifications to the cache layer.
+func (bp *beamProcess) doRequest(ctx context.Context, service, op byte, payload []byte, handleResp func(status byte, payload []byte) error) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
+	reqID, respCh := bp.addPending()
+
+	bp.writeMu.Lock()
+	if ctx.Err() != nil {
+		bp.writeMu.Unlock()
+		bp.removePending(reqID)
+		return ctx.Err()
+	}
+	if !bp.alive() {
+		bp.writeMu.Unlock()
+		bp.removePending(reqID)
+		return bp.wrapError(fmt.Errorf("BEAM process is not alive"))
+	}
+
+	var frame bytes.Buffer
+	frame.WriteByte(frameRequest)
+	_ = binary.Write(&frame, binary.BigEndian, reqID)
+	frame.WriteByte(service)
+	frame.WriteByte(op)
+	_ = binary.Write(&frame, binary.BigEndian, uint32(len(payload)))
+	frame.Write(payload)
+
+	_, err := bp.stdin.Write(frame.Bytes())
+	bp.writeMu.Unlock()
+	if err != nil {
+		bp.removePending(reqID)
+		return bp.wrapError(fmt.Errorf("write request: %w", err))
+	}
+
+	select {
+	case resp := <-respCh:
+		if resp.err != nil {
+			return resp.err
+		}
+		return handleResp(resp.status, resp.payload)
+	case <-ctx.Done():
+		bp.removePending(reqID)
+		return ctx.Err()
+	case <-bp.closed:
+		bp.removePending(reqID)
+		return bp.wrapError(fmt.Errorf("BEAM process closed"))
+	}
+}
+
 // Format sends a format request to the BEAM process. The formatterExs path
 // tells the BEAM which .formatter.exs config to use (starting a new formatter
 // child if needed).
 func (bp *beamProcess) Format(ctx context.Context, content, filename, formatterExs string) (string, error) {
-	bp.mu.Lock()
-	defer bp.mu.Unlock()
-
+	var result string
 	configPathBytes := []byte(formatterExs)
 	filenameBytes := []byte(filename)
 	contentBytes := []byte(content)
-	var req bytes.Buffer
-	req.WriteByte(serviceFormatter)
-	_ = binary.Write(&req, binary.BigEndian, uint16(len(configPathBytes)))
-	req.Write(configPathBytes)
-	_ = binary.Write(&req, binary.BigEndian, uint16(len(filenameBytes)))
-	req.Write(filenameBytes)
-	_ = binary.Write(&req, binary.BigEndian, uint32(len(contentBytes)))
-	req.Write(contentBytes)
-	if _, err := bp.stdin.Write(req.Bytes()); err != nil {
-		return "", fmt.Errorf("write request: %w", err)
-	}
+	var payload bytes.Buffer
+	_ = binary.Write(&payload, binary.BigEndian, uint16(len(configPathBytes)))
+	payload.Write(configPathBytes)
+	_ = binary.Write(&payload, binary.BigEndian, uint16(len(filenameBytes)))
+	payload.Write(filenameBytes)
+	_ = binary.Write(&payload, binary.BigEndian, uint32(len(contentBytes)))
+	payload.Write(contentBytes)
 
-	type readResult struct {
-		text string
-		err  error
-	}
-	ch := make(chan readResult, 1)
-	go func() {
-		var status byte
-		if err := binary.Read(bp.stdout, binary.BigEndian, &status); err != nil {
-			ch <- readResult{err: fmt.Errorf("read status: %w", err)}
-			return
-		}
-		var respLen uint32
-		if err := binary.Read(bp.stdout, binary.BigEndian, &respLen); err != nil {
-			ch <- readResult{err: fmt.Errorf("read length: %w", err)}
-			return
-		}
-		buf := make([]byte, respLen)
-		if _, err := io.ReadFull(bp.stdout, buf); err != nil {
-			ch <- readResult{err: fmt.Errorf("read data: %w", err)}
-			return
-		}
+	err := bp.doRequest(ctx, serviceFormatter, formatterOpFormat, payload.Bytes(), func(status byte, payload []byte) error {
 		if status != 0 {
-			ch <- readResult{err: &FormatError{Message: string(buf)}}
-			return
+			return &FormatError{Message: string(payload)}
 		}
-		ch <- readResult{text: string(buf)}
-	}()
-
-	select {
-	case r := <-ch:
-		return r.text, r.err
-	case <-ctx.Done():
-		_ = bp.cmd.process.Kill()
-		<-ch
-		return "", ctx.Err()
-	}
+		result = string(payload)
+		return nil
+	})
+	return result, err
 }
 
 // ErlangSourceResult holds the resolved source location for an Erlang function.
@@ -146,133 +396,198 @@ type ErlangSourceResult struct {
 // ErlangSource asks the BEAM's CodeIntel service to resolve an Erlang module/function
 // to its source file and line number.
 func (bp *beamProcess) ErlangSource(ctx context.Context, module, function string, arity int) (*ErlangSourceResult, error) {
-	bp.mu.Lock()
-	defer bp.mu.Unlock()
-
-	moduleBytes := []byte(module)
-	functionBytes := []byte(function)
-	arityByte := byte(255) // 255 = unspecified
+	var result *ErlangSourceResult
+	arityByte := byte(255)
 	if arity >= 0 && arity < 255 {
 		arityByte = byte(arity)
 	}
 
-	var req bytes.Buffer
-	req.WriteByte(serviceCodeIntel) // service tag
-	req.WriteByte(0)                // op: erlang_source
-	_ = binary.Write(&req, binary.BigEndian, uint16(len(moduleBytes)))
-	req.Write(moduleBytes)
-	_ = binary.Write(&req, binary.BigEndian, uint16(len(functionBytes)))
-	req.Write(functionBytes)
-	req.WriteByte(arityByte)
-	if _, err := bp.stdin.Write(req.Bytes()); err != nil {
-		return nil, fmt.Errorf("write code_intel request: %w", err)
-	}
+	var payload bytes.Buffer
+	_ = binary.Write(&payload, binary.BigEndian, uint16(len(module)))
+	payload.WriteString(module)
+	_ = binary.Write(&payload, binary.BigEndian, uint16(len(function)))
+	payload.WriteString(function)
+	payload.WriteByte(arityByte)
 
-	type readResult struct {
-		result *ErlangSourceResult
-		err    error
-	}
-	ch := make(chan readResult, 1)
-	go func() {
-		var status byte
-		if err := binary.Read(bp.stdout, binary.BigEndian, &status); err != nil {
-			ch <- readResult{err: fmt.Errorf("read status: %w", err)}
-			return
-		}
+	err := bp.doRequest(ctx, serviceCodeIntel, codeIntelOpErlangSource, payload.Bytes(), func(status byte, payload []byte) error {
+		reader := bytes.NewReader(payload)
 		var fileLen uint16
-		if err := binary.Read(bp.stdout, binary.BigEndian, &fileLen); err != nil {
-			ch <- readResult{err: fmt.Errorf("read file length: %w", err)}
-			return
+		if err := binary.Read(reader, binary.BigEndian, &fileLen); err != nil {
+			return fmt.Errorf("read file length: %w", err)
 		}
 		fileBuf := make([]byte, fileLen)
-		if _, err := io.ReadFull(bp.stdout, fileBuf); err != nil {
-			ch <- readResult{err: fmt.Errorf("read file: %w", err)}
-			return
+		if _, err := io.ReadFull(reader, fileBuf); err != nil {
+			return fmt.Errorf("read file: %w", err)
 		}
 		var line uint32
-		if err := binary.Read(bp.stdout, binary.BigEndian, &line); err != nil {
-			ch <- readResult{err: fmt.Errorf("read line: %w", err)}
-			return
+		if err := binary.Read(reader, binary.BigEndian, &line); err != nil {
+			return fmt.Errorf("read line: %w", err)
 		}
 		if status != 0 {
-			ch <- readResult{err: fmt.Errorf("erlang source not found")}
-			return
+			return fmt.Errorf("erlang source not found")
 		}
-		ch <- readResult{result: &ErlangSourceResult{File: string(fileBuf), Line: int(line)}}
-	}()
-
-	select {
-	case r := <-ch:
-		return r.result, r.err
-	case <-ctx.Done():
-		_ = bp.cmd.process.Kill()
-		<-ch
-		return nil, ctx.Err()
-	}
+		result = &ErlangSourceResult{File: string(fileBuf), Line: int(line)}
+		return nil
+	})
+	return result, err
 }
 
 // ErlangDocs asks the BEAM's CodeIntel service for the documentation of an
 // Erlang module or function. Returns pre-formatted markdown, or empty string
 // if no docs are available (e.g. OTP < 24 or undocumented function).
 func (bp *beamProcess) ErlangDocs(ctx context.Context, module, function string, arity int) (string, error) {
-	bp.mu.Lock()
-	defer bp.mu.Unlock()
-
-	moduleBytes := []byte(module)
-	functionBytes := []byte(function)
+	var doc string
 	arityByte := byte(255)
 	if arity >= 0 && arity < 255 {
 		arityByte = byte(arity)
 	}
 
-	var req bytes.Buffer
-	req.WriteByte(serviceCodeIntel)
-	req.WriteByte(1) // op: erlang_docs
-	_ = binary.Write(&req, binary.BigEndian, uint16(len(moduleBytes)))
-	req.Write(moduleBytes)
-	_ = binary.Write(&req, binary.BigEndian, uint16(len(functionBytes)))
-	req.Write(functionBytes)
-	req.WriteByte(arityByte)
-	if _, err := bp.stdin.Write(req.Bytes()); err != nil {
-		return "", fmt.Errorf("write code_intel request: %w", err)
-	}
+	var payload bytes.Buffer
+	_ = binary.Write(&payload, binary.BigEndian, uint16(len(module)))
+	payload.WriteString(module)
+	_ = binary.Write(&payload, binary.BigEndian, uint16(len(function)))
+	payload.WriteString(function)
+	payload.WriteByte(arityByte)
 
-	type readResult struct {
-		doc string
-		err error
-	}
-	ch := make(chan readResult, 1)
-	go func() {
-		var status byte
-		if err := binary.Read(bp.stdout, binary.BigEndian, &status); err != nil {
-			ch <- readResult{err: fmt.Errorf("read status: %w", err)}
-			return
-		}
+	err := bp.doRequest(ctx, serviceCodeIntel, codeIntelOpErlangDocs, payload.Bytes(), func(status byte, payload []byte) error {
+		reader := bytes.NewReader(payload)
 		var docLen uint32
-		if err := binary.Read(bp.stdout, binary.BigEndian, &docLen); err != nil {
-			ch <- readResult{err: fmt.Errorf("read doc length: %w", err)}
-			return
+		if err := binary.Read(reader, binary.BigEndian, &docLen); err != nil {
+			return fmt.Errorf("read doc length: %w", err)
 		}
 		docBuf := make([]byte, docLen)
-		if _, err := io.ReadFull(bp.stdout, docBuf); err != nil {
-			ch <- readResult{err: fmt.Errorf("read doc: %w", err)}
-			return
+		if _, err := io.ReadFull(reader, docBuf); err != nil {
+			return fmt.Errorf("read doc: %w", err)
 		}
-		if status != 0 {
-			ch <- readResult{doc: ""}
-			return
+		if status == 0 {
+			doc = string(docBuf)
 		}
-		ch <- readResult{doc: string(docBuf)}
-	}()
+		return nil
+	})
+	return doc, err
+}
 
-	select {
-	case r := <-ch:
-		return r.doc, r.err
-	case <-ctx.Done():
-		_ = bp.cmd.process.Kill()
-		<-ch
-		return "", ctx.Err()
-	}
+// ErlangExport represents a single exported function from an Erlang module.
+type ErlangExport struct {
+	Function string
+	Arity    int
+	Params   string
+}
+
+// ErlangRuntimeInfo identifies the BEAM runtime backing a process.
+type ErlangRuntimeInfo struct {
+	OTPRelease  string
+	CodeRootDir string
+}
+
+// ErlangRuntimeInfo asks the BEAM's CodeIntel service for a stable runtime
+// fingerprint. This lets the LSP share OTP completion caches across build
+// roots that resolve to the same OTP install.
+func (bp *beamProcess) ErlangRuntimeInfo(ctx context.Context) (*ErlangRuntimeInfo, error) {
+	var info *ErlangRuntimeInfo
+	err := bp.doRequest(ctx, serviceCodeIntel, codeIntelOpRuntimeInfo, nil, func(status byte, payload []byte) error {
+		if status != 0 {
+			if len(payload) > 0 {
+				return fmt.Errorf("runtime info failed: %s", strings.TrimSpace(string(payload)))
+			}
+			return fmt.Errorf("runtime info failed")
+		}
+
+		reader := bytes.NewReader(payload)
+		var releaseLen uint16
+		if err := binary.Read(reader, binary.BigEndian, &releaseLen); err != nil {
+			return fmt.Errorf("read otp release length: %w", err)
+		}
+		releaseBuf := make([]byte, releaseLen)
+		if _, err := io.ReadFull(reader, releaseBuf); err != nil {
+			return fmt.Errorf("read otp release: %w", err)
+		}
+
+		var rootLen uint16
+		if err := binary.Read(reader, binary.BigEndian, &rootLen); err != nil {
+			return fmt.Errorf("read code root length: %w", err)
+		}
+		rootBuf := make([]byte, rootLen)
+		if _, err := io.ReadFull(reader, rootBuf); err != nil {
+			return fmt.Errorf("read code root: %w", err)
+		}
+
+		info = &ErlangRuntimeInfo{
+			OTPRelease:  string(releaseBuf),
+			CodeRootDir: string(rootBuf),
+		}
+		return nil
+	})
+	return info, err
+}
+
+// WarmOTPModuleNames asks the BEAM's CodeIntel service to ensure OTP Erlang
+// modules are loaded. Completion data is pushed back asynchronously via a
+// notification frame once the background warmup finishes.
+func (bp *beamProcess) WarmOTPModuleNames(ctx context.Context) error {
+	return bp.doRequest(ctx, serviceCodeIntel, codeIntelOpWarmOTPModules, nil, func(status byte, payload []byte) error {
+		if status != 0 {
+			if len(payload) > 0 {
+				return fmt.Errorf("warm OTP modules: %s", strings.TrimSpace(string(payload)))
+			}
+			return fmt.Errorf("warm OTP modules failed")
+		}
+		return nil
+	})
+}
+
+// ErlangExports asks the BEAM's CodeIntel service for the exported functions
+// of a single Erlang module.
+func (bp *beamProcess) ErlangExports(ctx context.Context, module string) ([]ErlangExport, error) {
+	var exports []ErlangExport
+	var payload bytes.Buffer
+	_ = binary.Write(&payload, binary.BigEndian, uint16(len(module)))
+	payload.WriteString(module)
+
+	err := bp.doRequest(ctx, serviceCodeIntel, codeIntelOpErlangExports, payload.Bytes(), func(status byte, payload []byte) error {
+		if status != 0 {
+			if len(payload) > 0 {
+				return fmt.Errorf("erlang exports failed: %s", strings.TrimSpace(string(payload)))
+			}
+			return fmt.Errorf("erlang exports failed")
+		}
+
+		reader := bytes.NewReader(payload)
+		var exportCount uint16
+		if err := binary.Read(reader, binary.BigEndian, &exportCount); err != nil {
+			return fmt.Errorf("read export count: %w", err)
+		}
+		exports = make([]ErlangExport, 0, exportCount)
+		for i := 0; i < int(exportCount); i++ {
+			var funcLen uint16
+			if err := binary.Read(reader, binary.BigEndian, &funcLen); err != nil {
+				return fmt.Errorf("read func name length: %w", err)
+			}
+			funcBuf := make([]byte, funcLen)
+			if _, err := io.ReadFull(reader, funcBuf); err != nil {
+				return fmt.Errorf("read func name: %w", err)
+			}
+			var arity uint8
+			if err := binary.Read(reader, binary.BigEndian, &arity); err != nil {
+				return fmt.Errorf("read arity: %w", err)
+			}
+			var paramsLen uint16
+			if err := binary.Read(reader, binary.BigEndian, &paramsLen); err != nil {
+				return fmt.Errorf("read params length: %w", err)
+			}
+			paramsBuf := make([]byte, paramsLen)
+			if _, err := io.ReadFull(reader, paramsBuf); err != nil {
+				return fmt.Errorf("read params: %w", err)
+			}
+			exports = append(exports, ErlangExport{
+				Function: string(funcBuf),
+				Arity:    int(arity),
+				Params:   string(paramsBuf),
+			})
+		}
+		return nil
+	})
+	return exports, err
 }
 
 // FormatError represents a formatting failure (e.g. syntax error in the source).
@@ -286,16 +601,25 @@ func (e *FormatError) Error() string {
 }
 
 func (bp *beamProcess) Close() {
-	// Acquire mu to wait for any in-flight request to finish before killing
-	// the process — prevents broken pipe errors on concurrent format + close.
-	bp.mu.Lock()
-	defer bp.mu.Unlock()
+	bp.closeWithReason("caller did not provide a reason")
+}
+
+func (bp *beamProcess) closeWithReason(reason string) {
+	if reason == "" {
+		reason = "no reason provided"
+	}
+
+	bp.writeMu.Lock()
+	defer bp.writeMu.Unlock()
 
 	select {
 	case <-bp.closed:
+		return // already closed
 	default:
 		close(bp.closed)
 	}
+	bp.finishStartup(fmt.Errorf("BEAM closed"))
+	log.Printf("BEAM: closing process (pid %d): %s", bp.cmd.process.Pid, reason)
 	_ = bp.stdin.Close()
 	_ = bp.cmd.process.Kill()
 }
@@ -346,50 +670,32 @@ func (s *Server) startBeamProcess(buildRoot string) (*beamProcess, error) {
 		cmd:       handle,
 		stdin:     stdin,
 		stdout:    stdout,
+		stderr:    &stderrBuf,
+		pending:   make(map[uint32]chan beamResponse),
 		startedAt: time.Now(),
 		ready:     make(chan struct{}),
 		closed:    make(chan struct{}),
+		notify: func(notification beamNotification) {
+			s.handleBeamNotification(buildRoot, notification)
+		},
 	}
 
 	go func() {
-		type readyResult struct {
-			status byte
-			err    error
-		}
-		readyCh := make(chan readyResult, 1)
-		go func() {
-			var status byte
-			if err := binary.Read(stdout, binary.BigEndian, &status); err != nil {
-				readyCh <- readyResult{err: err}
-				return
-			}
-			var readyLen uint32
-			if err := binary.Read(stdout, binary.BigEndian, &readyLen); err != nil {
-				readyCh <- readyResult{err: err}
-				return
-			}
-			readyCh <- readyResult{status: status}
-		}()
-
 		select {
-		case r := <-readyCh:
-			if r.err != nil {
-				bp.startErr = fmt.Errorf("BEAM ready: %w", r.err)
+		case <-bp.ready:
+			if bp.startErr != nil {
 				_ = cmd.Process.Kill()
 				<-done
 				s.notifyOTPMismatch(stderrBuf.String())
-			} else if r.status != 0 {
-				bp.startErr = fmt.Errorf("BEAM failed to initialize (status %d)", r.status)
-				_ = cmd.Process.Kill()
-			} else {
-				log.Printf("BEAM: started persistent process (pid %d)", cmd.Process.Pid)
 			}
 		case <-time.After(beamStuckTimeout):
-			bp.startErr = fmt.Errorf("BEAM startup timed out")
+			bp.finishStartup(fmt.Errorf("BEAM startup timed out"))
 			_ = cmd.Process.Kill()
+			<-done
 		}
-		close(bp.ready)
 	}()
+
+	go bp.readLoop()
 
 	return bp, nil
 }
@@ -420,8 +726,11 @@ func (s *Server) getBeamProcess(ctx context.Context, buildRoot string) *beamProc
 	s.beamMu.Lock()
 	defer s.beamMu.Unlock()
 
-	if bp, ok := s.beams[buildRoot]; ok && bp.alive() {
-		return bp
+	if bp, ok := s.beams[buildRoot]; ok {
+		if bp.alive() {
+			return bp
+		}
+		log.Printf("BEAM: process for %s is dead, restarting", buildRoot)
 	}
 
 	if s.mixBin == "" {
@@ -483,7 +792,7 @@ func (s *Server) formatContent(ctx context.Context, mixRoot, path, content strin
 	select {
 	case <-bp.ready:
 		if bp.startErr != nil {
-			s.evictBeam(bp)
+			s.evictBeam(bp, fmt.Sprintf("formatContent: startup finished with error: %v", bp.startErr))
 			log.Printf("Formatting: BEAM process failed to start, falling back to mix format: %v", bp.startErr)
 			return s.formatWithMixFormat(ctx, mixRoot, path, content)
 		}
@@ -493,7 +802,7 @@ func (s *Server) formatContent(ctx context.Context, mixRoot, path, content strin
 		switch {
 		case age > beamStuckTimeout:
 			log.Printf("Formatting: BEAM process stuck (started %s ago), restarting", age.Truncate(time.Second))
-			s.evictBeam(bp)
+			s.evictBeam(bp, fmt.Sprintf("formatContent: startup exceeded %s without becoming ready", beamStuckTimeout))
 			return s.formatWithMixFormat(ctx, mixRoot, path, content)
 
 		case age > beamWaitTimeout:
@@ -505,7 +814,7 @@ func (s *Server) formatContent(ctx context.Context, mixRoot, path, content strin
 				if ctx.Err() != nil {
 					return "", err
 				}
-				s.evictBeam(bp)
+				s.evictBeam(bp, fmt.Sprintf("formatContent: Ready failed: %v", err))
 				log.Printf("Formatting: BEAM process failed to start, falling back to mix format: %v", err)
 				return s.formatWithMixFormat(ctx, mixRoot, path, content)
 			}
@@ -522,8 +831,10 @@ func (s *Server) formatContent(ctx context.Context, mixRoot, path, content strin
 		var formatErr *FormatError
 		if errors.As(err, &formatErr) {
 			log.Printf("Formatting: %s failed: %s", path, formatErr.Message)
+		} else if ctx.Err() != nil {
+			// Context cancelled — the BEAM is fine, the editor just moved on.
 		} else {
-			s.evictBeam(bp)
+			s.evictBeam(bp, fmt.Sprintf("formatContent: Format request failed: %v", err))
 			log.Printf("Formatting: BEAM process crashed: %v", err)
 		}
 		return "", err
@@ -533,16 +844,29 @@ func (s *Server) formatContent(ctx context.Context, mixRoot, path, content strin
 	return result, nil
 }
 
-func (s *Server) evictBeam(bp *beamProcess) {
+func (s *Server) evictBeam(bp *beamProcess, reason string) {
+	if reason == "" {
+		reason = "no reason provided"
+	}
+
+	buildRoot := ""
 	s.beamMu.Lock()
 	for key, b := range s.beams {
 		if b == bp {
 			delete(s.beams, key)
+			buildRoot = key
 			break
 		}
 	}
 	s.beamMu.Unlock()
-	bp.Close()
+
+	if buildRoot != "" {
+		log.Printf("BEAM: evicting process for %s (pid %d): %s", buildRoot, bp.cmd.process.Pid, reason)
+	} else {
+		log.Printf("BEAM: evicting untracked process (pid %d): %s", bp.cmd.process.Pid, reason)
+	}
+
+	bp.closeWithReason("evicted: " + reason)
 }
 
 func (s *Server) formatWithMixFormat(ctx context.Context, mixRoot, path, content string) (string, error) {
@@ -720,7 +1044,7 @@ func (s *Server) closeBeams() {
 	s.beamMu.Lock()
 	defer s.beamMu.Unlock()
 	for _, bp := range s.beams {
-		bp.Close()
+		bp.closeWithReason("server shutdown")
 	}
 	s.beams = nil
 }

@@ -372,6 +372,11 @@ func ExtractCompletionContext(line string, col int) (prefix string, afterDot boo
 		start--
 	}
 
+	// Include a leading colon for Erlang module references (:lists, :ets, etc.)
+	if start > 0 && line[start-1] == ':' {
+		start--
+	}
+
 	raw := line[start : end+1]
 
 	// Trim trailing dots — "Foo." means afterDot=true, prefix="Foo"

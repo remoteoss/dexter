@@ -4,39 +4,51 @@
 #   - Multiple formatter instances (one per .formatter.exs, started on demand)
 #   - A singleton CodeIntel service for Erlang source/docs lookups
 #
-# Communication is via stdin/stdout with binary framing:
+# Communication is via stdin/stdout with framed binary messages:
 #
-# Request envelope:  1-byte service tag + service-specific payload
-# Response envelope: service-specific (see below)
+# Frame 0x00 = request:
+#   request_id(u32) + service(u8) + op(u8) + payload_len(u32) + payload
+#
+# Frame 0x01 = response:
+#   request_id(u32) + status(u8) + payload_len(u32) + payload
+#
+# Frame 0x02 = notification:
+#   op(u8) + payload_len(u32) + payload
+#
+# Frame 0x03 = ready:
+#   status(u8) + payload_len(u32) + payload
 #
 # Service tags:
 #   0x00 = Formatter
 #   0x01 = CodeIntel
 #
-# Formatter protocol (after service tag):
-#   Request:  2-byte formatter_exs path length (big-endian) + formatter_exs path +
-#             2-byte filename length (big-endian) + filename +
-#             4-byte content length (big-endian) + content
-#   Response: 1-byte status (0=ok, 1=error) +
-#             4-byte result length (big-endian) + result
+# Formatter op 0 (format) payload:
+#   2-byte formatter_exs path length (big-endian) + formatter_exs path +
+#   2-byte filename length (big-endian) + filename +
+#   4-byte content length (big-endian) + content
 #
-# CodeIntel protocol (after service tag):
-#   Request:  1-byte op +
-#             2-byte module length (big-endian) + module +
-#             2-byte function length (big-endian) + function +
-#             1-byte arity (255 = unspecified)
+# CodeIntel op 0 (erlang_source) payload:
+#   2-byte module length (big-endian) + module +
+#   2-byte function length (big-endian) + function +
+#   1-byte arity (255 = unspecified)
 #
-#   Op 0 (erlang_source) response:
-#             1-byte status (0=ok, 1=not_found) +
-#             2-byte file length (big-endian) + file +
-#             4-byte line (big-endian, 0 if not found)
+# CodeIntel op 1 (erlang_docs) payload:
+#   Same as erlang_source
 #
-#   Op 1 (erlang_docs) response:
-#             1-byte status (0=ok, 1=not_found) +
-#             4-byte doc length (big-endian) + doc (markdown string)
+# CodeIntel op 2 (warm_otp_modules) payload:
+#   empty; results arrive asynchronously via notification 0
 #
-# Sends a ready signal once initialization is complete:
-#   1-byte status (0=ok) + 4-byte length (0)
+# CodeIntel op 3 (erlang_exports) payload:
+#   2-byte module length (big-endian) + module
+#
+# CodeIntel op 4 (runtime_info) payload:
+#   empty
+#
+# Notification 0 (otp_modules_ready) payload:
+#   2-byte module_count (big-endian) + [name_len(u16) name]
+#
+# Notification 1 (otp_modules_failed) payload:
+#   error string
 #
 # Force raw byte mode on stdin/stdout — without this, the Erlang IO server
 # applies Unicode encoding, expanding bytes > 127 to multi-byte UTF-8 and
@@ -231,38 +243,188 @@ defmodule Dexter.Formatter do
   defp do_format(_, _, _, _), do: {1, "invalid input"}
 end
 
+# Protocol Writer
+
+defmodule Dexter.Writer do
+  use GenServer
+
+  @frame_response 1
+  @frame_notification 2
+  @frame_ready 3
+
+  @notif_otp_modules_ready 0
+  @notif_otp_modules_failed 1
+
+  def start_link() do
+    GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
+  end
+
+  def send_ready(status, payload \\ <<>>) when is_binary(payload) do
+    GenServer.call(__MODULE__, {:write, ready_frame(status, payload)}, :infinity)
+  end
+
+  def send_response(req_id, status, payload) when is_binary(payload) do
+    GenServer.cast(__MODULE__, {:write, response_frame(req_id, status, payload)})
+  end
+
+  def send_otp_modules_ready(names) do
+    GenServer.cast(__MODULE__, {:write, notification_frame(@notif_otp_modules_ready, encode_module_names(names))})
+  end
+
+  def send_otp_modules_failed(message) do
+    payload = if message, do: to_string(message), else: ""
+    GenServer.cast(__MODULE__, {:write, notification_frame(@notif_otp_modules_failed, payload)})
+  end
+
+  @impl true
+  def init(:ok), do: {:ok, nil}
+
+  @impl true
+  def handle_call({:write, frame}, _from, state) do
+    write_frame(frame)
+    {:reply, :ok, state}
+  end
+
+  @impl true
+  def handle_cast({:write, frame}, state) do
+    write_frame(frame)
+    {:noreply, state}
+  end
+
+  defp write_frame(frame) do
+    case IO.binwrite(:stdio, frame) do
+      :ok -> :ok
+      {:error, reason} -> exit({:write_failed, reason})
+    end
+  end
+
+  defp response_frame(req_id, status, payload) do
+    <<@frame_response::8, req_id::unsigned-big-32, status::8, byte_size(payload)::unsigned-big-32,
+      payload::binary>>
+  end
+
+  defp notification_frame(op, payload) do
+    <<@frame_notification::8, op::8, byte_size(payload)::unsigned-big-32, payload::binary>>
+  end
+
+  defp ready_frame(status, payload) do
+    <<@frame_ready::8, status::8, byte_size(payload)::unsigned-big-32, payload::binary>>
+  end
+
+  defp encode_module_names(names) do
+    payload =
+      for name <- names, into: <<>> do
+        <<byte_size(name)::unsigned-big-16, name::binary>>
+      end
+
+    <<length(names)::unsigned-big-16, payload::binary>>
+  end
+end
+
 # CodeIntel Service
+
+defmodule Dexter.CodeIntelCache do
+  use GenServer
+
+  def start_link() do
+    GenServer.start_link(__MODULE__, %{}, name: __MODULE__)
+  end
+
+  def warm_otp_modules() do
+    GenServer.call(__MODULE__, :warm_otp_modules)
+  end
+
+  @impl true
+  def init(_state) do
+    {:ok, %{otp_modules: nil, loading: false}}
+  end
+
+  @impl true
+  def handle_call(:warm_otp_modules, _from, %{otp_modules: names} = state) when is_list(names) do
+    Dexter.Writer.send_otp_modules_ready(names)
+    {:reply, :ok, state}
+  end
+
+  def handle_call(:warm_otp_modules, _from, %{loading: true} = state) do
+    {:reply, :ok, state}
+  end
+
+  def handle_call(:warm_otp_modules, _from, state) do
+    {:ok, _pid} =
+      Task.Supervisor.start_child(Dexter.TaskSup, fn ->
+        result =
+          try do
+            {:ok, compute_otp_module_names()}
+          rescue
+            error -> {:error, {:error, error, __STACKTRACE__}}
+          catch
+            kind, reason -> {:error, {kind, reason}}
+          end
+
+        GenServer.cast(__MODULE__, {:otp_module_result, result})
+      end)
+
+    {:reply, :ok, %{state | loading: true}}
+  end
+
+  @impl true
+  def handle_cast({:otp_module_result, {:ok, names}}, state) do
+    Dexter.Writer.send_otp_modules_ready(names)
+    {:noreply, %{state | otp_modules: names, loading: false}}
+  end
+
+  def handle_cast({:otp_module_result, {:error, reason}}, state) do
+    IO.puts(:stderr, "CodeIntelCache: failed to load OTP modules: #{inspect(reason)}")
+    Dexter.Writer.send_otp_modules_failed(inspect(reason))
+    {:noreply, %{state | loading: false}}
+  end
+
+  defp compute_otp_module_names do
+    otp_root = :code.lib_dir() |> to_string()
+
+    :code.all_available()
+    |> Enum.reduce([], fn {name, path, _loaded}, acc ->
+      mod_name = to_string(name)
+
+      if is_list(path) and String.starts_with?(to_string(path), otp_root) and
+           not String.starts_with?(mod_name, "Elixir.") do
+        [mod_name | acc]
+      else
+        acc
+      end
+    end)
+    |> Enum.sort()
+  end
+end
 
 defmodule Dexter.CodeIntel do
   @op_erlang_source 0
   @op_erlang_docs 1
+  @op_warm_otp_modules 2
+  @op_erlang_exports 3
+  @op_runtime_info 4
 
-  def handle_request() do
-    case IO.binread(:stdio, 1) do
-      <<@op_erlang_source>> ->
-        handle_erlang_source()
-
-      <<@op_erlang_docs>> ->
-        handle_erlang_docs()
-
-      _ ->
-        :eof
+  def handle_request(op, payload) do
+    case op do
+      @op_erlang_source -> handle_erlang_source(payload)
+      @op_erlang_docs -> handle_erlang_docs(payload)
+      @op_warm_otp_modules -> handle_warm_otp_modules(payload)
+      @op_erlang_exports -> handle_erlang_exports(payload)
+      @op_runtime_info -> handle_runtime_info(payload)
+      _ -> {1, "unknown code intel op: #{inspect(op)}"}
     end
   end
 
-  defp handle_erlang_source do
-    <<module_len::unsigned-big-16>> = IO.binread(:stdio, 2)
-    module_name = if module_len > 0, do: IO.binread(:stdio, module_len), else: ""
-    <<function_len::unsigned-big-16>> = IO.binread(:stdio, 2)
-    function_name = if function_len > 0, do: IO.binread(:stdio, function_len), else: ""
-    <<arity::unsigned-8>> = IO.binread(:stdio, 1)
+  defp handle_erlang_source(payload) do
+    case parse_module_function_arity(payload) do
+      {:ok, module_name, function_name, arity} ->
+        {status, file, line} = resolve_erlang_source(module_name, function_name, arity)
+        file_bytes = if file, do: file, else: ""
+        {status, <<byte_size(file_bytes)::unsigned-big-16, file_bytes::binary, line::unsigned-big-32>>}
 
-    {status, file, line} = resolve_erlang_source(module_name, function_name, arity)
-
-    file_bytes = if file, do: file, else: ""
-    file_len = byte_size(file_bytes)
-    IO.binwrite(:stdio, <<status::8, file_len::unsigned-big-16, file_bytes::binary, line::unsigned-big-32>>)
-    :ok
+      :error ->
+        {1, "invalid erlang_source payload"}
+    end
   end
 
   defp resolve_erlang_source(module_name, function_name, arity) do
@@ -298,13 +460,11 @@ defmodule Dexter.CodeIntel do
   defp find_function_line(module_atom, function_name, arity) do
     function_atom = String.to_atom(function_name)
 
-    # Try abstract code first for arity-accurate line numbers
     line = find_line_from_abstract_code(module_atom, function_atom, arity)
 
     if line > 0 do
       line
     else
-      # Fallback: regex search in source file
       find_line_from_source(module_atom, function_atom)
     end
   end
@@ -370,21 +530,16 @@ defmodule Dexter.CodeIntel do
     end
   end
 
-  # Erlang Docs
+  defp handle_erlang_docs(payload) do
+    case parse_module_function_arity(payload) do
+      {:ok, module_name, function_name, arity} ->
+        {status, doc} = fetch_erlang_docs(module_name, function_name, arity)
+        doc_bytes = doc || ""
+        {status, <<byte_size(doc_bytes)::unsigned-big-32, doc_bytes::binary>>}
 
-  defp handle_erlang_docs do
-    <<module_len::unsigned-big-16>> = IO.binread(:stdio, 2)
-    module_name = if module_len > 0, do: IO.binread(:stdio, module_len), else: ""
-    <<function_len::unsigned-big-16>> = IO.binread(:stdio, 2)
-    function_name = if function_len > 0, do: IO.binread(:stdio, function_len), else: ""
-    <<arity::unsigned-8>> = IO.binread(:stdio, 1)
-
-    {status, doc} = fetch_erlang_docs(module_name, function_name, arity)
-
-    doc_bytes = doc || ""
-    doc_len = byte_size(doc_bytes)
-    IO.binwrite(:stdio, <<status::8, doc_len::unsigned-big-32, doc_bytes::binary>>)
-    :ok
+      :error ->
+        {1, "invalid erlang_docs payload"}
+    end
   end
 
   defp fetch_erlang_docs(module_name, function_name, arity) do
@@ -407,17 +562,24 @@ defmodule Dexter.CodeIntel do
     end
   end
 
-  defp find_function_doc(docs, function_atom, arity) do
+  defp find_function_doc(docs, name_atom, arity) do
+    case find_doc_entry(docs, :function, name_atom, arity) do
+      nil -> find_doc_entry(docs, :type, name_atom, arity) || {1, nil}
+      result -> result
+    end
+  end
+
+  defp find_doc_entry(docs, kind, name_atom, arity) do
     candidates =
       Enum.filter(docs, fn
-        {{:function, ^function_atom, _arity}, _anno, _sig, _doc, _meta} -> true
+        {{^kind, ^name_atom, _arity}, _anno, _sig, _doc, _meta} -> true
         _ -> false
       end)
 
     match =
       if arity != 255 do
         Enum.find(candidates, fn
-          {{:function, _, ^arity}, _, _, _, _} -> true
+          {{_, _, ^arity}, _, _, _, _} -> true
           _ -> false
         end) || List.first(candidates)
       else
@@ -425,8 +587,8 @@ defmodule Dexter.CodeIntel do
       end
 
     case match do
-      {{:function, _, match_arity}, _anno, signatures, doc, _meta} ->
-        signature = format_signatures(signatures, function_atom, match_arity)
+      {{_, _, match_arity}, _anno, signatures, doc, _meta} ->
+        signature = format_signatures(signatures, name_atom, match_arity)
         doc_text = extract_doc_text(doc)
 
         parts = []
@@ -434,14 +596,211 @@ defmodule Dexter.CodeIntel do
         parts = if doc_text, do: parts ++ [doc_text], else: parts
 
         case parts do
-          [] -> {1, nil}
+          [] -> nil
           _ -> {0, Enum.join(parts, "\n\n")}
         end
 
       nil ->
-        {1, nil}
+        nil
     end
   end
+
+  defp handle_warm_otp_modules(_payload) do
+    :ok = Dexter.CodeIntelCache.warm_otp_modules()
+    {0, <<>>}
+  end
+
+  defp handle_erlang_exports(payload) do
+    case parse_module(payload) do
+      {:ok, module_name} ->
+        mod_atom = String.to_atom(module_name)
+        export_params = export_param_names(mod_atom)
+
+        exports =
+          case :code.ensure_loaded(mod_atom) do
+            {:module, _} ->
+              mod_atom.module_info(:exports)
+              |> Enum.reject(fn {f, _} -> f in [:module_info, :behaviour_info] end)
+
+            _ ->
+              []
+          end
+
+        exports_payload =
+          for {func, arity} <- exports, into: <<>> do
+            func_str = to_string(func)
+            params = Map.get(export_params, {func, arity}, "")
+
+            <<byte_size(func_str)::unsigned-big-16, func_str::binary, arity::unsigned-8,
+              byte_size(params)::unsigned-big-16, params::binary>>
+          end
+
+        {0, <<length(exports)::unsigned-big-16, exports_payload::binary>>}
+
+      :error ->
+        {1, "invalid erlang_exports payload"}
+    end
+  end
+
+  defp export_param_names(module_atom) do
+    case Code.fetch_docs(module_atom) do
+      {:docs_v1, _, :erlang, _format, _module_doc, _metadata, docs} ->
+        Enum.reduce(docs, %{}, fn
+          {{:function, name, arity}, _anno, signatures, _doc, _meta}, acc ->
+            case signature_params(signatures, arity) do
+              "" -> acc
+              params -> Map.put(acc, {name, arity}, params)
+            end
+
+          _other, acc ->
+            acc
+        end)
+
+      _ ->
+        %{}
+    end
+  end
+
+  defp signature_params(signatures, arity) when is_list(signatures) do
+    signatures
+    |> Enum.find_value("", fn
+      sig when is_binary(sig) ->
+        case extract_signature_args(sig) do
+          {:ok, args} ->
+            params =
+              args
+              |> split_signature_args()
+              |> Enum.with_index(1)
+              |> Enum.map(fn {param, index} -> normalize_signature_param(param, index) end)
+
+            if length(params) == arity, do: Enum.join(params, ","), else: nil
+
+          :error ->
+            nil
+        end
+
+      _ ->
+        nil
+    end)
+  end
+
+  defp signature_params(_, _arity), do: ""
+
+  defp extract_signature_args(signature) do
+    case :binary.match(signature, "(") do
+      {start, 1} ->
+        rest = binary_part(signature, start + 1, byte_size(signature) - start - 1)
+        collect_signature_args(rest, 0, [])
+
+      :nomatch ->
+        :error
+    end
+  end
+
+  defp collect_signature_args(<<>>, _depth, _acc), do: :error
+
+  defp collect_signature_args(<<")", _rest::binary>>, 0, acc) do
+    {:ok, acc |> Enum.reverse() |> IO.iodata_to_binary()}
+  end
+
+  defp collect_signature_args(<<"(", rest::binary>>, depth, acc),
+    do: collect_signature_args(rest, depth + 1, ["(" | acc])
+
+  defp collect_signature_args(<<")", rest::binary>>, depth, acc),
+    do: collect_signature_args(rest, depth - 1, [")" | acc])
+
+  defp collect_signature_args(<<char::utf8, rest::binary>>, depth, acc),
+    do: collect_signature_args(rest, depth, [<<char::utf8>> | acc])
+
+  defp split_signature_args(""), do: []
+
+  defp split_signature_args(args) do
+    {parts, current, _depths} =
+      args
+      |> String.to_charlist()
+      |> Enum.reduce({[], [], {0, 0, 0}}, fn char, {parts, current, {paren, bracket, brace}} ->
+        case char do
+          ?, when paren == 0 and bracket == 0 and brace == 0 ->
+            part = current |> Enum.reverse() |> to_string() |> String.trim()
+            {[part | parts], [], {paren, bracket, brace}}
+
+          ?( ->
+            {parts, [char | current], {paren + 1, bracket, brace}}
+
+          ?) ->
+            {parts, [char | current], {paren - 1, bracket, brace}}
+
+          ?[ ->
+            {parts, [char | current], {paren, bracket + 1, brace}}
+
+          ?] ->
+            {parts, [char | current], {paren, bracket - 1, brace}}
+
+          ?{ ->
+            {parts, [char | current], {paren, bracket, brace + 1}}
+
+          ?} ->
+            {parts, [char | current], {paren, bracket, brace - 1}}
+
+          _ ->
+            {parts, [char | current], {paren, bracket, brace}}
+        end
+      end)
+
+    last = current |> Enum.reverse() |> to_string() |> String.trim()
+
+    (if last == "", do: parts, else: [last | parts])
+    |> Enum.reverse()
+  end
+
+  defp normalize_signature_param(param, index) do
+    name =
+      Regex.scan(~r/[A-Za-z][A-Za-z0-9_]*/, param)
+      |> List.flatten()
+      |> Enum.map(&Macro.underscore/1)
+      |> Enum.join("_")
+      |> String.replace(~r/_+/, "_")
+      |> String.trim("_")
+
+    if name == "", do: "arg#{index}", else: name
+  end
+
+  defp handle_runtime_info(_payload) do
+    otp_release = :erlang.system_info(:otp_release) |> to_string()
+    code_root_dir = :code.root_dir() |> to_string()
+
+    {0,
+     <<byte_size(otp_release)::unsigned-big-16, otp_release::binary,
+       byte_size(code_root_dir)::unsigned-big-16, code_root_dir::binary>>}
+  end
+
+  defp parse_module_function_arity(payload) do
+    with <<module_len::unsigned-big-16, rest::binary>> <- payload,
+         {:ok, module_name, rest} <- take_string(rest, module_len),
+         <<function_len::unsigned-big-16, rest::binary>> <- rest,
+         {:ok, function_name, rest} <- take_string(rest, function_len),
+         <<arity::unsigned-8>> <- rest do
+      {:ok, module_name, function_name, arity}
+    else
+      _ -> :error
+    end
+  end
+
+  defp parse_module(payload) do
+    with <<module_len::unsigned-big-16, rest::binary>> <- payload,
+         {:ok, module_name, <<>>} <- take_string(rest, module_len) do
+      {:ok, module_name}
+    else
+      _ -> :error
+    end
+  end
+
+  defp take_string(binary, size) when byte_size(binary) >= size do
+    <<value::binary-size(size), rest::binary>> = binary
+    {:ok, value, rest}
+  end
+
+  defp take_string(_binary, _size), do: :error
 
   defp format_signatures(signatures, function_atom, arity) when is_list(signatures) do
     case signatures do
@@ -461,51 +820,130 @@ end
 # Main IO Loop
 
 defmodule Dexter.Loop do
+  @frame_request 0
   @service_formatter 0
   @service_code_intel 1
+  @formatter_op_format 0
 
-  def run(first_call?) do
-    if first_call?, do: IO.binwrite(:stdio, <<0, 0, 0, 0, 0>>)
+  def run do
+    case read_request_frame() do
+      {:ok, req_id, service, op, payload} ->
+        dispatch_request(req_id, service, op, payload)
+        run()
 
+      :eof ->
+        :ok
+
+      {:error, reason} ->
+        :erlang.display({:beam_loop_read_error, reason})
+        :ok
+    end
+  end
+
+  defp dispatch_request(req_id, service, op, payload) do
+    {:ok, _pid} =
+      Task.Supervisor.start_child(Dexter.TaskSup, fn ->
+        {status, response_payload} =
+          try do
+            case {service, op} do
+              {@service_formatter, @formatter_op_format} ->
+                handle_format_request(payload)
+
+              {@service_code_intel, _} ->
+                Dexter.CodeIntel.handle_request(op, payload)
+
+              _ ->
+                {1, "unknown request #{service}/#{op}"}
+            end
+          rescue
+            error ->
+              :erlang.display({:beam_request_crash, service, op, error, __STACKTRACE__})
+              {1, Exception.message(error)}
+          catch
+            kind, reason ->
+              :erlang.display({:beam_request_crash, service, op, kind, reason})
+              {1, inspect({kind, reason})}
+          end
+
+        Dexter.Writer.send_response(req_id, status, response_payload)
+      end)
+
+    :ok
+  end
+
+  defp read_request_frame do
+    with {:ok, @frame_request} <- read_byte(),
+         {:ok, <<req_id::unsigned-big-32>>} <- read_exact(4),
+         {:ok, <<service::8, op::8, payload_len::unsigned-big-32>>} <- read_exact(6),
+         {:ok, payload} <- read_exact(payload_len) do
+      {:ok, req_id, service, op, payload}
+    else
+      :eof -> :eof
+      {:error, :eof} -> :eof
+      {:ok, other} -> {:error, {:unexpected_frame, other}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp read_byte do
     case IO.binread(:stdio, 1) do
-      <<@service_formatter>> ->
-        case handle_format_request() do
-          :ok -> run(false)
-          :eof -> :ok
-        end
-
-      <<@service_code_intel>> ->
-        case Dexter.CodeIntel.handle_request() do
-          :ok -> run(false)
-          :eof -> :ok
-        end
-
-      _ ->
-        :ok
+      :eof -> :eof
+      <<byte>> -> {:ok, byte}
+      other -> {:error, {:bad_read, other}}
     end
   end
 
-  defp handle_format_request do
-    case IO.binread(:stdio, 2) do
-      <<config_path_len::unsigned-big-16>> ->
-        config_path = if config_path_len > 0, do: IO.binread(:stdio, config_path_len), else: ""
-        <<filename_len::unsigned-big-16>> = IO.binread(:stdio, 2)
-        filename = if filename_len > 0, do: IO.binread(:stdio, filename_len), else: ""
-        <<content_len::unsigned-big-32>> = IO.binread(:stdio, 4)
-        content = IO.binread(:stdio, content_len)
+  defp read_exact(0), do: {:ok, <<>>}
 
-        # Start a formatter for this config if we haven't seen it before
-        ensure_formatter(config_path)
+  defp read_exact(size) when size > 0 do
+    case IO.binread(:stdio, size) do
+      :eof ->
+        {:error, :eof}
 
-        {status, result} = Dexter.Formatter.format(config_path, content, filename)
-        size = byte_size(result)
-        IO.binwrite(:stdio, <<status::8, size::unsigned-big-32, result::binary>>)
-        :ok
+      data when is_binary(data) and byte_size(data) == size ->
+        {:ok, data}
 
-      _ ->
-        :eof
+      data when is_binary(data) ->
+        {:error, {:short_read, size, byte_size(data)}}
+
+      other ->
+        {:error, {:bad_read, other}}
     end
   end
+
+  defp handle_format_request(payload) do
+    case parse_format_payload(payload) do
+      {:ok, config_path, filename, content} ->
+        with :ok <- ensure_formatter(config_path) do
+          Dexter.Formatter.format(config_path, content, filename)
+        else
+          {:error, reason} -> {1, format_formatter_start_error(reason)}
+        end
+
+      :error ->
+        {1, "invalid format payload"}
+    end
+  end
+
+  defp parse_format_payload(payload) do
+    with <<config_path_len::unsigned-big-16, rest::binary>> <- payload,
+         {:ok, config_path, rest} <- take_string(rest, config_path_len),
+         <<filename_len::unsigned-big-16, rest::binary>> <- rest,
+         {:ok, filename, rest} <- take_string(rest, filename_len),
+         <<content_len::unsigned-big-32, rest::binary>> <- rest,
+         {:ok, content, <<>>} <- take_string(rest, content_len) do
+      {:ok, config_path, filename, content}
+    else
+      _ -> :error
+    end
+  end
+
+  defp take_string(binary, size) when byte_size(binary) >= size do
+    <<value::binary-size(size), rest::binary>> = binary
+    {:ok, value, rest}
+  end
+
+  defp take_string(_binary, _size), do: :error
 
   defp ensure_formatter(config_path) do
     case Registry.lookup(Dexter.FormatterRegistry, config_path) do
@@ -513,25 +951,37 @@ defmodule Dexter.Loop do
         :ok
 
       [] ->
-        DynamicSupervisor.start_child(
-          Dexter.FormatterSup,
-          {Dexter.Formatter, config_path}
-        )
-
-        :ok
+        case DynamicSupervisor.start_child(
+               Dexter.FormatterSup,
+               {Dexter.Formatter, config_path}
+             ) do
+          {:ok, _pid} -> :ok
+          {:error, {:already_started, _pid}} -> :ok
+          {:error, reason} -> {:error, reason}
+        end
     end
   end
+
+  defp format_formatter_start_error({%_{} = error, _stacktrace}) do
+    Exception.message(error)
+  end
+
+  defp format_formatter_start_error(reason), do: inspect(reason)
 end
 
 # Boot
 
 {:ok, _} = Registry.start_link(keys: :unique, name: Dexter.FormatterRegistry)
 {:ok, _} = DynamicSupervisor.start_link(strategy: :one_for_one, name: Dexter.FormatterSup)
+{:ok, _} = Task.Supervisor.start_link(name: Dexter.TaskSup)
+{:ok, _} = Dexter.Writer.start_link()
+{:ok, _} = Dexter.CodeIntelCache.start_link()
 
 IO.puts(:stderr, "Dexter BEAM: started (pid #{System.pid()})")
 
 try do
-  Dexter.Loop.run(true)
+  :ok = Dexter.Writer.send_ready(0)
+  Dexter.Loop.run()
 rescue
   e ->
     IO.puts(:stderr, "Dexter BEAM: crash in loop: #{Exception.message(e)}")

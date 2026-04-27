@@ -2,7 +2,9 @@ package lsp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -51,6 +53,20 @@ type usingCacheEntry struct {
 	aliases     map[string]string      // alias short name → full module injected by __using__
 }
 
+type erlangBuildRootState struct {
+	runtimeKey string
+	loading    bool
+}
+
+type erlangRuntimeCache struct {
+	otpRelease  string
+	codeRootDir string
+	moduleNames map[string]bool
+	exports     map[string][]ErlangExport
+	loading     bool
+	readyCh     chan struct{}
+}
+
 type Server struct {
 	store           *store.Store
 	docs            *DocumentStore
@@ -65,6 +81,10 @@ type Server struct {
 
 	beams  map[string]*beamProcess // build root → persistent BEAM process
 	beamMu sync.Mutex
+
+	erlangBuildRoots   map[string]*erlangBuildRootState // build root → runtime resolution state
+	erlangRuntimeCache map[string]*erlangRuntimeCache   // runtime key → cached OTP modules/exports
+	erlangRuntimeMu    sync.Mutex
 
 	usingCache   map[string]*usingCacheEntry // module name → parsed __using__ result
 	usingCacheMu sync.RWMutex
@@ -97,13 +117,15 @@ func (s *Server) debugNow() time.Time {
 
 func NewServer(s *store.Store, projectRoot string) *Server {
 	return &Server{
-		store:           s,
-		docs:            NewDocumentStore(),
-		projectRoot:     projectRoot,
-		explicitRoot:    projectRoot != "",
-		followDelegates: true,
-		usingCache:      make(map[string]*usingCacheEntry),
-		depsCache:       make(map[string]bool),
+		store:              s,
+		docs:               NewDocumentStore(),
+		projectRoot:        projectRoot,
+		explicitRoot:       projectRoot != "",
+		followDelegates:    true,
+		erlangBuildRoots:   make(map[string]*erlangBuildRootState),
+		erlangRuntimeCache: make(map[string]*erlangRuntimeCache),
+		usingCache:         make(map[string]*usingCacheEntry),
+		depsCache:          make(map[string]bool),
 	}
 }
 
@@ -435,16 +457,18 @@ func (s *Server) Exit(ctx context.Context) error {
 // === Document Sync ===
 
 func (s *Server) DidOpen(ctx context.Context, params *protocol.DidOpenTextDocumentParams) error {
-	s.docs.Set(string(params.TextDocument.URI), params.TextDocument.Text)
+	docURI := string(params.TextDocument.URI)
+	s.docs.Set(docURI, params.TextDocument.Text)
+	path := uriToPath(params.TextDocument.URI)
 
 	// Eagerly start the persistent BEAM process so the first format is instant.
 	// Skip deps and stdlib files — we don't format those.
-	path := uriToPath(params.TextDocument.URI)
 	if path != "" && isFormattableFile(path) && s.isProjectFile(path) && !s.isDepsFile(path) {
-		go func() {
-			buildRoot := s.findBuildRoot(filepath.Dir(path))
+		buildRoot := s.findBuildRoot(filepath.Dir(path))
+		go func(path, buildRoot string) {
 			_ = s.getBeamProcess(context.Background(), buildRoot)
-		}()
+			s.startErlangModuleLoad(path)
+		}(path, buildRoot)
 	}
 
 	return nil
@@ -453,7 +477,8 @@ func (s *Server) DidOpen(ctx context.Context, params *protocol.DidOpenTextDocume
 func (s *Server) DidChange(ctx context.Context, params *protocol.DidChangeTextDocumentParams) error {
 	if len(params.ContentChanges) > 0 {
 		// Full sync mode — last change contains the full text
-		s.docs.Set(string(params.TextDocument.URI), params.ContentChanges[len(params.ContentChanges)-1].Text)
+		text := params.ContentChanges[len(params.ContentChanges)-1].Text
+		s.docs.Set(string(params.TextDocument.URI), text)
 	}
 	return nil
 }
@@ -473,13 +498,17 @@ func (s *Server) DidSave(ctx context.Context, params *protocol.DidSaveTextDocume
 	// config is picked up on the next format request.
 	if filepath.Base(path) == ".formatter.exs" {
 		buildRoot := s.findBuildRoot(filepath.Dir(path))
+		var bp *beamProcess
 		s.beamMu.Lock()
-		if bp, ok := s.beams[buildRoot]; ok {
+		if existing, ok := s.beams[buildRoot]; ok {
 			delete(s.beams, buildRoot)
+			bp = existing
+		}
+		s.beamMu.Unlock()
+		if bp != nil {
 			bp.Close()
 			log.Printf("BEAM: restarting for %s (.formatter.exs changed)", buildRoot)
 		}
-		s.beamMu.Unlock()
 		return nil
 	}
 
@@ -724,10 +753,137 @@ func filterOutTypes(results []store.LookupResult) []store.LookupResult {
 	return results
 }
 
+func (s *Server) erlangBuildRoot(filePath string) string {
+	if filePath != "" {
+		return s.findBuildRoot(filepath.Dir(filePath))
+	}
+	return s.findBuildRoot(s.projectRoot)
+}
+
+func erlangRuntimeKey(info *ErlangRuntimeInfo) string {
+	if info == nil {
+		return ""
+	}
+	return info.OTPRelease + "\x00" + info.CodeRootDir
+}
+
+func decodeErlangModuleNames(payload []byte) ([]string, error) {
+	reader := bytes.NewReader(payload)
+	var count uint16
+	if err := binary.Read(reader, binary.BigEndian, &count); err != nil {
+		return nil, fmt.Errorf("read module count: %w", err)
+	}
+
+	names := make([]string, 0, count)
+	for i := 0; i < int(count); i++ {
+		var nameLen uint16
+		if err := binary.Read(reader, binary.BigEndian, &nameLen); err != nil {
+			return nil, fmt.Errorf("read module name length: %w", err)
+		}
+		nameBuf := make([]byte, nameLen)
+		if _, err := io.ReadFull(reader, nameBuf); err != nil {
+			return nil, fmt.Errorf("read module name: %w", err)
+		}
+		names = append(names, string(nameBuf))
+	}
+
+	return names, nil
+}
+
+func (s *Server) clearErlangWarmup(runtimeKey string, readyCh chan struct{}) {
+	var notifyCh chan struct{}
+
+	s.erlangRuntimeMu.Lock()
+	cache := s.erlangRuntimeCache[runtimeKey]
+	if cache != nil && cache.readyCh == readyCh {
+		cache.loading = false
+		notifyCh = cache.readyCh
+		cache.readyCh = nil
+	}
+	s.erlangRuntimeMu.Unlock()
+
+	if notifyCh != nil {
+		close(notifyCh)
+	}
+}
+
+func (s *Server) completeErlangWarmup(buildRoot string, names []string) {
+	moduleNames := make(map[string]bool, len(names))
+	for _, name := range names {
+		moduleNames[name] = true
+	}
+
+	var notifyCh chan struct{}
+	s.erlangRuntimeMu.Lock()
+	state := s.erlangBuildRoots[buildRoot]
+	if state == nil || state.runtimeKey == "" {
+		s.erlangRuntimeMu.Unlock()
+		return
+	}
+
+	cache := s.erlangRuntimeCache[state.runtimeKey]
+	if cache == nil {
+		cache = &erlangRuntimeCache{exports: make(map[string][]ErlangExport)}
+		s.erlangRuntimeCache[state.runtimeKey] = cache
+	}
+	if cache.exports == nil {
+		cache.exports = make(map[string][]ErlangExport)
+	}
+	cache.moduleNames = moduleNames
+	cache.loading = false
+	notifyCh = cache.readyCh
+	cache.readyCh = nil
+	s.erlangRuntimeMu.Unlock()
+
+	if notifyCh != nil {
+		close(notifyCh)
+	}
+}
+
+func (s *Server) failErlangWarmup(buildRoot string) {
+	var notifyCh chan struct{}
+
+	s.erlangRuntimeMu.Lock()
+	state := s.erlangBuildRoots[buildRoot]
+	if state != nil && state.runtimeKey != "" {
+		if cache := s.erlangRuntimeCache[state.runtimeKey]; cache != nil {
+			cache.loading = false
+			notifyCh = cache.readyCh
+			cache.readyCh = nil
+		}
+	}
+	s.erlangRuntimeMu.Unlock()
+
+	if notifyCh != nil {
+		close(notifyCh)
+	}
+}
+
+func (s *Server) handleBeamNotification(buildRoot string, notification beamNotification) {
+	switch notification.op {
+	case beamNotificationOTPModulesReady:
+		names, err := decodeErlangModuleNames(notification.payload)
+		if err != nil {
+			log.Printf("failed to decode Erlang module notification: %v", err)
+			s.failErlangWarmup(buildRoot)
+			return
+		}
+		s.completeErlangWarmup(buildRoot, names)
+
+	case beamNotificationOTPModulesFailed:
+		if len(notification.payload) > 0 {
+			log.Printf("failed to warm Erlang modules: %s", strings.TrimSpace(string(notification.payload)))
+		} else {
+			log.Printf("failed to warm Erlang modules")
+		}
+		s.failErlangWarmup(buildRoot)
+	}
+}
+
 // erlangHover fetches documentation for an Erlang module/function via the
 // BEAM process's CodeIntel service.
 func (s *Server) erlangHover(ctx context.Context, filePath, module, function string) (*protocol.Hover, error) {
-	buildRoot := s.findBuildRoot(filepath.Dir(filePath))
+	buildRoot := s.erlangBuildRoot(filePath)
 	bp := s.getBeamProcess(ctx, buildRoot)
 	if bp == nil {
 		return nil, nil
@@ -752,7 +908,7 @@ func (s *Server) erlangHover(ctx context.Context, filePath, module, function str
 // erlangDefinition resolves an Erlang module/function to its .erl source via
 // the BEAM process's CodeIntel service.
 func (s *Server) erlangDefinition(ctx context.Context, filePath, module, function string) ([]protocol.Location, error) {
-	buildRoot := s.findBuildRoot(filepath.Dir(filePath))
+	buildRoot := s.erlangBuildRoot(filePath)
 	bp := s.getBeamProcess(ctx, buildRoot)
 	if bp == nil {
 		s.debugf("Definition: no BEAM process available for Erlang resolution")
@@ -778,6 +934,243 @@ func (s *Server) erlangDefinition(ctx context.Context, filePath, module, functio
 		URI:   uri.File(result.File),
 		Range: lineRange(line),
 	}}, nil
+}
+
+// startErlangModuleLoad kicks off a background warmup for the current file's
+// runtime. Build roots first resolve to a runtime fingerprint, then runtime
+// caches (OTP module names + exports) are loaded once per runtime.
+func (s *Server) startErlangModuleLoad(filePath string) {
+	buildRoot := s.erlangBuildRoot(filePath)
+
+	s.erlangRuntimeMu.Lock()
+	state, ok := s.erlangBuildRoots[buildRoot]
+	if !ok {
+		state = &erlangBuildRootState{}
+		s.erlangBuildRoots[buildRoot] = state
+	}
+
+	if state.runtimeKey != "" {
+		runtimeKey := state.runtimeKey
+		cache := s.erlangRuntimeCache[runtimeKey]
+		switch {
+		case cache != nil && cache.moduleNames != nil:
+			s.erlangRuntimeMu.Unlock()
+			return
+		case cache != nil && cache.loading:
+			s.erlangRuntimeMu.Unlock()
+			return
+		default:
+			if cache == nil {
+				cache = &erlangRuntimeCache{exports: make(map[string][]ErlangExport)}
+				s.erlangRuntimeCache[runtimeKey] = cache
+			}
+			if cache.exports == nil {
+				cache.exports = make(map[string][]ErlangExport)
+			}
+			cache.loading = true
+			cache.readyCh = make(chan struct{})
+			readyCh := cache.readyCh
+			s.erlangRuntimeMu.Unlock()
+			go s.loadErlangRuntimeCache(buildRoot, runtimeKey, readyCh)
+			return
+		}
+	}
+
+	if state.loading {
+		s.erlangRuntimeMu.Unlock()
+		return
+	}
+
+	state.loading = true
+	s.erlangRuntimeMu.Unlock()
+	go s.resolveErlangRuntime(buildRoot)
+}
+
+func (s *Server) resolveErlangRuntime(buildRoot string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	bp := s.getBeamProcess(ctx, buildRoot)
+	if bp == nil {
+		s.erlangRuntimeMu.Lock()
+		if state := s.erlangBuildRoots[buildRoot]; state != nil {
+			state.loading = false
+		}
+		s.erlangRuntimeMu.Unlock()
+		return
+	}
+	if err := bp.Ready(ctx); err != nil {
+		s.erlangRuntimeMu.Lock()
+		if state := s.erlangBuildRoots[buildRoot]; state != nil {
+			state.loading = false
+		}
+		s.erlangRuntimeMu.Unlock()
+		return
+	}
+
+	info, err := bp.ErlangRuntimeInfo(ctx)
+	if err != nil {
+		s.erlangRuntimeMu.Lock()
+		if state := s.erlangBuildRoots[buildRoot]; state != nil {
+			state.loading = false
+		}
+		s.erlangRuntimeMu.Unlock()
+		return
+	}
+
+	runtimeKey := erlangRuntimeKey(info)
+	if runtimeKey == "" {
+		s.erlangRuntimeMu.Lock()
+		if state := s.erlangBuildRoots[buildRoot]; state != nil {
+			state.loading = false
+		}
+		s.erlangRuntimeMu.Unlock()
+		return
+	}
+
+	startLoad := false
+	var readyCh chan struct{}
+	s.erlangRuntimeMu.Lock()
+	state := s.erlangBuildRoots[buildRoot]
+	if state == nil {
+		state = &erlangBuildRootState{}
+		s.erlangBuildRoots[buildRoot] = state
+	}
+	state.runtimeKey = runtimeKey
+	state.loading = false
+
+	cache := s.erlangRuntimeCache[runtimeKey]
+	if cache == nil {
+		cache = &erlangRuntimeCache{
+			otpRelease:  info.OTPRelease,
+			codeRootDir: info.CodeRootDir,
+			exports:     make(map[string][]ErlangExport),
+		}
+		s.erlangRuntimeCache[runtimeKey] = cache
+	}
+	if cache.exports == nil {
+		cache.exports = make(map[string][]ErlangExport)
+	}
+	if cache.otpRelease == "" {
+		cache.otpRelease = info.OTPRelease
+	}
+	if cache.codeRootDir == "" {
+		cache.codeRootDir = info.CodeRootDir
+	}
+	if cache.moduleNames == nil && !cache.loading {
+		cache.loading = true
+		cache.readyCh = make(chan struct{})
+		readyCh = cache.readyCh
+		startLoad = true
+	}
+	s.erlangRuntimeMu.Unlock()
+
+	if startLoad {
+		go s.loadErlangRuntimeCache(buildRoot, runtimeKey, readyCh)
+	}
+}
+
+func (s *Server) loadErlangRuntimeCache(buildRoot, runtimeKey string, readyCh chan struct{}) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	bp := s.getBeamProcess(ctx, buildRoot)
+	if bp == nil {
+		s.clearErlangWarmup(runtimeKey, readyCh)
+		return
+	}
+	if err := bp.Ready(ctx); err != nil {
+		s.clearErlangWarmup(runtimeKey, readyCh)
+		return
+	}
+
+	if err := bp.WarmOTPModuleNames(ctx); err != nil {
+		log.Printf("failed to start OTP module warmup: %v", err)
+		s.clearErlangWarmup(runtimeKey, readyCh)
+		return
+	}
+
+	select {
+	case <-readyCh:
+		return
+	case <-ctx.Done():
+		s.clearErlangWarmup(runtimeKey, readyCh)
+		return
+	}
+}
+
+func (s *Server) erlangModuleNamesForFile(filePath string) map[string]bool {
+	buildRoot := s.erlangBuildRoot(filePath)
+
+	s.erlangRuntimeMu.Lock()
+	defer s.erlangRuntimeMu.Unlock()
+
+	state := s.erlangBuildRoots[buildRoot]
+	if state == nil || state.runtimeKey == "" {
+		return nil
+	}
+	cache := s.erlangRuntimeCache[state.runtimeKey]
+	if cache == nil {
+		return nil
+	}
+	return cache.moduleNames
+}
+
+func (s *Server) erlangModulesAvailable(filePath string) bool {
+	moduleNames := s.erlangModuleNamesForFile(filePath)
+	return moduleNames != nil
+}
+
+// getErlangExports returns the cached exports for an Erlang module, fetching
+// from the BEAM on first access. Export caches are shared across build roots
+// that resolve to the same runtime fingerprint.
+func (s *Server) getErlangExports(ctx context.Context, filePath, module string) []ErlangExport {
+	buildRoot := s.erlangBuildRoot(filePath)
+
+	s.erlangRuntimeMu.Lock()
+	state := s.erlangBuildRoots[buildRoot]
+	if state == nil || state.runtimeKey == "" {
+		s.erlangRuntimeMu.Unlock()
+		s.startErlangModuleLoad(filePath)
+		return nil
+	}
+
+	runtimeKey := state.runtimeKey
+	cache := s.erlangRuntimeCache[runtimeKey]
+	if cache == nil || cache.moduleNames == nil {
+		s.erlangRuntimeMu.Unlock()
+		s.startErlangModuleLoad(filePath)
+		return nil
+	}
+	if exports, ok := cache.exports[module]; ok {
+		s.erlangRuntimeMu.Unlock()
+		return exports
+	}
+	s.erlangRuntimeMu.Unlock()
+
+	bp := s.getBeamProcess(ctx, buildRoot)
+	if bp == nil {
+		return nil
+	}
+	if err := bp.Ready(ctx); err != nil {
+		return nil
+	}
+
+	exports, err := bp.ErlangExports(ctx, module)
+	if err != nil {
+		return nil
+	}
+
+	s.erlangRuntimeMu.Lock()
+	cache = s.erlangRuntimeCache[runtimeKey]
+	if cache != nil {
+		if cache.exports == nil {
+			cache.exports = make(map[string][]ErlangExport)
+		}
+		cache.exports[module] = exports
+	}
+	s.erlangRuntimeMu.Unlock()
+	return exports
 }
 
 func lineRange(line int) protocol.Range {
@@ -1003,6 +1396,7 @@ func (s *Server) ColorPresentation(ctx context.Context, params *protocol.ColorPr
 }
 func (s *Server) Completion(ctx context.Context, params *protocol.CompletionParams) (*protocol.CompletionList, error) {
 	docURI := string(params.TextDocument.URI)
+	filePath := uriToPath(params.TextDocument.URI)
 
 	text, ok := s.docs.Get(docURI)
 	if !ok {
@@ -1068,9 +1462,70 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 		Start: protocol.Position{Line: uint32(lineNum), Character: uint32(prefixStartCol)},
 		End:   protocol.Position{Line: uint32(lineNum), Character: uint32(col)},
 	}
+	inPipe := IsPipeContext(lines[lineNum], prefixStartCol)
+
+	// Erlang module/function completions (prefix starts with ":")
+	if strings.HasPrefix(prefix, ":") {
+		s.startErlangModuleLoad(filePath)
+		if !s.erlangModulesAvailable(filePath) {
+			return nil, nil
+		}
+		moduleNames := s.erlangModuleNamesForFile(filePath)
+		if moduleNames == nil {
+			return nil, nil
+		}
+		erlPrefix := prefix[1:] // strip leading colon
+		var items []protocol.CompletionItem
+
+		if afterDot || strings.Contains(erlPrefix, ".") {
+			// :module.func — complete exported functions
+			var erlModule, erlFuncPrefix string
+			if dotIdx := strings.IndexByte(erlPrefix, '.'); dotIdx >= 0 {
+				erlModule = erlPrefix[:dotIdx]
+				erlFuncPrefix = erlPrefix[dotIdx+1:]
+			} else {
+				erlModule = erlPrefix
+			}
+			if moduleNames[erlModule] {
+				for _, e := range s.getErlangExports(ctx, filePath, erlModule) {
+					if strings.HasPrefix(e.Function, erlFuncPrefix) {
+						item := protocol.CompletionItem{
+							Label:  e.Function,
+							Kind:   protocol.CompletionItemKindFunction,
+							Detail: fmt.Sprintf(":%s.%s/%d", erlModule, e.Function, e.Arity),
+						}
+						applySnippet(&item, e.Function, e.Arity, e.Params, inPipe, s.snippetSupport)
+						items = append(items, item)
+					}
+				}
+			}
+		} else {
+			// :mod — complete module names
+			for name := range moduleNames {
+				if strings.HasPrefix(name, erlPrefix) {
+					items = append(items, protocol.CompletionItem{
+						Label:  ":" + name,
+						Kind:   protocol.CompletionItemKindModule,
+						Detail: "Erlang module",
+						TextEdit: &protocol.TextEdit{
+							Range:   prefixRange,
+							NewText: ":" + name,
+						},
+					})
+				}
+			}
+		}
+
+		if len(items) == 0 {
+			return nil, nil
+		}
+		return &protocol.CompletionList{
+			IsIncomplete: len(items) >= 100,
+			Items:        items,
+		}, nil
+	}
 
 	moduleRef, funcPrefix := ExtractModuleAndFunction(prefix)
-	inPipe := IsPipeContext(lines[lineNum], prefixStartCol)
 
 	// "Module.func." or "variable." — dot after a function call result or
 	// map/struct field access. We have no type info to complete the result.
@@ -1194,12 +1649,17 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 			}
 		}
 
-		for _, mod := range ExtractImports(text) {
+		imports := ExtractImports(text)
+		imports = append(imports, "Kernel")
+		for _, mod := range imports {
 			results, err := s.store.ListModuleFunctions(mod, true)
 			if err != nil {
 				continue
 			}
 			for _, r := range results {
+				if s.snippetSupport && elixirFormSnippets[r.Function] != "" {
+					continue
+				}
 				key := funcKey(r.Function, r.Arity)
 				if strings.HasPrefix(r.Function, funcPrefix) && !seen[key] {
 					seen[key] = true
@@ -1239,6 +1699,21 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 					Kind:   protocol.CompletionItemKindVariable,
 					Detail: "variable",
 				})
+			}
+		}
+
+		if s.snippetSupport {
+			for name, snippet := range elixirFormSnippets {
+				if strings.HasPrefix(name, funcPrefix) && !seen[name] {
+					seen[name] = true
+					items = append(items, protocol.CompletionItem{
+						Label:            name,
+						Kind:             protocol.CompletionItemKindKeyword,
+						Detail:           "special form",
+						InsertText:       snippet,
+						InsertTextFormat: protocol.InsertTextFormatSnippet,
+					})
+				}
 			}
 		}
 	}
@@ -1767,14 +2242,29 @@ func funcKey(name string, arity int) string {
 	return name + "/" + strconv.Itoa(arity)
 }
 
+var elixirFormSnippets = map[string]string{
+	"for":     "for ${1:pattern} <- ${2:enumerable} do\n\t$0\nend",
+	"with":    "with ${1:pattern} <- ${2:expression} do\n\t$0\nend",
+	"case":    "case ${1:expression} do\n\t${2:pattern} ->\n\t\t$0\nend",
+	"cond":    "cond do\n\t${1:condition} ->\n\t\t$0\nend",
+	"if":      "if ${1:condition} do\n\t$0\nend",
+	"unless":  "unless ${1:condition} do\n\t$0\nend",
+	"receive": "receive do\n\t${1:pattern} ->\n\t\t$0\nend",
+	"try":     "try do\n\t$0\nrescue\n\t${1:exception} ->\n\t\t${2:handler}\nend",
+	"quote":   "quote do\n\t$0\nend",
+	"fn":      "fn ${1:args} -> $0 end",
+}
+
 func applySnippet(item *protocol.CompletionItem, name string, arity int, params string, inPipe bool, useSnippets bool) {
 	item.Label = fmt.Sprintf("%s/%d", name, arity)
 	item.FilterText = name
 
 	snippetArity := arity
 	snippetParams := params
+	paramStartIndex := 1
 	if inPipe && arity > 0 {
 		snippetArity--
+		paramStartIndex = 2
 		if snippetParams != "" {
 			if commaIdx := strings.IndexByte(snippetParams, ','); commaIdx >= 0 {
 				snippetParams = snippetParams[commaIdx+1:]
@@ -1786,7 +2276,7 @@ func applySnippet(item *protocol.CompletionItem, name string, arity int, params 
 
 	if !useSnippets {
 		if snippetArity > 0 {
-			item.InsertText = functionCallText(name, snippetArity, snippetParams)
+			item.InsertText = functionCallText(name, snippetArity, snippetParams, paramStartIndex)
 		} else {
 			item.InsertText = name + "()"
 		}
@@ -1795,33 +2285,36 @@ func applySnippet(item *protocol.CompletionItem, name string, arity int, params 
 
 	if snippetArity > 0 {
 		item.InsertTextFormat = protocol.InsertTextFormatSnippet
-		item.InsertText = functionSnippet(name, snippetArity, snippetParams)
+		item.InsertText = functionSnippet(name, snippetArity, snippetParams, paramStartIndex)
 	} else {
 		item.InsertText = name + "()"
 	}
 }
 
-func functionSnippet(name string, arity int, params string) string {
-	return buildCallText(name, arity, params, true)
+func functionSnippet(name string, arity int, params string, paramStartIndex int) string {
+	return buildCallText(name, arity, params, true, paramStartIndex)
 }
 
-func functionCallText(name string, arity int, params string) string {
-	return buildCallText(name, arity, params, false)
+func functionCallText(name string, arity int, params string, paramStartIndex int) string {
+	return buildCallText(name, arity, params, false, paramStartIndex)
 }
 
-func buildCallText(name string, arity int, params string, snippet bool) string {
+func buildCallText(name string, arity int, params string, snippet bool, paramStartIndex int) string {
+	if paramStartIndex < 1 {
+		paramStartIndex = 1
+	}
 	var paramNames []string
 	if params != "" {
 		paramNames = strings.Split(params, ",")
 	}
 	var args []string
-	for i := 1; i <= arity; i++ {
-		paramName := fmt.Sprintf("arg%d", i)
-		if i-1 < len(paramNames) {
-			paramName = paramNames[i-1]
+	for i := 0; i < arity; i++ {
+		paramName := fmt.Sprintf("arg%d", paramStartIndex+i)
+		if i < len(paramNames) {
+			paramName = paramNames[i]
 		}
 		if snippet {
-			args = append(args, fmt.Sprintf("${%d:%s}", i, paramName))
+			args = append(args, fmt.Sprintf("${%d:%s}", i+1, paramName))
 		} else {
 			args = append(args, paramName)
 		}
@@ -2888,6 +3381,12 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 		// Fallback for use-chain inline defs (not stored as module definitions)
 		if results := s.lookupThroughUse(text, functionName, aliases); len(results) > 0 {
 			return s.hoverFromFile(functionName, results[0])
+		}
+
+		// Fallback: bare identifier might be an Erlang built-in type or function
+		// (e.g. pos_integer, binary, term, length, is_atom)
+		if hover, _ := s.erlangHover(ctx, uriToPath(protocol.DocumentURI(docURI)), "erlang", functionName); hover != nil {
+			return hover, nil
 		}
 
 		return nil, nil

@@ -1251,6 +1251,34 @@ func TestExtractCompletionContext(t *testing.T) {
 			wantPrefix:   "Enum.map",
 			wantAfterDot: false,
 		},
+		{
+			name:         "erlang module prefix",
+			line:         "  :lis",
+			col:          6,
+			wantPrefix:   ":lis",
+			wantAfterDot: false,
+		},
+		{
+			name:         "erlang module dot",
+			line:         "  :lists.",
+			col:          9,
+			wantPrefix:   ":lists",
+			wantAfterDot: true,
+		},
+		{
+			name:         "erlang module function prefix",
+			line:         "  :lists.fla",
+			col:          12,
+			wantPrefix:   ":lists.fla",
+			wantAfterDot: false,
+		},
+		{
+			name:         "bare colon — no completion",
+			line:         "  :",
+			col:          3,
+			wantPrefix:   "",
+			wantAfterDot: false,
+		},
 	}
 
 	for _, tt := range tests {
