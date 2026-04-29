@@ -217,7 +217,7 @@ lspconfig.dexter.setup({})
 
 ### Zed
 
-Enable Dexter in your Zed `settings.json`:
+See the [Zed docs](https://zed.dev/docs/languages/elixir#using-dexter) for full details. Enable Dexter in your Zed `settings.json`:
 
 ```json
 {
