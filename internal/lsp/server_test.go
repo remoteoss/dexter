@@ -122,6 +122,66 @@ end
 	}
 }
 
+func TestDefinition_FollowDelegates_WrappedMacroViaUseChain(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/custom_macros.ex", `defmodule MyApp.CustomMacros do
+  defmacro action(name, opts) do
+    quote do
+      defdelegate unquote(name)(), unquote(opts)
+    end
+  end
+end
+`)
+	indexFile(t, server.store, server.projectRoot, "lib/actions.ex", `defmodule MyApp.Actions do
+  defmacro __using__(_opts) do
+    quote do
+      import MyApp.CustomMacros
+    end
+  end
+end
+`)
+	indexFile(t, server.store, server.projectRoot, "lib/facade.ex", `defmodule MyApp.Facade do
+  use MyApp.Actions
+  alias MyApp.Workers.Runner
+
+  action :run, to: Runner, as: :call
+end
+`)
+	indexFile(t, server.store, server.projectRoot, "lib/workers/runner.ex", `defmodule MyApp.Workers.Runner do
+  def call() do
+    :ok
+  end
+end
+`)
+
+	callerSrc := `defmodule MyApp.Caller do
+  def run do
+    MyApp.Facade.run()
+  end
+end
+`
+	callerURI := "file://" + filepath.Join(server.projectRoot, "lib/caller.ex")
+	server.docs.Set(callerURI, callerSrc)
+
+	locs := definitionAt(t, server, callerURI, 2, 18)
+	if len(locs) == 0 {
+		t.Fatal("expected go-to-definition to follow wrapped defdelegate via use-chain-imported macro")
+	}
+
+	foundRunner := false
+	for _, loc := range locs {
+		if strings.HasSuffix(string(loc.URI), "lib/workers/runner.ex") {
+			foundRunner = true
+			break
+		}
+	}
+	if !foundRunner {
+		t.Fatalf("expected definition in lib/workers/runner.ex, got %v", locs)
+	}
+}
+
 // waitFor polls condition every 10ms until it returns true or one second elapses.
 func waitFor(t *testing.T, condition func() bool) {
 	t.Helper()
