@@ -230,7 +230,7 @@ func TestFormatterServer_WithStylerPlugin(t *testing.T) {
 	}
 }
 
-func TestFormatterServer_HEEXPluginFormatsSigilInElixirFile(t *testing.T) {
+func TestFormatterServer_HEEXPluginFormatsSigilsAndFiles(t *testing.T) {
 	if _, err := exec.LookPath("mix"); err != nil {
 		t.Skip("mix not available in PATH")
 	}
@@ -248,7 +248,17 @@ func TestFormatterServer_HEEXPluginFormatsSigilInElixirFile(t *testing.T) {
 		server.mixBin = p
 	}
 
-	input := `defmodule MyApp.Component do
+	tests := []struct {
+		name           string
+		relativePath   string
+		input          string
+		want           []string
+		unwantedOutput string
+	}{
+		{
+			name:         "sigil in Elixir file",
+			relativePath: filepath.Join("lib", "component.ex"),
+			input: `defmodule MyApp.Component do
   def render(assigns) do
     ~H"""
     <div>
@@ -262,52 +272,17 @@ func TestFormatterServer_HEEXPluginFormatsSigilInElixirFile(t *testing.T) {
     """
   end
 end
-`
-	filePath := filepath.Join(mixRoot, "lib", "component.ex")
-	docURI := string(uri.File(filePath))
-	server.docs.Set(docURI, input)
-
-	edits, err := server.Formatting(context.Background(), &protocol.DocumentFormattingParams{
-		TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(docURI)},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if edits == nil {
-		t.Fatal("expected formatting edits from HEEX formatter plugin, got nil")
-	}
-	for _, want := range []string{
-		"      <span>text</span>",
-		"      <span>more text</span>",
-	} {
-		if !strings.Contains(edits[0].NewText, want) {
-			t.Errorf("expected HEEX formatter output %q, got:\n%s", want, edits[0].NewText)
-		}
-	}
-	if strings.Contains(edits[0].NewText, "<span>more text\n") {
-		t.Errorf("expected HEEX formatter to collapse split span, got:\n%s", edits[0].NewText)
-	}
-}
-
-func TestFormatterServer_HEEXPluginFormatsHEEXFile(t *testing.T) {
-	if _, err := exec.LookPath("mix"); err != nil {
-		t.Skip("mix not available in PATH")
-	}
-
-	mixRoot := createHEEXFormatterFixture(t)
-	storeDir := t.TempDir()
-	s, err := store.Open(storeDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = s.Close() }()
-
-	server := NewServer(s, mixRoot)
-	if p, err := exec.LookPath("mix"); err == nil {
-		server.mixBin = p
-	}
-
-	input := `<div>
+`,
+			want: []string{
+				"      <span>text</span>",
+				"      <span>more text</span>",
+			},
+			unwantedOutput: "<span>more text\n",
+		},
+		{
+			name:         "HEEX file",
+			relativePath: filepath.Join("lib", "component.heex"),
+			input: `<div>
 <span>text</span>
 
     
@@ -315,27 +290,38 @@ func TestFormatterServer_HEEXPluginFormatsHEEXFile(t *testing.T) {
     <span>more text
       </span>
 </div>
-`
-	filePath := filepath.Join(mixRoot, "lib", "component.heex")
-	docURI := string(uri.File(filePath))
-	server.docs.Set(docURI, input)
+`,
+			want: []string{
+				"  <span>text</span>",
+				"  <span>more text</span>",
+			},
+		},
+	}
 
-	edits, err := server.Formatting(context.Background(), &protocol.DocumentFormattingParams{
-		TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(docURI)},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if edits == nil {
-		t.Fatal("expected formatting edits for .heex file, got nil")
-	}
-	for _, want := range []string{
-		"  <span>text</span>",
-		"  <span>more text</span>",
-	} {
-		if !strings.Contains(edits[0].NewText, want) {
-			t.Errorf("expected HEEX formatter output %q, got:\n%s", want, edits[0].NewText)
-		}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			filePath := filepath.Join(mixRoot, tt.relativePath)
+			docURI := string(uri.File(filePath))
+			server.docs.Set(docURI, tt.input)
+
+			edits, err := server.Formatting(context.Background(), &protocol.DocumentFormattingParams{
+				TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(docURI)},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if edits == nil {
+				t.Fatal("expected formatting edits from HEEX formatter plugin, got nil")
+			}
+			for _, want := range tt.want {
+				if !strings.Contains(edits[0].NewText, want) {
+					t.Errorf("expected HEEX formatter output %q, got:\n%s", want, edits[0].NewText)
+				}
+			}
+			if tt.unwantedOutput != "" && strings.Contains(edits[0].NewText, tt.unwantedOutput) {
+				t.Errorf("expected HEEX formatter to remove %q, got:\n%s", tt.unwantedOutput, edits[0].NewText)
+			}
+		})
 	}
 }
 
