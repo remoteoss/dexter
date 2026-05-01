@@ -122,19 +122,178 @@ func (tf *TokenizedFile) ExtractAliasesInScope(targetLine int) map[string]string
 	return extractAliasesFromTokens(tf.source, tf.tokens, targetLine)
 }
 
+// ExtractAliases parses all alias declarations from the tokenized file.
+func (tf *TokenizedFile) ExtractAliases() map[string]string {
+	return extractAliasesFromTokens(tf.source, tf.tokens, -1)
+}
+
 // ExtractImports returns all import declarations from the tokenized file.
 func (tf *TokenizedFile) ExtractImports() []string {
-	var imports []string
-	for i := 0; i < tf.n; i++ {
-		if tf.tokens[i].Kind == parser.TokImport {
-			j := tokNextSig(tf.tokens, tf.n, i+1)
-			mod, _ := tokCollectModuleName(tf.source, tf.tokens, tf.n, j)
-			if mod != "" {
-				imports = append(imports, mod)
-			}
+	return extractImportsFromTokens(tf.source, tf.tokens)
+}
+
+// ExtractUses returns module names from all `use Module` declarations.
+func (tf *TokenizedFile) ExtractUses() []string {
+	return extractUsesFromTokens(tf.source, tf.tokens)
+}
+
+// ExtractUsesWithOpts parses all `use Module` declarations with keyword opts.
+func (tf *TokenizedFile) ExtractUsesWithOpts(aliases map[string]string) []UseCall {
+	return extractUsesWithOptsFromTokens(tf.source, tf.tokens, aliases)
+}
+
+// FindBufferFunctions scans the tokenized file for all function and type definitions.
+func (tf *TokenizedFile) FindBufferFunctions() []BufferFunction {
+	return findBufferFunctionsFromTokens(tf.source, tf.tokens)
+}
+
+// ExtractAliasBlockParent detects whether targetLine is inside a multi-line alias block.
+func (tf *TokenizedFile) ExtractAliasBlockParent(targetLine int) (string, bool) {
+	return extractAliasBlockParentFromTokens(tf.source, tf.tokens, targetLine)
+}
+
+// CompletionContext describes the token-aware completion prefix at the cursor.
+type CompletionContext struct {
+	Prefix   string
+	AfterDot bool
+	StartCol int
+}
+
+// Empty returns true if no completion should be offered at the cursor.
+func (c CompletionContext) Empty() bool {
+	return c.Prefix == "" && !c.AfterDot
+}
+
+// CompletionContextAtCursor extracts the completion prefix at the given 0-based
+// line/column using the cached token stream. Unlike ExtractCompletionContext,
+// this ignores strings/comments/heredocs and treats `::` distinctly from `:atom`.
+func (tf *TokenizedFile) CompletionContextAtCursor(line, col int) CompletionContext {
+	return CompletionContextAtCursor(tf.tokens, tf.source, tf.lineStarts, line, col)
+}
+
+// CompletionContextAtCursor extracts the token-aware completion context at the
+// given 0-based line/column.
+func CompletionContextAtCursor(tokens []parser.Token, source []byte, lineStarts []int, line, col int) CompletionContext {
+	if line < 0 || line >= len(lineStarts) || col <= 0 {
+		return CompletionContext{}
+	}
+
+	lineStart := lineStarts[line]
+	lineEnd := len(source)
+	if line+1 < len(lineStarts) {
+		lineEnd = lineStarts[line+1] - 1 // exclude the newline byte
+	}
+	maxCol := lineEnd - lineStart
+	if maxCol < 0 {
+		maxCol = 0
+	}
+	if col > maxCol {
+		col = maxCol
+	}
+
+	offset := parser.LineColToOffset(lineStarts, line, col)
+	if offset <= lineStart {
+		return CompletionContext{}
+	}
+
+	idx := parser.TokenAtOffset(tokens, offset-1)
+	if idx < 0 {
+		return CompletionContext{}
+	}
+
+	tok := tokens[idx]
+	if tok.Kind == parser.TokDot {
+		exprIdx := idx - 1
+		if exprIdx < 0 || !isCompletionSegmentToken(tokens[exprIdx].Kind) {
+			return CompletionContext{}
+		}
+		startIdx := completionChainStart(tokens, exprIdx)
+		prefix := buildCompletionPrefix(source, tokens, startIdx, exprIdx, tok.Start)
+		if prefix == "" {
+			return CompletionContext{}
+		}
+		return CompletionContext{
+			Prefix:   prefix,
+			AfterDot: true,
+			StartCol: tokens[startIdx].Start - lineStart,
 		}
 	}
-	return imports
+
+	if !isCompletionSegmentToken(tok.Kind) {
+		return CompletionContext{}
+	}
+
+	startIdx := completionChainStart(tokens, idx)
+	prefix := buildCompletionPrefix(source, tokens, startIdx, idx, offset)
+	if prefix == "" {
+		return CompletionContext{}
+	}
+	return CompletionContext{
+		Prefix:   prefix,
+		AfterDot: false,
+		StartCol: tokens[startIdx].Start - lineStart,
+	}
+}
+
+func completionChainStart(tokens []parser.Token, idx int) int {
+	startIdx := idx
+	for startIdx >= 2 {
+		dotIdx := startIdx - 1
+		prevIdx := startIdx - 2
+		if tokens[dotIdx].Kind == parser.TokDot && isCompletionModuleToken(tokens[prevIdx].Kind) {
+			startIdx = prevIdx
+			continue
+		}
+		break
+	}
+	return startIdx
+}
+
+func buildCompletionPrefix(source []byte, tokens []parser.Token, startIdx, endIdx, endOffset int) string {
+	var b strings.Builder
+	for i := startIdx; i <= endIdx; i++ {
+		tok := tokens[i]
+		switch tok.Kind {
+		case parser.TokDot:
+			b.WriteByte('.')
+		default:
+			if !isCompletionSegmentToken(tok.Kind) {
+				return ""
+			}
+			end := tok.End
+			if i == endIdx && endOffset < end {
+				end = endOffset
+			}
+			if end <= tok.Start {
+				return ""
+			}
+			b.Write(source[tok.Start:end])
+		}
+	}
+	return b.String()
+}
+
+func isCompletionModuleToken(k parser.TokenKind) bool {
+	return k == parser.TokModule || k == parser.TokAtom
+}
+
+func isCompletionFunctionToken(k parser.TokenKind) bool {
+	switch k {
+	case parser.TokIdent,
+		parser.TokDefmodule, parser.TokDefprotocol, parser.TokDefimpl,
+		parser.TokDefstruct, parser.TokDefexception, parser.TokDefdelegate,
+		parser.TokDefmacro, parser.TokDefmacrop, parser.TokDefguard,
+		parser.TokDefguardp, parser.TokDefp, parser.TokDef,
+		parser.TokAlias, parser.TokImport, parser.TokUse, parser.TokRequire,
+		parser.TokDo, parser.TokEnd, parser.TokFn, parser.TokWhen:
+		return true
+	default:
+		return false
+	}
+}
+
+func isCompletionSegmentToken(k parser.TokenKind) bool {
+	return isCompletionModuleToken(k) || isCompletionFunctionToken(k)
 }
 
 func isExprChar(b byte) bool {
@@ -178,9 +337,9 @@ func (c CursorContext) Empty() bool {
 }
 
 // isExprToken returns true for token kinds that can be part of a dotted
-// expression chain (Module.function).
+// expression chain (Module.function or :atom.function).
 func isExprToken(k parser.TokenKind) bool {
-	return k == parser.TokModule || k == parser.TokIdent
+	return k == parser.TokModule || k == parser.TokIdent || k == parser.TokAtom
 }
 
 // ExpressionAtCursor extracts the dotted expression at the cursor position
@@ -286,11 +445,14 @@ func expressionAtCursorImpl(tokens []parser.Token, source []byte, lineStarts []i
 	for ti := startIdx; ti <= truncEnd; ti += 2 {
 		t := tokens[ti]
 		text := parser.TokenText(source, t)
-		if t.Kind == parser.TokModule {
+		switch t.Kind {
+		case parser.TokModule, parser.TokAtom:
 			moduleParts = append(moduleParts, text)
-		} else {
+		default:
 			// TokIdent — this is the function name; stop here
 			functionName = text
+		}
+		if functionName != "" {
 			break
 		}
 	}
@@ -369,6 +531,11 @@ func ExtractCompletionContext(line string, col int) (prefix string, afterDot boo
 		start--
 	}
 
+	// Include a leading colon for Erlang module references (:lists, :ets, etc.)
+	if start > 0 && line[start-1] == ':' {
+		start--
+	}
+
 	raw := line[start : end+1]
 
 	// Trim trailing dots — "Foo." means afterDot=true, prefix="Foo"
@@ -408,16 +575,20 @@ func ExtractAliasBlockParent(lines []string, targetLine int) (string, bool) {
 		return "", false
 	}
 
-	// Use tokenizer for accurate parsing
 	source := []byte(strings.Join(lines, "\n"))
-	tokens := parser.Tokenize(source)
-	n := len(tokens)
+	return extractAliasBlockParentFromTokens(source, parser.Tokenize(source), targetLine)
+}
 
-	// targetLine is 0-based; token.Line is 1-based
+func extractAliasBlockParentFromTokens(source []byte, tokens []parser.Token, targetLine int) (string, bool) {
+	n := len(tokens)
+	if targetLine < 0 || n == 0 {
+		return "", false
+	}
+
 	targetLine1 := targetLine + 1
 
 	// Find the token position for the target line
-	targetIdx := 0
+	targetIdx := n - 1
 	for i, tok := range tokens {
 		if tok.Line >= targetLine1 {
 			targetIdx = i
@@ -685,9 +856,11 @@ type BufferFunction struct {
 // Private types (@typep) are included since they are accessible within the same file.
 func FindBufferFunctions(text string) []BufferFunction {
 	source := []byte(text)
-	tokens := parser.Tokenize(source)
-	n := len(tokens)
+	return findBufferFunctionsFromTokens(source, parser.Tokenize(source))
+}
 
+func findBufferFunctionsFromTokens(source []byte, tokens []parser.Token) []BufferFunction {
+	n := len(tokens)
 	seen := make(map[string]bool)
 	var results []BufferFunction
 
@@ -715,15 +888,16 @@ func FindBufferFunctions(text string) []BufferFunction {
 			minArity := maxArity - defaultCount
 			for arity := minArity; arity <= maxArity; arity++ {
 				key := name + "/" + strconv.Itoa(arity)
-				if !seen[key] {
-					seen[key] = true
-					results = append(results, BufferFunction{
-						Name:   name,
-						Arity:  arity,
-						Kind:   kind,
-						Params: parser.JoinParams(paramNames, arity),
-					})
+				if seen[key] {
+					continue
 				}
+				seen[key] = true
+				results = append(results, BufferFunction{
+					Name:   name,
+					Arity:  arity,
+					Kind:   kind,
+					Params: parser.JoinParams(paramNames, arity),
+				})
 			}
 
 		case parser.TokAttrType:
@@ -746,10 +920,11 @@ func FindBufferFunctions(text string) []BufferFunction {
 				arity, _, _, _ = parser.CollectParams(source, tokens, n, pj)
 			}
 			key := name + "/" + strconv.Itoa(arity)
-			if !seen[key] {
-				seen[key] = true
-				results = append(results, BufferFunction{Name: name, Arity: arity, Kind: kind})
+			if seen[key] {
+				continue
 			}
+			seen[key] = true
+			results = append(results, BufferFunction{Name: name, Arity: arity, Kind: kind})
 		}
 	}
 	return results
@@ -930,16 +1105,20 @@ var (
 // Returns a slice of full module names.
 func ExtractImports(text string) []string {
 	source := []byte(text)
-	tokens := parser.Tokenize(source)
+	return extractImportsFromTokens(source, parser.Tokenize(source))
+}
+
+func extractImportsFromTokens(source []byte, tokens []parser.Token) []string {
 	n := len(tokens)
 	var imports []string
 	for i := 0; i < n; i++ {
-		if tokens[i].Kind == parser.TokImport {
-			j := tokNextSig(tokens, n, i+1)
-			mod, _ := tokCollectModuleName(source, tokens, n, j)
-			if mod != "" {
-				imports = append(imports, mod)
-			}
+		if tokens[i].Kind != parser.TokImport {
+			continue
+		}
+		j := tokNextSig(tokens, n, i+1)
+		mod, _ := tokCollectModuleName(source, tokens, n, j)
+		if mod != "" {
+			imports = append(imports, mod)
 		}
 	}
 	return imports
@@ -1124,16 +1303,20 @@ func parseHelperQuoteBlock(lines []string, helperName string, fileAliases map[st
 // ExtractUses returns module names from all `use Module` declarations.
 func ExtractUses(text string) []string {
 	source := []byte(text)
-	tokens := parser.Tokenize(source)
+	return extractUsesFromTokens(source, parser.Tokenize(source))
+}
+
+func extractUsesFromTokens(source []byte, tokens []parser.Token) []string {
 	n := len(tokens)
 	var uses []string
 	for i := 0; i < n; i++ {
-		if tokens[i].Kind == parser.TokUse {
-			j := tokNextSig(tokens, n, i+1)
-			mod, _ := tokCollectModuleName(source, tokens, n, j)
-			if mod != "" {
-				uses = append(uses, mod)
-			}
+		if tokens[i].Kind != parser.TokUse {
+			continue
+		}
+		j := tokNextSig(tokens, n, i+1)
+		mod, _ := tokCollectModuleName(source, tokens, n, j)
+		if mod != "" {
+			uses = append(uses, mod)
 		}
 	}
 	return uses
@@ -1150,7 +1333,10 @@ type UseCall struct {
 // provided map. Handles opts spanning multiple lines via the tokenizer.
 func ExtractUsesWithOpts(text string, aliases map[string]string) []UseCall {
 	source := []byte(text)
-	tokens := parser.Tokenize(source)
+	return extractUsesWithOptsFromTokens(source, parser.Tokenize(source), aliases)
+}
+
+func extractUsesWithOptsFromTokens(source []byte, tokens []parser.Token, aliases map[string]string) []UseCall {
 	n := len(tokens)
 	var calls []UseCall
 
@@ -1165,7 +1351,6 @@ func ExtractUsesWithOpts(text string, aliases map[string]string) []UseCall {
 		}
 		module := parser.ResolveModuleRef(modName, aliases, "")
 
-		// Check for comma after module name → keyword opts follow
 		nk := tokNextSig(tokens, n, k)
 		if nk < n && tokens[nk].Kind == parser.TokComma {
 			opts := tokCollectKeywordModuleOpts(source, tokens, n, nk+1, aliases)

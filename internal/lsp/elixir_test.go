@@ -231,6 +231,39 @@ func TestExpressionAtCursor(t *testing.T) {
 			wantMod:  "Foo.Bar",
 			wantFunc: "transform",
 		},
+		// --- Erlang atom module support ---
+		{
+			name:     "erlang atom module with function",
+			code:     "    :code.all_loaded()",
+			line:     0,
+			col:      11, // 'a' in all_loaded
+			wantMod:  ":code",
+			wantFunc: "all_loaded",
+		},
+		{
+			name:     "erlang atom module cursor on atom",
+			code:     "    :code.all_loaded()",
+			line:     0,
+			col:      6, // 'o' in code
+			wantMod:  ":code",
+			wantFunc: "",
+		},
+		{
+			name:     "erlang atom :lists.flatten",
+			code:     ":lists.flatten(data)",
+			line:     0,
+			col:      7, // 'f' in flatten
+			wantMod:  ":lists",
+			wantFunc: "flatten",
+		},
+		{
+			name:     "erlang atom piped",
+			code:     "    |> :lists.flatten()",
+			line:     0,
+			col:      13, // 'f' in flatten
+			wantMod:  ":lists",
+			wantFunc: "flatten",
+		},
 	}
 
 	for _, tt := range tests {
@@ -242,6 +275,116 @@ func TestExpressionAtCursor(t *testing.T) {
 			}
 			if ctx.FunctionName != tt.wantFunc {
 				t.Errorf("FunctionName = %q, want %q", ctx.FunctionName, tt.wantFunc)
+			}
+		})
+	}
+}
+
+func TestCompletionContextAtCursor(t *testing.T) {
+	tests := []struct {
+		name         string
+		code         string
+		line         int
+		col          int
+		wantPrefix   string
+		wantAfterDot bool
+		wantStartCol int
+	}{
+		{
+			name:         "module prefix",
+			code:         "  MyApp.Han",
+			line:         0,
+			col:          11,
+			wantPrefix:   "MyApp.Han",
+			wantAfterDot: false,
+			wantStartCol: 2,
+		},
+		{
+			name:         "after dot",
+			code:         "  Foo.",
+			line:         0,
+			col:          6,
+			wantPrefix:   "Foo",
+			wantAfterDot: true,
+			wantStartCol: 2,
+		},
+		{
+			name:         "function prefix after dot",
+			code:         "  Foo.ba",
+			line:         0,
+			col:          8,
+			wantPrefix:   "Foo.ba",
+			wantAfterDot: false,
+			wantStartCol: 2,
+		},
+		{
+			name:         "mid-word cursor truncates current token",
+			code:         "  Enum.map_reduce",
+			line:         0,
+			col:          10,
+			wantPrefix:   "Enum.map",
+			wantAfterDot: false,
+			wantStartCol: 2,
+		},
+		{
+			name:         "erlang module prefix",
+			code:         "  :lis",
+			line:         0,
+			col:          6,
+			wantPrefix:   ":lis",
+			wantAfterDot: false,
+			wantStartCol: 2,
+		},
+		{
+			name:         "double colon does not create atom prefix",
+			code:         "  value::foo",
+			line:         0,
+			col:          12,
+			wantPrefix:   "foo",
+			wantAfterDot: false,
+			wantStartCol: 9,
+		},
+		{
+			name:         "string is ignored",
+			code:         `  "MyApp.Acc"`,
+			line:         0,
+			col:          12,
+			wantPrefix:   "",
+			wantAfterDot: false,
+			wantStartCol: 0,
+		},
+		{
+			name:         "comment is ignored",
+			code:         "  # MyApp.Acc",
+			line:         0,
+			col:          13,
+			wantPrefix:   "",
+			wantAfterDot: false,
+			wantStartCol: 0,
+		},
+		{
+			name:         "heredoc is ignored",
+			code:         "  \"\"\"\n  MyApp.Acc\n  \"\"\"",
+			line:         1,
+			col:          11,
+			wantPrefix:   "",
+			wantAfterDot: false,
+			wantStartCol: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tokens, source, lineStarts := tokenize(tt.code)
+			ctx := CompletionContextAtCursor(tokens, source, lineStarts, tt.line, tt.col)
+			if ctx.Prefix != tt.wantPrefix {
+				t.Errorf("Prefix = %q, want %q", ctx.Prefix, tt.wantPrefix)
+			}
+			if ctx.AfterDot != tt.wantAfterDot {
+				t.Errorf("AfterDot = %v, want %v", ctx.AfterDot, tt.wantAfterDot)
+			}
+			if ctx.StartCol != tt.wantStartCol {
+				t.Errorf("StartCol = %d, want %d", ctx.StartCol, tt.wantStartCol)
 			}
 		})
 	}
@@ -1216,6 +1359,34 @@ func TestExtractCompletionContext(t *testing.T) {
 			line:         "  Enum.map_reduce",
 			col:          10,
 			wantPrefix:   "Enum.map",
+			wantAfterDot: false,
+		},
+		{
+			name:         "erlang module prefix",
+			line:         "  :lis",
+			col:          6,
+			wantPrefix:   ":lis",
+			wantAfterDot: false,
+		},
+		{
+			name:         "erlang module dot",
+			line:         "  :lists.",
+			col:          9,
+			wantPrefix:   ":lists",
+			wantAfterDot: true,
+		},
+		{
+			name:         "erlang module function prefix",
+			line:         "  :lists.fla",
+			col:          12,
+			wantPrefix:   ":lists.fla",
+			wantAfterDot: false,
+		},
+		{
+			name:         "bare colon — no completion",
+			line:         "  :",
+			col:          3,
+			wantPrefix:   "",
 			wantAfterDot: false,
 		},
 	}

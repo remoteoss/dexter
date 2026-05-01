@@ -2,7 +2,9 @@ package lsp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -51,6 +53,20 @@ type usingCacheEntry struct {
 	aliases     map[string]string      // alias short name → full module injected by __using__
 }
 
+type erlangBuildRootState struct {
+	runtimeKey string
+	loading    bool
+}
+
+type erlangRuntimeCache struct {
+	otpRelease  string
+	codeRootDir string
+	moduleNames map[string]bool
+	exports     map[string][]ErlangExport
+	loading     bool
+	readyCh     chan struct{}
+}
+
 type Server struct {
 	store           *store.Store
 	docs            *DocumentStore
@@ -63,8 +79,12 @@ type Server struct {
 	debug           bool
 	mixBin          string // resolved path to the mix binary
 
-	formatters   map[string]*formatterProcess // formatterExs path → persistent formatter
-	formattersMu sync.Mutex
+	beams  map[string]*beamProcess // build root → persistent BEAM process
+	beamMu sync.Mutex
+
+	erlangBuildRoots   map[string]*erlangBuildRootState // build root → runtime resolution state
+	erlangRuntimeCache map[string]*erlangRuntimeCache   // runtime key → cached OTP modules/exports
+	erlangRuntimeMu    sync.Mutex
 
 	usingCache   map[string]*usingCacheEntry // module name → parsed __using__ result
 	usingCacheMu sync.RWMutex
@@ -97,13 +117,15 @@ func (s *Server) debugNow() time.Time {
 
 func NewServer(s *store.Store, projectRoot string) *Server {
 	return &Server{
-		store:           s,
-		docs:            NewDocumentStore(),
-		projectRoot:     projectRoot,
-		explicitRoot:    projectRoot != "",
-		followDelegates: true,
-		usingCache:      make(map[string]*usingCacheEntry),
-		depsCache:       make(map[string]bool),
+		store:              s,
+		docs:               NewDocumentStore(),
+		projectRoot:        projectRoot,
+		explicitRoot:       projectRoot != "",
+		followDelegates:    true,
+		erlangBuildRoots:   make(map[string]*erlangBuildRootState),
+		erlangRuntimeCache: make(map[string]*erlangRuntimeCache),
+		usingCache:         make(map[string]*usingCacheEntry),
+		depsCache:          make(map[string]bool),
 	}
 }
 
@@ -423,7 +445,7 @@ func (s *Server) Initialized(ctx context.Context, params *protocol.InitializedPa
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
-	s.closeFormatters()
+	s.closeBeams()
 	return nil
 }
 
@@ -435,18 +457,18 @@ func (s *Server) Exit(ctx context.Context) error {
 // === Document Sync ===
 
 func (s *Server) DidOpen(ctx context.Context, params *protocol.DidOpenTextDocumentParams) error {
-	s.docs.Set(string(params.TextDocument.URI), params.TextDocument.Text)
-
-	// Eagerly start the persistent formatter so the first format is instant.
-	// Skip deps and stdlib files — we don't format those.
+	docURI := string(params.TextDocument.URI)
+	s.docs.Set(docURI, params.TextDocument.Text)
 	path := uriToPath(params.TextDocument.URI)
+
+	// Eagerly start the persistent BEAM process so the first format is instant.
+	// Skip deps and stdlib files — we don't format those.
 	if path != "" && isFormattableFile(path) && s.isProjectFile(path) && !s.isDepsFile(path) {
-		go func() {
-			if mixRoot := findMixRoot(filepath.Dir(path)); mixRoot != "" {
-				formatterExs := findFormatterConfig(path, mixRoot)
-				_, _ = s.getFormatter(mixRoot, formatterExs)
-			}
-		}()
+		buildRoot := s.findBuildRoot(filepath.Dir(path))
+		go func(path, buildRoot string) {
+			_ = s.getBeamProcess(context.Background(), buildRoot)
+			s.startErlangModuleLoad(path)
+		}(path, buildRoot)
 	}
 
 	return nil
@@ -455,7 +477,8 @@ func (s *Server) DidOpen(ctx context.Context, params *protocol.DidOpenTextDocume
 func (s *Server) DidChange(ctx context.Context, params *protocol.DidChangeTextDocumentParams) error {
 	if len(params.ContentChanges) > 0 {
 		// Full sync mode — last change contains the full text
-		s.docs.Set(string(params.TextDocument.URI), params.ContentChanges[len(params.ContentChanges)-1].Text)
+		text := params.ContentChanges[len(params.ContentChanges)-1].Text
+		s.docs.Set(string(params.TextDocument.URI), text)
 	}
 	return nil
 }
@@ -465,9 +488,35 @@ func (s *Server) DidClose(ctx context.Context, params *protocol.DidCloseTextDocu
 	return nil
 }
 
+func (s *Server) restartBeamForFormatterConfig(path string) {
+	buildRoot := s.findBuildRoot(filepath.Dir(path))
+	var bp *beamProcess
+	s.beamMu.Lock()
+	if existing, ok := s.beams[buildRoot]; ok {
+		delete(s.beams, buildRoot)
+		bp = existing
+	}
+	s.beamMu.Unlock()
+	if bp != nil {
+		bp.Close()
+		log.Printf("BEAM: restarting for %s (.formatter.exs changed)", buildRoot)
+	}
+}
+
 func (s *Server) DidSave(ctx context.Context, params *protocol.DidSaveTextDocumentParams) error {
 	path := uriToPath(params.TextDocument.URI)
-	if path == "" || !parser.IsElixirFile(path) {
+	if path == "" {
+		return nil
+	}
+
+	// Restart the BEAM process when .formatter.exs changes so the new
+	// config is picked up on the next format request.
+	if filepath.Base(path) == ".formatter.exs" {
+		s.restartBeamForFormatterConfig(path)
+		return nil
+	}
+
+	if !parser.IsElixirFile(path) {
 		return nil
 	}
 
@@ -551,17 +600,25 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		return nil, nil
 	}
 
+	// Erlang module atom (e.g. :code.all_loaded) — resolve via BEAM process.
+	// Check before ExtractModuleAndFunction which doesn't handle atom-prefixed modules.
+	if strings.HasPrefix(exprCtx.ModuleRef, ":") {
+		erlModule := exprCtx.ModuleRef[1:] // strip the : prefix
+		s.debugf("Definition: Erlang module %q function=%q", erlModule, exprCtx.FunctionName)
+		return s.erlangDefinition(ctx, uriToPath(params.TextDocument.URI), erlModule, exprCtx.FunctionName)
+	}
+
 	expr := tf.ResolveModuleExpr(exprCtx.Expr(), lineNum)
 	moduleRef, functionName := ExtractModuleAndFunction(expr)
 
 	if moduleRef != "" {
-		if aliasParent, inBlock := ExtractAliasBlockParent(lines, lineNum); inBlock {
+		if aliasParent, inBlock := tf.ExtractAliasBlockParent(lineNum); inBlock {
 			moduleRef = aliasParent + "." + moduleRef
 		}
 	}
 
 	aliases := tf.ExtractAliasesInScope(lineNum)
-	s.mergeAliasesFromUse(text, aliases)
+	s.mergeAliasesFromUseTokenized(tf, aliases)
 	s.debugf("Definition: expr=%q module=%q function=%q", expr, moduleRef, functionName)
 
 	// Bare identifier — check variable first (cheap tree-sitter lookup), then functions
@@ -583,7 +640,7 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		}
 
 		currentModule := tf.FirstDefmodule()
-		fullModule := s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, lines, lineNum, functionName, aliases)
+		fullModule := s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, tf, lineNum, functionName, aliases)
 		s.debugf("Definition: resolved bare %q -> %q", functionName, fullModule)
 		if fullModule == "" {
 			s.debugf("Definition: could not resolve bare function %q", functionName)
@@ -700,6 +757,426 @@ func filterOutTypes(results []store.LookupResult) []store.LookupResult {
 	return results
 }
 
+func (s *Server) erlangBuildRoot(filePath string) string {
+	if filePath != "" {
+		return s.findBuildRoot(filepath.Dir(filePath))
+	}
+	return s.findBuildRoot(s.projectRoot)
+}
+
+func erlangRuntimeKey(info *ErlangRuntimeInfo) string {
+	if info == nil {
+		return ""
+	}
+	return info.OTPRelease + "\x00" + info.CodeRootDir
+}
+
+func decodeErlangModuleNames(payload []byte) ([]string, error) {
+	reader := bytes.NewReader(payload)
+	var count uint16
+	if err := binary.Read(reader, binary.BigEndian, &count); err != nil {
+		return nil, fmt.Errorf("read module count: %w", err)
+	}
+
+	names := make([]string, 0, count)
+	for i := 0; i < int(count); i++ {
+		var nameLen uint16
+		if err := binary.Read(reader, binary.BigEndian, &nameLen); err != nil {
+			return nil, fmt.Errorf("read module name length: %w", err)
+		}
+		nameBuf := make([]byte, nameLen)
+		if _, err := io.ReadFull(reader, nameBuf); err != nil {
+			return nil, fmt.Errorf("read module name: %w", err)
+		}
+		names = append(names, string(nameBuf))
+	}
+
+	return names, nil
+}
+
+func (s *Server) clearErlangWarmup(runtimeKey string, readyCh chan struct{}) {
+	var notifyCh chan struct{}
+
+	s.erlangRuntimeMu.Lock()
+	cache := s.erlangRuntimeCache[runtimeKey]
+	if cache != nil && cache.readyCh == readyCh {
+		cache.loading = false
+		notifyCh = cache.readyCh
+		cache.readyCh = nil
+	}
+	s.erlangRuntimeMu.Unlock()
+
+	if notifyCh != nil {
+		close(notifyCh)
+	}
+}
+
+func (s *Server) completeErlangWarmup(buildRoot string, names []string) {
+	moduleNames := make(map[string]bool, len(names))
+	for _, name := range names {
+		moduleNames[name] = true
+	}
+
+	var notifyCh chan struct{}
+	s.erlangRuntimeMu.Lock()
+	state := s.erlangBuildRoots[buildRoot]
+	if state == nil || state.runtimeKey == "" {
+		s.erlangRuntimeMu.Unlock()
+		return
+	}
+
+	cache := s.erlangRuntimeCache[state.runtimeKey]
+	if cache == nil {
+		cache = &erlangRuntimeCache{exports: make(map[string][]ErlangExport)}
+		s.erlangRuntimeCache[state.runtimeKey] = cache
+	}
+	if cache.exports == nil {
+		cache.exports = make(map[string][]ErlangExport)
+	}
+	cache.moduleNames = moduleNames
+	cache.loading = false
+	notifyCh = cache.readyCh
+	cache.readyCh = nil
+	s.erlangRuntimeMu.Unlock()
+
+	if notifyCh != nil {
+		close(notifyCh)
+	}
+}
+
+func (s *Server) failErlangWarmup(buildRoot string) {
+	var notifyCh chan struct{}
+
+	s.erlangRuntimeMu.Lock()
+	state := s.erlangBuildRoots[buildRoot]
+	if state != nil && state.runtimeKey != "" {
+		if cache := s.erlangRuntimeCache[state.runtimeKey]; cache != nil {
+			cache.loading = false
+			notifyCh = cache.readyCh
+			cache.readyCh = nil
+		}
+	}
+	s.erlangRuntimeMu.Unlock()
+
+	if notifyCh != nil {
+		close(notifyCh)
+	}
+}
+
+func (s *Server) handleBeamNotification(buildRoot string, notification beamNotification) {
+	switch notification.op {
+	case beamNotificationOTPModulesReady:
+		names, err := decodeErlangModuleNames(notification.payload)
+		if err != nil {
+			log.Printf("failed to decode Erlang module notification: %v", err)
+			s.failErlangWarmup(buildRoot)
+			return
+		}
+		s.completeErlangWarmup(buildRoot, names)
+
+	case beamNotificationOTPModulesFailed:
+		if len(notification.payload) > 0 {
+			log.Printf("failed to warm Erlang modules: %s", strings.TrimSpace(string(notification.payload)))
+		} else {
+			log.Printf("failed to warm Erlang modules")
+		}
+		s.failErlangWarmup(buildRoot)
+	}
+}
+
+// erlangHover fetches documentation for an Erlang module/function via the
+// BEAM process's CodeIntel service.
+func (s *Server) erlangHover(ctx context.Context, filePath, module, function string) (*protocol.Hover, error) {
+	buildRoot := s.erlangBuildRoot(filePath)
+	bp := s.getBeamProcess(ctx, buildRoot)
+	if bp == nil {
+		return nil, nil
+	}
+	if err := bp.Ready(ctx); err != nil {
+		return nil, nil
+	}
+
+	doc, err := bp.ErlangDocs(ctx, module, function, -1)
+	if err != nil || doc == "" {
+		return nil, nil
+	}
+
+	return &protocol.Hover{
+		Contents: protocol.MarkupContent{
+			Kind:  protocol.Markdown,
+			Value: doc,
+		},
+	}, nil
+}
+
+// erlangDefinition resolves an Erlang module/function to its .erl source via
+// the BEAM process's CodeIntel service.
+func (s *Server) erlangDefinition(ctx context.Context, filePath, module, function string) ([]protocol.Location, error) {
+	buildRoot := s.erlangBuildRoot(filePath)
+	bp := s.getBeamProcess(ctx, buildRoot)
+	if bp == nil {
+		s.debugf("Definition: no BEAM process available for Erlang resolution")
+		return nil, nil
+	}
+	if err := bp.Ready(ctx); err != nil {
+		s.debugf("Definition: BEAM process not ready: %v", err)
+		return nil, nil
+	}
+
+	result, err := bp.ErlangSource(ctx, module, function, -1)
+	if err != nil {
+		s.debugf("Definition: Erlang source lookup failed: %v", err)
+		return nil, nil
+	}
+
+	line := result.Line
+	if line > 0 {
+		line-- // convert 1-based to 0-based for LSP
+	}
+
+	return []protocol.Location{{
+		URI:   uri.File(result.File),
+		Range: lineRange(line),
+	}}, nil
+}
+
+// startErlangModuleLoad kicks off a background warmup for the current file's
+// runtime. Build roots first resolve to a runtime fingerprint, then runtime
+// caches (OTP module names + exports) are loaded once per runtime.
+func (s *Server) startErlangModuleLoad(filePath string) {
+	buildRoot := s.erlangBuildRoot(filePath)
+
+	s.erlangRuntimeMu.Lock()
+	state, ok := s.erlangBuildRoots[buildRoot]
+	if !ok {
+		state = &erlangBuildRootState{}
+		s.erlangBuildRoots[buildRoot] = state
+	}
+
+	if state.runtimeKey != "" {
+		runtimeKey := state.runtimeKey
+		cache := s.erlangRuntimeCache[runtimeKey]
+		switch {
+		case cache != nil && cache.moduleNames != nil:
+			s.erlangRuntimeMu.Unlock()
+			return
+		case cache != nil && cache.loading:
+			s.erlangRuntimeMu.Unlock()
+			return
+		default:
+			if cache == nil {
+				cache = &erlangRuntimeCache{exports: make(map[string][]ErlangExport)}
+				s.erlangRuntimeCache[runtimeKey] = cache
+			}
+			if cache.exports == nil {
+				cache.exports = make(map[string][]ErlangExport)
+			}
+			cache.loading = true
+			cache.readyCh = make(chan struct{})
+			readyCh := cache.readyCh
+			s.erlangRuntimeMu.Unlock()
+			go s.loadErlangRuntimeCache(buildRoot, runtimeKey, readyCh)
+			return
+		}
+	}
+
+	if state.loading {
+		s.erlangRuntimeMu.Unlock()
+		return
+	}
+
+	state.loading = true
+	s.erlangRuntimeMu.Unlock()
+	go s.resolveErlangRuntime(buildRoot)
+}
+
+func (s *Server) resolveErlangRuntime(buildRoot string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	bp := s.getBeamProcess(ctx, buildRoot)
+	if bp == nil {
+		s.erlangRuntimeMu.Lock()
+		if state := s.erlangBuildRoots[buildRoot]; state != nil {
+			state.loading = false
+		}
+		s.erlangRuntimeMu.Unlock()
+		return
+	}
+	if err := bp.Ready(ctx); err != nil {
+		s.erlangRuntimeMu.Lock()
+		if state := s.erlangBuildRoots[buildRoot]; state != nil {
+			state.loading = false
+		}
+		s.erlangRuntimeMu.Unlock()
+		return
+	}
+
+	info, err := bp.ErlangRuntimeInfo(ctx)
+	if err != nil {
+		s.erlangRuntimeMu.Lock()
+		if state := s.erlangBuildRoots[buildRoot]; state != nil {
+			state.loading = false
+		}
+		s.erlangRuntimeMu.Unlock()
+		return
+	}
+
+	runtimeKey := erlangRuntimeKey(info)
+	if runtimeKey == "" {
+		s.erlangRuntimeMu.Lock()
+		if state := s.erlangBuildRoots[buildRoot]; state != nil {
+			state.loading = false
+		}
+		s.erlangRuntimeMu.Unlock()
+		return
+	}
+
+	startLoad := false
+	var readyCh chan struct{}
+	s.erlangRuntimeMu.Lock()
+	state := s.erlangBuildRoots[buildRoot]
+	if state == nil {
+		state = &erlangBuildRootState{}
+		s.erlangBuildRoots[buildRoot] = state
+	}
+	state.runtimeKey = runtimeKey
+	state.loading = false
+
+	cache := s.erlangRuntimeCache[runtimeKey]
+	if cache == nil {
+		cache = &erlangRuntimeCache{
+			otpRelease:  info.OTPRelease,
+			codeRootDir: info.CodeRootDir,
+			exports:     make(map[string][]ErlangExport),
+		}
+		s.erlangRuntimeCache[runtimeKey] = cache
+	}
+	if cache.exports == nil {
+		cache.exports = make(map[string][]ErlangExport)
+	}
+	if cache.otpRelease == "" {
+		cache.otpRelease = info.OTPRelease
+	}
+	if cache.codeRootDir == "" {
+		cache.codeRootDir = info.CodeRootDir
+	}
+	if cache.moduleNames == nil && !cache.loading {
+		cache.loading = true
+		cache.readyCh = make(chan struct{})
+		readyCh = cache.readyCh
+		startLoad = true
+	}
+	s.erlangRuntimeMu.Unlock()
+
+	if startLoad {
+		go s.loadErlangRuntimeCache(buildRoot, runtimeKey, readyCh)
+	}
+}
+
+func (s *Server) loadErlangRuntimeCache(buildRoot, runtimeKey string, readyCh chan struct{}) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	bp := s.getBeamProcess(ctx, buildRoot)
+	if bp == nil {
+		s.clearErlangWarmup(runtimeKey, readyCh)
+		return
+	}
+	if err := bp.Ready(ctx); err != nil {
+		s.clearErlangWarmup(runtimeKey, readyCh)
+		return
+	}
+
+	if err := bp.WarmOTPModuleNames(ctx); err != nil {
+		log.Printf("failed to start OTP module warmup: %v", err)
+		s.clearErlangWarmup(runtimeKey, readyCh)
+		return
+	}
+
+	select {
+	case <-readyCh:
+		return
+	case <-ctx.Done():
+		s.clearErlangWarmup(runtimeKey, readyCh)
+		return
+	}
+}
+
+func (s *Server) erlangModuleNamesForFile(filePath string) map[string]bool {
+	buildRoot := s.erlangBuildRoot(filePath)
+
+	s.erlangRuntimeMu.Lock()
+	defer s.erlangRuntimeMu.Unlock()
+
+	state := s.erlangBuildRoots[buildRoot]
+	if state == nil || state.runtimeKey == "" {
+		return nil
+	}
+	cache := s.erlangRuntimeCache[state.runtimeKey]
+	if cache == nil {
+		return nil
+	}
+	return cache.moduleNames
+}
+
+func (s *Server) erlangModulesAvailable(filePath string) bool {
+	moduleNames := s.erlangModuleNamesForFile(filePath)
+	return moduleNames != nil
+}
+
+// getErlangExports returns the cached exports for an Erlang module, fetching
+// from the BEAM on first access. Export caches are shared across build roots
+// that resolve to the same runtime fingerprint.
+func (s *Server) getErlangExports(ctx context.Context, filePath, module string) []ErlangExport {
+	buildRoot := s.erlangBuildRoot(filePath)
+
+	s.erlangRuntimeMu.Lock()
+	state := s.erlangBuildRoots[buildRoot]
+	if state == nil || state.runtimeKey == "" {
+		s.erlangRuntimeMu.Unlock()
+		s.startErlangModuleLoad(filePath)
+		return nil
+	}
+
+	runtimeKey := state.runtimeKey
+	cache := s.erlangRuntimeCache[runtimeKey]
+	if cache == nil || cache.moduleNames == nil {
+		s.erlangRuntimeMu.Unlock()
+		s.startErlangModuleLoad(filePath)
+		return nil
+	}
+	if exports, ok := cache.exports[module]; ok {
+		s.erlangRuntimeMu.Unlock()
+		return exports
+	}
+	s.erlangRuntimeMu.Unlock()
+
+	bp := s.getBeamProcess(ctx, buildRoot)
+	if bp == nil {
+		return nil
+	}
+	if err := bp.Ready(ctx); err != nil {
+		return nil
+	}
+
+	exports, err := bp.ErlangExports(ctx, module)
+	if err != nil {
+		return nil
+	}
+
+	s.erlangRuntimeMu.Lock()
+	cache = s.erlangRuntimeCache[runtimeKey]
+	if cache != nil {
+		if cache.exports == nil {
+			cache.exports = make(map[string][]ErlangExport)
+		}
+		cache.exports[module] = exports
+	}
+	s.erlangRuntimeMu.Unlock()
+	return exports
+}
+
 func lineRange(line int) protocol.Range {
 	return protocol.Range{
 		Start: protocol.Position{Line: uint32(line), Character: 0},
@@ -783,7 +1260,7 @@ func (s *Server) CodeAction(ctx context.Context, params *protocol.CodeActionPara
 	}
 
 	aliases := tf.ExtractAliasesInScope(lineNum)
-	s.mergeAliasesFromUse(text, aliases)
+	s.mergeAliasesFromUseTokenized(tf, aliases)
 
 	// Check if the first segment is already aliased — if so, the reference
 	// already resolves and no code action is needed.
@@ -923,6 +1400,7 @@ func (s *Server) ColorPresentation(ctx context.Context, params *protocol.ColorPr
 }
 func (s *Server) Completion(ctx context.Context, params *protocol.CompletionParams) (*protocol.CompletionList, error) {
 	docURI := string(params.TextDocument.URI)
+	filePath := uriToPath(params.TextDocument.URI)
 
 	text, ok := s.docs.Get(docURI)
 	if !ok {
@@ -937,10 +1415,16 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 		return nil, nil
 	}
 
-	prefix, afterDot, prefixStartCol := ExtractCompletionContext(lines[lineNum], col)
+	tf := s.docs.GetTokenizedFile(docURI)
+	if tf == nil {
+		tf = NewTokenizedFile(text)
+	}
+
+	completionCtx := tf.CompletionContextAtCursor(lineNum, col)
+	prefix, afterDot, prefixStartCol := completionCtx.Prefix, completionCtx.AfterDot, completionCtx.StartCol
 
 	// Inside a multi-line alias block: complete child module segments under the parent.
-	if aliasParent, inBlock := ExtractAliasBlockParent(lines, lineNum); inBlock {
+	if aliasParent, inBlock := tf.ExtractAliasBlockParent(lineNum); inBlock {
 		searchParent := aliasParent
 		segmentPrefix := prefix
 		labelPrefix := ""
@@ -988,9 +1472,70 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 		Start: protocol.Position{Line: uint32(lineNum), Character: uint32(prefixStartCol)},
 		End:   protocol.Position{Line: uint32(lineNum), Character: uint32(col)},
 	}
+	inPipe := IsPipeContext(lines[lineNum], prefixStartCol)
+
+	// Erlang module/function completions (prefix starts with ":")
+	if strings.HasPrefix(prefix, ":") {
+		s.startErlangModuleLoad(filePath)
+		if !s.erlangModulesAvailable(filePath) {
+			return nil, nil
+		}
+		moduleNames := s.erlangModuleNamesForFile(filePath)
+		if moduleNames == nil {
+			return nil, nil
+		}
+		erlPrefix := prefix[1:] // strip leading colon
+		var items []protocol.CompletionItem
+
+		if afterDot || strings.Contains(erlPrefix, ".") {
+			// :module.func — complete exported functions
+			var erlModule, erlFuncPrefix string
+			if dotIdx := strings.IndexByte(erlPrefix, '.'); dotIdx >= 0 {
+				erlModule = erlPrefix[:dotIdx]
+				erlFuncPrefix = erlPrefix[dotIdx+1:]
+			} else {
+				erlModule = erlPrefix
+			}
+			if moduleNames[erlModule] {
+				for _, e := range s.getErlangExports(ctx, filePath, erlModule) {
+					if strings.HasPrefix(e.Function, erlFuncPrefix) {
+						item := protocol.CompletionItem{
+							Label:  e.Function,
+							Kind:   protocol.CompletionItemKindFunction,
+							Detail: fmt.Sprintf(":%s.%s/%d", erlModule, e.Function, e.Arity),
+						}
+						applySnippet(&item, e.Function, e.Arity, e.Params, inPipe, s.snippetSupport)
+						items = append(items, item)
+					}
+				}
+			}
+		} else {
+			// :mod — complete module names
+			for name := range moduleNames {
+				if strings.HasPrefix(name, erlPrefix) {
+					items = append(items, protocol.CompletionItem{
+						Label:  ":" + name,
+						Kind:   protocol.CompletionItemKindModule,
+						Detail: "Erlang module",
+						TextEdit: &protocol.TextEdit{
+							Range:   prefixRange,
+							NewText: ":" + name,
+						},
+					})
+				}
+			}
+		}
+
+		if len(items) == 0 {
+			return nil, nil
+		}
+		return &protocol.CompletionList{
+			IsIncomplete: len(items) >= 100,
+			Items:        items,
+		}, nil
+	}
 
 	moduleRef, funcPrefix := ExtractModuleAndFunction(prefix)
-	inPipe := IsPipeContext(lines[lineNum], prefixStartCol)
 
 	// "Module.func." or "variable." — dot after a function call result or
 	// map/struct field access. We have no type info to complete the result.
@@ -1001,8 +1546,8 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 	var items []protocol.CompletionItem
 
 	if moduleRef != "" && (afterDot || funcPrefix != "") {
-		aliases := ExtractAliases(text)
-		s.mergeAliasesFromUse(text, aliases)
+		aliases := tf.ExtractAliases()
+		s.mergeAliasesFromUseTokenized(tf, aliases)
 		resolved := resolveModule(moduleRef, aliases)
 		results, err := s.store.ListModuleFunctions(resolved, true)
 		if err != nil {
@@ -1038,8 +1583,8 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 			}
 		}
 	} else if moduleRef != "" {
-		aliases := ExtractAliases(text)
-		s.mergeAliasesFromUse(text, aliases)
+		aliases := tf.ExtractAliases()
+		s.mergeAliasesFromUseTokenized(tf, aliases)
 		seenModules := make(map[string]bool)
 
 		addModuleItem := func(label, detail string) {
@@ -1100,7 +1645,7 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 	} else if funcPrefix != "" {
 		seen := make(map[string]bool)
 
-		for _, bf := range FindBufferFunctions(text) {
+		for _, bf := range tf.FindBufferFunctions() {
 			key := funcKey(bf.Name, bf.Arity)
 			if strings.HasPrefix(bf.Name, funcPrefix) && !seen[key] {
 				seen[key] = true
@@ -1114,12 +1659,17 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 			}
 		}
 
-		for _, mod := range ExtractImports(text) {
+		imports := tf.ExtractImports()
+		imports = append(imports, "Kernel")
+		for _, mod := range imports {
 			results, err := s.store.ListModuleFunctions(mod, true)
 			if err != nil {
 				continue
 			}
 			for _, r := range results {
+				if s.snippetSupport && elixirFormSnippets[r.Function] != "" {
+					continue
+				}
 				key := funcKey(r.Function, r.Arity)
 				if strings.HasPrefix(r.Function, funcPrefix) && !seen[key] {
 					seen[key] = true
@@ -1139,10 +1689,10 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 		}
 
 		// Check use-injected imports and inline defs (including transitive use chains)
-		aliases := ExtractAliases(text)
-		s.mergeAliasesFromUse(text, aliases)
+		aliases := tf.ExtractAliases()
+		s.mergeAliasesFromUseTokenized(tf, aliases)
 		visitedCompletion := make(map[string]bool)
-		for _, usedModule := range ExtractUses(text) {
+		for _, usedModule := range tf.ExtractUses() {
 			s.addCompletionsFromUsing(resolveModule(usedModule, aliases), funcPrefix, seen, &items, visitedCompletion, inPipe, s.snippetSupport)
 		}
 
@@ -1159,6 +1709,21 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 					Kind:   protocol.CompletionItemKindVariable,
 					Detail: "variable",
 				})
+			}
+		}
+
+		if s.snippetSupport {
+			for name, snippet := range elixirFormSnippets {
+				if strings.HasPrefix(name, funcPrefix) && !seen[name] {
+					seen[name] = true
+					items = append(items, protocol.CompletionItem{
+						Label:            name,
+						Kind:             protocol.CompletionItemKindKeyword,
+						Detail:           "special form",
+						InsertText:       snippet,
+						InsertTextFormat: protocol.InsertTextFormatSnippet,
+					})
+				}
 			}
 		}
 	}
@@ -1564,15 +2129,19 @@ func (s *Server) addCompletionsFromUsing(moduleName, funcPrefix string, seen map
 // resolveBareFunctionModule finds the module that defines a bare function name.
 // Mirrors the go-to-definition priority: current file modules → imports → use chains → Kernel.
 // Callers should pass pre-computed aliases to avoid redundant ExtractAliases scans.
-func (s *Server) resolveBareFunctionModule(filePath, text string, lines []string, lineNum int, functionName string, aliases map[string]string) string {
+func (s *Server) resolveBareFunctionModule(filePath, text string, tf *TokenizedFile, lineNum int, functionName string, aliases map[string]string) string {
 	// Check all modules in the current file with a single query, preferring
 	// the one closest to the cursor line (handles sibling nested modules).
 	if mod, ok := s.store.LookupFunctionInFile(filePath, functionName, lineNum+1); ok {
 		return mod
 	}
 
+	if tf == nil {
+		tf = NewTokenizedFile(text)
+	}
+
 	// Explicit imports (direct definitions only — fast store lookup)
-	imports := ExtractImports(text)
+	imports := tf.ExtractImports()
 	for _, mod := range imports {
 		if results, err := s.store.LookupFunction(mod, functionName); err == nil && len(results) > 0 {
 			return mod
@@ -1581,7 +2150,7 @@ func (s *Server) resolveBareFunctionModule(filePath, text string, lines []string
 
 	// Use chains — use opts-aware resolution so `import unquote(mod)` patterns
 	// resolve to the consumer-provided module rather than always using the default.
-	for _, uc := range ExtractUsesWithOpts(text, aliases) {
+	for _, uc := range tf.ExtractUsesWithOpts(aliases) {
 		if mod := s.resolveModuleViaUseChainWithOpts(uc.Module, functionName, uc.Opts, map[string]bool{}); mod != "" {
 			return mod
 		}
@@ -1619,7 +2188,17 @@ func resolveModule(moduleRef string, aliases map[string]string) string {
 // declarations in the file. For example, if the file has `use MyApp.Schema`
 // and MyApp.Schema.__using__ contains `alias MyApp.Repo`, then Repo is added.
 func (s *Server) mergeAliasesFromUse(text string, aliases map[string]string) {
-	useCalls := ExtractUsesWithOpts(text, aliases)
+	s.mergeAliasesFromUseCalls(ExtractUsesWithOpts(text, aliases), aliases)
+}
+
+func (s *Server) mergeAliasesFromUseTokenized(tf *TokenizedFile, aliases map[string]string) {
+	if tf == nil {
+		return
+	}
+	s.mergeAliasesFromUseCalls(tf.ExtractUsesWithOpts(aliases), aliases)
+}
+
+func (s *Server) mergeAliasesFromUseCalls(useCalls []UseCall, aliases map[string]string) {
 	visited := make(map[string]bool)
 	for _, uc := range useCalls {
 		s.mergeAliasesFromUsingEntry(uc.Module, aliases, visited)
@@ -1687,14 +2266,29 @@ func funcKey(name string, arity int) string {
 	return name + "/" + strconv.Itoa(arity)
 }
 
+var elixirFormSnippets = map[string]string{
+	"for":     "for ${1:pattern} <- ${2:enumerable} do\n\t$0\nend",
+	"with":    "with ${1:pattern} <- ${2:expression} do\n\t$0\nend",
+	"case":    "case ${1:expression} do\n\t${2:pattern} ->\n\t\t$0\nend",
+	"cond":    "cond do\n\t${1:condition} ->\n\t\t$0\nend",
+	"if":      "if ${1:condition} do\n\t$0\nend",
+	"unless":  "unless ${1:condition} do\n\t$0\nend",
+	"receive": "receive do\n\t${1:pattern} ->\n\t\t$0\nend",
+	"try":     "try do\n\t$0\nrescue\n\t${1:exception} ->\n\t\t${2:handler}\nend",
+	"quote":   "quote do\n\t$0\nend",
+	"fn":      "fn ${1:args} -> $0 end",
+}
+
 func applySnippet(item *protocol.CompletionItem, name string, arity int, params string, inPipe bool, useSnippets bool) {
 	item.Label = fmt.Sprintf("%s/%d", name, arity)
 	item.FilterText = name
 
 	snippetArity := arity
 	snippetParams := params
+	paramStartIndex := 1
 	if inPipe && arity > 0 {
 		snippetArity--
+		paramStartIndex = 2
 		if snippetParams != "" {
 			if commaIdx := strings.IndexByte(snippetParams, ','); commaIdx >= 0 {
 				snippetParams = snippetParams[commaIdx+1:]
@@ -1706,7 +2300,7 @@ func applySnippet(item *protocol.CompletionItem, name string, arity int, params 
 
 	if !useSnippets {
 		if snippetArity > 0 {
-			item.InsertText = functionCallText(name, snippetArity, snippetParams)
+			item.InsertText = functionCallText(name, snippetArity, snippetParams, paramStartIndex)
 		} else {
 			item.InsertText = name + "()"
 		}
@@ -1715,33 +2309,36 @@ func applySnippet(item *protocol.CompletionItem, name string, arity int, params 
 
 	if snippetArity > 0 {
 		item.InsertTextFormat = protocol.InsertTextFormatSnippet
-		item.InsertText = functionSnippet(name, snippetArity, snippetParams)
+		item.InsertText = functionSnippet(name, snippetArity, snippetParams, paramStartIndex)
 	} else {
 		item.InsertText = name + "()"
 	}
 }
 
-func functionSnippet(name string, arity int, params string) string {
-	return buildCallText(name, arity, params, true)
+func functionSnippet(name string, arity int, params string, paramStartIndex int) string {
+	return buildCallText(name, arity, params, true, paramStartIndex)
 }
 
-func functionCallText(name string, arity int, params string) string {
-	return buildCallText(name, arity, params, false)
+func functionCallText(name string, arity int, params string, paramStartIndex int) string {
+	return buildCallText(name, arity, params, false, paramStartIndex)
 }
 
-func buildCallText(name string, arity int, params string, snippet bool) string {
+func buildCallText(name string, arity int, params string, snippet bool, paramStartIndex int) string {
+	if paramStartIndex < 1 {
+		paramStartIndex = 1
+	}
 	var paramNames []string
 	if params != "" {
 		paramNames = strings.Split(params, ",")
 	}
 	var args []string
-	for i := 1; i <= arity; i++ {
-		paramName := fmt.Sprintf("arg%d", i)
-		if i-1 < len(paramNames) {
-			paramName = paramNames[i-1]
+	for i := 0; i < arity; i++ {
+		paramName := fmt.Sprintf("arg%d", paramStartIndex+i)
+		if i < len(paramNames) {
+			paramName = paramNames[i]
 		}
 		if snippet {
-			args = append(args, fmt.Sprintf("${%d:%s}", i, paramName))
+			args = append(args, fmt.Sprintf("${%d:%s}", i+1, paramName))
 		} else {
 			args = append(args, paramName)
 		}
@@ -2008,6 +2605,10 @@ func (s *Server) DidChangeWatchedFiles(ctx context.Context, params *protocol.Did
 	for _, change := range params.Changes {
 		path := uriToPath(change.URI)
 		if path == "" {
+			continue
+		}
+		if filepath.Base(path) == ".formatter.exs" {
+			s.restartBeamForFormatterConfig(path)
 			continue
 		}
 		switch change.Type {
@@ -2757,19 +3358,24 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 		return nil, nil
 	}
 
+	// Erlang module atom (e.g. :lists.flatten) — fetch docs via BEAM process
+	if strings.HasPrefix(exprCtx.ModuleRef, ":") {
+		return s.erlangHover(ctx, uriToPath(params.TextDocument.URI), exprCtx.ModuleRef[1:], exprCtx.FunctionName)
+	}
+
 	expr := tf.ResolveModuleExpr(exprCtx.Expr(), lineNum)
 	moduleRef, functionName := ExtractModuleAndFunction(expr)
 
 	// Inside a multi-line alias block like "alias MyModule.{ Something }",
 	// prepend the parent so "Something" resolves to "MyModule.Something".
 	if moduleRef != "" {
-		if aliasParent, inBlock := ExtractAliasBlockParent(lines, lineNum); inBlock {
+		if aliasParent, inBlock := tf.ExtractAliasBlockParent(lineNum); inBlock {
 			moduleRef = aliasParent + "." + moduleRef
 		}
 	}
 
 	aliases := tf.ExtractAliasesInScope(lineNum)
-	s.mergeAliasesFromUse(text, aliases)
+	s.mergeAliasesFromUseTokenized(tf, aliases)
 
 	if moduleRef == "" {
 		if functionName == "" {
@@ -2777,7 +3383,7 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 		}
 
 		currentModule := tf.FirstDefmodule()
-		fullModule := s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, lines, lineNum, functionName, aliases)
+		fullModule := s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, tf, lineNum, functionName, aliases)
 
 		if fullModule != "" {
 			// Current module — hover from the buffer directly
@@ -2803,6 +3409,12 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 		// Fallback for use-chain inline defs (not stored as module definitions)
 		if results := s.lookupThroughUse(text, functionName, aliases); len(results) > 0 {
 			return s.hoverFromFile(functionName, results[0])
+		}
+
+		// Fallback: bare identifier might be an Erlang built-in type or function
+		// (e.g. pos_integer, binary, term, length, is_atom)
+		if hover, _ := s.erlangHover(ctx, uriToPath(protocol.DocumentURI(docURI)), "erlang", functionName); hover != nil {
+			return hover, nil
 		}
 
 		return nil, nil
@@ -2947,7 +3559,7 @@ func (s *Server) PrepareRename(ctx context.Context, params *protocol.PrepareRena
 
 	// Try module/function rename via the index
 	if !exprCtx.Empty() {
-		aliases := ExtractAliasesInScope(text, lineNum)
+		aliases := tf.ExtractAliasesInScope(lineNum)
 
 		// Detect `as:` aliases — these are file-local renames, not module renames.
 		// An `as:` alias has a short name that differs from the last segment of
@@ -2965,7 +3577,7 @@ func (s *Server) PrepareRename(ctx context.Context, params *protocol.PrepareRena
 			}
 		}
 
-		s.mergeAliasesFromUse(text, aliases)
+		s.mergeAliasesFromUseTokenized(tf, aliases)
 
 		var tokenName string
 		var fullModule string
@@ -2976,7 +3588,7 @@ func (s *Server) PrepareRename(ctx context.Context, params *protocol.PrepareRena
 			if moduleRef != "" {
 				fullModule = resolveModule(moduleRef, aliases)
 			} else {
-				fullModule = s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, lines, lineNum, functionName, aliases)
+				fullModule = s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, tf, lineNum, functionName, aliases)
 			}
 			found = fullModule != ""
 		} else if moduleRef != "" {
@@ -3102,13 +3714,13 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 	moduleRef, functionName := ExtractModuleAndFunction(expr)
 
 	if moduleRef != "" {
-		if aliasParent, inBlock := ExtractAliasBlockParent(lines, lineNum); inBlock {
+		if aliasParent, inBlock := tf.ExtractAliasBlockParent(lineNum); inBlock {
 			moduleRef = aliasParent + "." + moduleRef
 		}
 	}
 
 	aliases := tf.ExtractAliasesInScope(lineNum)
-	s.mergeAliasesFromUse(text, aliases)
+	s.mergeAliasesFromUseTokenized(tf, aliases)
 	s.debugf("References: expr=%q module=%q function=%q", expr, moduleRef, functionName)
 
 	var fullModule string
@@ -3142,7 +3754,7 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 		}
 
 		// Bare function — resolve to its defining module
-		fullModule = s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, lines, lineNum, functionName, aliases)
+		fullModule = s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, tf, lineNum, functionName, aliases)
 		s.debugf("References: resolved bare %q -> %q", functionName, fullModule)
 		if fullModule == "" {
 			s.debugf("References: could not resolve bare function %q", functionName)
@@ -3172,7 +3784,7 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 	// findModulesWhoseUsingImports scan entirely.
 	var injectors []string
 	if functionName != "" && moduleRef == "" {
-		useCalls := ExtractUsesWithOpts(text, aliases)
+		useCalls := tf.ExtractUsesWithOpts(aliases)
 		visited := make(map[string]bool)
 		for _, uc := range useCalls {
 			if s.lookupInUsingEntry(uc.Module, functionName, uc.Opts, visited) != nil {
@@ -3351,7 +3963,7 @@ func (s *Server) Rename(ctx context.Context, params *protocol.RenameParams) (*pr
 
 	// Try module/function rename via the index
 	if !renameCtx.Empty() {
-		aliases := ExtractAliasesInScope(text, lineNum)
+		aliases := tf.ExtractAliasesInScope(lineNum)
 
 		// Detect `as:` aliases — file-local rename of the alias name, not
 		// the underlying module. This check runs before merging use-injected
@@ -3385,14 +3997,14 @@ func (s *Server) Rename(ctx context.Context, params *protocol.RenameParams) (*pr
 			}
 		}
 
-		s.mergeAliasesFromUse(text, aliases)
+		s.mergeAliasesFromUseTokenized(tf, aliases)
 
 		if functionName != "" {
 			var fullModule string
 			if moduleRef != "" {
 				fullModule = resolveModule(moduleRef, aliases)
 			} else {
-				fullModule = s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, lines, lineNum, functionName, aliases)
+				fullModule = s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, tf, lineNum, functionName, aliases)
 			}
 			if fullModule != "" {
 				if !isValidFunctionName(params.NewName) {
@@ -4393,7 +5005,7 @@ func (s *Server) SignatureHelp(ctx context.Context, params *protocol.SignatureHe
 	}
 
 	aliases := tf.ExtractAliasesInScope(lineNum)
-	s.mergeAliasesFromUse(text, aliases)
+	s.mergeAliasesFromUseTokenized(tf, aliases)
 	lines := strings.Split(text, "\n")
 
 	// Resolve the function to a store lookup result
@@ -4558,7 +5170,7 @@ func (s *Server) TypeDefinition(ctx context.Context, params *protocol.TypeDefini
 	}
 
 	aliases := tf.ExtractAliasesInScope(lineNum)
-	s.mergeAliasesFromUse(text, aliases)
+	s.mergeAliasesFromUseTokenized(tf, aliases)
 	fullModule := s.resolveModuleWithNesting(typeCtx.ModuleRef, aliases, uriToPath(protocol.DocumentURI(docURI)), lineNum)
 
 	results, err := s.store.LookupFunction(fullModule, typeName)
@@ -4631,12 +5243,12 @@ func (s *Server) PrepareCallHierarchy(ctx context.Context, params *protocol.Call
 	}
 
 	aliases := tf.ExtractAliasesInScope(lineNum)
-	s.mergeAliasesFromUse(text, aliases)
+	s.mergeAliasesFromUseTokenized(tf, aliases)
 	var fullModule string
 	if callCtx.ModuleRef != "" {
 		fullModule = resolveModule(callCtx.ModuleRef, aliases)
 	} else {
-		fullModule = s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, lines, lineNum, functionName, aliases)
+		fullModule = s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, tf, lineNum, functionName, aliases)
 	}
 	if fullModule == "" {
 		return nil, nil
