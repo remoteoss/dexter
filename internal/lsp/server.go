@@ -488,6 +488,21 @@ func (s *Server) DidClose(ctx context.Context, params *protocol.DidCloseTextDocu
 	return nil
 }
 
+func (s *Server) restartBeamForFormatterConfig(path string) {
+	buildRoot := s.findBuildRoot(filepath.Dir(path))
+	var bp *beamProcess
+	s.beamMu.Lock()
+	if existing, ok := s.beams[buildRoot]; ok {
+		delete(s.beams, buildRoot)
+		bp = existing
+	}
+	s.beamMu.Unlock()
+	if bp != nil {
+		bp.Close()
+		log.Printf("BEAM: restarting for %s (.formatter.exs changed)", buildRoot)
+	}
+}
+
 func (s *Server) DidSave(ctx context.Context, params *protocol.DidSaveTextDocumentParams) error {
 	path := uriToPath(params.TextDocument.URI)
 	if path == "" {
@@ -497,18 +512,7 @@ func (s *Server) DidSave(ctx context.Context, params *protocol.DidSaveTextDocume
 	// Restart the BEAM process when .formatter.exs changes so the new
 	// config is picked up on the next format request.
 	if filepath.Base(path) == ".formatter.exs" {
-		buildRoot := s.findBuildRoot(filepath.Dir(path))
-		var bp *beamProcess
-		s.beamMu.Lock()
-		if existing, ok := s.beams[buildRoot]; ok {
-			delete(s.beams, buildRoot)
-			bp = existing
-		}
-		s.beamMu.Unlock()
-		if bp != nil {
-			bp.Close()
-			log.Printf("BEAM: restarting for %s (.formatter.exs changed)", buildRoot)
-		}
+		s.restartBeamForFormatterConfig(path)
 		return nil
 	}
 
@@ -608,13 +612,13 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 	moduleRef, functionName := ExtractModuleAndFunction(expr)
 
 	if moduleRef != "" {
-		if aliasParent, inBlock := ExtractAliasBlockParent(lines, lineNum); inBlock {
+		if aliasParent, inBlock := tf.ExtractAliasBlockParent(lineNum); inBlock {
 			moduleRef = aliasParent + "." + moduleRef
 		}
 	}
 
 	aliases := tf.ExtractAliasesInScope(lineNum)
-	s.mergeAliasesFromUse(text, aliases)
+	s.mergeAliasesFromUseTokenized(tf, aliases)
 	s.debugf("Definition: expr=%q module=%q function=%q", expr, moduleRef, functionName)
 
 	// Bare identifier — check variable first (cheap tree-sitter lookup), then functions
@@ -636,7 +640,7 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		}
 
 		currentModule := tf.FirstDefmodule()
-		fullModule := s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, lines, lineNum, functionName, aliases)
+		fullModule := s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, tf, lineNum, functionName, aliases)
 		s.debugf("Definition: resolved bare %q -> %q", functionName, fullModule)
 		if fullModule == "" {
 			s.debugf("Definition: could not resolve bare function %q", functionName)
@@ -1256,7 +1260,7 @@ func (s *Server) CodeAction(ctx context.Context, params *protocol.CodeActionPara
 	}
 
 	aliases := tf.ExtractAliasesInScope(lineNum)
-	s.mergeAliasesFromUse(text, aliases)
+	s.mergeAliasesFromUseTokenized(tf, aliases)
 
 	// Check if the first segment is already aliased — if so, the reference
 	// already resolves and no code action is needed.
@@ -1411,10 +1415,16 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 		return nil, nil
 	}
 
-	prefix, afterDot, prefixStartCol := ExtractCompletionContext(lines[lineNum], col)
+	tf := s.docs.GetTokenizedFile(docURI)
+	if tf == nil {
+		tf = NewTokenizedFile(text)
+	}
+
+	completionCtx := tf.CompletionContextAtCursor(lineNum, col)
+	prefix, afterDot, prefixStartCol := completionCtx.Prefix, completionCtx.AfterDot, completionCtx.StartCol
 
 	// Inside a multi-line alias block: complete child module segments under the parent.
-	if aliasParent, inBlock := ExtractAliasBlockParent(lines, lineNum); inBlock {
+	if aliasParent, inBlock := tf.ExtractAliasBlockParent(lineNum); inBlock {
 		searchParent := aliasParent
 		segmentPrefix := prefix
 		labelPrefix := ""
@@ -1536,8 +1546,8 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 	var items []protocol.CompletionItem
 
 	if moduleRef != "" && (afterDot || funcPrefix != "") {
-		aliases := ExtractAliases(text)
-		s.mergeAliasesFromUse(text, aliases)
+		aliases := tf.ExtractAliases()
+		s.mergeAliasesFromUseTokenized(tf, aliases)
 		resolved := resolveModule(moduleRef, aliases)
 		results, err := s.store.ListModuleFunctions(resolved, true)
 		if err != nil {
@@ -1573,8 +1583,8 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 			}
 		}
 	} else if moduleRef != "" {
-		aliases := ExtractAliases(text)
-		s.mergeAliasesFromUse(text, aliases)
+		aliases := tf.ExtractAliases()
+		s.mergeAliasesFromUseTokenized(tf, aliases)
 		seenModules := make(map[string]bool)
 
 		addModuleItem := func(label, detail string) {
@@ -1635,7 +1645,7 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 	} else if funcPrefix != "" {
 		seen := make(map[string]bool)
 
-		for _, bf := range FindBufferFunctions(text) {
+		for _, bf := range tf.FindBufferFunctions() {
 			key := funcKey(bf.Name, bf.Arity)
 			if strings.HasPrefix(bf.Name, funcPrefix) && !seen[key] {
 				seen[key] = true
@@ -1649,7 +1659,7 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 			}
 		}
 
-		imports := ExtractImports(text)
+		imports := tf.ExtractImports()
 		imports = append(imports, "Kernel")
 		for _, mod := range imports {
 			results, err := s.store.ListModuleFunctions(mod, true)
@@ -1679,10 +1689,10 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 		}
 
 		// Check use-injected imports and inline defs (including transitive use chains)
-		aliases := ExtractAliases(text)
-		s.mergeAliasesFromUse(text, aliases)
+		aliases := tf.ExtractAliases()
+		s.mergeAliasesFromUseTokenized(tf, aliases)
 		visitedCompletion := make(map[string]bool)
-		for _, usedModule := range ExtractUses(text) {
+		for _, usedModule := range tf.ExtractUses() {
 			s.addCompletionsFromUsing(resolveModule(usedModule, aliases), funcPrefix, seen, &items, visitedCompletion, inPipe, s.snippetSupport)
 		}
 
@@ -2119,15 +2129,19 @@ func (s *Server) addCompletionsFromUsing(moduleName, funcPrefix string, seen map
 // resolveBareFunctionModule finds the module that defines a bare function name.
 // Mirrors the go-to-definition priority: current file modules → imports → use chains → Kernel.
 // Callers should pass pre-computed aliases to avoid redundant ExtractAliases scans.
-func (s *Server) resolveBareFunctionModule(filePath, text string, lines []string, lineNum int, functionName string, aliases map[string]string) string {
+func (s *Server) resolveBareFunctionModule(filePath, text string, tf *TokenizedFile, lineNum int, functionName string, aliases map[string]string) string {
 	// Check all modules in the current file with a single query, preferring
 	// the one closest to the cursor line (handles sibling nested modules).
 	if mod, ok := s.store.LookupFunctionInFile(filePath, functionName, lineNum+1); ok {
 		return mod
 	}
 
+	if tf == nil {
+		tf = NewTokenizedFile(text)
+	}
+
 	// Explicit imports (direct definitions only — fast store lookup)
-	imports := ExtractImports(text)
+	imports := tf.ExtractImports()
 	for _, mod := range imports {
 		if results, err := s.store.LookupFunction(mod, functionName); err == nil && len(results) > 0 {
 			return mod
@@ -2136,7 +2150,7 @@ func (s *Server) resolveBareFunctionModule(filePath, text string, lines []string
 
 	// Use chains — use opts-aware resolution so `import unquote(mod)` patterns
 	// resolve to the consumer-provided module rather than always using the default.
-	for _, uc := range ExtractUsesWithOpts(text, aliases) {
+	for _, uc := range tf.ExtractUsesWithOpts(aliases) {
 		if mod := s.resolveModuleViaUseChainWithOpts(uc.Module, functionName, uc.Opts, map[string]bool{}); mod != "" {
 			return mod
 		}
@@ -2174,7 +2188,17 @@ func resolveModule(moduleRef string, aliases map[string]string) string {
 // declarations in the file. For example, if the file has `use MyApp.Schema`
 // and MyApp.Schema.__using__ contains `alias MyApp.Repo`, then Repo is added.
 func (s *Server) mergeAliasesFromUse(text string, aliases map[string]string) {
-	useCalls := ExtractUsesWithOpts(text, aliases)
+	s.mergeAliasesFromUseCalls(ExtractUsesWithOpts(text, aliases), aliases)
+}
+
+func (s *Server) mergeAliasesFromUseTokenized(tf *TokenizedFile, aliases map[string]string) {
+	if tf == nil {
+		return
+	}
+	s.mergeAliasesFromUseCalls(tf.ExtractUsesWithOpts(aliases), aliases)
+}
+
+func (s *Server) mergeAliasesFromUseCalls(useCalls []UseCall, aliases map[string]string) {
 	visited := make(map[string]bool)
 	for _, uc := range useCalls {
 		s.mergeAliasesFromUsingEntry(uc.Module, aliases, visited)
@@ -2581,6 +2605,10 @@ func (s *Server) DidChangeWatchedFiles(ctx context.Context, params *protocol.Did
 	for _, change := range params.Changes {
 		path := uriToPath(change.URI)
 		if path == "" {
+			continue
+		}
+		if filepath.Base(path) == ".formatter.exs" {
+			s.restartBeamForFormatterConfig(path)
 			continue
 		}
 		switch change.Type {
@@ -3341,13 +3369,13 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 	// Inside a multi-line alias block like "alias MyModule.{ Something }",
 	// prepend the parent so "Something" resolves to "MyModule.Something".
 	if moduleRef != "" {
-		if aliasParent, inBlock := ExtractAliasBlockParent(lines, lineNum); inBlock {
+		if aliasParent, inBlock := tf.ExtractAliasBlockParent(lineNum); inBlock {
 			moduleRef = aliasParent + "." + moduleRef
 		}
 	}
 
 	aliases := tf.ExtractAliasesInScope(lineNum)
-	s.mergeAliasesFromUse(text, aliases)
+	s.mergeAliasesFromUseTokenized(tf, aliases)
 
 	if moduleRef == "" {
 		if functionName == "" {
@@ -3355,7 +3383,7 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 		}
 
 		currentModule := tf.FirstDefmodule()
-		fullModule := s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, lines, lineNum, functionName, aliases)
+		fullModule := s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, tf, lineNum, functionName, aliases)
 
 		if fullModule != "" {
 			// Current module — hover from the buffer directly
@@ -3531,7 +3559,7 @@ func (s *Server) PrepareRename(ctx context.Context, params *protocol.PrepareRena
 
 	// Try module/function rename via the index
 	if !exprCtx.Empty() {
-		aliases := ExtractAliasesInScope(text, lineNum)
+		aliases := tf.ExtractAliasesInScope(lineNum)
 
 		// Detect `as:` aliases — these are file-local renames, not module renames.
 		// An `as:` alias has a short name that differs from the last segment of
@@ -3549,7 +3577,7 @@ func (s *Server) PrepareRename(ctx context.Context, params *protocol.PrepareRena
 			}
 		}
 
-		s.mergeAliasesFromUse(text, aliases)
+		s.mergeAliasesFromUseTokenized(tf, aliases)
 
 		var tokenName string
 		var fullModule string
@@ -3560,7 +3588,7 @@ func (s *Server) PrepareRename(ctx context.Context, params *protocol.PrepareRena
 			if moduleRef != "" {
 				fullModule = resolveModule(moduleRef, aliases)
 			} else {
-				fullModule = s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, lines, lineNum, functionName, aliases)
+				fullModule = s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, tf, lineNum, functionName, aliases)
 			}
 			found = fullModule != ""
 		} else if moduleRef != "" {
@@ -3686,13 +3714,13 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 	moduleRef, functionName := ExtractModuleAndFunction(expr)
 
 	if moduleRef != "" {
-		if aliasParent, inBlock := ExtractAliasBlockParent(lines, lineNum); inBlock {
+		if aliasParent, inBlock := tf.ExtractAliasBlockParent(lineNum); inBlock {
 			moduleRef = aliasParent + "." + moduleRef
 		}
 	}
 
 	aliases := tf.ExtractAliasesInScope(lineNum)
-	s.mergeAliasesFromUse(text, aliases)
+	s.mergeAliasesFromUseTokenized(tf, aliases)
 	s.debugf("References: expr=%q module=%q function=%q", expr, moduleRef, functionName)
 
 	var fullModule string
@@ -3726,7 +3754,7 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 		}
 
 		// Bare function — resolve to its defining module
-		fullModule = s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, lines, lineNum, functionName, aliases)
+		fullModule = s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, tf, lineNum, functionName, aliases)
 		s.debugf("References: resolved bare %q -> %q", functionName, fullModule)
 		if fullModule == "" {
 			s.debugf("References: could not resolve bare function %q", functionName)
@@ -3756,7 +3784,7 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 	// findModulesWhoseUsingImports scan entirely.
 	var injectors []string
 	if functionName != "" && moduleRef == "" {
-		useCalls := ExtractUsesWithOpts(text, aliases)
+		useCalls := tf.ExtractUsesWithOpts(aliases)
 		visited := make(map[string]bool)
 		for _, uc := range useCalls {
 			if s.lookupInUsingEntry(uc.Module, functionName, uc.Opts, visited) != nil {
@@ -3935,7 +3963,7 @@ func (s *Server) Rename(ctx context.Context, params *protocol.RenameParams) (*pr
 
 	// Try module/function rename via the index
 	if !renameCtx.Empty() {
-		aliases := ExtractAliasesInScope(text, lineNum)
+		aliases := tf.ExtractAliasesInScope(lineNum)
 
 		// Detect `as:` aliases — file-local rename of the alias name, not
 		// the underlying module. This check runs before merging use-injected
@@ -3969,14 +3997,14 @@ func (s *Server) Rename(ctx context.Context, params *protocol.RenameParams) (*pr
 			}
 		}
 
-		s.mergeAliasesFromUse(text, aliases)
+		s.mergeAliasesFromUseTokenized(tf, aliases)
 
 		if functionName != "" {
 			var fullModule string
 			if moduleRef != "" {
 				fullModule = resolveModule(moduleRef, aliases)
 			} else {
-				fullModule = s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, lines, lineNum, functionName, aliases)
+				fullModule = s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, tf, lineNum, functionName, aliases)
 			}
 			if fullModule != "" {
 				if !isValidFunctionName(params.NewName) {
@@ -4977,7 +5005,7 @@ func (s *Server) SignatureHelp(ctx context.Context, params *protocol.SignatureHe
 	}
 
 	aliases := tf.ExtractAliasesInScope(lineNum)
-	s.mergeAliasesFromUse(text, aliases)
+	s.mergeAliasesFromUseTokenized(tf, aliases)
 	lines := strings.Split(text, "\n")
 
 	// Resolve the function to a store lookup result
@@ -5142,7 +5170,7 @@ func (s *Server) TypeDefinition(ctx context.Context, params *protocol.TypeDefini
 	}
 
 	aliases := tf.ExtractAliasesInScope(lineNum)
-	s.mergeAliasesFromUse(text, aliases)
+	s.mergeAliasesFromUseTokenized(tf, aliases)
 	fullModule := s.resolveModuleWithNesting(typeCtx.ModuleRef, aliases, uriToPath(protocol.DocumentURI(docURI)), lineNum)
 
 	results, err := s.store.LookupFunction(fullModule, typeName)
@@ -5215,12 +5243,12 @@ func (s *Server) PrepareCallHierarchy(ctx context.Context, params *protocol.Call
 	}
 
 	aliases := tf.ExtractAliasesInScope(lineNum)
-	s.mergeAliasesFromUse(text, aliases)
+	s.mergeAliasesFromUseTokenized(tf, aliases)
 	var fullModule string
 	if callCtx.ModuleRef != "" {
 		fullModule = resolveModule(callCtx.ModuleRef, aliases)
 	} else {
-		fullModule = s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, lines, lineNum, functionName, aliases)
+		fullModule = s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, tf, lineNum, functionName, aliases)
 	}
 	if fullModule == "" {
 		return nil, nil

@@ -280,6 +280,116 @@ func TestExpressionAtCursor(t *testing.T) {
 	}
 }
 
+func TestCompletionContextAtCursor(t *testing.T) {
+	tests := []struct {
+		name         string
+		code         string
+		line         int
+		col          int
+		wantPrefix   string
+		wantAfterDot bool
+		wantStartCol int
+	}{
+		{
+			name:         "module prefix",
+			code:         "  MyApp.Han",
+			line:         0,
+			col:          11,
+			wantPrefix:   "MyApp.Han",
+			wantAfterDot: false,
+			wantStartCol: 2,
+		},
+		{
+			name:         "after dot",
+			code:         "  Foo.",
+			line:         0,
+			col:          6,
+			wantPrefix:   "Foo",
+			wantAfterDot: true,
+			wantStartCol: 2,
+		},
+		{
+			name:         "function prefix after dot",
+			code:         "  Foo.ba",
+			line:         0,
+			col:          8,
+			wantPrefix:   "Foo.ba",
+			wantAfterDot: false,
+			wantStartCol: 2,
+		},
+		{
+			name:         "mid-word cursor truncates current token",
+			code:         "  Enum.map_reduce",
+			line:         0,
+			col:          10,
+			wantPrefix:   "Enum.map",
+			wantAfterDot: false,
+			wantStartCol: 2,
+		},
+		{
+			name:         "erlang module prefix",
+			code:         "  :lis",
+			line:         0,
+			col:          6,
+			wantPrefix:   ":lis",
+			wantAfterDot: false,
+			wantStartCol: 2,
+		},
+		{
+			name:         "double colon does not create atom prefix",
+			code:         "  value::foo",
+			line:         0,
+			col:          12,
+			wantPrefix:   "foo",
+			wantAfterDot: false,
+			wantStartCol: 9,
+		},
+		{
+			name:         "string is ignored",
+			code:         `  "MyApp.Acc"`,
+			line:         0,
+			col:          12,
+			wantPrefix:   "",
+			wantAfterDot: false,
+			wantStartCol: 0,
+		},
+		{
+			name:         "comment is ignored",
+			code:         "  # MyApp.Acc",
+			line:         0,
+			col:          13,
+			wantPrefix:   "",
+			wantAfterDot: false,
+			wantStartCol: 0,
+		},
+		{
+			name:         "heredoc is ignored",
+			code:         "  \"\"\"\n  MyApp.Acc\n  \"\"\"",
+			line:         1,
+			col:          11,
+			wantPrefix:   "",
+			wantAfterDot: false,
+			wantStartCol: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tokens, source, lineStarts := tokenize(tt.code)
+			ctx := CompletionContextAtCursor(tokens, source, lineStarts, tt.line, tt.col)
+			if ctx.Prefix != tt.wantPrefix {
+				t.Errorf("Prefix = %q, want %q", ctx.Prefix, tt.wantPrefix)
+			}
+			if ctx.AfterDot != tt.wantAfterDot {
+				t.Errorf("AfterDot = %v, want %v", ctx.AfterDot, tt.wantAfterDot)
+			}
+			if ctx.StartCol != tt.wantStartCol {
+				t.Errorf("StartCol = %d, want %d", ctx.StartCol, tt.wantStartCol)
+			}
+		})
+	}
+}
+
 func TestFullExpressionAtCursor(t *testing.T) {
 	code := "    Foo.Bar.baz(123)"
 	tokens, source, lineStarts := tokenize(code)

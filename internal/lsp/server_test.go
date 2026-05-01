@@ -1198,6 +1198,40 @@ func TestCompletion_NoResults(t *testing.T) {
 	}
 }
 
+func TestCompletion_IgnoresStringsAndComments(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", `defmodule MyApp.Accounts do
+  def create(attrs) do
+    :ok
+  end
+end
+`)
+
+	uri := "file:///test.ex"
+
+	t.Run("string", func(t *testing.T) {
+		line := `  "MyApp.Acc"`
+		server.docs.Set(uri, line)
+
+		items := completionAt(t, server, uri, 0, uint32(len(line)-1))
+		if len(items) != 0 {
+			t.Errorf("expected no completions inside string, got %d: %v", len(items), items)
+		}
+	})
+
+	t.Run("comment", func(t *testing.T) {
+		line := "  # MyApp.Acc"
+		server.docs.Set(uri, line)
+
+		items := completionAt(t, server, uri, 0, uint32(len(line)))
+		if len(items) != 0 {
+			t.Errorf("expected no completions inside comment, got %d: %v", len(items), items)
+		}
+	})
+}
+
 func TestCompletion_FunctionResultDotNoResults(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
@@ -3525,6 +3559,62 @@ func TestDidSave_FormatterConfigRestartPicksUpUpdatedConfig(t *testing.T) {
 	}
 	if !strings.Contains(edits[0].NewText, "def hello do") {
 		t.Fatalf("expected updated formatter config to force do/end blocks, got:\n%s", edits[0].NewText)
+	}
+}
+
+func TestFormatter_ExternalFormatterConfigChangePicksUpUpdatedConfig(t *testing.T) {
+	if _, err := exec.LookPath("mix"); err != nil {
+		t.Skip("mix not available in PATH")
+	}
+
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+	defer server.closeBeams()
+
+	if err := os.WriteFile(filepath.Join(server.projectRoot, "mix.exs"), []byte(""), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	configPath := filepath.Join(server.projectRoot, ".formatter.exs")
+	if err := os.WriteFile(configPath, []byte("[]"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	filePath := filepath.Join(server.projectRoot, "lib", "test.ex")
+	if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	docURI := string(uri.File(filePath))
+	input := "defmodule Test do\n  def hello, do: :world\nend\n"
+	server.docs.Set(docURI, input)
+
+	edits, err := server.Formatting(context.Background(), &protocol.DocumentFormattingParams{
+		TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(docURI)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if edits != nil {
+		t.Fatalf("expected initial formatting to match input, got %#v", edits)
+	}
+
+	time.Sleep(10 * time.Millisecond)
+	if err := os.WriteFile(configPath, []byte("[force_do_end_blocks: true]\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	server.docs.Set(docURI, input)
+	edits, err = server.Formatting(context.Background(), &protocol.DocumentFormattingParams{
+		TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(docURI)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if edits == nil {
+		t.Fatal("expected formatting edits after external .formatter.exs change")
+	}
+	if !strings.Contains(edits[0].NewText, "def hello do") {
+		t.Fatalf("expected external formatter config change to force do/end blocks, got:\n%s", edits[0].NewText)
 	}
 }
 

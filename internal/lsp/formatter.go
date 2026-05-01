@@ -56,20 +56,22 @@ const (
 )
 
 type beamProcess struct {
-	cmd       *commandHandle
-	stdin     io.WriteCloser
-	stdout    io.ReadCloser
-	stderr    *bytes.Buffer // rolling stderr capture for crash diagnostics
-	writeMu   sync.Mutex
-	pendingMu sync.Mutex
-	pending   map[uint32]chan beamResponse
-	nextReqID uint32
-	startedAt time.Time     // when the process was launched
-	ready     chan struct{} // closed when the BEAM has sent the ready signal
-	startErr  error         // non-nil if startup failed; set before ready is closed
-	startOnce sync.Once
-	closed    chan struct{} // closed by Close(); makes alive() return false immediately
-	notify    func(beamNotification)
+	cmd                   *commandHandle
+	stdin                 io.WriteCloser
+	stdout                io.ReadCloser
+	stderr                *stderrCapture // rolling stderr capture for crash diagnostics
+	writeMu               sync.Mutex
+	pendingMu             sync.Mutex
+	pending               map[uint32]chan beamResponse
+	nextReqID             uint32
+	formatterConfigMu     sync.Mutex
+	formatterConfigStamps map[string]fileStamp
+	startedAt             time.Time     // when the process was launched
+	ready                 chan struct{} // closed when the BEAM has sent the ready signal
+	startErr              error         // non-nil if startup failed; set before ready is closed
+	startOnce             sync.Once
+	closed                chan struct{} // closed by Close(); makes alive() return false immediately
+	notify                func(beamNotification)
 }
 
 type beamResponse struct {
@@ -81,6 +83,58 @@ type beamResponse struct {
 type beamNotification struct {
 	op      byte
 	payload []byte
+}
+
+type stderrCapture struct {
+	mu  sync.Mutex
+	buf []byte
+	max int
+}
+
+func newStderrCapture() *stderrCapture {
+	return &stderrCapture{max: 4096}
+}
+
+func (c *stderrCapture) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.buf = append(c.buf, p...)
+	if len(c.buf) > c.max {
+		c.buf = append([]byte(nil), c.buf[len(c.buf)-c.max:]...)
+	}
+	return len(p), nil
+}
+
+func (c *stderrCapture) String() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return string(append([]byte(nil), c.buf...))
+}
+
+func (c *stderrCapture) Tail(n int) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	b := c.buf
+	if len(b) > n {
+		b = b[len(b)-n:]
+	}
+	return string(append([]byte(nil), b...))
+}
+
+type fileStamp struct {
+	exists bool
+	mtime  int64
+	size   int64
+}
+
+func statFileStamp(path string) fileStamp {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fileStamp{}
+	}
+	return fileStamp{exists: true, mtime: info.ModTime().UnixNano(), size: info.Size()}
 }
 
 // commandHandle wraps the process so we can check liveness.
@@ -106,11 +160,7 @@ func (bp *beamProcess) recentStderr() string {
 	if bp.stderr == nil {
 		return ""
 	}
-	b := bp.stderr.Bytes()
-	if len(b) > 512 {
-		b = b[len(b)-512:]
-	}
-	return strings.TrimSpace(string(b))
+	return strings.TrimSpace(bp.stderr.Tail(512))
 }
 
 // wrapError annotates a read/write error with recent stderr output if the
@@ -125,6 +175,23 @@ func (bp *beamProcess) wrapError(err error) error {
 		}
 	}
 	return err
+}
+
+func (bp *beamProcess) formatterConfigChanged(formatterExs string) bool {
+	stamp := statFileStamp(formatterExs)
+
+	bp.formatterConfigMu.Lock()
+	defer bp.formatterConfigMu.Unlock()
+
+	if bp.formatterConfigStamps == nil {
+		bp.formatterConfigStamps = make(map[string]fileStamp)
+	}
+	prev, ok := bp.formatterConfigStamps[formatterExs]
+	if ok && prev != stamp {
+		return true
+	}
+	bp.formatterConfigStamps[formatterExs] = stamp
+	return false
 }
 
 // Ready blocks until the process has finished startup. Returns startErr if
@@ -651,8 +718,8 @@ func (s *Server) startBeamProcess(buildRoot string) (*beamProcess, error) {
 	if err != nil {
 		return nil, err
 	}
-	var stderrBuf bytes.Buffer
-	cmd.Stderr = io.MultiWriter(os.Stderr, &stderrBuf)
+	stderrBuf := newStderrCapture()
+	cmd.Stderr = io.MultiWriter(os.Stderr, stderrBuf)
 
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start BEAM: %w", err)
@@ -670,7 +737,7 @@ func (s *Server) startBeamProcess(buildRoot string) (*beamProcess, error) {
 		cmd:       handle,
 		stdin:     stdin,
 		stdout:    stdout,
-		stderr:    &stderrBuf,
+		stderr:    stderrBuf,
 		pending:   make(map[uint32]chan beamResponse),
 		startedAt: time.Now(),
 		ready:     make(chan struct{}),
@@ -786,6 +853,15 @@ func (s *Server) formatContent(ctx context.Context, mixRoot, path, content strin
 	if bp == nil {
 		log.Printf("Formatting: BEAM process unavailable, falling back to mix format")
 		return s.formatWithMixFormat(ctx, mixRoot, path, content)
+	}
+	if bp.formatterConfigChanged(formatterExs) {
+		s.evictBeam(bp, fmt.Sprintf("formatter config changed: %s", formatterExs))
+		bp = s.getBeamProcess(ctx, buildRoot)
+		if bp == nil {
+			log.Printf("Formatting: BEAM process unavailable after formatter config change, falling back to mix format")
+			return s.formatWithMixFormat(ctx, mixRoot, path, content)
+		}
+		_ = bp.formatterConfigChanged(formatterExs)
 	}
 
 	// Check if already ready (non-blocking)

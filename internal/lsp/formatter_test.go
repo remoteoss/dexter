@@ -72,7 +72,7 @@ func newTestBeamProcess(stdin io.WriteCloser, stdout io.ReadCloser, notify func(
 		},
 		stdin:   stdin,
 		stdout:  stdout,
-		stderr:  &bytes.Buffer{},
+		stderr:  newStderrCapture(),
 		pending: make(map[uint32]chan beamResponse),
 		ready:   make(chan struct{}),
 		closed:  make(chan struct{}),
