@@ -48,6 +48,74 @@ func ensureFixtureDeps(t *testing.T, mixRoot string) {
 	}
 }
 
+func createHEEXFormatterFixture(t *testing.T) string {
+	t.Helper()
+	mixRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(mixRoot, "lib", "phoenix", "live_view"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(mixRoot, "mix.exs"),
+		[]byte(`defmodule AppWithHEEXFormatter.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :app_with_heex_formatter,
+      version: "0.1.0",
+      elixir: "~> 1.18"
+    ]
+  end
+end
+`),
+		0644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(mixRoot, ".formatter.exs"),
+		[]byte("[plugins: [Phoenix.LiveView.HTMLFormatter], inputs: [\"{lib,test}/**/*.{ex,exs,heex}\"]]\n"),
+		0644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(mixRoot, "lib", "phoenix", "live_view", "html_formatter.ex"),
+		[]byte(`defmodule Phoenix.LiveView.HTMLFormatter do
+  def features(_opts), do: [extensions: [".heex"], sigils: [:H]]
+
+  def format(input, opts) do
+    cond do
+      Keyword.get(opts, :sigil) == :H and Keyword.get(opts, :file) ->
+        format_heex(input)
+
+      Keyword.get(opts, :extension) == ".heex" and Keyword.get(opts, :file) ->
+        format_heex(input)
+
+      true ->
+        raise "expected HEEX formatter metadata"
+    end
+  end
+
+  defp format_heex(input) do
+    input = Regex.replace(~r/^\s*<span>text<\/span>$/m, input, "  <span>text</span>")
+    input = Regex.replace(~r/^\s*<span>more text\s*\n\s*<\/span>$/m, input, "  <span>more text</span>")
+    Regex.replace(~r/\n\s*\n\s*\n+/, input, "\n\n")
+  end
+end
+`),
+		0644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("mix", "compile")
+	cmd.Dir = mixRoot
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("could not compile HEEX formatter fixture: %v\n%s", err, out)
+	}
+	return mixRoot
+}
+
 func setupTestServerForFixture(t *testing.T, mixRoot string) (*Server, func()) {
 	t.Helper()
 	dir := t.TempDir()
@@ -159,6 +227,115 @@ func TestFormatterServer_WithStylerPlugin(t *testing.T) {
 	}
 	if strings.Contains(edits[0].NewText, "|>") {
 		t.Errorf("expected Styler to remove single pipe, got:\n%s", edits[0].NewText)
+	}
+}
+
+func TestFormatterServer_HEEXPluginFormatsSigilInElixirFile(t *testing.T) {
+	if _, err := exec.LookPath("mix"); err != nil {
+		t.Skip("mix not available in PATH")
+	}
+
+	mixRoot := createHEEXFormatterFixture(t)
+	storeDir := t.TempDir()
+	s, err := store.Open(storeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+
+	server := NewServer(s, mixRoot)
+	if p, err := exec.LookPath("mix"); err == nil {
+		server.mixBin = p
+	}
+
+	input := `defmodule MyApp.Component do
+  def render(assigns) do
+    ~H"""
+    <div>
+    <span>text</span>
+
+    
+
+        <span>more text
+          </span>
+    </div>
+    """
+  end
+end
+`
+	filePath := filepath.Join(mixRoot, "lib", "component.ex")
+	docURI := string(uri.File(filePath))
+	server.docs.Set(docURI, input)
+
+	edits, err := server.Formatting(context.Background(), &protocol.DocumentFormattingParams{
+		TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(docURI)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if edits == nil {
+		t.Fatal("expected formatting edits from HEEX formatter plugin, got nil")
+	}
+	for _, want := range []string{
+		"      <span>text</span>",
+		"      <span>more text</span>",
+	} {
+		if !strings.Contains(edits[0].NewText, want) {
+			t.Errorf("expected HEEX formatter output %q, got:\n%s", want, edits[0].NewText)
+		}
+	}
+	if strings.Contains(edits[0].NewText, "<span>more text\n") {
+		t.Errorf("expected HEEX formatter to collapse split span, got:\n%s", edits[0].NewText)
+	}
+}
+
+func TestFormatterServer_HEEXPluginFormatsHEEXFile(t *testing.T) {
+	if _, err := exec.LookPath("mix"); err != nil {
+		t.Skip("mix not available in PATH")
+	}
+
+	mixRoot := createHEEXFormatterFixture(t)
+	storeDir := t.TempDir()
+	s, err := store.Open(storeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+
+	server := NewServer(s, mixRoot)
+	if p, err := exec.LookPath("mix"); err == nil {
+		server.mixBin = p
+	}
+
+	input := `<div>
+<span>text</span>
+
+    
+
+    <span>more text
+      </span>
+</div>
+`
+	filePath := filepath.Join(mixRoot, "lib", "component.heex")
+	docURI := string(uri.File(filePath))
+	server.docs.Set(docURI, input)
+
+	edits, err := server.Formatting(context.Background(), &protocol.DocumentFormattingParams{
+		TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(docURI)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if edits == nil {
+		t.Fatal("expected formatting edits for .heex file, got nil")
+	}
+	for _, want := range []string{
+		"  <span>text</span>",
+		"  <span>more text</span>",
+	} {
+		if !strings.Contains(edits[0].NewText, want) {
+			t.Errorf("expected HEEX formatter output %q, got:\n%s", want, edits[0].NewText)
+		}
 	}
 }
 

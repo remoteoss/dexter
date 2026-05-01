@@ -192,7 +192,28 @@ defmodule Dexter.Formatter do
       IO.puts(:stderr, "Formatter: plugins loaded for #{formatter_exs_path}: #{Enum.map_join(active_plugins, ", ", &inspect/1)}")
     end
 
+    format_opts = Keyword.put(format_opts, :sigils, sigils_for_plugins(active_plugins, format_opts))
+
     {format_opts, active_plugins}
+  end
+
+  defp sigils_for_plugins(plugins, format_opts) do
+    plugins
+    |> Enum.flat_map(fn plugin ->
+      plugin.features(format_opts)
+      |> Keyword.get(:sigils)
+      |> List.wrap()
+      |> Enum.map(fn sigil -> {sigil, plugin} end)
+    end)
+    |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
+    |> Enum.map(fn {sigil, plugins} ->
+      {sigil,
+       fn input, opts ->
+         Enum.reduce(plugins, input, fn plugin, acc ->
+           plugin.format(acc, opts ++ format_opts)
+         end)
+       end}
+    end)
   end
 
   defp do_format(content, filename, format_opts, plugins) when is_binary(content) do
@@ -200,30 +221,22 @@ defmodule Dexter.Formatter do
       opts = if filename != "", do: [file: filename] ++ format_opts, else: format_opts
       ext = Path.extname(filename)
 
-      # Filter plugins to those that handle this file extension
-      applicable_plugins =
-        Enum.filter(plugins, fn plugin ->
-          features = plugin.features(format_opts)
-          extensions = Keyword.get(features, :extensions, [])
-          extensions == [] or ext in extensions
-        end)
+      extension_plugins = plugins_for_extension(plugins, ext, format_opts)
 
       formatted =
-        if applicable_plugins != [] do
-          # Redirect group leader to stderr during plugin calls so any
-          # IO.puts from plugins doesn't corrupt the binary protocol on stdout.
-          old_gl = Process.group_leader()
-          Process.group_leader(self(), Process.whereis(:standard_error))
-
-          try do
-            Enum.reduce(applicable_plugins, content, fn plugin, acc ->
-              plugin.format(acc, opts)
+        cond do
+          extension_plugins != [] ->
+            with_plugin_output_redirect(fn ->
+              Enum.reduce(extension_plugins, content, fn plugin, acc ->
+                plugin.format(acc, [extension: ext] ++ opts)
+              end)
             end)
-          after
-            Process.group_leader(self(), old_gl)
-          end
-        else
-          content |> Code.format_string!(opts) |> IO.iodata_to_binary()
+
+          elixir_source?(ext) ->
+            format_elixir(content, opts)
+
+          true ->
+            content
         end
 
       # Ensure trailing newline to match mix format output
@@ -241,6 +254,40 @@ defmodule Dexter.Formatter do
   end
 
   defp do_format(_, _, _, _), do: {1, "invalid input"}
+
+  defp plugins_for_extension(plugins, ext, format_opts) do
+    Enum.filter(plugins, fn plugin ->
+      ext in List.wrap(plugin.features(format_opts)[:extensions])
+    end)
+  end
+
+  defp elixir_source?(""), do: true
+  defp elixir_source?(ext), do: ext in [".ex", ".exs"]
+
+  defp format_elixir(content, opts) do
+    formatter = fn ->
+      content |> Code.format_string!(opts) |> IO.iodata_to_binary()
+    end
+
+    if Keyword.get(opts, :sigils, []) != [] do
+      with_plugin_output_redirect(formatter)
+    else
+      formatter.()
+    end
+  end
+
+  # Plugin callbacks can write to the group leader. Redirect those writes to
+  # stderr so they cannot corrupt the stdout binary protocol.
+  defp with_plugin_output_redirect(fun) do
+    old_gl = Process.group_leader()
+    Process.group_leader(self(), Process.whereis(:standard_error))
+
+    try do
+      fun.()
+    after
+      Process.group_leader(self(), old_gl)
+    end
+  end
 end
 
 # Protocol Writer
