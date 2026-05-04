@@ -44,6 +44,9 @@
 # CodeIntel op 4 (runtime_info) payload:
 #   empty
 #
+# CodeIntel op 5 (struct_fields) payload:
+#   2-byte Elixir module length (big-endian) + module
+#
 # Notification 0 (otp_modules_ready) payload:
 #   2-byte module_count (big-endian) + [name_len(u16) name]
 #
@@ -450,6 +453,7 @@ defmodule Dexter.CodeIntel do
   @op_warm_otp_modules 2
   @op_erlang_exports 3
   @op_runtime_info 4
+  @op_struct_fields 5
 
   def handle_request(op, payload) do
     case op do
@@ -458,6 +462,7 @@ defmodule Dexter.CodeIntel do
       @op_warm_otp_modules -> handle_warm_otp_modules(payload)
       @op_erlang_exports -> handle_erlang_exports(payload)
       @op_runtime_info -> handle_runtime_info(payload)
+      @op_struct_fields -> handle_struct_fields(payload)
       _ -> {1, "unknown code intel op: #{inspect(op)}"}
     end
   end
@@ -819,6 +824,62 @@ defmodule Dexter.CodeIntel do
     {0,
      <<byte_size(otp_release)::unsigned-big-16, otp_release::binary,
        byte_size(code_root_dir)::unsigned-big-16, code_root_dir::binary>>}
+  end
+
+  defp handle_struct_fields(payload) do
+    case parse_module(payload) do
+      {:ok, module_name} ->
+        case fetch_struct_fields(module_name) do
+          {:ok, fields} -> {0, encode_string_list(fields)}
+          :error -> {1, "struct fields not found"}
+        end
+
+      :error ->
+        {1, "invalid struct_fields payload"}
+    end
+  end
+
+  defp fetch_struct_fields(module_name) do
+    with {:ok, module_atom} <- elixir_module_atom(module_name),
+         {:module, ^module_atom} <- Code.ensure_loaded(module_atom),
+         true <- function_exported?(module_atom, :__struct__, 0),
+         struct when is_map(struct) <- apply(module_atom, :__struct__, []) do
+      fields =
+        struct
+        |> Map.delete(:__struct__)
+        |> Map.keys()
+        |> Enum.map(&Atom.to_string/1)
+        |> Enum.sort()
+
+      {:ok, fields}
+    else
+      _ -> :error
+    end
+  rescue
+    _ -> :error
+  end
+
+  defp elixir_module_atom(module_name) do
+    if Regex.match?(~r/\A(?:Elixir\.)?[A-Z][A-Za-z0-9_]*(?:\.[A-Z][A-Za-z0-9_]*)*\z/, module_name) do
+      module_atom =
+        module_name
+        |> String.trim_leading("Elixir.")
+        |> String.split(".")
+        |> Module.concat()
+
+      {:ok, module_atom}
+    else
+      :error
+    end
+  end
+
+  defp encode_string_list(values) do
+    payload =
+      for value <- values, into: <<>> do
+        <<byte_size(value)::unsigned-big-16, value::binary>>
+      end
+
+    <<length(values)::unsigned-big-16, payload::binary>>
   end
 
   defp parse_module_function_arity(payload) do

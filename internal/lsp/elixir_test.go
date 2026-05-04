@@ -390,6 +390,239 @@ func TestCompletionContextAtCursor(t *testing.T) {
 	}
 }
 
+func TestStructCompletionContextAtCursor(t *testing.T) {
+	tests := []struct {
+		name       string
+		code       string
+		line       int
+		col        int
+		wantOK     bool
+		wantModule string
+		wantPrefix string
+		wantStart  int
+	}{
+		{
+			name:       "field prefix",
+			code:       "  %User{em",
+			line:       0,
+			col:        len("  %User{em"),
+			wantOK:     true,
+			wantModule: "User",
+			wantPrefix: "em",
+			wantStart:  len("  %User{"),
+		},
+		{
+			name:       "empty field prefix",
+			code:       "  %User{",
+			line:       0,
+			col:        len("  %User{"),
+			wantOK:     true,
+			wantModule: "User",
+			wantPrefix: "",
+			wantStart:  len("  %User{"),
+		},
+		{
+			name:       "qualified module",
+			code:       "  %MyApp.User{na",
+			line:       0,
+			col:        len("  %MyApp.User{na"),
+			wantOK:     true,
+			wantModule: "MyApp.User",
+			wantPrefix: "na",
+			wantStart:  len("  %MyApp.User{"),
+		},
+		{
+			name:       "module special",
+			code:       "  %__MODULE__{na",
+			line:       0,
+			col:        len("  %__MODULE__{na"),
+			wantOK:     true,
+			wantModule: "__MODULE__",
+			wantPrefix: "na",
+			wantStart:  len("  %__MODULE__{"),
+		},
+		{
+			name:       "after previous field",
+			code:       `  %User{name: "x", em`,
+			line:       0,
+			col:        len(`  %User{name: "x", em`),
+			wantOK:     true,
+			wantModule: "User",
+			wantPrefix: "em",
+			wantStart:  len(`  %User{name: "x", `),
+		},
+		{
+			name:       "struct update",
+			code:       "  %User{user | em",
+			line:       0,
+			col:        len("  %User{user | em"),
+			wantOK:     true,
+			wantModule: "User",
+			wantPrefix: "em",
+			wantStart:  len("  %User{user | "),
+		},
+		{
+			name:   "struct update variable position rejected",
+			code:   "  %User{user | em",
+			line:   0,
+			col:    len("  %User{user"),
+			wantOK: false,
+		},
+		{
+			name:       "struct update empty key position after pipe",
+			code:       "  %User{user | ",
+			line:       0,
+			col:        len("  %User{user | "),
+			wantOK:     true,
+			wantModule: "User",
+			wantPrefix: "",
+			wantStart:  len("  %User{user | "),
+		},
+		{
+			name:       "multiline field prefix",
+			code:       "  %User{\n    em\n  }",
+			line:       1,
+			col:        len("    em"),
+			wantOK:     true,
+			wantModule: "User",
+			wantPrefix: "em",
+			wantStart:  len("    "),
+		},
+		{
+			name:   "value position rejected",
+			code:   "  %User{name: ",
+			line:   0,
+			col:    len("  %User{name: "),
+			wantOK: false,
+		},
+		{
+			name:   "nested map value rejected",
+			code:   "  %User{name: %{em",
+			line:   0,
+			col:    len("  %User{name: %{em"),
+			wantOK: false,
+		},
+		{
+			name:   "plain map rejected",
+			code:   "  %{em",
+			line:   0,
+			col:    len("  %{em"),
+			wantOK: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tokens, source, lineStarts := tokenize(tt.code)
+			ctx, ok := StructCompletionContextAtCursor(tokens, source, lineStarts, tt.line, tt.col)
+			if ok != tt.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tt.wantOK)
+			}
+			if !ok {
+				return
+			}
+			if ctx.ModuleRef != tt.wantModule {
+				t.Errorf("ModuleRef = %q, want %q", ctx.ModuleRef, tt.wantModule)
+			}
+			if ctx.FieldPrefix != tt.wantPrefix {
+				t.Errorf("FieldPrefix = %q, want %q", ctx.FieldPrefix, tt.wantPrefix)
+			}
+			if ctx.StartCol != tt.wantStart {
+				t.Errorf("StartCol = %d, want %d", ctx.StartCol, tt.wantStart)
+			}
+		})
+	}
+}
+
+func TestStructValueContextAtCursor(t *testing.T) {
+	tests := []struct {
+		name string
+		code string
+		line int
+		col  int
+		want bool
+	}{
+		{
+			name: "empty value position",
+			code: "  %User{name: ",
+			line: 0,
+			col:  len("  %User{name: "),
+			want: true,
+		},
+		{
+			name: "typed value position",
+			code: "  %User{name: na",
+			line: 0,
+			col:  len("  %User{name: na"),
+			want: true,
+		},
+		{
+			name: "key position",
+			code: "  %User{na",
+			line: 0,
+			col:  len("  %User{na"),
+			want: false,
+		},
+		{
+			name: "struct update variable position",
+			code: "  %User{user | name: ",
+			line: 0,
+			col:  len("  %User{user"),
+			want: false,
+		},
+		{
+			name: "nested map value rejected",
+			code: "  %User{meta: %{",
+			line: 0,
+			col:  len("  %User{meta: %{"),
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tokens, source, lineStarts := tokenize(tt.code)
+			got := StructValueContextAtCursor(tokens, source, lineStarts, tt.line, tt.col)
+			if got != tt.want {
+				t.Fatalf("StructValueContextAtCursor = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestStructModuleRefs(t *testing.T) {
+	code := `defmodule MyApp.Controller do
+  alias MyApp.Accounts.User
+
+  def run do
+    %User{name: "A"}
+    %MyApp.Accounts.Org{
+      id: 1
+    }
+    %{}
+    %__MODULE__{}
+    %MyApp.Accounts.Pending
+  end
+end`
+	tokens, source, _ := tokenize(code)
+	refs := StructModuleRefs(tokens, source)
+
+	want := []StructModuleRef{
+		{ModuleRef: "User", Line: 4},
+		{ModuleRef: "MyApp.Accounts.Org", Line: 5},
+		{ModuleRef: "__MODULE__", Line: 9},
+		{ModuleRef: "MyApp.Accounts.Pending", Line: 10},
+	}
+	if len(refs) != len(want) {
+		t.Fatalf("got %d refs, want %d: %#v", len(refs), len(want), refs)
+	}
+	for i := range want {
+		if refs[i] != want[i] {
+			t.Errorf("refs[%d] = %#v, want %#v", i, refs[i], want[i])
+		}
+	}
+}
+
 func TestFullExpressionAtCursor(t *testing.T) {
 	code := "    Foo.Bar.baz(123)"
 	tokens, source, lineStarts := tokenize(code)

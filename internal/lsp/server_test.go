@@ -284,11 +284,17 @@ func referencesAt(t *testing.T, server *Server, uri string, line, col uint32) []
 
 func completionAt(t *testing.T, server *Server, uri string, line, col uint32) []protocol.CompletionItem {
 	t.Helper()
+	return completionAtWithContext(t, server, uri, line, col, nil)
+}
+
+func completionAtWithContext(t *testing.T, server *Server, uri string, line, col uint32, completionCtx *protocol.CompletionContext) []protocol.CompletionItem {
+	t.Helper()
 	result, err := server.Completion(context.Background(), &protocol.CompletionParams{
 		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
 			TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(uri)},
 			Position:     protocol.Position{Line: line, Character: col},
 		},
+		Context: completionCtx,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -302,6 +308,15 @@ func completionAt(t *testing.T, server *Server, uri string, line, col uint32) []
 func hasCompletionItem(items []protocol.CompletionItem, label string) bool {
 	for _, item := range items {
 		if item.Label == label || item.FilterText == label {
+			return true
+		}
+	}
+	return false
+}
+
+func hasString(values []string, value string) bool {
+	for _, existing := range values {
+		if existing == value {
 			return true
 		}
 	}
@@ -744,6 +759,214 @@ end`)
 	items := completionAt(t, server, uri, 3, 12)
 	if !hasCompletionItem(items, "create") {
 		t.Error("expected 'create' via aliased module")
+	}
+}
+
+func TestCompletion_StructFieldsFromWarmCache(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	path := filepath.Join(server.projectRoot, "lib", "controller.ex")
+	uriStr := string(uri.File(path))
+	server.docs.Set(uriStr, `defmodule MyApp.Controller do
+  alias MyApp.Accounts.User
+
+  def run do
+    %User{em
+  end
+end`)
+
+	key := structFieldCacheKey{
+		buildRoot: server.structFieldBuildRoot(path),
+		module:    "MyApp.Accounts.User",
+	}
+	server.structFieldMu.Lock()
+	server.structFieldCache[key] = &structFieldCacheEntry{
+		fields: []string{"active?", "email", "name"},
+		loaded: true,
+	}
+	server.structFieldMu.Unlock()
+
+	items := completionAt(t, server, uriStr, 4, uint32(len("    %User{em")))
+	if !hasCompletionItem(items, "email") {
+		t.Fatal("expected 'email' struct field completion")
+	}
+	if hasCompletionItem(items, "name") {
+		t.Fatal("did not expect non-matching 'name' completion")
+	}
+
+	for _, item := range items {
+		if item.Label != "email" {
+			continue
+		}
+		if item.Kind != protocol.CompletionItemKindField {
+			t.Errorf("Kind = %v, want Field", item.Kind)
+		}
+		if item.TextEdit == nil || item.TextEdit.NewText != "email: " {
+			t.Fatalf("TextEdit = %#v, want email insertion", item.TextEdit)
+		}
+	}
+
+	server.docs.Set(uriStr, `defmodule MyApp.Controller do
+  alias MyApp.Accounts.User
+
+  def run do
+    %User{
+  end
+end`)
+	items = completionAt(t, server, uriStr, 4, uint32(len("    %User{")))
+	for _, label := range []string{"active?", "email", "name"} {
+		if !hasCompletionItem(items, label) {
+			t.Fatalf("expected %q for empty struct field prefix", label)
+		}
+	}
+}
+
+func TestStructFieldPrewarmFromDocument(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+	server.mixBin = "" // keep the cache warm test from starting a real sidecar
+
+	path := filepath.Join(server.projectRoot, "lib", "controller.ex")
+	docURI := string(uri.File(path))
+	text := `defmodule MyApp.Controller do
+  alias MyApp.Accounts.User
+
+  def run do
+    %User{}
+    %__MODULE__{}
+    %User{name: "duplicate"}
+  end
+end`
+	indexFile(t, server.store, server.projectRoot, "lib/user.ex", `defmodule MyApp.Accounts.User do
+  defstruct [:name]
+end`)
+	indexFile(t, server.store, server.projectRoot, "lib/controller.ex", text)
+
+	server.prewarmStructFieldsFromText(docURI, path, text)
+
+	userKey := structFieldCacheKey{
+		buildRoot: server.structFieldBuildRoot(path),
+		module:    "MyApp.Accounts.User",
+	}
+	moduleKey := structFieldCacheKey{
+		buildRoot: server.structFieldBuildRoot(path),
+		module:    "MyApp.Controller",
+	}
+
+	server.structFieldMu.Lock()
+	_, hasUser := server.structFieldCache[userKey]
+	_, hasModule := server.structFieldCache[moduleKey]
+	cacheLen := len(server.structFieldCache)
+	server.structFieldMu.Unlock()
+
+	if !hasUser {
+		t.Fatal("expected prewarm to enqueue aliased User struct fields")
+	}
+	if !hasModule {
+		t.Fatal("expected prewarm to enqueue __MODULE__ struct fields")
+	}
+	if cacheLen != 2 {
+		t.Fatalf("expected duplicate User structs to share one cache entry, got %d entries", cacheLen)
+	}
+}
+
+func TestStructFieldCacheInvalidatedForReindexedModule(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/user.ex", `defmodule MyApp.User do
+  defstruct [:name]
+end`)
+
+	key := structFieldCacheKey{
+		buildRoot: server.structFieldBuildRoot(filepath.Join(server.projectRoot, "lib", "user.ex")),
+		module:    "MyApp.User",
+	}
+	server.structFieldMu.Lock()
+	server.structFieldCache[key] = &structFieldCacheEntry{
+		fields: []string{"name"},
+		loaded: true,
+	}
+	beforeGen := server.structFieldGen
+	server.structFieldMu.Unlock()
+
+	path := filepath.Join(server.projectRoot, "lib", "user.ex")
+	defs, _, err := parser.ParseText(path, `defmodule MyApp.User do
+  defstruct [:name, :email]
+end`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.invalidateStructFieldCacheForFile(path, defs)
+
+	server.structFieldMu.Lock()
+	_, stillCached := server.structFieldCache[key]
+	afterGen := server.structFieldGen
+	server.structFieldMu.Unlock()
+
+	if stillCached {
+		t.Fatal("expected struct field cache entry to be invalidated")
+	}
+	if afterGen <= beforeGen {
+		t.Fatal("expected struct field generation to advance")
+	}
+}
+
+func TestCompletion_StructValueShowsLocalVariables(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	path := filepath.Join(server.projectRoot, "lib", "controller.ex")
+	uriStr := string(uri.File(path))
+	server.docs.Set(uriStr, `defmodule MyApp.Controller do
+  def helper(value), do: value
+
+  def run(status, actor) do
+    local_status = status
+    _ignored = "label only"
+
+    %ContractDocument{status: 
+  end
+end`)
+
+	key := structFieldCacheKey{
+		buildRoot: server.structFieldBuildRoot(path),
+		module:    "ContractDocument",
+	}
+	server.structFieldMu.Lock()
+	server.structFieldCache[key] = &structFieldCacheEntry{
+		fields: []string{"contract_id"},
+		loaded: true,
+	}
+	server.structFieldMu.Unlock()
+
+	items := completionAtWithContext(t, server, uriStr, 7, uint32(len("    %ContractDocument{status: ")), &protocol.CompletionContext{
+		TriggerKind:      protocol.CompletionTriggerKindTriggerCharacter,
+		TriggerCharacter: " ",
+	})
+	for _, label := range []string{"status", "actor", "local_status"} {
+		if !hasCompletionItem(items, label) {
+			t.Fatalf("expected local variable %q in struct value completions", label)
+		}
+	}
+	if len(items) == 0 || items[0].Kind != protocol.CompletionItemKindVariable {
+		t.Fatalf("expected variables to be prioritized first, got %#v", items)
+	}
+	if items[0].SortText == "" || !strings.HasPrefix(items[0].SortText, "000_") {
+		t.Fatalf("expected variable sort text to prioritize variables, got %#v", items[0])
+	}
+	if hasCompletionItem(items, "_ignored") {
+		t.Fatal("did not expect underscore-prefixed variables in completions")
+	}
+	if !hasCompletionItem(items, "helper") {
+		t.Fatal("expected regular bare function completion in struct value completions")
+	}
+	if !hasCompletionItem(items, "if") {
+		t.Fatal("expected regular special-form completion in struct value completions")
+	}
+	if hasCompletionItem(items, "contract_id") {
+		t.Fatal("did not expect struct field key completion in struct value position")
 	}
 }
 
@@ -1195,6 +1418,19 @@ func TestCompletion_NoResults(t *testing.T) {
 	items := completionAt(t, server, uri, 0, 2)
 	if len(items) != 0 {
 		t.Errorf("expected no completions on whitespace, got %d", len(items))
+	}
+
+	server.docs.Set(uri, `defmodule MyModule do
+  def run do
+    value = 
+  end
+end`)
+	items = completionAtWithContext(t, server, uri, 2, uint32(len("    value = ")), &protocol.CompletionContext{
+		TriggerKind:      protocol.CompletionTriggerKindTriggerCharacter,
+		TriggerCharacter: " ",
+	})
+	if len(items) != 0 {
+		t.Errorf("expected no completions for ordinary space trigger, got %d", len(items))
 	}
 }
 
@@ -4526,6 +4762,12 @@ func TestServer_Capabilities_DocumentSymbolAndWorkspaceSymbol(t *testing.T) {
 	}
 	if caps.SignatureHelpProvider == nil {
 		t.Error("SignatureHelpProvider should not be nil")
+	}
+	if caps.CompletionProvider == nil {
+		t.Fatal("CompletionProvider should not be nil")
+	}
+	if !hasString(caps.CompletionProvider.TriggerCharacters, " ") {
+		t.Error("CompletionProvider should advertise space trigger for struct value completions")
 	}
 }
 

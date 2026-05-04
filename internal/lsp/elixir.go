@@ -171,6 +171,422 @@ func (tf *TokenizedFile) CompletionContextAtCursor(line, col int) CompletionCont
 	return CompletionContextAtCursor(tf.tokens, tf.source, tf.lineStarts, line, col)
 }
 
+// StructCompletionContext describes completion inside `%Module{...}` field keys.
+type StructCompletionContext struct {
+	ModuleRef   string
+	FieldPrefix string
+	StartCol    int
+}
+
+type StructModuleRef struct {
+	ModuleRef string
+	Line      int
+}
+
+// StructModuleRefs returns module references used in struct literals, including
+// incomplete `%Module` expressions before the opening brace has been typed.
+func (tf *TokenizedFile) StructModuleRefs() []StructModuleRef {
+	return StructModuleRefs(tf.tokens, tf.source)
+}
+
+func StructModuleRefs(tokens []parser.Token, source []byte) []StructModuleRef {
+	var refs []StructModuleRef
+	for i := 0; i < len(tokens); i++ {
+		if tokens[i].Kind != parser.TokPercent {
+			continue
+		}
+		j := tokNextSig(tokens, len(tokens), i+1)
+		if j >= len(tokens) || tokens[j].Kind != parser.TokModule {
+			continue
+		}
+		moduleRef, k := tokCollectModuleName(source, tokens, len(tokens), j)
+		if moduleRef == "" {
+			continue
+		}
+		k = tokNextSig(tokens, len(tokens), k)
+		refs = append(refs, StructModuleRef{
+			ModuleRef: moduleRef,
+			Line:      tokens[i].Line - 1,
+		})
+		if k < len(tokens) && tokens[k].Kind == parser.TokOpenBrace {
+			i = k
+		} else {
+			i = k - 1
+		}
+	}
+	return refs
+}
+
+// StructCompletionContextAtCursor returns the struct module and current field
+// prefix when the cursor is inside a struct literal/update key position.
+func (tf *TokenizedFile) StructCompletionContextAtCursor(line, col int) (StructCompletionContext, bool) {
+	return StructCompletionContextAtCursor(tf.tokens, tf.source, tf.lineStarts, line, col)
+}
+
+// StructValueContextAtCursor reports whether the cursor is in a top-level value
+// position inside a struct literal, e.g. `%User{name: |}`.
+func (tf *TokenizedFile) StructValueContextAtCursor(line, col int) bool {
+	return StructValueContextAtCursor(tf.tokens, tf.source, tf.lineStarts, line, col)
+}
+
+func (tf *TokenizedFile) VariableNamesBeforeCursor(line, col int) []string {
+	return VariableNamesBeforeCursor(tf.tokens, tf.source, tf.lineStarts, line, col)
+}
+
+func VariableNamesBeforeCursor(tokens []parser.Token, source []byte, lineStarts []int, line, col int) []string {
+	offset := parser.LineColToOffset(lineStarts, line, col)
+	if offset < 0 {
+		return nil
+	}
+
+	defIdx := -1
+	for i := 0; i < len(tokens); i++ {
+		tok := tokens[i]
+		if tok.Kind == parser.TokEOF || tok.Start >= offset {
+			break
+		}
+		if isFunctionDefinitionToken(tok.Kind) {
+			defIdx = i
+		}
+	}
+	if defIdx < 0 {
+		return nil
+	}
+
+	seen := make(map[string]bool)
+	var names []string
+	for i := defIdx + 1; i < len(tokens); i++ {
+		tok := tokens[i]
+		if tok.Kind == parser.TokEOF || tok.Start >= offset {
+			break
+		}
+		if tok.Kind != parser.TokIdent {
+			continue
+		}
+		name := parser.TokenText(source, tok)
+		if strings.HasPrefix(name, "_") || parser.IsElixirKeyword(name) {
+			continue
+		}
+		prev := prevSignificantToken(tokens, i)
+		if prev >= 0 {
+			if tokens[prev].Kind == parser.TokDot || isFunctionDefinitionToken(tokens[prev].Kind) {
+				continue
+			}
+		}
+		next := tokNextSig(tokens, len(tokens), i+1)
+		if next < len(tokens) {
+			if tokens[next].Kind == parser.TokColon {
+				continue
+			}
+			if tokens[next].Kind == parser.TokOpenParen {
+				continue
+			}
+		}
+		if !seen[name] {
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+func isFunctionDefinitionToken(kind parser.TokenKind) bool {
+	switch kind {
+	case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
+		parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate:
+		return true
+	default:
+		return false
+	}
+}
+
+func StructValueContextAtCursor(tokens []parser.Token, source []byte, lineStarts []int, line, col int) bool {
+	if line < 0 || line >= len(lineStarts) || col < 0 {
+		return false
+	}
+	offset := parser.LineColToOffset(lineStarts, line, col)
+	if offset < 0 {
+		return false
+	}
+
+	openIdx := enclosingOpenBraceBeforeOffset(tokens, offset)
+	if openIdx < 0 {
+		return false
+	}
+	if _, ok := structModuleBeforeOpenBrace(tokens, source, openIdx); !ok {
+		return false
+	}
+
+	return structValuePositionAtOffset(tokens, openIdx, offset)
+}
+
+// StructCompletionContextAtCursor returns struct-key completion context at the
+// given 0-based line/column. It intentionally rejects value positions, so
+// `%User{name: |}` does not ask for field completions.
+func StructCompletionContextAtCursor(tokens []parser.Token, source []byte, lineStarts []int, line, col int) (StructCompletionContext, bool) {
+	if line < 0 || line >= len(lineStarts) || col < 0 {
+		return StructCompletionContext{}, false
+	}
+	offset := parser.LineColToOffset(lineStarts, line, col)
+	if offset < 0 {
+		return StructCompletionContext{}, false
+	}
+
+	openIdx := enclosingOpenBraceBeforeOffset(tokens, offset)
+	if openIdx < 0 {
+		return StructCompletionContext{}, false
+	}
+
+	moduleRef, ok := structModuleBeforeOpenBrace(tokens, source, openIdx)
+	if !ok {
+		return StructCompletionContext{}, false
+	}
+
+	fieldPrefix, startOffset, ok := structFieldPrefixAtOffset(tokens, source, openIdx, offset)
+	if !ok {
+		return StructCompletionContext{}, false
+	}
+
+	return StructCompletionContext{
+		ModuleRef:   moduleRef,
+		FieldPrefix: fieldPrefix,
+		StartCol:    startOffset - lineStarts[line],
+	}, true
+}
+
+func enclosingOpenBraceBeforeOffset(tokens []parser.Token, offset int) int {
+	depth := 0
+	for i := len(tokens) - 1; i >= 0; i-- {
+		tok := tokens[i]
+		if tok.Kind == parser.TokEOF || tok.Start >= offset {
+			continue
+		}
+		switch tok.Kind {
+		case parser.TokCloseBrace:
+			depth++
+		case parser.TokOpenBrace:
+			if depth == 0 {
+				return i
+			}
+			depth--
+		}
+	}
+	return -1
+}
+
+func prevSignificantToken(tokens []parser.Token, before int) int {
+	for i := before - 1; i >= 0; i-- {
+		switch tokens[i].Kind {
+		case parser.TokEOL, parser.TokComment:
+			continue
+		default:
+			return i
+		}
+	}
+	return -1
+}
+
+func structModuleBeforeOpenBrace(tokens []parser.Token, source []byte, openIdx int) (string, bool) {
+	endIdx := prevSignificantToken(tokens, openIdx)
+	if endIdx < 0 || tokens[endIdx].Kind != parser.TokModule {
+		return "", false
+	}
+
+	startIdx := endIdx
+	for startIdx >= 2 && tokens[startIdx-1].Kind == parser.TokDot && tokens[startIdx-2].Kind == parser.TokModule {
+		startIdx -= 2
+	}
+
+	percentIdx := prevSignificantToken(tokens, startIdx)
+	if percentIdx < 0 || tokens[percentIdx].Kind != parser.TokPercent {
+		return "", false
+	}
+
+	moduleRef, nextIdx := tokCollectModuleName(source, tokens, len(tokens), startIdx)
+	if moduleRef == "" || nextIdx != openIdx {
+		return "", false
+	}
+	return moduleRef, true
+}
+
+func structFieldPrefixAtOffset(tokens []parser.Token, source []byte, openIdx, offset int) (string, int, bool) {
+	segmentStartOffset := tokens[openIdx].End
+	parenDepth, bracketDepth, braceDepth := 0, 0, 0
+	inValue := false
+
+	for i := openIdx + 1; i < len(tokens); i++ {
+		tok := tokens[i]
+		if tok.Kind == parser.TokEOF || tok.Start >= offset {
+			break
+		}
+
+		if parenDepth == 0 && bracketDepth == 0 && braceDepth == 0 {
+			switch tok.Kind {
+			case parser.TokComma:
+				segmentStartOffset = tok.End
+				inValue = false
+				continue
+			case parser.TokColon, parser.TokAssoc:
+				inValue = true
+				continue
+			case parser.TokOther:
+				if parser.TokenText(source, tok) == "|" && !inValue {
+					segmentStartOffset = tok.End
+					continue
+				}
+			}
+		}
+
+		switch tok.Kind {
+		case parser.TokOpenParen:
+			parenDepth++
+		case parser.TokCloseParen:
+			if parenDepth > 0 {
+				parenDepth--
+			}
+		case parser.TokOpenBracket:
+			bracketDepth++
+		case parser.TokCloseBracket:
+			if bracketDepth > 0 {
+				bracketDepth--
+			}
+		case parser.TokOpenBrace:
+			braceDepth++
+		case parser.TokCloseBrace:
+			if braceDepth == 0 {
+				return "", 0, false
+			}
+			braceDepth--
+		}
+	}
+
+	if parenDepth != 0 || bracketDepth != 0 || braceDepth != 0 {
+		return "", 0, false
+	}
+	if inValue {
+		return "", 0, false
+	}
+	if segmentStartOffset == tokens[openIdx].End && hasTopLevelStructUpdatePipeAhead(tokens, source, openIdx, offset) {
+		return "", 0, false
+	}
+
+	if offset > 0 {
+		if idx := parser.TokenAtOffset(tokens, offset-1); idx >= 0 {
+			tok := tokens[idx]
+			if tok.Start >= segmentStartOffset && tok.Kind == parser.TokIdent {
+				end := offset
+				if end > tok.End {
+					end = tok.End
+				}
+				if end > tok.Start {
+					return string(source[tok.Start:end]), tok.Start, true
+				}
+			}
+			switch tok.Kind {
+			case parser.TokOpenBrace, parser.TokComma, parser.TokPipe, parser.TokEOL, parser.TokComment:
+				return "", offset, true
+			}
+		}
+	}
+
+	return "", offset, true
+}
+
+func structValuePositionAtOffset(tokens []parser.Token, openIdx, offset int) bool {
+	parenDepth, bracketDepth, braceDepth := 0, 0, 0
+	inValue := false
+
+	for i := openIdx + 1; i < len(tokens); i++ {
+		tok := tokens[i]
+		if tok.Kind == parser.TokEOF || tok.Start >= offset {
+			break
+		}
+
+		if parenDepth == 0 && bracketDepth == 0 && braceDepth == 0 {
+			switch tok.Kind {
+			case parser.TokComma:
+				inValue = false
+				continue
+			case parser.TokColon, parser.TokAssoc:
+				inValue = true
+				continue
+			case parser.TokCloseBrace:
+				return false
+			}
+		}
+
+		switch tok.Kind {
+		case parser.TokOpenParen:
+			parenDepth++
+		case parser.TokCloseParen:
+			if parenDepth > 0 {
+				parenDepth--
+			}
+		case parser.TokOpenBracket:
+			bracketDepth++
+		case parser.TokCloseBracket:
+			if bracketDepth > 0 {
+				bracketDepth--
+			}
+		case parser.TokOpenBrace:
+			braceDepth++
+		case parser.TokCloseBrace:
+			if braceDepth == 0 {
+				return false
+			}
+			braceDepth--
+		}
+	}
+
+	return inValue && parenDepth == 0 && bracketDepth == 0 && braceDepth == 0
+}
+
+func hasTopLevelStructUpdatePipeAhead(tokens []parser.Token, source []byte, openIdx, offset int) bool {
+	parenDepth, bracketDepth, braceDepth := 0, 0, 0
+	for i := openIdx + 1; i < len(tokens); i++ {
+		tok := tokens[i]
+		if tok.Kind == parser.TokEOF {
+			return false
+		}
+		if tok.Start < offset {
+			continue
+		}
+
+		if parenDepth == 0 && bracketDepth == 0 && braceDepth == 0 {
+			switch tok.Kind {
+			case parser.TokColon, parser.TokAssoc, parser.TokComma, parser.TokCloseBrace:
+				return false
+			case parser.TokOther:
+				if parser.TokenText(source, tok) == "|" {
+					return true
+				}
+			}
+		}
+
+		switch tok.Kind {
+		case parser.TokOpenParen:
+			parenDepth++
+		case parser.TokCloseParen:
+			if parenDepth > 0 {
+				parenDepth--
+			}
+		case parser.TokOpenBracket:
+			bracketDepth++
+		case parser.TokCloseBracket:
+			if bracketDepth > 0 {
+				bracketDepth--
+			}
+		case parser.TokOpenBrace:
+			braceDepth++
+		case parser.TokCloseBrace:
+			if braceDepth > 0 {
+				braceDepth--
+			}
+		}
+	}
+	return false
+}
+
 // CompletionContextAtCursor extracts the token-aware completion context at the
 // given 0-based line/column.
 func CompletionContextAtCursor(tokens []parser.Token, source []byte, lineStarts []int, line, col int) CompletionContext {
