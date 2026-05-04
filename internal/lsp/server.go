@@ -3247,6 +3247,25 @@ func (s *Server) FoldingRanges(ctx context.Context, params *protocol.FoldingRang
 	var stack []blockStart
 	depth := 0
 
+	// Track multi-line bracket pairs ({}, [], (), <<>>)
+	type bracketFrame struct {
+		line int
+		open parser.TokenKind
+	}
+	var brackets []bracketFrame
+	popBracket := func(open parser.TokenKind, line int) {
+		if n := len(brackets); n > 0 && brackets[n-1].open == open {
+			top := brackets[n-1]
+			brackets = brackets[:n-1]
+			if line > top.line {
+				ranges = append(ranges, protocol.FoldingRange{
+					StartLine: uint32(top.line - 1), // convert to 0-based
+					EndLine:   uint32(line - 1),
+				})
+			}
+		}
+	}
+
 	for i := 0; i < n; i++ {
 		tok := tokens[i]
 
@@ -3285,6 +3304,17 @@ func (s *Server) FoldingRanges(ctx context.Context, params *protocol.FoldingRang
 					})
 				}
 			}
+
+		case parser.TokOpenBrace, parser.TokOpenBracket, parser.TokOpenParen, parser.TokOpenAngle:
+			brackets = append(brackets, bracketFrame{line: tok.Line, open: tok.Kind})
+		case parser.TokCloseBrace:
+			popBracket(parser.TokOpenBrace, tok.Line)
+		case parser.TokCloseBracket:
+			popBracket(parser.TokOpenBracket, tok.Line)
+		case parser.TokCloseParen:
+			popBracket(parser.TokOpenParen, tok.Line)
+		case parser.TokCloseAngle:
+			popBracket(parser.TokOpenAngle, tok.Line)
 		}
 	}
 

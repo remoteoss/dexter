@@ -4895,6 +4895,162 @@ end`)
 	}
 }
 
+func runFoldingRanges(t *testing.T, source string) []protocol.FoldingRange {
+	t.Helper()
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+	uri := "file:///test.ex"
+	server.docs.Set(uri, source)
+	result, err := server.FoldingRanges(context.Background(), &protocol.FoldingRangeParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(uri)},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func hasRange(ranges []protocol.FoldingRange, start, end uint32) bool {
+	for _, r := range ranges {
+		if r.StartLine == start && r.EndLine == end {
+			return true
+		}
+	}
+	return false
+}
+
+func TestFoldingRanges_Map(t *testing.T) {
+	result := runFoldingRanges(t, `foo = %{
+  a: 1,
+  b: 2
+}`)
+	if !hasRange(result, 0, 3) {
+		t.Errorf("expected map fold (0-3), got %+v", result)
+	}
+}
+
+func TestFoldingRanges_NestedMaps(t *testing.T) {
+	result := runFoldingRanges(t, `%{
+  outer: %{
+    inner: 1
+  }
+}`)
+	if !hasRange(result, 0, 4) {
+		t.Errorf("expected outer map fold (0-4), got %+v", result)
+	}
+	if !hasRange(result, 1, 3) {
+		t.Errorf("expected inner map fold (1-3), got %+v", result)
+	}
+}
+
+func TestFoldingRanges_List(t *testing.T) {
+	result := runFoldingRanges(t, `[
+  1,
+  2
+]`)
+	if !hasRange(result, 0, 3) {
+		t.Errorf("expected list fold (0-3), got %+v", result)
+	}
+}
+
+func TestFoldingRanges_Tuple(t *testing.T) {
+	result := runFoldingRanges(t, `{:ok,
+ :result
+}`)
+	if !hasRange(result, 0, 2) {
+		t.Errorf("expected tuple fold (0-2), got %+v", result)
+	}
+}
+
+func TestFoldingRanges_FunctionCall(t *testing.T) {
+	result := runFoldingRanges(t, `foo(
+  arg1,
+  arg2
+)`)
+	if !hasRange(result, 0, 3) {
+		t.Errorf("expected function-call fold (0-3), got %+v", result)
+	}
+}
+
+func TestFoldingRanges_Binary(t *testing.T) {
+	result := runFoldingRanges(t, `<<
+  1, 2,
+  3
+>>`)
+	if !hasRange(result, 0, 3) {
+		t.Errorf("expected binary fold (0-3), got %+v", result)
+	}
+}
+
+func TestFoldingRanges_SingleLineMapDoesNotFold(t *testing.T) {
+	result := runFoldingRanges(t, `foo = %{a: 1, b: 2}`)
+	if len(result) != 0 {
+		t.Errorf("expected no folds for single-line map, got %+v", result)
+	}
+}
+
+func TestFoldingRanges_BracketsInsideStringsAreIgnored(t *testing.T) {
+	result := runFoldingRanges(t, `foo = "open { brace"
+bar = "close } brace"`)
+	if len(result) != 0 {
+		t.Errorf("expected no folds when brackets are inside strings, got %+v", result)
+	}
+}
+
+func TestFoldingRanges_BracketsInsideCommentsAreIgnored(t *testing.T) {
+	result := runFoldingRanges(t, `foo = 1 # open {
+bar = 2 # close }`)
+	if len(result) != 0 {
+		t.Errorf("expected no folds when brackets are inside comments, got %+v", result)
+	}
+}
+
+func TestFoldingRanges_BracketsSpanningHeredoc(t *testing.T) {
+	result := runFoldingRanges(t, `foo = %{
+  doc: """
+    a } looking like a closer
+    """,
+  other: 1
+}`)
+	if !hasRange(result, 0, 5) {
+		t.Errorf("expected map fold (0-5) across heredoc, got %+v", result)
+	}
+	if !hasRange(result, 1, 3) {
+		t.Errorf("expected heredoc fold (1-3), got %+v", result)
+	}
+}
+
+func TestFoldingRanges_StrayCloserDoesNotPopDoFrame(t *testing.T) {
+	result := runFoldingRanges(t, `def foo do
+  }
+  :ok
+end`)
+	if !hasRange(result, 0, 3) {
+		t.Errorf("expected def fold (0-3) preserved despite stray }, got %+v", result)
+	}
+}
+
+func TestFoldingRanges_DoBlockWithMapBody(t *testing.T) {
+	result := runFoldingRanges(t, `defmodule M do
+  def list do
+    %{
+      a: 1
+    }
+  end
+end`)
+	if !hasRange(result, 0, 6) {
+		t.Errorf("expected defmodule fold (0-6), got %+v", result)
+	}
+	if !hasRange(result, 1, 5) {
+		t.Errorf("expected def fold (1-5), got %+v", result)
+	}
+	if !hasRange(result, 2, 4) {
+		t.Errorf("expected map fold (2-4), got %+v", result)
+	}
+}
+
 // === CodeAction ===
 
 func TestCodeAction_AddAlias(t *testing.T) {
