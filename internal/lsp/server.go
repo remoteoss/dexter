@@ -1780,6 +1780,60 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 		}, nil
 	}
 
+	// "variable." or "variable.field_prefix" — struct field access on a typed variable.
+	if fieldAccess, ok := tf.VariableFieldAccessAtCursor(lineNum, col); ok {
+		varStructTypes := tf.VariableStructTypes(lineNum, col)
+		if structModule, ok := varStructTypes[fieldAccess.VariableName]; ok {
+			tStruct := s.debugNow()
+			aliases := tf.ExtractAliasesInScope(lineNum)
+			s.mergeAliasesFromUseTokenized(tf, aliases)
+			resolvedModule := tf.ResolveModuleExpr(structModule, lineNum)
+			fullModule := s.resolveModuleWithNesting(resolvedModule, aliases, filePath, lineNum)
+			if s.debug {
+				s.debugf("Completion variable struct type")
+				s.debugf("  variable=%s", fieldAccess.VariableName)
+				s.debugf("  structModule=%s", structModule)
+				s.debugf("  resolved=%s", fullModule)
+				s.debugf("  fieldPrefix=%q", fieldAccess.FieldPrefix)
+			}
+			fields, ready := s.cachedStructFieldsOrWarm(filePath, fullModule)
+			if ready && len(fields) > 0 {
+				fieldPrefixRange := protocol.Range{
+					Start: protocol.Position{Line: uint32(lineNum), Character: uint32(fieldAccess.StartCol)},
+					End:   protocol.Position{Line: uint32(lineNum), Character: uint32(col)},
+				}
+				var items []protocol.CompletionItem
+				for _, field := range fields {
+					if !strings.HasPrefix(field, fieldAccess.FieldPrefix) {
+						continue
+					}
+					items = append(items, protocol.CompletionItem{
+						Label:  field,
+						Kind:   protocol.CompletionItemKindField,
+						Detail: fullModule + " struct field",
+						TextEdit: &protocol.TextEdit{
+							Range:   fieldPrefixRange,
+							NewText: field,
+						},
+					})
+				}
+				if len(items) > 0 {
+					if s.debug {
+						s.debugf("Completion variable struct fields returned")
+						s.debugf("  variable=%s", fieldAccess.VariableName)
+						s.debugf("  module=%s", fullModule)
+						s.debugf("  items=%d", len(items))
+						s.debugf("  elapsed=%s", time.Since(tStruct).Round(time.Microsecond))
+					}
+					return &protocol.CompletionList{
+						IsIncomplete: false,
+						Items:        items,
+					}, nil
+				}
+			}
+		}
+	}
+
 	completionCtx := tf.CompletionContextAtCursor(lineNum, col)
 	prefix, afterDot, prefixStartCol := completionCtx.Prefix, completionCtx.AfterDot, completionCtx.StartCol
 	structValueContext := tf.StructValueContextAtCursor(lineNum, col)
@@ -1900,6 +1954,7 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 
 	// "Module.func." or "variable." — dot after a function call result or
 	// map/struct field access. We have no type info to complete the result.
+	// (Variable struct types were already handled by VariableFieldAccessAtCursor above.)
 	if afterDot && (funcPrefix != "" || moduleRef == "") {
 		return nil, nil
 	}
