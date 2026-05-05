@@ -334,51 +334,11 @@ language-servers = ["dexter"]
 }
 ```
 
-**1. Create the plugin manifest:**
+**Install:**
 
 ```sh
-mkdir -p ~/.claude/plugins/local/.claude-plugin
-mkdir -p ~/.claude/plugins/local/plugins/dexter-lsp
-```
-
-Create `~/.claude/plugins/local/.claude-plugin/marketplace.json`. If the file already exists, add the `dexter-lsp` entry to the `plugins` array.
-
-```json
-{
-  "$schema": "https://claude.ai/schemas/marketplace.json",
-  "name": "local",
-  "description": "Local plugins",
-  "owner": { "name": "local" },
-  "plugins": [
-    {
-      "name": "dexter-lsp",
-      "description": "Dexter language server for Elixir (.ex, .exs, .heex)",
-      "version": "1.0.0",
-      "author": { "name": "local" },
-      "source": "./plugins/dexter-lsp",
-      "category": "development",
-      "strict": false,
-      "lspServers": {
-        "dexter": {
-          "command": "dexter",
-          "args": ["lsp"],
-          "extensionToLanguage": {
-            ".ex": "elixir",
-            ".exs": "elixir",
-            ".heex": "phoenix-heex"
-          }
-        }
-      }
-    }
-  ]
-}
-```
-
-**2. Register the marketplace and install:**
-
-```sh
-claude plugin marketplace add ~/.claude/plugins/local
-claude plugin install dexter-lsp@local
+claude plugin marketplace add remoteoss/dexter
+claude plugin install dexter-lsp@dexter
 ```
 
 That's it. Open an Elixir project in Claude Code and Dexter will handle go-to-definition, hover documentation, find references, and more.

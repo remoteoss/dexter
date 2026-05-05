@@ -1,0 +1,14 @@
+{
+  "name": "dexter",
+  "owner": {
+    "name": "remoteoss",
+    "url": "https://github.com/remoteoss"
+  },
+  "plugins": [
+    {
+      "name": "dexter-lsp",
+      "source": "./plugins/dexter-lsp",
+      "description": "Dexter language server for Elixir (.ex, .exs, .heex)"
+    }
+  ]
+}
