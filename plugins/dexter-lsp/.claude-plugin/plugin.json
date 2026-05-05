@@ -20,7 +20,6 @@
         ".exs": "elixir",
         ".heex": "phoenix-heex"
       },
-      "restartOnCrash": true,
       "initializationOptions": {
         "followDelegates": "${user_config.follow_delegates}",
         "debug": "${user_config.debug}"
