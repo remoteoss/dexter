@@ -15,6 +15,7 @@ A fast, full-featured Elixir LSP optimized for large Elixir codebases.
     - [Configuring format on save](#configuring-format-on-save)
   - [Neovim (with nvim-lspconfig — \< 0.11)](#neovim-with-nvim-lspconfig---011)
   - [Zed](#zed)
+  - [Claude Code](#claude-code)
   - [Emacs](#emacs)
     - [Eglot](#eglot)
       - [Emacs version \>= 30](#emacs-version--30)
@@ -318,6 +319,69 @@ args = ["lsp"]
 name = "elixir"
 language-servers = ["dexter"]
 ```
+
+### Claude Code
+
+[Claude Code](https://claude.ai/code) supports Dexter as an Elixir LSP via its plugin system, enabling go-to-definition, hover docs, find references, and more when working on `.ex`, `.exs`, and `.heex` files.
+
+**Prerequisites:** The LSP tool must be enabled. Add this to your `~/.claude/settings.json`:
+
+```json
+{
+  "env": {
+    "ENABLE_LSP_TOOL": "1"
+  }
+}
+```
+
+**1. Create the plugin manifest:**
+
+```sh
+mkdir -p ~/.claude/plugins/local/.claude-plugin
+mkdir -p ~/.claude/plugins/local/plugins/dexter-lsp
+```
+
+Create `~/.claude/plugins/local/.claude-plugin/marketplace.json`. If the file already exists, add the `dexter-lsp` entry to the `plugins` array.
+
+```json
+{
+  "$schema": "https://claude.ai/schemas/marketplace.json",
+  "name": "local",
+  "description": "Local plugins",
+  "owner": { "name": "local" },
+  "plugins": [
+    {
+      "name": "dexter-lsp",
+      "description": "Dexter language server for Elixir (.ex, .exs, .heex)",
+      "version": "1.0.0",
+      "author": { "name": "local" },
+      "source": "./plugins/dexter-lsp",
+      "category": "development",
+      "strict": false,
+      "lspServers": {
+        "dexter": {
+          "command": "dexter",
+          "args": ["lsp"],
+          "extensionToLanguage": {
+            ".ex": "elixir",
+            ".exs": "elixir",
+            ".heex": "phoenix-heex"
+          }
+        }
+      }
+    }
+  ]
+}
+```
+
+**2. Register the marketplace and install:**
+
+```sh
+claude plugin marketplace add ~/.claude/plugins/local
+claude plugin install dexter-lsp@local
+```
+
+That's it. Open an Elixir project in Claude Code and Dexter will handle go-to-definition, hover documentation, find references, and more.
 
 ## Why build another LSP?
 
