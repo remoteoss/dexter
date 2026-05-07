@@ -231,25 +231,52 @@ end`)
 	})
 }
 
-func TestServer_InitializationOptions_FollowDelegates(t *testing.T) {
-	server, cleanup := setupTestServer(t)
-	defer cleanup()
+func TestServer_InitializationOptions(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) {
+		server, cleanup := setupTestServer(t)
+		defer cleanup()
+		if !server.followDelegates {
+			t.Error("followDelegates should default to true")
+		}
+		if server.debug {
+			t.Error("debug should default to false")
+		}
+	})
 
-	// Default should be true
-	if !server.followDelegates {
-		t.Error("followDelegates should default to true")
+	// Claude Code plugin template substitution yields strings, not booleans.
+	// Verify coerceBool handles both native bools and string-encoded bools.
+	cases := []struct {
+		name             string
+		opts             map[string]interface{}
+		wantFollowDel    bool
+		wantDebug        bool
+	}{
+		{"bool true/false", map[string]interface{}{"followDelegates": false, "debug": true}, false, true},
+		{"string true/false", map[string]interface{}{"followDelegates": "false", "debug": "true"}, false, true},
+		{"string 1/0", map[string]interface{}{"followDelegates": "0", "debug": "1"}, false, true},
+		{"empty string leaves default", map[string]interface{}{"followDelegates": "", "debug": ""}, true, false},
+		{"unsupported type leaves default", map[string]interface{}{"followDelegates": 1, "debug": 0}, true, false},
 	}
 
-	// Simulate initializationOptions with followDelegates=false
-	opts := map[string]interface{}{
-		"followDelegates": false,
-	}
-	if v, ok := opts["followDelegates"].(bool); ok {
-		server.followDelegates = v
-	}
-
-	if server.followDelegates {
-		t.Error("followDelegates should be false after setting via initializationOptions")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server, cleanup := setupTestServer(t)
+			defer cleanup()
+			dir := t.TempDir()
+			_, err := server.Initialize(context.Background(), &protocol.InitializeParams{
+				RootURI:               protocol.DocumentURI("file://" + dir),
+				InitializationOptions: tc.opts,
+			})
+			if err != nil {
+				t.Fatalf("Initialize returned error: %v", err)
+			}
+			if server.followDelegates != tc.wantFollowDel {
+				t.Errorf("followDelegates: got %v, want %v", server.followDelegates, tc.wantFollowDel)
+			}
+			if server.debug != tc.wantDebug {
+				t.Errorf("debug: got %v, want %v", server.debug, tc.wantDebug)
+			}
+		})
 	}
 }
 

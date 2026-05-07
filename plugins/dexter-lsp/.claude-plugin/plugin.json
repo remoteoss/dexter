@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "dexter-lsp",
+  "description": "Dexter language server for Elixir (.ex, .exs, .heex)",
+  "version": "0.1.0",
+  "author": {
+    "name": "remoteoss",
+    "url": "https://github.com/remoteoss"
+  },
+  "homepage": "https://github.com/remoteoss/dexter",
+  "repository": "https://github.com/remoteoss/dexter",
+  "license": "MIT",
+  "keywords": ["elixir", "lsp", "dexter", "phoenix", "heex"],
+  "lspServers": {
+    "dexter": {
+      "command": "dexter",
+      "args": ["lsp"],
+      "extensionToLanguage": {
+        ".ex": "elixir",
+        ".exs": "elixir",
+        ".heex": "phoenix-heex"
+      },
+      "initializationOptions": {
+        "followDelegates": "${user_config.follow_delegates}",
+        "debug": "${user_config.debug}"
+      }
+    }
+  },
+  "userConfig": {
+    "follow_delegates": {
+      "type": "boolean",
+      "title": "Follow delegates",
+      "description": "Jump through defdelegate to the target function definition",
+      "default": true
+    },
+    "debug": {
+      "type": "boolean",
+      "title": "Debug logging",
+      "description": "Enable verbose LSP logging to stderr",
+      "default": false
+    }
+  }
+}

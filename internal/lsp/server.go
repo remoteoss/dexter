@@ -294,6 +294,26 @@ func (s *Server) notifyOTPMismatch(stderr string) {
 
 // === LSP Lifecycle ===
 
+// coerceBool accepts a JSON bool or a JSON string ("true"/"false"/"1"/"0"…).
+// Claude Code plugin template substitution (e.g. "${user_config.debug}") produces
+// a string, not a bool, so we accept both forms.
+func coerceBool(v interface{}) (bool, bool) {
+	switch x := v.(type) {
+	case bool:
+		return x, true
+	case string:
+		if x == "" {
+			return false, false
+		}
+		b, err := strconv.ParseBool(x)
+		if err != nil {
+			return false, false
+		}
+		return b, true
+	}
+	return false, false
+}
+
 func (s *Server) Initialize(ctx context.Context, params *protocol.InitializeParams) (*protocol.InitializeResult, error) {
 	// Note: unlike cmd/main.go, the LSP deliberately does NOT pass "mix.exs"
 	// to store.FindProjectRoot. In a monorepo we want to anchor on
@@ -315,13 +335,13 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 
 	var explicitStdlibPath string
 	if opts, ok := params.InitializationOptions.(map[string]interface{}); ok {
-		if v, ok := opts["followDelegates"].(bool); ok {
+		if v, ok := coerceBool(opts["followDelegates"]); ok {
 			s.followDelegates = v
 		}
 		if v, ok := opts["stdlibPath"].(string); ok {
 			explicitStdlibPath = v
 		}
-		if v, ok := opts["debug"].(bool); ok {
+		if v, ok := coerceBool(opts["debug"]); ok {
 			s.debug = v
 		}
 	}

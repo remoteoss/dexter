@@ -15,6 +15,7 @@ A fast, full-featured Elixir LSP optimized for large Elixir codebases.
     - [Configuring format on save](#configuring-format-on-save)
   - [Neovim (with nvim-lspconfig — \< 0.11)](#neovim-with-nvim-lspconfig---011)
   - [Zed](#zed)
+  - [Claude Code](#claude-code)
   - [Emacs](#emacs)
     - [Eglot](#eglot)
       - [Emacs version \>= 30](#emacs-version--30)
@@ -318,6 +319,29 @@ args = ["lsp"]
 name = "elixir"
 language-servers = ["dexter"]
 ```
+
+### Claude Code
+
+[Claude Code](https://claude.ai/code) supports Dexter as an Elixir LSP via its plugin system, enabling go-to-definition, hover docs, find references, and more when working on `.ex`, `.exs`, and `.heex` files.
+
+**Prerequisites:** The LSP tool must be enabled. Add this to your `~/.claude/settings.json`:
+
+```json
+{
+  "env": {
+    "ENABLE_LSP_TOOL": "1"
+  }
+}
+```
+
+**Install:**
+
+```sh
+claude plugin marketplace add remoteoss/dexter
+claude plugin install dexter-lsp@dexter
+```
+
+That's it. Open an Elixir project in Claude Code and Dexter will handle go-to-definition, hover documentation, find references, and more.
 
 ## Why build another LSP?
 
