@@ -984,6 +984,112 @@ end`,
 			col:  len("  user"),
 			want: map[string]string{"user": "User"},
 		},
+		// Typespec-based parameter inference
+		{
+			name: "typespec t() infers __MODULE__",
+			code: `@spec changeset(t(), map()) :: Ecto.Changeset.t()
+def changeset(leave_type, attrs) do
+  leave_type
+end`,
+			line: 2,
+			col:  len("  leave_type"),
+			want: map[string]string{"leave_type": "__MODULE__"},
+		},
+		{
+			name: "typespec Module.t() infers remote module",
+			code: `@spec process(User.t(), map()) :: :ok
+def process(user, attrs) do
+  user
+end`,
+			line: 2,
+			col:  len("  user"),
+			want: map[string]string{"user": "User"},
+		},
+		{
+			name: "typespec qualified Module.t()",
+			code: `@spec process(MyApp.Accounts.User.t(), map()) :: :ok
+def process(user, attrs) do
+  user
+end`,
+			line: 2,
+			col:  len("  user"),
+			want: map[string]string{"user": "MyApp.Accounts.User"},
+		},
+		{
+			name: "typespec second param t()",
+			code: `@spec update(map(), t()) :: t()
+def update(attrs, schema) do
+  schema
+end`,
+			line: 2,
+			col:  len("  schema"),
+			want: map[string]string{"schema": "__MODULE__"},
+		},
+		{
+			name: "typespec does not override pattern match",
+			code: `@spec changeset(t(), map()) :: Ecto.Changeset.t()
+def changeset(%LeaveType{} = leave_type, attrs) do
+  leave_type
+end`,
+			line: 2,
+			col:  len("  leave_type"),
+			want: map[string]string{"leave_type": "LeaveType"},
+		},
+		{
+			name: "typespec with defp",
+			code: `@spec do_work(t()) :: :ok
+defp do_work(item) do
+  item
+end`,
+			line: 2,
+			col:  len("  item"),
+			want: map[string]string{"item": "__MODULE__"},
+		},
+		{
+			name: "typespec non-struct types ignored",
+			code: `@spec run(String.t(), integer(), atom()) :: :ok
+def run(name, count, label) do
+  name
+end`,
+			line: 2,
+			col:  len("  name"),
+			want: map[string]string{},
+		},
+		{
+			name: "typespec with no params",
+			code: `@spec run() :: :ok
+def run do
+  :ok
+end`,
+			line: 2,
+			col:  len("  :ok"),
+			want: map[string]string{},
+		},
+		{
+			name: "typespec multiple struct params",
+			code: `@spec merge(t(), User.t()) :: t()
+def merge(schema, user) do
+  schema
+end`,
+			line: 2,
+			col:  len("  schema"),
+			want: map[string]string{"schema": "__MODULE__", "user": "User"},
+		},
+		{
+			name: "typespec only matches preceding spec",
+			code: `@spec unrelated(t()) :: :ok
+def unrelated(x) do
+  x
+end
+
+@spec actual(map()) :: :ok
+def actual(data) do
+  data
+end`,
+			line: 7,
+			col:  len("  data"),
+			want: map[string]string{},
+		},
 	}
 
 	for _, tt := range tests {
@@ -998,6 +1104,210 @@ end`,
 					t.Errorf("missing variable %q (want module %q)", varName, wantModule)
 				} else if gotModule != wantModule {
 					t.Errorf("variable %q: got module %q, want %q", varName, gotModule, wantModule)
+				}
+			}
+		})
+	}
+}
+
+func TestVariableFunctionCalls(t *testing.T) {
+	tests := []struct {
+		name string
+		code string
+		line int
+		col  int
+		want []VariableFunctionCall
+	}{
+		{
+			name: "simple module function call",
+			code: `def run do
+  user = Accounts.get_user(id)
+  user
+end`,
+			line: 2,
+			col:  len("  user"),
+			want: []VariableFunctionCall{
+				{VarName: "user", Module: "Accounts", Function: "get_user", Arity: 1},
+			},
+		},
+		{
+			name: "qualified module call",
+			code: `def run do
+  user = MyApp.Accounts.get_user(id)
+  user
+end`,
+			line: 2,
+			col:  len("  user"),
+			want: []VariableFunctionCall{
+				{VarName: "user", Module: "MyApp.Accounts", Function: "get_user", Arity: 1},
+			},
+		},
+		{
+			name: "zero arity",
+			code: `def run do
+  users = Repo.all()
+  users
+end`,
+			line: 2,
+			col:  len("  users"),
+			want: []VariableFunctionCall{
+				{VarName: "users", Module: "Repo", Function: "all", Arity: 0},
+			},
+		},
+		{
+			name: "multiple arguments",
+			code: `def run do
+  user = Repo.get(User, id)
+  user
+end`,
+			line: 2,
+			col:  len("  user"),
+			want: []VariableFunctionCall{
+				{VarName: "user", Module: "Repo", Function: "get", Arity: 2},
+			},
+		},
+		{
+			name: "multiple calls",
+			code: `def run do
+  user = Accounts.get_user(id)
+  org = Organizations.get_org(slug)
+  org
+end`,
+			line: 3,
+			col:  len("  org"),
+			want: []VariableFunctionCall{
+				{VarName: "user", Module: "Accounts", Function: "get_user", Arity: 1},
+				{VarName: "org", Module: "Organizations", Function: "get_org", Arity: 1},
+			},
+		},
+		{
+			name: "reassignment keeps last call",
+			code: `def run do
+  user = Accounts.get_user(id)
+  user = Accounts.get_admin(id)
+  user
+end`,
+			line: 3,
+			col:  len("  user"),
+			want: []VariableFunctionCall{
+				{VarName: "user", Module: "Accounts", Function: "get_admin", Arity: 1},
+			},
+		},
+		{
+			name: "bare function call ignored",
+			code: `def run do
+  user = get_user(id)
+  user
+end`,
+			line: 2,
+			col:  len("  user"),
+			want: nil,
+		},
+		{
+			name: "after cursor excluded",
+			code: `def run do
+  cursor
+  user = Accounts.get_user(id)
+end`,
+			line: 1,
+			col:  len("  cursor"),
+			want: nil,
+		},
+		{
+			name: "scoped to current function",
+			code: `def first do
+  user = Accounts.get_user(id)
+end
+
+def second do
+  user
+end`,
+			line: 5,
+			col:  len("  user"),
+			want: nil,
+		},
+		{
+			name: "nested call in args counted correctly",
+			code: `def run do
+  user = Repo.get(User, String.to_integer(id))
+  user
+end`,
+			line: 2,
+			col:  len("  user"),
+			want: []VariableFunctionCall{
+				{VarName: "user", Module: "Repo", Function: "get", Arity: 2},
+			},
+		},
+		{
+			name: "pipeline not detected",
+			code: `def run do
+  result = id |> Accounts.get_user()
+  result
+end`,
+			line: 2,
+			col:  len("  result"),
+			want: nil,
+		},
+		{
+			name: "no-paren call single arg",
+			code: `def run do
+  user = Repo.get! User
+  user
+end`,
+			line: 2,
+			col:  len("  user"),
+			want: []VariableFunctionCall{
+				{VarName: "user", Module: "Repo", Function: "get!", Arity: 1},
+			},
+		},
+		{
+			name: "no-paren call multiple args",
+			code: `def run do
+  user = Repo.get User, id
+  user
+end`,
+			line: 2,
+			col:  len("  user"),
+			want: []VariableFunctionCall{
+				{VarName: "user", Module: "Repo", Function: "get", Arity: 2},
+			},
+		},
+		{
+			name: "no-paren call with do block",
+			code: `def run do
+  changeset = Ecto.Changeset.change user do
+    :ok
+  end
+  changeset
+end`,
+			line: 4,
+			col:  len("  changeset"),
+			want: []VariableFunctionCall{
+				{VarName: "changeset", Module: "Ecto.Changeset", Function: "change", Arity: 1},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tokens, source, lineStarts := tokenize(tt.code)
+			got := VariableFunctionCalls(tokens, source, lineStarts, tt.line, tt.col)
+			if len(got) != len(tt.want) {
+				t.Fatalf("got %d calls %v, want %d", len(got), got, len(tt.want))
+			}
+			for i, want := range tt.want {
+				g := got[i]
+				if g.VarName != want.VarName {
+					t.Errorf("[%d] VarName = %q, want %q", i, g.VarName, want.VarName)
+				}
+				if g.Module != want.Module {
+					t.Errorf("[%d] Module = %q, want %q", i, g.Module, want.Module)
+				}
+				if g.Function != want.Function {
+					t.Errorf("[%d] Function = %q, want %q", i, g.Function, want.Function)
+				}
+				if g.Arity != want.Arity {
+					t.Errorf("[%d] Arity = %d, want %d", i, g.Arity, want.Arity)
 				}
 			}
 		})

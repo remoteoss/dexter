@@ -45,12 +45,13 @@ const (
 
 	formatterOpFormat byte = 0x00
 
-	codeIntelOpErlangSource   byte = 0x00
-	codeIntelOpErlangDocs     byte = 0x01
-	codeIntelOpWarmOTPModules byte = 0x02
-	codeIntelOpErlangExports  byte = 0x03
-	codeIntelOpRuntimeInfo    byte = 0x04
-	codeIntelOpStructFields   byte = 0x05
+	codeIntelOpErlangSource     byte = 0x00
+	codeIntelOpErlangDocs       byte = 0x01
+	codeIntelOpWarmOTPModules   byte = 0x02
+	codeIntelOpErlangExports    byte = 0x03
+	codeIntelOpRuntimeInfo      byte = 0x04
+	codeIntelOpStructFields     byte = 0x05
+	codeIntelOpReturnTypeStruct byte = 0x06
 
 	beamNotificationOTPModulesReady  byte = 0x00
 	beamNotificationOTPModulesFailed byte = 0x01
@@ -694,6 +695,44 @@ func (bp *beamProcess) StructFields(ctx context.Context, module string) ([]strin
 		return nil
 	})
 	return fields, err
+}
+
+// ReturnTypeStruct queries the ExCk chunk of a compiled module to determine if
+// a function's return type is a struct. Returns the struct module name (e.g.
+// "MyApp.User") or empty string if the return type is not a single struct type.
+// Gracefully returns empty string if the ExCk chunk is not available.
+func (bp *beamProcess) ReturnTypeStruct(ctx context.Context, module, function string, arity int) (string, error) {
+	var payload bytes.Buffer
+	_ = binary.Write(&payload, binary.BigEndian, uint16(len(module)))
+	payload.WriteString(module)
+	_ = binary.Write(&payload, binary.BigEndian, uint16(len(function)))
+	payload.WriteString(function)
+	payload.WriteByte(byte(arity))
+
+	var structModule string
+	err := bp.doRequest(ctx, serviceCodeIntel, codeIntelOpReturnTypeStruct, payload.Bytes(), func(status byte, respPayload []byte) error {
+		if status != 0 {
+			// Non-zero status means lookup failed (e.g. old Elixir without ExCk).
+			// Treat as graceful "not a struct".
+			return nil
+		}
+
+		reader := bytes.NewReader(respPayload)
+		var nameLen uint16
+		if err := binary.Read(reader, binary.BigEndian, &nameLen); err != nil {
+			return fmt.Errorf("read struct module name length: %w", err)
+		}
+		if nameLen == 0 {
+			return nil
+		}
+		nameBuf := make([]byte, nameLen)
+		if _, err := io.ReadFull(reader, nameBuf); err != nil {
+			return fmt.Errorf("read struct module name: %w", err)
+		}
+		structModule = string(nameBuf)
+		return nil
+	})
+	return structModule, err
 }
 
 // FormatError represents a formatting failure (e.g. syntax error in the source).

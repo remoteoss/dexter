@@ -1209,6 +1209,61 @@ func (s *Server) structFieldBuildRoot(filePath string) string {
 	return s.findBuildRoot(s.projectRoot)
 }
 
+// resolveVariableTypeFromExCk checks if a variable was assigned from a module
+// function call and queries the ExCk chunk to determine if the function's return
+// type is a struct. Returns the fully-qualified struct module name or "".
+func (s *Server) resolveVariableTypeFromExCk(ctx context.Context, tf *TokenizedFile, filePath, varName string, lineNum, col int) string {
+	calls := tf.VariableFunctionCalls(lineNum, col)
+	if len(calls) == 0 {
+		return ""
+	}
+
+	// Find the call for this variable.
+	var call *VariableFunctionCall
+	for i := range calls {
+		if calls[i].VarName == varName {
+			call = &calls[i]
+			break
+		}
+	}
+	if call == nil {
+		return ""
+	}
+
+	// Resolve the module reference through aliases.
+	aliases := tf.ExtractAliasesInScope(call.Line)
+	s.mergeAliasesFromUseTokenized(tf, aliases)
+	resolvedModule := tf.ResolveModuleExpr(call.Module, call.Line)
+	fullCallModule := s.resolveModuleWithNesting(resolvedModule, aliases, filePath, call.Line)
+	if fullCallModule == "" {
+		return ""
+	}
+
+	buildRoot := s.structFieldBuildRoot(filePath)
+	if buildRoot == "" {
+		return ""
+	}
+
+	bp := s.getBeamProcess(ctx, buildRoot)
+	if bp == nil {
+		return ""
+	}
+	if err := bp.Ready(ctx); err != nil {
+		return ""
+	}
+
+	structModule, err := bp.ReturnTypeStruct(ctx, fullCallModule, call.Function, call.Arity)
+	if err != nil || structModule == "" {
+		return ""
+	}
+
+	if s.debug {
+		s.debugf("ExCk return type struct: %s.%s/%d -> %s", fullCallModule, call.Function, call.Arity, structModule)
+	}
+
+	return structModule
+}
+
 func (s *Server) cachedStructFieldsOrWarm(filePath, module string) ([]string, bool) {
 	return s.cachedStructFieldsOrWarmWithLogging(filePath, module, true)
 }
@@ -1410,14 +1465,6 @@ func (s *Server) invalidateStructFieldCacheForFile(filePath string, newDefs []pa
 	}
 }
 
-func (s *Server) moduleKnown(module string) bool {
-	if module == "" {
-		return false
-	}
-	results, err := s.store.LookupModule(module)
-	return err == nil && len(results) > 0
-}
-
 func (s *Server) maybePrewarmStructFields(docURI, filePath, text string) {
 	if filePath == "" || !parser.IsElixirFile(filePath) || !s.isProjectFile(filePath) || s.isDepsFile(filePath) {
 		return
@@ -1436,14 +1483,12 @@ func (s *Server) maybePrewarmStructFields(docURI, filePath, text string) {
 func (s *Server) prewarmStructFieldsFromText(_ string, filePath, text string) {
 	tPrewarm := s.debugNow()
 	tf := NewTokenizedFile(text)
-	refs := tf.StructModuleRefs()
-	if len(refs) == 0 {
-		return
-	}
 
-	seen := make(map[string]bool, len(refs))
+	seen := make(map[string]bool)
 	warmed := 0
-	skippedUnknown := 0
+
+	// Pre-warm from struct literal references (%Module{}).
+	refs := tf.StructModuleRefs()
 	for _, ref := range refs {
 		aliases := tf.ExtractAliasesInScope(ref.Line)
 		s.mergeAliasesFromUseTokenized(tf, aliases)
@@ -1453,16 +1498,52 @@ func (s *Server) prewarmStructFieldsFromText(_ string, filePath, text string) {
 			continue
 		}
 		seen[fullModule] = true
-		if !s.moduleKnown(fullModule) {
-			skippedUnknown++
-			continue
-		}
 		s.prewarmStructFields(filePath, fullModule)
 		warmed++
 	}
 
+	// Pre-warm from function call return types via ExCk.
+	// Scan the entire file for var = Module.func(...) patterns.
+	lines := strings.Count(text, "\n")
+	endCol := len(text)
+	calls := tf.VariableFunctionCalls(lines, endCol)
+	for _, call := range calls {
+		aliases := tf.ExtractAliasesInScope(call.Line)
+		s.mergeAliasesFromUseTokenized(tf, aliases)
+		resolvedModule := tf.ResolveModuleExpr(call.Module, call.Line)
+		fullCallModule := s.resolveModuleWithNesting(resolvedModule, aliases, filePath, call.Line)
+		if fullCallModule == "" {
+			continue
+		}
+
+		buildRoot := s.structFieldBuildRoot(filePath)
+		if buildRoot == "" {
+			continue
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		bp := s.getBeamProcess(ctx, buildRoot)
+		if bp == nil {
+			cancel()
+			continue
+		}
+		if err := bp.Ready(ctx); err != nil {
+			cancel()
+			continue
+		}
+
+		structModule, err := bp.ReturnTypeStruct(ctx, fullCallModule, call.Function, call.Arity)
+		cancel()
+		if err != nil || structModule == "" || seen[structModule] {
+			continue
+		}
+		seen[structModule] = true
+		s.prewarmStructFields(filePath, structModule)
+		warmed++
+	}
+
 	if s.debug && warmed > 0 {
-		s.debugf("StructFields prewarm refs=%d queued=%d skipped_unknown=%d (%s)", len(refs), warmed, skippedUnknown, time.Since(tPrewarm).Round(time.Microsecond))
+		s.debugf("StructFields prewarm queued=%d (%s)", warmed, time.Since(tPrewarm).Round(time.Microsecond))
 	}
 }
 
@@ -1782,17 +1863,27 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 
 	// "variable." or "variable.field_prefix" — struct field access on a typed variable.
 	if fieldAccess, ok := tf.VariableFieldAccessAtCursor(lineNum, col); ok {
+		fullModule := ""
+
+		// Tier 1: check pattern-match inference (pure tokens, no BEAM needed).
 		varStructTypes := tf.VariableStructTypes(lineNum, col)
 		if structModule, ok := varStructTypes[fieldAccess.VariableName]; ok {
-			tStruct := s.debugNow()
 			aliases := tf.ExtractAliasesInScope(lineNum)
 			s.mergeAliasesFromUseTokenized(tf, aliases)
 			resolvedModule := tf.ResolveModuleExpr(structModule, lineNum)
-			fullModule := s.resolveModuleWithNesting(resolvedModule, aliases, filePath, lineNum)
+			fullModule = s.resolveModuleWithNesting(resolvedModule, aliases, filePath, lineNum)
+		}
+
+		// Tier 2: check ExCk return type inference for function call assignments.
+		if fullModule == "" {
+			fullModule = s.resolveVariableTypeFromExCk(ctx, tf, filePath, fieldAccess.VariableName, lineNum, col)
+		}
+
+		if fullModule != "" {
+			tStruct := s.debugNow()
 			if s.debug {
 				s.debugf("Completion variable struct type")
 				s.debugf("  variable=%s", fieldAccess.VariableName)
-				s.debugf("  structModule=%s", structModule)
 				s.debugf("  resolved=%s", fullModule)
 				s.debugf("  fieldPrefix=%q", fieldAccess.FieldPrefix)
 			}

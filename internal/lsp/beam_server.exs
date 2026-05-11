@@ -47,6 +47,12 @@
 # CodeIntel op 5 (struct_fields) payload:
 #   2-byte Elixir module length (big-endian) + module
 #
+# CodeIntel op 6 (return_type_struct) payload:
+#   2-byte module length (big-endian) + module +
+#   2-byte function length (big-endian) + function +
+#   1-byte arity
+# Response: 2-byte struct module name length + name (empty string = not a struct)
+#
 # Notification 0 (otp_modules_ready) payload:
 #   2-byte module_count (big-endian) + [name_len(u16) name]
 #
@@ -454,6 +460,7 @@ defmodule Dexter.CodeIntel do
   @op_erlang_exports 3
   @op_runtime_info 4
   @op_struct_fields 5
+  @op_return_type_struct 6
 
   def handle_request(op, payload) do
     case op do
@@ -463,6 +470,7 @@ defmodule Dexter.CodeIntel do
       @op_erlang_exports -> handle_erlang_exports(payload)
       @op_runtime_info -> handle_runtime_info(payload)
       @op_struct_fields -> handle_struct_fields(payload)
+      @op_return_type_struct -> handle_return_type_struct(payload)
       _ -> {1, "unknown code intel op: #{inspect(op)}"}
     end
   end
@@ -858,6 +866,111 @@ defmodule Dexter.CodeIntel do
   rescue
     _ -> :error
   end
+
+  defp handle_return_type_struct(payload) do
+    case parse_module_function_arity(payload) do
+      {:ok, module_name, function_name, arity} ->
+        case fetch_return_type_struct(module_name, function_name, arity) do
+          {:ok, struct_module} ->
+            {0, <<byte_size(struct_module)::unsigned-big-16, struct_module::binary>>}
+
+          :none ->
+            {0, <<0::unsigned-big-16>>}
+
+          :error ->
+            {1, "return type struct lookup failed"}
+        end
+
+      :error ->
+        {1, "invalid return_type_struct payload"}
+    end
+  end
+
+  defp fetch_return_type_struct(module_name, function_name, arity) do
+    with {:ok, module_atom} <- elixir_module_atom(module_name),
+         {:module, ^module_atom} <- Code.ensure_loaded(module_atom),
+         {:ok, exports} <- fetch_exck_exports(module_atom),
+         {:ok, sig} <- find_export_sig(exports, function_name, arity),
+         {:ok, struct_module} <- extract_struct_from_sig(sig) do
+      {:ok, inspect(struct_module)}
+    else
+      :none -> :none
+      _ -> :none
+    end
+  rescue
+    _ -> :error
+  end
+
+  defp fetch_exck_exports(module_atom) do
+    case :code.get_object_code(module_atom) do
+      {^module_atom, binary, _filename} ->
+        case :beam_lib.chunks(binary, [~c"ExCk"]) do
+          {:ok, {^module_atom, [{~c"ExCk", chunk}]}} ->
+            {_version, contents} = :erlang.binary_to_term(chunk)
+
+            case contents do
+              %{exports: exports} when is_list(exports) -> {:ok, exports}
+              _ -> :error
+            end
+
+          _ ->
+            :error
+        end
+
+      :error ->
+        :error
+    end
+  end
+
+  defp find_export_sig(exports, function_name, arity) do
+    function_atom = String.to_atom(function_name)
+
+    case List.keyfind(exports, {function_atom, arity}, 0) do
+      {_, %{sig: {:infer, _domain, clauses}}} when is_list(clauses) ->
+        {:ok, clauses}
+
+      _ ->
+        :none
+    end
+  end
+
+  defp extract_struct_from_sig(clauses) do
+    struct_modules =
+      clauses
+      |> Enum.map(fn {_args, return_type} -> extract_struct_from_type(return_type) end)
+      |> Enum.reject(&is_nil/1)
+      |> Enum.uniq()
+
+    case struct_modules do
+      [single_module] -> {:ok, single_module}
+      _ -> :none
+    end
+  end
+
+  defp extract_struct_from_type(type) when is_map(type) do
+    # Check the direct map descriptor for a struct
+    extract_struct_from_map_desc(type[:map]) ||
+      # Check inside dynamic wrapper
+      extract_struct_from_dynamic(type[:dynamic])
+  end
+
+  defp extract_struct_from_type(_), do: nil
+
+  defp extract_struct_from_dynamic(%{map: map_desc}), do: extract_struct_from_map_desc(map_desc)
+  defp extract_struct_from_dynamic(:term), do: nil
+  defp extract_struct_from_dynamic(_), do: nil
+
+  defp extract_struct_from_map_desc({:closed, fields}) when is_map(fields) do
+    case fields do
+      %{__struct__: %{atom: {:union, union_map}}} when map_size(union_map) == 1 ->
+        union_map |> Map.keys() |> hd()
+
+      _ ->
+        nil
+    end
+  end
+
+  defp extract_struct_from_map_desc(_), do: nil
 
   defp elixir_module_atom(module_name) do
     if Regex.match?(~r/\A(?:Elixir\.)?[A-Z][A-Za-z0-9_]*(?:\.[A-Z][A-Za-z0-9_]*)*\z/, module_name) do

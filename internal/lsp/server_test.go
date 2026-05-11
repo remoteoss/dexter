@@ -822,6 +822,128 @@ end`)
 	}
 }
 
+func TestCompletion_VariableDotFromPatternMatch(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	path := filepath.Join(server.projectRoot, "lib", "controller.ex")
+	uriStr := string(uri.File(path))
+	server.docs.Set(uriStr, `defmodule MyApp.Controller do
+  alias MyApp.Accounts.User
+
+  def run do
+    user = %User{name: "test"}
+    user.
+  end
+end`)
+
+	key := structFieldCacheKey{
+		buildRoot: server.structFieldBuildRoot(path),
+		module:    "MyApp.Accounts.User",
+	}
+	server.structFieldMu.Lock()
+	server.structFieldCache[key] = &structFieldCacheEntry{
+		fields: []string{"active?", "email", "name"},
+		loaded: true,
+	}
+	server.structFieldMu.Unlock()
+
+	items := completionAt(t, server, uriStr, 5, uint32(len("    user.")))
+	if !hasCompletionItem(items, "email") {
+		t.Fatal("expected 'email' struct field completion on variable.dot")
+	}
+	if !hasCompletionItem(items, "name") {
+		t.Fatal("expected 'name' struct field completion on variable.dot")
+	}
+	for _, item := range items {
+		if item.Kind != protocol.CompletionItemKindField {
+			t.Errorf("item %q Kind = %v, want Field", item.Label, item.Kind)
+		}
+	}
+}
+
+func TestCompletion_VariableDotFromPatternMatchWithPrefix(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	path := filepath.Join(server.projectRoot, "lib", "controller.ex")
+	uriStr := string(uri.File(path))
+	server.docs.Set(uriStr, `defmodule MyApp.Controller do
+  alias MyApp.Accounts.User
+
+  def run do
+    user = %User{name: "test"}
+    user.na
+  end
+end`)
+
+	key := structFieldCacheKey{
+		buildRoot: server.structFieldBuildRoot(path),
+		module:    "MyApp.Accounts.User",
+	}
+	server.structFieldMu.Lock()
+	server.structFieldCache[key] = &structFieldCacheEntry{
+		fields: []string{"active?", "email", "name"},
+		loaded: true,
+	}
+	server.structFieldMu.Unlock()
+
+	items := completionAt(t, server, uriStr, 5, uint32(len("    user.na")))
+	if !hasCompletionItem(items, "name") {
+		t.Fatal("expected 'name' completion for user.na prefix")
+	}
+	if hasCompletionItem(items, "email") {
+		t.Fatal("did not expect 'email' for user.na prefix")
+	}
+}
+
+func TestCompletion_VariableDotFromExCk(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	path := filepath.Join(server.projectRoot, "lib", "controller.ex")
+	uriStr := string(uri.File(path))
+	server.docs.Set(uriStr, `defmodule MyApp.Controller do
+  def run(url) do
+    parsed = URI.parse(url)
+    parsed.
+  end
+end`)
+
+	// This test requires a real BEAM process to resolve URI.parse/1 -> URI struct
+	buildRoot := server.structFieldBuildRoot(path)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	bp := server.getBeamProcess(ctx, buildRoot)
+	if bp == nil {
+		t.Skip("BEAM process not available")
+	}
+	if err := bp.Ready(ctx); err != nil {
+		t.Skipf("BEAM process not ready: %v", err)
+	}
+
+	// Pre-warm the URI struct fields cache so completion doesn't have to wait
+	key := structFieldCacheKey{buildRoot: buildRoot, module: "URI"}
+	fields, err := bp.StructFields(ctx, "URI")
+	if err != nil || len(fields) == 0 {
+		t.Skipf("could not fetch URI struct fields: %v", err)
+	}
+	server.structFieldMu.Lock()
+	server.structFieldCache[key] = &structFieldCacheEntry{fields: fields, loaded: true}
+	server.structFieldMu.Unlock()
+
+	items := completionAt(t, server, uriStr, 3, uint32(len("    parsed.")))
+	if !hasCompletionItem(items, "host") {
+		t.Fatalf("expected 'host' struct field from ExCk return type, got %v", items)
+	}
+	if !hasCompletionItem(items, "scheme") {
+		t.Fatal("expected 'scheme' struct field from ExCk return type")
+	}
+	if !hasCompletionItem(items, "path") {
+		t.Fatal("expected 'path' struct field from ExCk return type")
+	}
+}
+
 func TestStructFieldPrewarmFromDocument(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
@@ -5568,5 +5690,71 @@ end`)
 	}
 	if !strings.Contains(hover.Contents.Value, "Creates a new account") {
 		t.Errorf("expected doc content, got %q", hover.Contents.Value)
+	}
+}
+
+func TestReturnTypeStruct_Integration(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	buildRoot := server.projectRoot
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	bp := server.getBeamProcess(ctx, buildRoot)
+	if bp == nil {
+		t.Skip("BEAM process not available (mix not in PATH)")
+	}
+	if err := bp.Ready(ctx); err != nil {
+		t.Skipf("BEAM process not ready: %v", err)
+	}
+
+	tests := []struct {
+		name     string
+		module   string
+		function string
+		arity    int
+		want     string
+	}{
+		{
+			name:     "URI.parse returns URI struct",
+			module:   "URI",
+			function: "parse",
+			arity:    1,
+			want:     "URI",
+		},
+		{
+			name:     "Map.new returns no struct",
+			module:   "Map",
+			function: "new",
+			arity:    0,
+			want:     "",
+		},
+		{
+			name:     "nonexistent module returns empty",
+			module:   "NonExistentModule12345",
+			function: "foo",
+			arity:    0,
+			want:     "",
+		},
+		{
+			name:     "nonexistent function returns empty",
+			module:   "URI",
+			function: "nonexistent_function_xyz",
+			arity:    0,
+			want:     "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := bp.ReturnTypeStruct(ctx, tt.module, tt.function, tt.arity)
+			if err != nil {
+				t.Fatalf("ReturnTypeStruct error: %v", err)
+			}
+			if result != tt.want {
+				t.Errorf("ReturnTypeStruct(%s.%s/%d) = %q, want %q", tt.module, tt.function, tt.arity, result, tt.want)
+			}
+		})
 	}
 }

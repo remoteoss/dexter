@@ -713,6 +713,149 @@ func TestFindFormatterConfig_PerAppOverridesRoot(t *testing.T) {
 	}
 }
 
+func TestBeamProcess_ReturnTypeStruct(t *testing.T) {
+	reqReader, reqWriter := io.Pipe()
+	respReader, respWriter := io.Pipe()
+
+	bp := newTestBeamProcess(reqWriter, respReader, nil)
+
+	readLoopDone := make(chan struct{})
+	go func() {
+		bp.readLoop()
+		close(readLoopDone)
+	}()
+
+	tests := []struct {
+		name       string
+		module     string
+		function   string
+		arity      int
+		respStatus byte
+		respName   string // struct module name in response ("" = not a struct)
+		wantResult string
+	}{
+		{
+			name:       "returns struct module name",
+			module:     "URI",
+			function:   "parse",
+			arity:      1,
+			respStatus: 0,
+			respName:   "URI",
+			wantResult: "URI",
+		},
+		{
+			name:       "returns empty for non-struct",
+			module:     "Map",
+			function:   "new",
+			arity:      0,
+			respStatus: 0,
+			respName:   "",
+			wantResult: "",
+		},
+		{
+			name:       "handles error status gracefully",
+			module:     "NoModule",
+			function:   "nope",
+			arity:      0,
+			respStatus: 1,
+			respName:   "",
+			wantResult: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			serverDone := make(chan struct{})
+			go func() {
+				defer close(serverDone)
+
+				frameType, err := readByte(reqReader)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				if frameType != frameRequest {
+					t.Errorf("expected request frame, got %d", frameType)
+					return
+				}
+
+				reqID, err := readUint32(reqReader)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+
+				header := make([]byte, 6)
+				if _, err := io.ReadFull(reqReader, header); err != nil {
+					t.Error(err)
+					return
+				}
+				if header[0] != serviceCodeIntel || header[1] != codeIntelOpReturnTypeStruct {
+					t.Errorf("unexpected service=%d op=%d", header[0], header[1])
+					return
+				}
+				payloadLen := binary.BigEndian.Uint32(header[2:])
+				payloadBuf := make([]byte, payloadLen)
+				if _, err := io.ReadFull(reqReader, payloadBuf); err != nil {
+					t.Error(err)
+					return
+				}
+
+				// Decode and verify the request payload
+				r := bytes.NewReader(payloadBuf)
+				var modLen uint16
+				_ = binary.Read(r, binary.BigEndian, &modLen)
+				modBuf := make([]byte, modLen)
+				_, _ = io.ReadFull(r, modBuf)
+				if string(modBuf) != tt.module {
+					t.Errorf("module = %q, want %q", string(modBuf), tt.module)
+				}
+
+				var fnLen uint16
+				_ = binary.Read(r, binary.BigEndian, &fnLen)
+				fnBuf := make([]byte, fnLen)
+				_, _ = io.ReadFull(r, fnBuf)
+				if string(fnBuf) != tt.function {
+					t.Errorf("function = %q, want %q", string(fnBuf), tt.function)
+				}
+
+				arityByte, _ := r.ReadByte()
+				if int(arityByte) != tt.arity {
+					t.Errorf("arity = %d, want %d", arityByte, tt.arity)
+				}
+
+				// Build response
+				var respPayload bytes.Buffer
+				if tt.respStatus == 0 {
+					_ = binary.Write(&respPayload, binary.BigEndian, uint16(len(tt.respName)))
+					respPayload.WriteString(tt.respName)
+				} else {
+					respPayload.WriteString("lookup failed")
+				}
+				writeTestResponseFrame(t, respWriter, reqID, tt.respStatus, respPayload.Bytes())
+			}()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			result, err := bp.ReturnTypeStruct(ctx, tt.module, tt.function, tt.arity)
+			if err != nil {
+				t.Fatalf("ReturnTypeStruct error: %v", err)
+			}
+			if result != tt.wantResult {
+				t.Errorf("ReturnTypeStruct = %q, want %q", result, tt.wantResult)
+			}
+
+			<-serverDone
+		})
+	}
+
+	_ = reqWriter.Close()
+	_ = reqReader.Close()
+	_ = respWriter.Close()
+	<-readLoopDone
+}
+
 func TestBeamProcess_DoRequestHandlesNotificationBeforeResponse(t *testing.T) {
 	reqReader, reqWriter := io.Pipe()
 	respReader, respWriter := io.Pipe()
