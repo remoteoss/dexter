@@ -390,6 +390,239 @@ func TestCompletionContextAtCursor(t *testing.T) {
 	}
 }
 
+func TestStructCompletionContextAtCursor(t *testing.T) {
+	tests := []struct {
+		name       string
+		code       string
+		line       int
+		col        int
+		wantOK     bool
+		wantModule string
+		wantPrefix string
+		wantStart  int
+	}{
+		{
+			name:       "field prefix",
+			code:       "  %User{em",
+			line:       0,
+			col:        len("  %User{em"),
+			wantOK:     true,
+			wantModule: "User",
+			wantPrefix: "em",
+			wantStart:  len("  %User{"),
+		},
+		{
+			name:       "empty field prefix",
+			code:       "  %User{",
+			line:       0,
+			col:        len("  %User{"),
+			wantOK:     true,
+			wantModule: "User",
+			wantPrefix: "",
+			wantStart:  len("  %User{"),
+		},
+		{
+			name:       "qualified module",
+			code:       "  %MyApp.User{na",
+			line:       0,
+			col:        len("  %MyApp.User{na"),
+			wantOK:     true,
+			wantModule: "MyApp.User",
+			wantPrefix: "na",
+			wantStart:  len("  %MyApp.User{"),
+		},
+		{
+			name:       "module special",
+			code:       "  %__MODULE__{na",
+			line:       0,
+			col:        len("  %__MODULE__{na"),
+			wantOK:     true,
+			wantModule: "__MODULE__",
+			wantPrefix: "na",
+			wantStart:  len("  %__MODULE__{"),
+		},
+		{
+			name:       "after previous field",
+			code:       `  %User{name: "x", em`,
+			line:       0,
+			col:        len(`  %User{name: "x", em`),
+			wantOK:     true,
+			wantModule: "User",
+			wantPrefix: "em",
+			wantStart:  len(`  %User{name: "x", `),
+		},
+		{
+			name:       "struct update",
+			code:       "  %User{user | em",
+			line:       0,
+			col:        len("  %User{user | em"),
+			wantOK:     true,
+			wantModule: "User",
+			wantPrefix: "em",
+			wantStart:  len("  %User{user | "),
+		},
+		{
+			name:   "struct update variable position rejected",
+			code:   "  %User{user | em",
+			line:   0,
+			col:    len("  %User{user"),
+			wantOK: false,
+		},
+		{
+			name:       "struct update empty key position after pipe",
+			code:       "  %User{user | ",
+			line:       0,
+			col:        len("  %User{user | "),
+			wantOK:     true,
+			wantModule: "User",
+			wantPrefix: "",
+			wantStart:  len("  %User{user | "),
+		},
+		{
+			name:       "multiline field prefix",
+			code:       "  %User{\n    em\n  }",
+			line:       1,
+			col:        len("    em"),
+			wantOK:     true,
+			wantModule: "User",
+			wantPrefix: "em",
+			wantStart:  len("    "),
+		},
+		{
+			name:   "value position rejected",
+			code:   "  %User{name: ",
+			line:   0,
+			col:    len("  %User{name: "),
+			wantOK: false,
+		},
+		{
+			name:   "nested map value rejected",
+			code:   "  %User{name: %{em",
+			line:   0,
+			col:    len("  %User{name: %{em"),
+			wantOK: false,
+		},
+		{
+			name:   "plain map rejected",
+			code:   "  %{em",
+			line:   0,
+			col:    len("  %{em"),
+			wantOK: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tokens, source, lineStarts := tokenize(tt.code)
+			ctx, ok := StructCompletionContextAtCursor(tokens, source, lineStarts, tt.line, tt.col)
+			if ok != tt.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tt.wantOK)
+			}
+			if !ok {
+				return
+			}
+			if ctx.ModuleRef != tt.wantModule {
+				t.Errorf("ModuleRef = %q, want %q", ctx.ModuleRef, tt.wantModule)
+			}
+			if ctx.FieldPrefix != tt.wantPrefix {
+				t.Errorf("FieldPrefix = %q, want %q", ctx.FieldPrefix, tt.wantPrefix)
+			}
+			if ctx.StartCol != tt.wantStart {
+				t.Errorf("StartCol = %d, want %d", ctx.StartCol, tt.wantStart)
+			}
+		})
+	}
+}
+
+func TestStructValueContextAtCursor(t *testing.T) {
+	tests := []struct {
+		name string
+		code string
+		line int
+		col  int
+		want bool
+	}{
+		{
+			name: "empty value position",
+			code: "  %User{name: ",
+			line: 0,
+			col:  len("  %User{name: "),
+			want: true,
+		},
+		{
+			name: "typed value position",
+			code: "  %User{name: na",
+			line: 0,
+			col:  len("  %User{name: na"),
+			want: true,
+		},
+		{
+			name: "key position",
+			code: "  %User{na",
+			line: 0,
+			col:  len("  %User{na"),
+			want: false,
+		},
+		{
+			name: "struct update variable position",
+			code: "  %User{user | name: ",
+			line: 0,
+			col:  len("  %User{user"),
+			want: false,
+		},
+		{
+			name: "nested map value rejected",
+			code: "  %User{meta: %{",
+			line: 0,
+			col:  len("  %User{meta: %{"),
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tokens, source, lineStarts := tokenize(tt.code)
+			got := StructValueContextAtCursor(tokens, source, lineStarts, tt.line, tt.col)
+			if got != tt.want {
+				t.Fatalf("StructValueContextAtCursor = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestStructModuleRefs(t *testing.T) {
+	code := `defmodule MyApp.Controller do
+  alias MyApp.Accounts.User
+
+  def run do
+    %User{name: "A"}
+    %MyApp.Accounts.Org{
+      id: 1
+    }
+    %{}
+    %__MODULE__{}
+    %MyApp.Accounts.Pending
+  end
+end`
+	tokens, source, _ := tokenize(code)
+	refs := StructModuleRefs(tokens, source)
+
+	want := []StructModuleRef{
+		{ModuleRef: "User", Line: 4},
+		{ModuleRef: "MyApp.Accounts.Org", Line: 5},
+		{ModuleRef: "__MODULE__", Line: 9},
+		{ModuleRef: "MyApp.Accounts.Pending", Line: 10},
+	}
+	if len(refs) != len(want) {
+		t.Fatalf("got %d refs, want %d: %#v", len(refs), len(want), refs)
+	}
+	for i := range want {
+		if refs[i] != want[i] {
+			t.Errorf("refs[%d] = %#v, want %#v", i, refs[i], want[i])
+		}
+	}
+}
+
 func TestFullExpressionAtCursor(t *testing.T) {
 	code := "    Foo.Bar.baz(123)"
 	tokens, source, lineStarts := tokenize(code)
@@ -433,6 +666,835 @@ func TestExpressionAtCursor_ExprBounds(t *testing.T) {
 	}
 	if ctx2.ExprEnd != 11 {
 		t.Errorf("ExprEnd = %d, want 11", ctx2.ExprEnd)
+	}
+}
+
+func TestVariableStructTypes(t *testing.T) {
+	tests := []struct {
+		name string
+		code string
+		line int
+		col  int
+		want map[string]string
+	}{
+		{
+			name: "direct struct assignment",
+			code: `def run do
+  user = %User{name: "A"}
+  user
+end`,
+			line: 2,
+			col:  len("  user"),
+			want: map[string]string{"user": "User"},
+		},
+		{
+			name: "pattern match left side",
+			code: `def run do
+  %User{} = get_user()
+end`,
+			line: 1,
+			col:  len("  %User{} = get_user()"),
+			want: map[string]string{},
+		},
+		{
+			name: "pattern match with named variable",
+			code: `def run do
+  %User{} = user = get_user()
+  user
+end`,
+			line: 2,
+			col:  len("  user"),
+			want: map[string]string{"user": "User"},
+		},
+		{
+			name: "match operator struct on left with var",
+			code: `def run do
+  %User{name: name} = user = get_user()
+  user
+end`,
+			line: 2,
+			col:  len("  user"),
+			want: map[string]string{"user": "User"},
+		},
+		{
+			name: "function head pattern match",
+			code: `def run(%User{} = user) do
+  user
+end`,
+			line: 1,
+			col:  len("  user"),
+			want: map[string]string{"user": "User"},
+		},
+		{
+			name: "function head with qualified module",
+			code: `def run(%MyApp.Accounts.User{} = user) do
+  user
+end`,
+			line: 1,
+			col:  len("  user"),
+			want: map[string]string{"user": "MyApp.Accounts.User"},
+		},
+		{
+			name: "multiple variables",
+			code: `def run do
+  user = %User{name: "A"}
+  org = %Organization{name: "B"}
+  user
+end`,
+			line: 3,
+			col:  len("  user"),
+			want: map[string]string{
+				"user": "User",
+				"org":  "Organization",
+			},
+		},
+		{
+			name: "variable after cursor excluded",
+			code: `def run do
+  user = %User{name: "A"}
+  cursor_here
+  org = %Organization{name: "B"}
+end`,
+			line: 2,
+			col:  len("  cursor_here"),
+			want: map[string]string{"user": "User"},
+		},
+		{
+			name: "struct literal on right side of assignment",
+			code: `def run do
+  user = %User{}
+  user
+end`,
+			line: 2,
+			col:  len("  user"),
+			want: map[string]string{"user": "User"},
+		},
+		{
+			name: "no struct patterns",
+			code: `def run do
+  x = 1
+  y = "hello"
+  y
+end`,
+			line: 3,
+			col:  len("  y"),
+			want: map[string]string{},
+		},
+		{
+			name: "case clause pattern",
+			code: `def run(thing) do
+  case thing do
+    %User{} = user -> user
+  end
+end`,
+			line: 2,
+			col:  len("    %User{} = user -> user"),
+			want: map[string]string{"user": "User"},
+		},
+		{
+			name: "with clause pattern",
+			code: `def run do
+  with %User{} = user <- fetch_user() do
+    user
+  end
+end`,
+			line: 2,
+			col:  len("    user"),
+			want: map[string]string{"user": "User"},
+		},
+		{
+			name: "var = struct on right side",
+			code: `def run do
+  result = %Result{ok: true}
+  result
+end`,
+			line: 2,
+			col:  len("  result"),
+			want: map[string]string{"result": "Result"},
+		},
+		{
+			name: "reassignment overrides type",
+			code: `def run do
+  thing = %User{name: "A"}
+  thing = %Organization{name: "B"}
+  thing
+end`,
+			line: 3,
+			col:  len("  thing"),
+			want: map[string]string{"thing": "Organization"},
+		},
+		{
+			name: "__MODULE__ struct",
+			code: `def run do
+  self = %__MODULE__{}
+  self
+end`,
+			line: 2,
+			col:  len("  self"),
+			want: map[string]string{"self": "__MODULE__"},
+		},
+		{
+			name: "scoped to current function",
+			code: `def first do
+  user = %User{}
+end
+
+def second do
+  user
+end`,
+			line: 5,
+			col:  len("  user"),
+			want: map[string]string{},
+		},
+		{
+			name: "defp function head",
+			code: `defp handle_user(%User{} = user) do
+  user
+end`,
+			line: 1,
+			col:  len("  user"),
+			want: map[string]string{"user": "User"},
+		},
+		{
+			name: "reverse pattern: var = %Struct{}",
+			code: `def run do
+  user = %User{name: "test"}
+  user
+end`,
+			line: 2,
+			col:  len("  user"),
+			want: map[string]string{"user": "User"},
+		},
+		{
+			name: "for comprehension pattern",
+			code: `def run(users) do
+  for %User{} = user <- users do
+    user
+  end
+end`,
+			line: 2,
+			col:  len("    user"),
+			want: map[string]string{"user": "User"},
+		},
+		{
+			name: "nested struct in value position does not leak",
+			code: `def run do
+  user = %User{address: %Address{city: "NY"}}
+  user
+end`,
+			line: 2,
+			col:  len("  user"),
+			want: map[string]string{"user": "User"},
+		},
+		{
+			name: "pipeline with struct does not bind",
+			code: `def run do
+  result = thing |> Map.merge(%User{})
+  result
+end`,
+			line: 2,
+			col:  len("  result"),
+			want: map[string]string{},
+		},
+		{
+			name: "struct inside function call args does not bind",
+			code: `def run do
+  Repo.insert(%User{name: "test"})
+  x
+end`,
+			line: 2,
+			col:  len("  x"),
+			want: map[string]string{},
+		},
+		{
+			name: "struct in list pattern",
+			code: `def run do
+  [%User{} = user] = list
+  user
+end`,
+			line: 2,
+			col:  len("  user"),
+			want: map[string]string{"user": "User"},
+		},
+		{
+			name: "struct in tuple pattern",
+			code: `def run do
+  {:ok, %User{} = user} = fetch()
+  user
+end`,
+			line: 2,
+			col:  len("  user"),
+			want: map[string]string{"user": "User"},
+		},
+		{
+			name: "plain map not treated as struct",
+			code: `def run do
+  map = %{name: "test"}
+  map
+end`,
+			line: 2,
+			col:  len("  map"),
+			want: map[string]string{},
+		},
+		{
+			name: "pinned variable not bound",
+			code: `def run(existing) do
+  %User{} = ^existing
+  existing
+end`,
+			line: 2,
+			col:  len("  existing"),
+			want: map[string]string{},
+		},
+		{
+			name: "struct as keyword arg value does not bind outer var",
+			code: `def run do
+  result = func(key: %User{})
+  result
+end`,
+			line: 2,
+			col:  len("  result"),
+			want: map[string]string{},
+		},
+		{
+			name: "deeply nested struct in value does not bind extra vars",
+			code: `def run do
+  org = %Org{owner: %User{address: %Address{city: "NY"}}}
+  org
+end`,
+			line: 2,
+			col:  len("  org"),
+			want: map[string]string{"org": "Org"},
+		},
+		{
+			name: "default argument with struct",
+			code: `def changeset(leave_type \\ %__MODULE__{}, attrs) do
+  leave_type
+end`,
+			line: 1,
+			col:  len("  leave_type"),
+			want: map[string]string{"leave_type": "__MODULE__"},
+		},
+		{
+			name: "default argument with named struct",
+			code: `def new(user \\ %User{}) do
+  user
+end`,
+			line: 1,
+			col:  len("  user"),
+			want: map[string]string{"user": "User"},
+		},
+		// Typespec-based parameter inference
+		{
+			name: "typespec t() infers __MODULE__",
+			code: `@spec changeset(t(), map()) :: Ecto.Changeset.t()
+def changeset(leave_type, attrs) do
+  leave_type
+end`,
+			line: 2,
+			col:  len("  leave_type"),
+			want: map[string]string{"leave_type": "__MODULE__"},
+		},
+		{
+			name: "typespec Module.t() infers remote module",
+			code: `@spec process(User.t(), map()) :: :ok
+def process(user, attrs) do
+  user
+end`,
+			line: 2,
+			col:  len("  user"),
+			want: map[string]string{"user": "User"},
+		},
+		{
+			name: "typespec qualified Module.t()",
+			code: `@spec process(MyApp.Accounts.User.t(), map()) :: :ok
+def process(user, attrs) do
+  user
+end`,
+			line: 2,
+			col:  len("  user"),
+			want: map[string]string{"user": "MyApp.Accounts.User"},
+		},
+		{
+			name: "typespec second param t()",
+			code: `@spec update(map(), t()) :: t()
+def update(attrs, schema) do
+  schema
+end`,
+			line: 2,
+			col:  len("  schema"),
+			want: map[string]string{"schema": "__MODULE__"},
+		},
+		{
+			name: "typespec does not override pattern match",
+			code: `@spec changeset(t(), map()) :: Ecto.Changeset.t()
+def changeset(%LeaveType{} = leave_type, attrs) do
+  leave_type
+end`,
+			line: 2,
+			col:  len("  leave_type"),
+			want: map[string]string{"leave_type": "LeaveType"},
+		},
+		{
+			name: "typespec with defp",
+			code: `@spec do_work(t()) :: :ok
+defp do_work(item) do
+  item
+end`,
+			line: 2,
+			col:  len("  item"),
+			want: map[string]string{"item": "__MODULE__"},
+		},
+		{
+			name: "typespec non-struct types ignored",
+			code: `@spec run(String.t(), integer(), atom()) :: :ok
+def run(name, count, label) do
+  name
+end`,
+			line: 2,
+			col:  len("  name"),
+			want: map[string]string{},
+		},
+		{
+			name: "typespec with no params",
+			code: `@spec run() :: :ok
+def run do
+  :ok
+end`,
+			line: 2,
+			col:  len("  :ok"),
+			want: map[string]string{},
+		},
+		{
+			name: "typespec multiple struct params",
+			code: `@spec merge(t(), User.t()) :: t()
+def merge(schema, user) do
+  schema
+end`,
+			line: 2,
+			col:  len("  schema"),
+			want: map[string]string{"schema": "__MODULE__", "user": "User"},
+		},
+		{
+			name: "typespec only matches preceding spec",
+			code: `@spec unrelated(t()) :: :ok
+def unrelated(x) do
+  x
+end
+
+@spec actual(map()) :: :ok
+def actual(data) do
+  data
+end`,
+			line: 7,
+			col:  len("  data"),
+			want: map[string]string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tokens, source, lineStarts := tokenize(tt.code)
+			got := VariableStructTypes(tokens, source, lineStarts, tt.line, tt.col)
+			if len(got) != len(tt.want) {
+				t.Fatalf("got %d entries %v, want %d entries %v", len(got), got, len(tt.want), tt.want)
+			}
+			for varName, wantModule := range tt.want {
+				if gotModule, ok := got[varName]; !ok {
+					t.Errorf("missing variable %q (want module %q)", varName, wantModule)
+				} else if gotModule != wantModule {
+					t.Errorf("variable %q: got module %q, want %q", varName, gotModule, wantModule)
+				}
+			}
+		})
+	}
+}
+
+func TestVariableFunctionCalls(t *testing.T) {
+	tests := []struct {
+		name string
+		code string
+		line int
+		col  int
+		want []VariableFunctionCall
+	}{
+		{
+			name: "simple module function call",
+			code: `def run do
+  user = Accounts.get_user(id)
+  user
+end`,
+			line: 2,
+			col:  len("  user"),
+			want: []VariableFunctionCall{
+				{VarName: "user", Module: "Accounts", Function: "get_user", Arity: 1},
+			},
+		},
+		{
+			name: "qualified module call",
+			code: `def run do
+  user = MyApp.Accounts.get_user(id)
+  user
+end`,
+			line: 2,
+			col:  len("  user"),
+			want: []VariableFunctionCall{
+				{VarName: "user", Module: "MyApp.Accounts", Function: "get_user", Arity: 1},
+			},
+		},
+		{
+			name: "zero arity",
+			code: `def run do
+  users = Repo.all()
+  users
+end`,
+			line: 2,
+			col:  len("  users"),
+			want: []VariableFunctionCall{
+				{VarName: "users", Module: "Repo", Function: "all", Arity: 0},
+			},
+		},
+		{
+			name: "multiple arguments",
+			code: `def run do
+  user = Repo.get(User, id)
+  user
+end`,
+			line: 2,
+			col:  len("  user"),
+			want: []VariableFunctionCall{
+				{VarName: "user", Module: "Repo", Function: "get", Arity: 2},
+			},
+		},
+		{
+			name: "multiple calls",
+			code: `def run do
+  user = Accounts.get_user(id)
+  org = Organizations.get_org(slug)
+  org
+end`,
+			line: 3,
+			col:  len("  org"),
+			want: []VariableFunctionCall{
+				{VarName: "user", Module: "Accounts", Function: "get_user", Arity: 1},
+				{VarName: "org", Module: "Organizations", Function: "get_org", Arity: 1},
+			},
+		},
+		{
+			name: "reassignment keeps last call",
+			code: `def run do
+  user = Accounts.get_user(id)
+  user = Accounts.get_admin(id)
+  user
+end`,
+			line: 3,
+			col:  len("  user"),
+			want: []VariableFunctionCall{
+				{VarName: "user", Module: "Accounts", Function: "get_admin", Arity: 1},
+			},
+		},
+		{
+			name: "bare function call ignored",
+			code: `def run do
+  user = get_user(id)
+  user
+end`,
+			line: 2,
+			col:  len("  user"),
+			want: nil,
+		},
+		{
+			name: "after cursor excluded",
+			code: `def run do
+  cursor
+  user = Accounts.get_user(id)
+end`,
+			line: 1,
+			col:  len("  cursor"),
+			want: nil,
+		},
+		{
+			name: "scoped to current function",
+			code: `def first do
+  user = Accounts.get_user(id)
+end
+
+def second do
+  user
+end`,
+			line: 5,
+			col:  len("  user"),
+			want: nil,
+		},
+		{
+			name: "nested call in args counted correctly",
+			code: `def run do
+  user = Repo.get(User, String.to_integer(id))
+  user
+end`,
+			line: 2,
+			col:  len("  user"),
+			want: []VariableFunctionCall{
+				{VarName: "user", Module: "Repo", Function: "get", Arity: 2},
+			},
+		},
+		{
+			name: "pipeline not detected",
+			code: `def run do
+  result = id |> Accounts.get_user()
+  result
+end`,
+			line: 2,
+			col:  len("  result"),
+			want: nil,
+		},
+		{
+			name: "no-paren call single arg",
+			code: `def run do
+  user = Repo.get! User
+  user
+end`,
+			line: 2,
+			col:  len("  user"),
+			want: []VariableFunctionCall{
+				{VarName: "user", Module: "Repo", Function: "get!", Arity: 1},
+			},
+		},
+		{
+			name: "no-paren call multiple args",
+			code: `def run do
+  user = Repo.get User, id
+  user
+end`,
+			line: 2,
+			col:  len("  user"),
+			want: []VariableFunctionCall{
+				{VarName: "user", Module: "Repo", Function: "get", Arity: 2},
+			},
+		},
+		{
+			name: "no-paren call with do block",
+			code: `def run do
+  changeset = Ecto.Changeset.change user do
+    :ok
+  end
+  changeset
+end`,
+			line: 4,
+			col:  len("  changeset"),
+			want: []VariableFunctionCall{
+				{VarName: "changeset", Module: "Ecto.Changeset", Function: "change", Arity: 1},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tokens, source, lineStarts := tokenize(tt.code)
+			got := VariableFunctionCalls(tokens, source, lineStarts, tt.line, tt.col)
+			if len(got) != len(tt.want) {
+				t.Fatalf("got %d calls %v, want %d", len(got), got, len(tt.want))
+			}
+			for i, want := range tt.want {
+				g := got[i]
+				if g.VarName != want.VarName {
+					t.Errorf("[%d] VarName = %q, want %q", i, g.VarName, want.VarName)
+				}
+				if g.Module != want.Module {
+					t.Errorf("[%d] Module = %q, want %q", i, g.Module, want.Module)
+				}
+				if g.Function != want.Function {
+					t.Errorf("[%d] Function = %q, want %q", i, g.Function, want.Function)
+				}
+				if g.Arity != want.Arity {
+					t.Errorf("[%d] Arity = %d, want %d", i, g.Arity, want.Arity)
+				}
+			}
+		})
+	}
+}
+
+func TestAllVariableFunctionCalls(t *testing.T) {
+	tests := []struct {
+		name string
+		code string
+		want []VariableFunctionCall
+	}{
+		{
+			name: "calls across multiple functions",
+			code: `defmodule M do
+  def first do
+    user = Accounts.get_user(id)
+    user
+  end
+
+  def second do
+    org = Organizations.get_org(slug)
+    org
+  end
+end`,
+			want: []VariableFunctionCall{
+				{VarName: "user", Module: "Accounts", Function: "get_user", Arity: 1},
+				{VarName: "org", Module: "Organizations", Function: "get_org", Arity: 1},
+			},
+		},
+		{
+			name: "same variable in two functions emitted twice",
+			code: `def first do
+  user = Accounts.get_user(id)
+end
+
+def second do
+  user = Admins.get_admin(id)
+end`,
+			want: []VariableFunctionCall{
+				{VarName: "user", Module: "Accounts", Function: "get_user", Arity: 1},
+				{VarName: "user", Module: "Admins", Function: "get_admin", Arity: 1},
+			},
+		},
+		{
+			name: "ignores module-level code",
+			code: `defmodule M do
+  @some_attr Accounts.get_user(id)
+end`,
+			want: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tokens, source, _ := tokenize(tt.code)
+			got := AllVariableFunctionCalls(tokens, source)
+			if len(got) != len(tt.want) {
+				t.Fatalf("got %d calls %+v, want %d %+v", len(got), got, len(tt.want), tt.want)
+			}
+			for i, want := range tt.want {
+				g := got[i]
+				if g.VarName != want.VarName {
+					t.Errorf("[%d] VarName = %q, want %q", i, g.VarName, want.VarName)
+				}
+				if g.Module != want.Module {
+					t.Errorf("[%d] Module = %q, want %q", i, g.Module, want.Module)
+				}
+				if g.Function != want.Function {
+					t.Errorf("[%d] Function = %q, want %q", i, g.Function, want.Function)
+				}
+				if g.Arity != want.Arity {
+					t.Errorf("[%d] Arity = %d, want %d", i, g.Arity, want.Arity)
+				}
+			}
+		})
+	}
+}
+
+func TestVariableFieldAccessAtCursor(t *testing.T) {
+	tests := []struct {
+		name      string
+		code      string
+		line      int
+		col       int
+		wantOK    bool
+		wantVar   string
+		wantPfx   string
+		wantStart int
+	}{
+		{
+			name:      "variable dot",
+			code:      "  user.",
+			line:      0,
+			col:       len("  user."),
+			wantOK:    true,
+			wantVar:   "user",
+			wantPfx:   "",
+			wantStart: len("  user."),
+		},
+		{
+			name:      "variable dot with field prefix",
+			code:      "  user.na",
+			line:      0,
+			col:       len("  user.na"),
+			wantOK:    true,
+			wantVar:   "user",
+			wantPfx:   "na",
+			wantStart: len("  user."),
+		},
+		{
+			name:      "variable dot partial field",
+			code:      "  user.email_addr",
+			line:      0,
+			col:       len("  user.email"),
+			wantOK:    true,
+			wantVar:   "user",
+			wantPfx:   "email",
+			wantStart: len("  user."),
+		},
+		{
+			name:   "module dot not variable",
+			code:   "  Enum.",
+			line:   0,
+			col:    len("  Enum."),
+			wantOK: false,
+		},
+		{
+			name:   "module dot function not variable",
+			code:   "  Enum.ma",
+			line:   0,
+			col:    len("  Enum.ma"),
+			wantOK: false,
+		},
+		{
+			name:   "underscore variable rejected",
+			code:   "  _user.",
+			line:   0,
+			col:    len("  _user."),
+			wantOK: false,
+		},
+		{
+			name:   "keyword rejected",
+			code:   "  do.",
+			line:   0,
+			col:    len("  do."),
+			wantOK: false,
+		},
+		{
+			name:   "no dot",
+			code:   "  user",
+			line:   0,
+			col:    len("  user"),
+			wantOK: false,
+		},
+		{
+			name:      "multiline",
+			code:      "def run do\n  user.na",
+			line:      1,
+			col:       len("  user.na"),
+			wantOK:    true,
+			wantVar:   "user",
+			wantPfx:   "na",
+			wantStart: len("  user."),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tokens, source, lineStarts := tokenize(tt.code)
+			access, ok := VariableFieldAccessAtCursor(tokens, source, lineStarts, tt.line, tt.col)
+			if ok != tt.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tt.wantOK)
+			}
+			if !ok {
+				return
+			}
+			if access.VariableName != tt.wantVar {
+				t.Errorf("VariableName = %q, want %q", access.VariableName, tt.wantVar)
+			}
+			if access.FieldPrefix != tt.wantPfx {
+				t.Errorf("FieldPrefix = %q, want %q", access.FieldPrefix, tt.wantPfx)
+			}
+			if access.StartCol != tt.wantStart {
+				t.Errorf("StartCol = %d, want %d", access.StartCol, tt.wantStart)
+			}
+		})
 	}
 }
 
@@ -2814,6 +3876,18 @@ func TestFindBareFunctionCalls(t *testing.T) {
 			text:     "defp resource_type(%Foo{}), do: \"foo\"\ndefp resource_type(%Bar{}), do: \"bar\"",
 			funcName: "resource_type",
 			want:     nil,
+		},
+		{
+			name:     "capture with arity",
+			text:     "def run(xs) do\n  Stream.map(xs, &normalize/1)\nend\n\ndefp normalize(x), do: x",
+			funcName: "normalize",
+			want:     []int{2},
+		},
+		{
+			name:     "capture without parens definition",
+			text:     "def go(xs), do: Enum.map(xs, &foo/1)\n\ndefp foo(x), do: x",
+			funcName: "foo",
+			want:     []int{1},
 		},
 	}
 	for _, tt := range tests {

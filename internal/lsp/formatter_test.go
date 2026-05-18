@@ -578,6 +578,81 @@ func TestFormatterServer_UmbrellaStylerPlugin(t *testing.T) {
 	}
 }
 
+func TestFormatterServer_NestedBuildSiblingProject(t *testing.T) {
+	if _, err := exec.LookPath("mix"); err != nil {
+		t.Skip("mix not available in PATH")
+	}
+
+	// Ensure the Styler fixture is compiled so we have beam files to reuse.
+	monorepo := fixtureMonorepoPath(t)
+	stylerFixture := filepath.Join(monorepo, "apps", "app_with_styler")
+	ensureFixtureDeps(t, stylerFixture)
+
+	// Monorepo where the project being edited (libs/remote-library) has no
+	// _build of its own, but a sibling sub-project (apps/tiger) does. This
+	// matches a real layout we saw in the wild, where deps were compiled in
+	// a sibling app instead of at the repo root.
+	projectRoot := t.TempDir()
+	siblingApp := filepath.Join(projectRoot, "apps", "tiger")
+	if err := os.MkdirAll(siblingApp, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(stylerFixture, "_build"), filepath.Join(siblingApp, "_build")); err != nil {
+		t.Fatal(err)
+	}
+
+	editedLib := filepath.Join(projectRoot, "libs", "remote-library")
+	if err := os.MkdirAll(filepath.Join(editedLib, "lib"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(editedLib, "mix.exs"),
+		[]byte("defmodule Remote.MixProject do\n  use Mix.Project\n  def project, do: [app: :remote, version: \"0.1.0\"]\nend\n"),
+		0644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(editedLib, ".formatter.exs"),
+		[]byte("[plugins: [Styler], inputs: [\"{lib,test}/**/*.{ex,exs}\"]]\n"),
+		0644,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	storeDir := t.TempDir()
+	s, err := store.Open(storeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	server := NewServer(s, projectRoot)
+	if p, err := exec.LookPath("mix"); err == nil {
+		server.mixBin = p
+	}
+
+	unformatted := "defmodule Test do\n  def hello(x) do\n    x |> to_string()\n  end\nend\n"
+	filePath := filepath.Join(editedLib, "lib", "test.ex")
+	docURI := string(uri.File(filePath))
+	server.docs.Set(docURI, unformatted)
+
+	edits, err := server.Formatting(context.Background(), &protocol.DocumentFormattingParams{
+		TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(docURI)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if edits == nil {
+		t.Fatal("expected formatting edits from Styler via sibling _build, got nil")
+	}
+	if !strings.Contains(edits[0].NewText, "to_string(x)") {
+		t.Errorf("expected Styler to rewrite pipe via sibling _build, got:\n%s", edits[0].NewText)
+	}
+	if strings.Contains(edits[0].NewText, "|>") {
+		t.Errorf("expected Styler to remove single pipe via sibling _build, got:\n%s", edits[0].NewText)
+	}
+}
+
 func TestComputeMinimalEdits(t *testing.T) {
 	t.Run("identical text returns nil", func(t *testing.T) {
 		edits := computeMinimalEdits("hello\nworld\n", "hello\nworld\n")
@@ -711,6 +786,149 @@ func TestFindFormatterConfig_PerAppOverridesRoot(t *testing.T) {
 	if got != appFormatter {
 		t.Errorf("expected app-level %s, got %s", appFormatter, got)
 	}
+}
+
+func TestBeamProcess_ReturnTypeStruct(t *testing.T) {
+	reqReader, reqWriter := io.Pipe()
+	respReader, respWriter := io.Pipe()
+
+	bp := newTestBeamProcess(reqWriter, respReader, nil)
+
+	readLoopDone := make(chan struct{})
+	go func() {
+		bp.readLoop()
+		close(readLoopDone)
+	}()
+
+	tests := []struct {
+		name       string
+		module     string
+		function   string
+		arity      int
+		respStatus byte
+		respName   string // struct module name in response ("" = not a struct)
+		wantResult string
+	}{
+		{
+			name:       "returns struct module name",
+			module:     "URI",
+			function:   "parse",
+			arity:      1,
+			respStatus: 0,
+			respName:   "URI",
+			wantResult: "URI",
+		},
+		{
+			name:       "returns empty for non-struct",
+			module:     "Map",
+			function:   "new",
+			arity:      0,
+			respStatus: 0,
+			respName:   "",
+			wantResult: "",
+		},
+		{
+			name:       "handles error status gracefully",
+			module:     "NoModule",
+			function:   "nope",
+			arity:      0,
+			respStatus: 1,
+			respName:   "",
+			wantResult: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			serverDone := make(chan struct{})
+			go func() {
+				defer close(serverDone)
+
+				frameType, err := readByte(reqReader)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				if frameType != frameRequest {
+					t.Errorf("expected request frame, got %d", frameType)
+					return
+				}
+
+				reqID, err := readUint32(reqReader)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+
+				header := make([]byte, 6)
+				if _, err := io.ReadFull(reqReader, header); err != nil {
+					t.Error(err)
+					return
+				}
+				if header[0] != serviceCodeIntel || header[1] != codeIntelOpReturnTypeStruct {
+					t.Errorf("unexpected service=%d op=%d", header[0], header[1])
+					return
+				}
+				payloadLen := binary.BigEndian.Uint32(header[2:])
+				payloadBuf := make([]byte, payloadLen)
+				if _, err := io.ReadFull(reqReader, payloadBuf); err != nil {
+					t.Error(err)
+					return
+				}
+
+				// Decode and verify the request payload
+				r := bytes.NewReader(payloadBuf)
+				var modLen uint16
+				_ = binary.Read(r, binary.BigEndian, &modLen)
+				modBuf := make([]byte, modLen)
+				_, _ = io.ReadFull(r, modBuf)
+				if string(modBuf) != tt.module {
+					t.Errorf("module = %q, want %q", string(modBuf), tt.module)
+				}
+
+				var fnLen uint16
+				_ = binary.Read(r, binary.BigEndian, &fnLen)
+				fnBuf := make([]byte, fnLen)
+				_, _ = io.ReadFull(r, fnBuf)
+				if string(fnBuf) != tt.function {
+					t.Errorf("function = %q, want %q", string(fnBuf), tt.function)
+				}
+
+				arityByte, _ := r.ReadByte()
+				if int(arityByte) != tt.arity {
+					t.Errorf("arity = %d, want %d", arityByte, tt.arity)
+				}
+
+				// Build response
+				var respPayload bytes.Buffer
+				if tt.respStatus == 0 {
+					_ = binary.Write(&respPayload, binary.BigEndian, uint16(len(tt.respName)))
+					respPayload.WriteString(tt.respName)
+				} else {
+					respPayload.WriteString("lookup failed")
+				}
+				writeTestResponseFrame(t, respWriter, reqID, tt.respStatus, respPayload.Bytes())
+			}()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			result, err := bp.ReturnTypeStruct(ctx, tt.module, tt.function, tt.arity)
+			if err != nil {
+				t.Fatalf("ReturnTypeStruct error: %v", err)
+			}
+			if result != tt.wantResult {
+				t.Errorf("ReturnTypeStruct = %q, want %q", result, tt.wantResult)
+			}
+
+			<-serverDone
+		})
+	}
+
+	_ = reqWriter.Close()
+	_ = reqReader.Close()
+	_ = respWriter.Close()
+	<-readLoopDone
 }
 
 func TestBeamProcess_DoRequestHandlesNotificationBeforeResponse(t *testing.T) {
