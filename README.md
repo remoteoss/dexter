@@ -84,13 +84,13 @@ A fast, full-featured Elixir LSP optimized for large Elixir codebases.
 
    ```sh
    # via mise
-   mise plugin add dexter https://github.com/remoteoss/dexter.git && mise use -g dexter@latest
+   mise use -g aqua:remoteoss/dexter@latest
 
    # via asdf
    asdf plugin add dexter https://github.com/remoteoss/dexter.git && asdf install dexter latest && asdf set --home dexter latest
-   
+
    # via Homebrew
-   brew install remoteoss/tap/dexter
+   brew install dexter-lsp
    ```
 
    Or [build from source](#development-building-from-source).
@@ -235,7 +235,7 @@ See the [Zed docs](https://zed.dev/docs/languages/elixir#using-dexter) for full 
 }
 ```
 
-If you already have Dexter installed via [mise](https://mise.jdx.dev/), the extension will use your local binary from PATH instead of downloading.
+If you already have Dexter installed via [mise](https://mise.en.dev/), the extension will use your local binary from PATH instead of downloading.
 
 To override the binary path manually, add this to your `settings.json`:
 
@@ -574,10 +574,8 @@ make tag VERSION=0.2.0
 This updates the version in `internal/version/version.go` on a release branch. After merging to main, `make tag` creates and pushes the git tag. Users can then upgrade via mise:
 
 ```sh
-mise plugin update dexter && mise install dexter@latest
+mise upgrade aqua:remoteoss/dexter
 ```
-
-The plugin update step is required to pick up newly tagged releases. Without it, `mise install dexter@latest` will resolve against a stale list.
 
 If the release changes how Elixir files are parsed or what gets stored in the index (e.g. a new definition kind, a change to delegate resolution), also bump `IndexVersion` in `internal/version/version.go`. Dexter will automatically rebuild the index when users upgrade to a binary with a higher `IndexVersion` — no manual `dexter init --force` required.
 
