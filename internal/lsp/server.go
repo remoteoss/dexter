@@ -637,7 +637,8 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 
 		// Variable go-to-definition via tree-sitter.
 		// The first occurrence in scope is the definition (pattern/assignment).
-		if tree, src, ok := s.docs.GetTree(docURI); ok {
+		if tree, src, release, ok := s.docs.GetTree(docURI); ok {
+			defer release()
 			if occs := treesitter.FindVariableOccurrencesWithTree(tree.RootNode(), src, uint(lineNum), uint(col)); len(occs) > 0 {
 				s.debugf("Definition: returning variable definition at line %d", occs[0].Line)
 				return []protocol.Location{{
@@ -1706,8 +1707,9 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 
 		// Variables in scope via tree-sitter
 		var varsInScope []string
-		if tree, src, ok := s.docs.GetTree(docURI); ok {
+		if tree, src, release, ok := s.docs.GetTree(docURI); ok {
 			varsInScope = treesitter.FindVariablesInScopeWithTree(tree.RootNode(), src, uint(lineNum), uint(col))
+			release()
 		}
 		for _, varName := range varsInScope {
 			if strings.HasPrefix(varName, funcPrefix) && !seen[varName] {
@@ -2658,10 +2660,11 @@ func (s *Server) DocumentHighlight(ctx context.Context, params *protocol.Documen
 	lineNum := int(params.Position.Line)
 	col := int(params.Position.Character)
 
-	tree, src, hasTree := s.docs.GetTree(docURI)
+	tree, src, release, hasTree := s.docs.GetTree(docURI)
 	if !hasTree {
 		return nil, nil
 	}
+	defer release()
 	root := tree.RootNode()
 
 	// Try scope-aware variable highlight first
@@ -3577,7 +3580,8 @@ func (s *Server) PrepareRename(ctx context.Context, params *protocol.PrepareRena
 	// For bare identifiers (no module qualifier), check tree-sitter variables
 	// first — a local variable shadows a same-named function in Elixir.
 	if moduleRef == "" {
-		if tree, src, ok := s.docs.GetTree(docURI); ok {
+		if tree, src, release, ok := s.docs.GetTree(docURI); ok {
+			defer release()
 			if occs := treesitter.FindVariableOccurrencesWithTree(tree.RootNode(), src, uint(lineNum), uint(col)); len(occs) > 0 {
 				for _, occ := range occs {
 					if occ.Line == uint(lineNum) && uint(col) >= occ.StartCol && uint(col) < occ.EndCol {
@@ -3774,7 +3778,8 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 		// function with the same name, so variable references take priority.
 		// Bare identifiers that aren't defined as variables fall through to
 		// function reference lookup.
-		if tree, src, ok := s.docs.GetTree(docURI); ok {
+		if tree, src, release, ok := s.docs.GetTree(docURI); ok {
+			defer release()
 			if occs := treesitter.FindVariableOccurrencesWithTree(tree.RootNode(), src, uint(lineNum), uint(col)); len(occs) > 0 {
 				var locations []protocol.Location
 				for _, occ := range occs {
@@ -3979,7 +3984,8 @@ func (s *Server) Rename(ctx context.Context, params *protocol.RenameParams) (*pr
 	// For bare identifiers, check tree-sitter variables first — a local
 	// variable shadows a same-named function in Elixir.
 	if moduleRef == "" {
-		if tree, src, ok := s.docs.GetTree(docURI); ok {
+		if tree, src, release, ok := s.docs.GetTree(docURI); ok {
+			defer release()
 			if occs := treesitter.FindVariableOccurrencesWithTree(tree.RootNode(), src, uint(lineNum), uint(col)); len(occs) > 0 {
 				if treesitter.NameExistsInScopeOf(tree.RootNode(), src, uint(lineNum), uint(col), params.NewName) {
 					return nil, fmt.Errorf("variable %q already exists in this scope", params.NewName)

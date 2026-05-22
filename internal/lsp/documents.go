@@ -20,7 +20,7 @@ const defaultMaxTransient = 50
 
 type cachedDoc struct {
 	text       string
-	tree       *tree_sitter.Tree
+	tree       *refTree
 	src        []byte         // source bytes the tree references - must stay alive
 	tokens     []parser.Token // cached tokenizer output
 	tokSrc     []byte         // source bytes for tokens
@@ -30,6 +30,38 @@ type cachedDoc struct {
 	// LRU and evicted once the transient cap is reached. Editor-owned
 	// entries (created via Set) are never transient and never evicted.
 	transient bool
+}
+
+// refTree wraps a tree-sitter parse tree with refcounting so that
+// concurrent handlers walking the tree (RootNode, queries) aren't racing
+// with eviction or replacement, which would free the underlying C memory
+// via ts_tree_delete and cause a use-after-free that the Go race detector
+// cannot observe.
+//
+// Lifecycle: GetTree increments refs under the store write lock; the
+// returned release closure decrements under the same lock and frees the
+// tree only once refs==0 AND retired is set. Set/Close/CloseAll/eviction
+// don't close the tree directly - they call retireLocked, which marks the
+// tree for free and only triggers ts_tree_delete if no handler still
+// holds a reference.
+type refTree struct {
+	tree    *tree_sitter.Tree
+	refs    int
+	retired bool
+}
+
+// retireLocked marks the tree for free. Caller must hold the store write
+// lock. If no handler is currently using the tree, frees it immediately;
+// otherwise the last release closes it.
+func (rt *refTree) retireLocked() {
+	if rt == nil || rt.tree == nil {
+		return
+	}
+	rt.retired = true
+	if rt.refs == 0 {
+		rt.tree.Close()
+		rt.tree = nil
+	}
 }
 
 // DocumentStore tracks the text content of open buffers and caches
@@ -69,7 +101,7 @@ func NewDocumentStore() *DocumentStore {
 }
 
 // SetMaxTransient updates the cap on disk-loaded (transient) entries and
-// evicts any excess immediately. A cap of 0 disables transient caching —
+// evicts any excess immediately. A cap of 0 disables transient caching -
 // disk-loaded entries are inserted and immediately evicted, so the store
 // still serves the read but never retains it. Editor-owned entries are
 // never affected. Negative values are clamped to 0.
@@ -86,8 +118,8 @@ func (ds *DocumentStore) SetMaxTransient(n int) {
 func (ds *DocumentStore) Set(uri string, text string) {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
-	if doc, ok := ds.docs[uri]; ok && doc.tree != nil {
-		doc.tree.Close()
+	if doc, ok := ds.docs[uri]; ok {
+		doc.tree.retireLocked()
 	}
 	// Editor took ownership of this URI - drop any LRU tracking for it.
 	ds.removeFromLRULocked(uri)
@@ -97,21 +129,22 @@ func (ds *DocumentStore) Set(uri string, text string) {
 func (ds *DocumentStore) Close(uri string) {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
-	if doc, ok := ds.docs[uri]; ok && doc.tree != nil {
-		doc.tree.Close()
+	if doc, ok := ds.docs[uri]; ok {
+		doc.tree.retireLocked()
 	}
 	ds.removeFromLRULocked(uri)
 	delete(ds.docs, uri)
 }
 
-// CloseAll frees all cached trees and the shared parser.
+// CloseAll frees all cached trees and the shared parser. Trees still
+// referenced by in-flight handlers stay alive until released; the parser
+// itself is safe to close immediately because parse trees are independent
+// of the parser once produced.
 func (ds *DocumentStore) CloseAll() {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	for _, doc := range ds.docs {
-		if doc.tree != nil {
-			doc.tree.Close()
-		}
+		doc.tree.retireLocked()
 	}
 	ds.docs = nil
 	ds.transientList = nil
@@ -222,29 +255,50 @@ func (ds *DocumentStore) evictTransientLocked() {
 		ds.transientList.Remove(elem)
 		delete(ds.transientIdx, victim)
 		if doc, ok := ds.docs[victim]; ok {
-			if doc.tree != nil {
-				doc.tree.Close()
-			}
+			doc.tree.retireLocked()
 			delete(ds.docs, victim)
 		}
 	}
 }
 
 // GetTree returns a cached tree-sitter parse tree and its source bytes for
-// the given URI. Parses on first access and caches the result. The tree is
-// invalidated on the next Set() call. Callers must not close the returned tree.
-func (ds *DocumentStore) GetTree(uri string) (*tree_sitter.Tree, []byte, bool) {
+// the given URI. Parses on first access and caches the result.
+//
+// The returned release closure MUST be called exactly once when the caller
+// is done with the tree (typically via defer). It increments the tree's
+// refcount under the store lock for the duration of the caller's use,
+// keeping the underlying C memory alive even if Set/Close/CloseAll or LRU
+// eviction concurrently retires the tree. Without this, a concurrent
+// GetOrLoad for one URI could evict and free the tree of another URI
+// while a handler is still walking it - a use-after-free on C memory that
+// the Go race detector cannot catch.
+//
+// Callers must not close the returned tree directly.
+//
+// When ok is false, release is nil and must not be called.
+func (ds *DocumentStore) GetTree(uri string) (*tree_sitter.Tree, []byte, func(), bool) {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	doc, ok := ds.docs[uri]
 	if !ok {
-		return nil, nil, false
+		return nil, nil, nil, false
 	}
 	if doc.tree == nil {
 		doc.src = []byte(doc.text)
-		doc.tree = ds.parser.Parse(doc.src, nil)
+		doc.tree = &refTree{tree: ds.parser.Parse(doc.src, nil)}
 	}
-	return doc.tree, doc.src, true
+	rt := doc.tree
+	rt.refs++
+	release := func() {
+		ds.mu.Lock()
+		defer ds.mu.Unlock()
+		rt.refs--
+		if rt.refs == 0 && rt.retired && rt.tree != nil {
+			rt.tree.Close()
+			rt.tree = nil
+		}
+	}
+	return rt.tree, doc.src, release, true
 }
 
 // GetTokens returns cached tokenizer output and source bytes for the given URI.

@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"testing"
 
 	"go.lsp.dev/uri"
@@ -254,10 +255,11 @@ func TestDocumentStore_GetTree_DiskLoaded(t *testing.T) {
 		t.Fatalf("GetOrLoad failed")
 	}
 
-	tree, src, ok := ds.GetTree(docURI)
+	tree, src, release, ok := ds.GetTree(docURI)
 	if !ok {
 		t.Fatalf("GetTree returned ok=false for disk-loaded entry")
 	}
+	defer release()
 	if tree == nil {
 		t.Fatalf("GetTree returned nil tree")
 	}
@@ -315,21 +317,26 @@ func TestDocumentStore_GetTree_SetInvalidatesCache(t *testing.T) {
 	if _, ok := ds.GetOrLoad(docURI); !ok {
 		t.Fatalf("GetOrLoad failed")
 	}
-	tree1, src1, _ := ds.GetTree(docURI)
+	tree1, src1, release1, _ := ds.GetTree(docURI)
 	if tree1 == nil {
 		t.Fatalf("first GetTree returned nil")
 	}
+	// Release before Set so the old tree is freed inline (refcount→0) rather
+	// than retired-and-deferred; the Set-replaces-tree invariant is the
+	// behavior under test, not the deferred-free path.
+	release1()
 
-	// Editor opens the buffer with different content — Set must replace the
+	// Editor opens the buffer with different content - Set must replace the
 	// cached tree, otherwise stale parses would leak across the transition
 	// from transient to editor-owned.
 	editorText := "defmodule B do\n  def x, do: 1\nend\n"
 	ds.Set(docURI, editorText)
 
-	tree2, src2, ok := ds.GetTree(docURI)
+	tree2, src2, release2, ok := ds.GetTree(docURI)
 	if !ok {
 		t.Fatalf("GetTree after Set returned ok=false")
 	}
+	defer release2()
 	if tree2 == nil {
 		t.Fatalf("GetTree after Set returned nil tree")
 	}
@@ -378,4 +385,113 @@ func transientCount(ds *DocumentStore) int {
 	ds.mu.RLock()
 	defer ds.mu.RUnlock()
 	return ds.transientList.Len()
+}
+
+// TestDocumentStore_GetTree_SurvivesEviction is the regression test for
+// the use-after-free where cross-URI LRU eviction calls ts_tree_delete on
+// a tree another handler is actively walking. With refcounted release,
+// the underlying tree must stay alive past eviction until the holder
+// calls release().
+func TestDocumentStore_GetTree_SurvivesEviction(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "victim.ex")
+	contents := "defmodule Victim do\n  def hello, do: :world\nend\n"
+	if err := os.WriteFile(path, []byte(contents), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	ds := NewDocumentStore()
+	defer ds.CloseAll()
+	docURI := string(uri.File(path))
+
+	if _, ok := ds.GetOrLoad(docURI); !ok {
+		t.Fatalf("GetOrLoad failed")
+	}
+
+	tree, _, release, ok := ds.GetTree(docURI)
+	if !ok {
+		t.Fatalf("GetTree returned ok=false")
+	}
+	if tree == nil {
+		t.Fatalf("GetTree returned nil tree")
+	}
+
+	// Capture the root node kind so we can re-read it after eviction.
+	// Pre-fix, the eviction below would call ts_tree_delete on this tree
+	// and the second RootNode() call would read freed C memory.
+	rootKindBefore := tree.RootNode().Kind()
+
+	// Force eviction of this URI while we still hold a ref.
+	ds.SetMaxTransient(0)
+	if got := transientCount(ds); got != 0 {
+		t.Fatalf("expected 0 transient entries after SetMaxTransient(0), got %d", got)
+	}
+
+	// Walking the tree after eviction must still work - this is the UAF
+	// the refcounting prevents.
+	rootKindAfter := tree.RootNode().Kind()
+	if rootKindAfter != rootKindBefore {
+		t.Fatalf("tree root kind changed across eviction: got %q want %q", rootKindAfter, rootKindBefore)
+	}
+	if rootKindAfter != "source" {
+		t.Fatalf("expected root node kind 'source', got %q", rootKindAfter)
+	}
+
+	// Release should now actually free the underlying C tree (refcount→0
+	// and retired is set). Nothing to assert directly - the absence of a
+	// crash on CloseAll later is the implicit check.
+	release()
+}
+
+// TestDocumentStore_GetTree_ConcurrentEvictionStress runs many goroutines
+// that load + walk + release trees against a small transient cap, which
+// keeps eviction happening continuously. Designed to catch the UAF race
+// when run under -race; pre-fix this reliably crashed on
+// ts_tree_delete'd memory.
+func TestDocumentStore_GetTree_ConcurrentEvictionStress(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping stress test in -short mode")
+	}
+	dir := t.TempDir()
+
+	const numURIs = 8
+	uris := make([]string, numURIs)
+	for i := 0; i < numURIs; i++ {
+		path := filepath.Join(dir, "f"+strconv.Itoa(i)+".ex")
+		body := "defmodule F" + strconv.Itoa(i) + " do\n  def hello, do: :world\nend\n"
+		if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+			t.Fatal(err)
+		}
+		uris[i] = string(uri.File(path))
+	}
+
+	ds := NewDocumentStore()
+	defer ds.CloseAll()
+	// Cap well below the working set so every load triggers eviction.
+	ds.SetMaxTransient(2)
+
+	const iterations = 200
+	const walkers = 4
+	var wg sync.WaitGroup
+	for w := 0; w < walkers; w++ {
+		wg.Add(1)
+		go func(seed int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				u := uris[(seed+i)%numURIs]
+				if _, ok := ds.GetOrLoad(u); !ok {
+					continue
+				}
+				tree, _, release, ok := ds.GetTree(u)
+				if !ok {
+					continue
+				}
+				root := tree.RootNode()
+				_ = root.Kind()
+				_ = root.ChildCount()
+				release()
+			}
+		}(w)
+	}
+	wg.Wait()
 }
