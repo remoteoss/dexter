@@ -499,6 +499,7 @@ Dexter reads `initializationOptions` from your editor configuration:
 - **`followDelegates`** (boolean, default: `true`): follow `defdelegate` targets on lookup.
 - **`stdlibPath`** (string): override the Elixir stdlib directory to index. Defaults to auto-detection; use this if your install is non-standard.
 - **`debug`** (boolean, default: `false`): enable verbose logging to stderr. Logs timing and resolution details for every definition, hover, references, and rename request. Can also be enabled via the `DEXTER_DEBUG=true` environment variable.
+- **`maxTransientDocuments`** (integer, default: `50`): cap on how many lazily-loaded buffers the server retains in memory. When an LSP client (e.g. Claude Code) queries a file it never opened via `didOpen`, dexter reads it from disk and caches it. Editor-owned buffers are unaffected; only disk-loaded entries are subject to LRU eviction. Set to `0` to disable transient caching.
 
 ## Index database location (.dexter/)
 

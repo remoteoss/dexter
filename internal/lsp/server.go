@@ -324,6 +324,14 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 		if v, ok := opts["debug"].(bool); ok {
 			s.debug = v
 		}
+		// JSON numbers decode to float64. Accept either form so a client
+		// sending an integer literal still works.
+		switch v := opts["maxTransientDocuments"].(type) {
+		case float64:
+			s.docs.SetMaxTransient(int(v))
+		case int:
+			s.docs.SetMaxTransient(v)
+		}
 	}
 	if os.Getenv("DEXTER_DEBUG") == "true" {
 		s.debug = true
@@ -565,7 +573,7 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		defer func() { s.debugf("Definition: total %s", time.Since(t0).Round(time.Microsecond)) }()
 	}
 
-	text, ok := s.docs.Get(docURI)
+	text, ok := s.docs.GetOrLoad(docURI)
 	if !ok {
 		return nil, nil
 	}
@@ -1230,7 +1238,7 @@ func (s *Server) LogTrace(ctx context.Context, params *protocol.LogTraceParams) 
 func (s *Server) SetTrace(ctx context.Context, params *protocol.SetTraceParams) error { return nil }
 func (s *Server) CodeAction(ctx context.Context, params *protocol.CodeActionParams) ([]protocol.CodeAction, error) {
 	docURI := string(params.TextDocument.URI)
-	text, ok := s.docs.Get(docURI)
+	text, ok := s.docs.GetOrLoad(docURI)
 	if !ok {
 		return nil, nil
 	}
@@ -1402,7 +1410,7 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 	docURI := string(params.TextDocument.URI)
 	filePath := uriToPath(params.TextDocument.URI)
 
-	text, ok := s.docs.Get(docURI)
+	text, ok := s.docs.GetOrLoad(docURI)
 	if !ok {
 		return nil, nil
 	}
@@ -2418,7 +2426,7 @@ func (s *Server) Declaration(ctx context.Context, params *protocol.DeclarationPa
 		defer func() { s.debugf("Declaration: total %s", time.Since(t0).Round(time.Microsecond)) }()
 	}
 
-	text, ok := s.docs.Get(docURI)
+	text, ok := s.docs.GetOrLoad(docURI)
 	if !ok {
 		s.debugf("Declaration: document not open")
 		return nil, nil
@@ -2642,7 +2650,7 @@ func (s *Server) DocumentColor(ctx context.Context, params *protocol.DocumentCol
 }
 func (s *Server) DocumentHighlight(ctx context.Context, params *protocol.DocumentHighlightParams) ([]protocol.DocumentHighlight, error) {
 	docURI := string(params.TextDocument.URI)
-	text, ok := s.docs.Get(docURI)
+	text, ok := s.docs.GetOrLoad(docURI)
 	if !ok {
 		return nil, nil
 	}
@@ -2714,7 +2722,7 @@ func (s *Server) DocumentLinkResolve(ctx context.Context, params *protocol.Docum
 }
 func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSymbolParams) ([]interface{}, error) {
 	docURI := string(params.TextDocument.URI)
-	text, ok := s.docs.Get(docURI)
+	text, ok := s.docs.GetOrLoad(docURI)
 	if !ok {
 		return nil, nil
 	}
@@ -3220,7 +3228,7 @@ func (s *Server) ExecuteCommand(ctx context.Context, params *protocol.ExecuteCom
 }
 func (s *Server) FoldingRanges(ctx context.Context, params *protocol.FoldingRangeParams) ([]protocol.FoldingRange, error) {
 	docURI := string(params.TextDocument.URI)
-	text, ok := s.docs.Get(docURI)
+	text, ok := s.docs.GetOrLoad(docURI)
 	if !ok {
 		return nil, nil
 	}
@@ -3364,7 +3372,7 @@ func (s *Server) Formatting(ctx context.Context, params *protocol.DocumentFormat
 func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*protocol.Hover, error) {
 	docURI := string(params.TextDocument.URI)
 
-	text, ok := s.docs.Get(docURI)
+	text, ok := s.docs.GetOrLoad(docURI)
 	if !ok {
 		return nil, nil
 	}
@@ -3479,7 +3487,7 @@ func (s *Server) Implementation(ctx context.Context, params *protocol.Implementa
 		defer func() { s.debugf("Implementation: total %s", time.Since(t0).Round(time.Microsecond)) }()
 	}
 
-	text, ok := s.docs.Get(docURI)
+	text, ok := s.docs.GetOrLoad(docURI)
 	if !ok {
 		return nil, nil
 	}
@@ -3546,7 +3554,7 @@ func (s *Server) OnTypeFormatting(ctx context.Context, params *protocol.Document
 }
 func (s *Server) PrepareRename(ctx context.Context, params *protocol.PrepareRenameParams) (*protocol.Range, error) {
 	docURI := string(params.TextDocument.URI)
-	text, ok := s.docs.Get(docURI)
+	text, ok := s.docs.GetOrLoad(docURI)
 	if !ok {
 		return nil, nil
 	}
@@ -3689,7 +3697,7 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 		defer func() { s.debugf("References: total %s", time.Since(t).Round(time.Microsecond)) }()
 	}
 
-	text, ok := s.docs.Get(docURI)
+	text, ok := s.docs.GetOrLoad(docURI)
 	if !ok {
 		s.debugf("References: document not found in store")
 		return nil, nil
@@ -3949,7 +3957,7 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 
 func (s *Server) Rename(ctx context.Context, params *protocol.RenameParams) (*protocol.WorkspaceEdit, error) {
 	docURI := string(params.TextDocument.URI)
-	text, ok := s.docs.Get(docURI)
+	text, ok := s.docs.GetOrLoad(docURI)
 	if !ok {
 		return nil, nil
 	}
@@ -5010,7 +5018,7 @@ func (s *Server) findBareCallRefs(module, functionName string) []store.Reference
 }
 func (s *Server) SignatureHelp(ctx context.Context, params *protocol.SignatureHelpParams) (*protocol.SignatureHelp, error) {
 	docURI := string(params.TextDocument.URI)
-	text, ok := s.docs.Get(docURI)
+	text, ok := s.docs.GetOrLoad(docURI)
 	if !ok {
 		return nil, nil
 	}
@@ -5177,7 +5185,7 @@ func (s *Server) Symbols(ctx context.Context, params *protocol.WorkspaceSymbolPa
 }
 func (s *Server) TypeDefinition(ctx context.Context, params *protocol.TypeDefinitionParams) ([]protocol.Location, error) {
 	docURI := string(params.TextDocument.URI)
-	text, ok := s.docs.Get(docURI)
+	text, ok := s.docs.GetOrLoad(docURI)
 	if !ok {
 		return nil, nil
 	}
@@ -5250,7 +5258,7 @@ func (s *Server) DidDeleteFiles(ctx context.Context, params *protocol.DeleteFile
 func (s *Server) CodeLensRefresh(ctx context.Context) error { return nil }
 func (s *Server) PrepareCallHierarchy(ctx context.Context, params *protocol.CallHierarchyPrepareParams) ([]protocol.CallHierarchyItem, error) {
 	docURI := string(params.TextDocument.URI)
-	text, ok := s.docs.Get(docURI)
+	text, ok := s.docs.GetOrLoad(docURI)
 	if !ok {
 		return nil, nil
 	}
