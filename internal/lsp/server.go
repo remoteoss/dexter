@@ -1708,8 +1708,8 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 		// Variables in scope via tree-sitter
 		var varsInScope []string
 		if tree, src, release, ok := s.docs.GetTree(docURI); ok {
+			defer release()
 			varsInScope = treesitter.FindVariablesInScopeWithTree(tree.RootNode(), src, uint(lineNum), uint(col))
-			release()
 		}
 		for _, varName := range varsInScope {
 			if strings.HasPrefix(varName, funcPrefix) && !seen[varName] {
