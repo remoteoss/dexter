@@ -211,8 +211,16 @@ func (ds *DocumentStore) GetOrLoad(uri string) (string, bool) {
 	// Re-check: another goroutine may have populated this URI (via Set
 	// or a concurrent GetOrLoad) while we were reading from disk. If so,
 	// prefer the existing entry - Set wins by definition; a concurrent
-	// transient load is equivalent to ours.
+	// transient load is equivalent to ours. Bump the LRU on the way out
+	// so this access registers as recency-of-use, matching the fast-path
+	// behavior above; without this, racing slow-path callers wouldn't
+	// keep the entry warm even though they just used it.
 	if existing, ok := ds.docs[uri]; ok {
+		if existing.transient {
+			if elem, ok := ds.transientIdx[uri]; ok {
+				ds.transientList.MoveToFront(elem)
+			}
+		}
 		return existing.text, true
 	}
 
