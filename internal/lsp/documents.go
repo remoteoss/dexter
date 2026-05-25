@@ -162,6 +162,16 @@ func (ds *DocumentStore) Get(uri string) (string, bool) {
 	return doc.text, true
 }
 
+// HasOpen reports whether the given URI is an editor-owned (non-transient)
+// entry in the store - i.e. the editor sent a didOpen for this document.
+// Transient entries loaded from disk via GetOrLoad return false.
+func (ds *DocumentStore) HasOpen(uri string) bool {
+	ds.mu.RLock()
+	defer ds.mu.RUnlock()
+	doc, ok := ds.docs[uri]
+	return ok && !doc.transient
+}
+
 // GetOrLoad returns the text for the given URI, falling back to a disk
 // read if no editor has opened the document. Disk-loaded entries are
 // marked transient and tracked in an LRU; if the transient population

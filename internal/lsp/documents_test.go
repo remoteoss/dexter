@@ -379,6 +379,51 @@ func TestDocumentStore_SetMaxTransient_EvictsImmediately(t *testing.T) {
 	}
 }
 
+func TestDocumentStore_HasOpen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "hasopen.ex")
+	if err := os.WriteFile(path, []byte("defmodule HasOpen do\nend\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	ds := NewDocumentStore()
+	defer ds.CloseAll()
+	docURI := string(uri.File(path))
+
+	// Nothing in the store yet.
+	if ds.HasOpen(docURI) {
+		t.Fatalf("HasOpen returned true for a URI that was never opened or loaded")
+	}
+
+	// GetOrLoad adds a transient entry - NOT editor-owned.
+	if _, ok := ds.GetOrLoad(docURI); !ok {
+		t.Fatalf("GetOrLoad failed")
+	}
+	if ds.HasOpen(docURI) {
+		t.Fatalf("HasOpen returned true for a transient (disk-loaded) entry")
+	}
+
+	// Set adds an editor-owned entry - IS open.
+	ds.Set(docURI, "defmodule HasOpen do\n  def open, do: true\nend\n")
+	if !ds.HasOpen(docURI) {
+		t.Fatalf("HasOpen returned false for an editor-owned entry after Set")
+	}
+
+	// Close removes the entry.
+	ds.Close(docURI)
+	if ds.HasOpen(docURI) {
+		t.Fatalf("HasOpen returned true after Close")
+	}
+
+	// GetOrLoad re-adds it as transient - NOT open.
+	if _, ok := ds.GetOrLoad(docURI); !ok {
+		t.Fatalf("GetOrLoad after Close failed")
+	}
+	if ds.HasOpen(docURI) {
+		t.Fatalf("HasOpen returned true for transient entry after re-load")
+	}
+}
+
 // transientCount returns the number of transient entries currently
 // tracked by the LRU. Used by tests; takes the read lock.
 func transientCount(ds *DocumentStore) int {

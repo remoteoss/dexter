@@ -4954,10 +4954,13 @@ func isDepsFileUncached(filePath string) bool {
 }
 
 // readFileText returns the contents of filePath, preferring the in-memory
-// document store for open buffers. The second return indicates whether the
-// file is currently open in the editor.
+// document store for editor-owned (didOpen) buffers. The second return
+// indicates whether the file is currently open in the editor — transient
+// entries loaded from disk via GetOrLoad are NOT reported as open.
 func (s *Server) readFileText(filePath string) (text string, open bool, ok bool) {
-	if t, found := s.docs.Get(string(uri.File(filePath))); found {
+	uri := string(uri.File(filePath))
+	if s.docs.HasOpen(uri) {
+		t, _ := s.docs.Get(uri)
 		return t, true, true
 	}
 	if data, err := os.ReadFile(filePath); err == nil {
@@ -4967,11 +4970,15 @@ func (s *Server) readFileText(filePath string) (text string, open bool, ok bool)
 }
 
 // getFileLine returns the text of line lineNum (1-based) from the file at
-// filePath, preferring the in-memory document store for open buffers.
-// For closed files, only reads up to the target line instead of the whole file.
+// filePath, preferring the in-memory document store for editor-owned
+// buffers. Transient entries loaded via GetOrLoad fall through to the
+// disk path. For closed files, only reads up to the target line instead
+// of the whole file.
 func (s *Server) getFileLine(filePath string, lineNum int) (string, bool) {
-	// Open buffer: extract the single line without splitting the entire text
-	if text, ok := s.docs.Get(string(uri.File(filePath))); ok {
+	// Editor-owned buffer: extract the single line from memory
+	uri := string(uri.File(filePath))
+	if s.docs.HasOpen(uri) {
+		text, _ := s.docs.Get(uri)
 		line, found := nthLine(text, lineNum-1)
 		if found {
 			return line, true
