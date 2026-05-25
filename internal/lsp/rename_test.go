@@ -418,6 +418,7 @@ end
 	r := prepareRenameAt(t, server, docURI, 1, 6)
 	if r == nil {
 		t.Fatal("expected non-nil range")
+		return
 	}
 	if r.Start.Line != 1 {
 		t.Errorf("expected line 1, got %d", r.Start.Line)
@@ -447,6 +448,7 @@ end
 	r := prepareRenameAt(t, server, docURI, 0, 20)
 	if r == nil {
 		t.Fatal("expected non-nil range")
+		return
 	}
 	// Should highlight just "Accounts" (the last segment), not "MyApp.Accounts"
 	// "Accounts" starts at col 16, ends at col 24
@@ -820,6 +822,7 @@ end
 	rng := prepareRenameAt(t, server, docURI, 3, 10)
 	if rng == nil {
 		t.Fatal("expected PrepareRename to return a range for the variable")
+		return
 	}
 	// The highlighted range should be on line 3 (the variable), not line 6 (the function)
 	if rng.Start.Line != 3 {
@@ -1091,6 +1094,7 @@ end
 	r := prepareRenameAt(t, server, docURI, 4, 4)
 	if r == nil {
 		t.Fatal("expected PrepareRename to succeed for as: alias")
+		return
 	}
 	if r.Start.Line != 4 {
 		t.Errorf("expected highlight on line 4, got line %d", r.Start.Line)
@@ -1120,6 +1124,7 @@ end
 	r := prepareRenameAt(t, server, docURI, 5, 6)
 	if r == nil {
 		t.Fatal("expected PrepareRename to succeed for nested module function")
+		return
 	}
 	if r.Start.Line != 5 {
 		t.Errorf("expected highlight on line 5, got line %d", r.Start.Line)
@@ -1883,6 +1888,7 @@ end
 	r := prepareRenameAt(t, server, defURI, 0, 16)
 	if r == nil {
 		t.Fatal("expected non-nil prepareRename result")
+		return
 	}
 	// "CostCalculator" starts at col 16 in "defmodule MyApp.CostCalculator do"
 	if r.Start.Character != 16 {

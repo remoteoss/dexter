@@ -168,6 +168,7 @@ func TestDocumentStore_Set_PromotesTransientToEditorOwned(t *testing.T) {
 	ds.mu.RUnlock()
 	if doc == nil {
 		t.Fatalf("entry missing after Set")
+		return
 	}
 	if doc.transient {
 		t.Fatalf("entry should be editor-owned after Set, still marked transient")
@@ -262,6 +263,7 @@ func TestDocumentStore_GetTree_DiskLoaded(t *testing.T) {
 	defer release()
 	if tree == nil {
 		t.Fatalf("GetTree returned nil tree")
+		return
 	}
 	if string(src) != contents {
 		t.Fatalf("GetTree src mismatch: got %q want %q", src, contents)
@@ -462,6 +464,7 @@ func TestDocumentStore_GetTree_SurvivesEviction(t *testing.T) {
 	}
 	if tree == nil {
 		t.Fatalf("GetTree returned nil tree")
+		return
 	}
 
 	// Capture the root node kind so we can re-read it after eviction.

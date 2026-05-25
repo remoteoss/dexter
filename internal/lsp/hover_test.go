@@ -463,6 +463,7 @@ end`)
 	hover := hoverAt(t, server, uri, 3, 13)
 	if hover == nil {
 		t.Fatal("expected hover result")
+		return
 	}
 
 	content := hover.Contents.Value
@@ -495,6 +496,7 @@ end
 	hover := hoverAt(t, server, uri, 0, 8)
 	if hover == nil {
 		t.Fatal("expected hover result for module")
+		return
 	}
 
 	content := hover.Contents.Value
@@ -520,6 +522,7 @@ end
 	hover := hoverAt(t, server, uri, 0, 19)
 	if hover == nil {
 		t.Fatal("expected hover result even without doc")
+		return
 	}
 
 	content := hover.Contents.Value
@@ -551,6 +554,7 @@ end`
 	hover := hoverAt(t, server, uri, 8, 6)
 	if hover == nil {
 		t.Fatal("expected hover for local function")
+		return
 	}
 
 	content := hover.Contents.Value
@@ -588,6 +592,7 @@ end
 	hover := hoverAt(t, server, uri, 0, 7)
 	if hover == nil {
 		t.Fatal("expected hover for external module function")
+		return
 	}
 
 	content := hover.Contents.Value
@@ -633,6 +638,7 @@ end
 	hover := hoverAt(t, server, uri, 0, 11)
 	if hover == nil {
 		t.Fatal("expected hover for @type t")
+		return
 	}
 	if !strings.Contains(hover.Contents.Value, "primary user struct") {
 		t.Errorf("expected typedoc in hover, got %q", hover.Contents.Value)
@@ -646,6 +652,7 @@ end
 	hover = hoverAt(t, server, uri, 0, 11)
 	if hover == nil {
 		t.Fatal("expected hover for @opaque token")
+		return
 	}
 	if !strings.Contains(hover.Contents.Value, "opaque session token") {
 		t.Errorf("expected typedoc in hover, got %q", hover.Contents.Value)
@@ -705,6 +712,7 @@ end`)
 	hover := hoverAt(t, server, uri, 3, 2)
 	if hover == nil {
 		t.Fatal("expected hover for use-injected macro")
+		return
 	}
 	if !strings.Contains(hover.Contents.Value, "Defines a schema with extended options") {
 		t.Errorf("expected doc for schema macro, got %q", hover.Contents.Value)
@@ -739,6 +747,7 @@ end`)
 	hover := hoverAt(t, server, uri, 4, 4)
 	if hover == nil {
 		t.Fatal("expected hover for use-injected inline def")
+		return
 	}
 	if !strings.Contains(hover.Contents.Value, "double") {
 		t.Errorf("expected signature for inline def, got %q", hover.Contents.Value)
@@ -785,6 +794,7 @@ end`)
 	hover := hoverAt(t, server, uri, 3, 2)
 	if hover == nil {
 		t.Fatal("expected hover for double-use-injected macro")
+		return
 	}
 	if !strings.Contains(hover.Contents.Value, "args_schema") {
 		t.Errorf("expected args_schema in hover, got %q", hover.Contents.Value)
@@ -845,6 +855,7 @@ end`)
 	hover := hoverAt(t, server, uri, 3, 2)
 	if hover == nil {
 		t.Fatal("expected hover for triple-use-chain with dynamic module")
+		return
 	}
 	if !strings.Contains(hover.Contents.Value, "args_schema") {
 		t.Errorf("expected args_schema in hover, got %q", hover.Contents.Value)
@@ -893,6 +904,7 @@ end`)
 	hover := hoverAt(t, server, uri, 4, 4)
 	if hover == nil {
 		t.Fatal("expected hover for build_conn injected via CaseTemplate using_block delegation")
+		return
 	}
 	if !strings.Contains(hover.Contents.Value, "build_conn") {
 		t.Errorf("expected build_conn in hover, got %q", hover.Contents.Value)
@@ -938,6 +950,7 @@ end`)
 	hover1 := hoverAt(t, server, uri1, 4, 4)
 	if hover1 == nil {
 		t.Fatal("expected hover for expect (default Mox)")
+		return
 	}
 	if !strings.Contains(hover1.Contents.Value, "Sets up an expectation") {
 		t.Errorf("expected Mox doc, got %q", hover1.Contents.Value)
@@ -955,6 +968,7 @@ end`)
 	hover2 := hoverAt(t, server, uri2, 4, 4)
 	if hover2 == nil {
 		t.Fatal("expected hover for expect (Hammox override)")
+		return
 	}
 	if !strings.Contains(hover2.Contents.Value, "type-checked") {
 		t.Errorf("expected Hammox doc, got %q", hover2.Contents.Value)
@@ -1028,6 +1042,7 @@ end`)
 	hover := hoverAt(t, server, uri, 3, 2)
 	if hover == nil {
 		t.Fatal("expected hover for args_schema with @doc since:")
+		return
 	}
 	if !strings.Contains(hover.Contents.Value, "Define an args schema struct") {
 		t.Errorf("expected doc content before @doc since:, got %q", hover.Contents.Value)
@@ -1075,6 +1090,7 @@ end`
 	hover := hoverAt(t, server, uri, 3, 9)
 	if hover == nil {
 		t.Fatal("expected hover for __MODULE__")
+		return
 	}
 	if !strings.Contains(hover.Contents.Value, "MyApp.Accounts") {
 		t.Errorf("expected module name in hover, got %q", hover.Contents.Value)
@@ -1106,6 +1122,7 @@ end`
 	hover := hoverAt(t, server, uri, 1, 20)
 	if hover == nil {
 		t.Fatal("expected hover for __MODULE__.User")
+		return
 	}
 	if !strings.Contains(hover.Contents.Value, "MyApp.Accounts.User") {
 		t.Errorf("expected submodule in hover, got %q", hover.Contents.Value)
@@ -1143,6 +1160,7 @@ end`
 	hover := hoverAt(t, server, uri, 2, 4)
 	if hover == nil {
 		t.Fatal("expected hover for Accounts inside multi-line alias block")
+		return
 	}
 	if !strings.Contains(hover.Contents.Value, "The Accounts context") {
 		t.Errorf("expected moduledoc in hover, got %q", hover.Contents.Value)
@@ -1152,6 +1170,7 @@ end`
 	hover = hoverAt(t, server, uri, 3, 4)
 	if hover == nil {
 		t.Fatal("expected hover for Users inside multi-line alias block")
+		return
 	}
 	if !strings.Contains(hover.Contents.Value, "User management") {
 		t.Errorf("expected moduledoc in hover, got %q", hover.Contents.Value)
@@ -1168,6 +1187,7 @@ end`
 	hover = hoverAt(t, server, uri2, 2, 6)
 	if hover == nil {
 		t.Fatal("expected hover for module on line with trailing brace")
+		return
 	}
 	if !strings.Contains(hover.Contents.Value, "The Accounts context") {
 		t.Errorf("expected moduledoc in hover, got %q", hover.Contents.Value)
@@ -1209,6 +1229,7 @@ end`)
 	hover := hoverAt(t, server, uri, 3, 15)
 	if hover == nil {
 		t.Fatal("expected hover for help() injected via multiline alias + import in __using__")
+		return
 	}
 	if !strings.Contains(hover.Contents.Value, "def help") {
 		t.Errorf("expected help signature in hover, got %q", hover.Contents.Value)

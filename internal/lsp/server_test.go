@@ -1099,6 +1099,7 @@ end
 	}
 	if statusItem == nil {
 		t.Fatal("status item not found")
+		return
 	}
 	if statusItem.Kind != protocol.CompletionItemKindTypeParameter {
 		t.Errorf("expected TypeParameter kind for @type, got %v", statusItem.Kind)
@@ -3853,10 +3854,12 @@ end
 	child := findSymbol(parent.Children, "Child")
 	if child == nil {
 		t.Fatal("Child not found")
+		return
 	}
 	grandChild := findSymbol(child.Children, "GrandChild")
 	if grandChild == nil {
 		t.Fatal("GrandChild not found")
+		return
 	}
 	if findSymbol(grandChild.Children, "grandchild_func/0") == nil {
 		t.Error("grandchild_func/0 not found in GrandChild")
@@ -3884,6 +3887,7 @@ end
 	multiLine := findSymbol(mod.Children, "multi_line/1")
 	if multiLine == nil {
 		t.Fatal("multi_line/1 not found")
+		return
 	}
 	// multi_line should span from def line to end line (lines 1-3, 0-based)
 	if multiLine.Range.Start.Line != 1 {
@@ -3896,6 +3900,7 @@ end
 	inline := findSymbol(mod.Children, "inline/1")
 	if inline == nil {
 		t.Fatal("inline/1 not found")
+		return
 	}
 	// inline should be single-line (line 5, 0-based)
 	if inline.Range.Start.Line != 5 {
@@ -4006,6 +4011,7 @@ end
 	}
 	if privateFn == nil {
 		t.Fatal("expected defp build_user/1 as direct child of module")
+		return
 	}
 	if privateFn.Name != "build_user/1" {
 		t.Errorf("expected build_user/1, got %q", privateFn.Name)
@@ -4459,6 +4465,7 @@ end
 	outer := findSymbol(mod.Children, "outer/0")
 	if outer == nil {
 		t.Fatal("outer/0 not found")
+		return
 	}
 	if outer.Range.End.Line != 6 {
 		t.Errorf("outer end line: expected 6, got %d", outer.Range.End.Line)
@@ -4490,6 +4497,7 @@ end
 	split := findSymbol(mod.Children, "split/1")
 	if split == nil {
 		t.Fatal("split/1 not found")
+		return
 	}
 	if split.Range.Start.Line != 1 {
 		t.Errorf("split start line: expected 1, got %d", split.Range.Start.Line)
@@ -4681,6 +4689,7 @@ end`)
 	}
 	if result == nil {
 		t.Fatal("expected signature help result")
+		return
 	}
 	if len(result.Signatures) != 1 {
 		t.Fatalf("expected 1 signature, got %d", len(result.Signatures))
@@ -4724,6 +4733,7 @@ end`)
 	}
 	if result == nil {
 		t.Fatal("expected signature help for local function")
+		return
 	}
 	if result.Signatures[0].Label != "process(data, opts)" {
 		t.Errorf("unexpected label: %s", result.Signatures[0].Label)
@@ -4762,6 +4772,7 @@ end`)
 	}
 	if result == nil {
 		t.Fatal("expected signature help for nested call")
+		return
 	}
 	if result.Signatures[0].Label != "upcase(text)" {
 		t.Errorf("expected upcase(text), got: %s", result.Signatures[0].Label)
@@ -5479,6 +5490,7 @@ end`)
 	hover := hoverAt(t, server, uri, 2, 13)
 	if hover == nil {
 		t.Fatal("expected Elixir hover to still work")
+		return
 	}
 	if !strings.Contains(hover.Contents.Value, "Creates a new account") {
 		t.Errorf("expected doc content, got %q", hover.Contents.Value)
