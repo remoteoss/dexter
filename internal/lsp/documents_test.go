@@ -379,10 +379,10 @@ func TestDocumentStore_SetMaxTransient_EvictsImmediately(t *testing.T) {
 	}
 }
 
-func TestDocumentStore_HasOpen(t *testing.T) {
+func TestDocumentStore_GetIfOpen(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "hasopen.ex")
-	if err := os.WriteFile(path, []byte("defmodule HasOpen do\nend\n"), 0644); err != nil {
+	path := filepath.Join(dir, "getifopen.ex")
+	if err := os.WriteFile(path, []byte("defmodule GetIfOpen do\nend\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -391,36 +391,39 @@ func TestDocumentStore_HasOpen(t *testing.T) {
 	docURI := string(uri.File(path))
 
 	// Nothing in the store yet.
-	if ds.HasOpen(docURI) {
-		t.Fatalf("HasOpen returned true for a URI that was never opened or loaded")
+	if _, ok := ds.GetIfOpen(docURI); ok {
+		t.Fatalf("GetIfOpen returned true for a URI that was never opened or loaded")
 	}
 
 	// GetOrLoad adds a transient entry - NOT editor-owned.
 	if _, ok := ds.GetOrLoad(docURI); !ok {
 		t.Fatalf("GetOrLoad failed")
 	}
-	if ds.HasOpen(docURI) {
-		t.Fatalf("HasOpen returned true for a transient (disk-loaded) entry")
+	if _, ok := ds.GetIfOpen(docURI); ok {
+		t.Fatalf("GetIfOpen returned true for a transient (disk-loaded) entry")
 	}
 
 	// Set adds an editor-owned entry - IS open.
-	ds.Set(docURI, "defmodule HasOpen do\n  def open, do: true\nend\n")
-	if !ds.HasOpen(docURI) {
-		t.Fatalf("HasOpen returned false for an editor-owned entry after Set")
+	editorText := "defmodule GetIfOpen do\n  def open, do: true\nend\n"
+	ds.Set(docURI, editorText)
+	if text, ok := ds.GetIfOpen(docURI); !ok {
+		t.Fatalf("GetIfOpen returned false for an editor-owned entry after Set")
+	} else if text != editorText {
+		t.Fatalf("GetIfOpen returned wrong text: got %q want %q", text, editorText)
 	}
 
 	// Close removes the entry.
 	ds.Close(docURI)
-	if ds.HasOpen(docURI) {
-		t.Fatalf("HasOpen returned true after Close")
+	if _, ok := ds.GetIfOpen(docURI); ok {
+		t.Fatalf("GetIfOpen returned true after Close")
 	}
 
 	// GetOrLoad re-adds it as transient - NOT open.
 	if _, ok := ds.GetOrLoad(docURI); !ok {
 		t.Fatalf("GetOrLoad after Close failed")
 	}
-	if ds.HasOpen(docURI) {
-		t.Fatalf("HasOpen returned true for transient entry after re-load")
+	if _, ok := ds.GetIfOpen(docURI); ok {
+		t.Fatalf("GetIfOpen returned true for transient entry after re-load")
 	}
 }
 

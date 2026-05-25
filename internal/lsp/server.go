@@ -4954,8 +4954,7 @@ func isDepsFileUncached(filePath string) bool {
 // entries loaded from disk via GetOrLoad are NOT reported as open.
 func (s *Server) readFileText(filePath string) (text string, open bool, ok bool) {
 	uri := string(uri.File(filePath))
-	if s.docs.HasOpen(uri) {
-		t, _ := s.docs.Get(uri)
+	if t, found := s.docs.GetIfOpen(uri); found {
 		return t, true, true
 	}
 	if data, err := os.ReadFile(filePath); err == nil {
@@ -4972,8 +4971,7 @@ func (s *Server) readFileText(filePath string) (text string, open bool, ok bool)
 func (s *Server) getFileLine(filePath string, lineNum int) (string, bool) {
 	// Editor-owned buffer: extract the single line from memory
 	uri := string(uri.File(filePath))
-	if s.docs.HasOpen(uri) {
-		text, _ := s.docs.Get(uri)
+	if text, ok := s.docs.GetIfOpen(uri); ok {
 		line, found := nthLine(text, lineNum-1)
 		if found {
 			return line, true
