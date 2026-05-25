@@ -324,13 +324,8 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 		if v, ok := opts["debug"].(bool); ok {
 			s.debug = v
 		}
-		// JSON numbers decode to float64. Accept either form so a client
-		// sending an integer literal still works.
-		switch v := opts["maxTransientDocuments"].(type) {
-		case float64:
+		if v, ok := opts["maxTransientDocuments"].(float64); ok {
 			s.docs.SetMaxTransient(int(v))
-		case int:
-			s.docs.SetMaxTransient(v)
 		}
 	}
 	if os.Getenv("DEXTER_DEBUG") == "true" {
