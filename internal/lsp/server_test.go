@@ -246,10 +246,10 @@ func TestServer_InitializationOptions(t *testing.T) {
 	// Claude Code plugin template substitution yields strings, not booleans.
 	// Verify coerceBool handles both native bools and string-encoded bools.
 	cases := []struct {
-		name             string
-		opts             map[string]interface{}
-		wantFollowDel    bool
-		wantDebug        bool
+		name          string
+		opts          map[string]interface{}
+		wantFollowDel bool
+		wantDebug     bool
 	}{
 		{"bool true/false", map[string]interface{}{"followDelegates": false, "debug": true}, false, true},
 		{"string true/false", map[string]interface{}{"followDelegates": "false", "debug": "true"}, false, true},
