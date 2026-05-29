@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.7.0] - 2026-05-28
+
+### Added
+
+- **Erlang go-to-definition and hover docs** — `textDocument/definition` and `textDocument/hover` now resolve Erlang modules and functions (e.g. `:lists.map/2`), jumping to the `.erl` source and rendering EDoc-style documentation alongside the existing Elixir support (#50)
+- **Claude Code plugin and marketplace** — the repo is now a Claude Code marketplace, so Dexter can be installed as an Elixir LSP with `claude plugin marketplace add remoteoss/dexter` followed by `claude plugin install dexter-lsp@dexter`; the plugin wires up `dexter lsp` for `.ex`, `.exs`, and `.heex` files and exposes `followDelegates` and `debug` as configurable options (#59)
+- **Lazy document loading for headless LSP clients** — the document store now falls back to reading files from disk for clients that don't drive the full `didOpen`/`didChange`/`didClose` lifecycle (e.g. Claude Code), so definitions, hovers, references, completions, and the other read-only handlers all work without an editor buffer; disk-loaded entries are tracked in an LRU cache (default cap 50, configurable via the new `maxTransientDocuments` init option) and never evict editor-owned buffers (#62)
+- **Bracket-pair folding** — `textDocument/foldingRange` now emits ranges for multi-line maps/structs (`{...}`), lists (`[...]`), parenthesized expressions (`(...)`), and binaries (`<<...>>`), in addition to the existing `do/fn..end` and heredoc support; brackets inside strings, comments, sigils, char literals, and atoms are skipped automatically (#56)
+
+### Changed
+
+- **Single consolidated BEAM server** — the per-`.formatter.exs` formatter process was reworked into a hardened persistent BEAM server (`beam_server.exs`) with synchronized stderr capture, automatic restart when `.formatter.exs` changes outside `DidSave`, and invalidation on formatter watcher events (#50, #55)
+- **Cached tokenized documents** — tokenized Elixir documents are now reused across LSP handlers instead of being re-tokenized for completions, alias/import/use resolution, buffer-function lookups, and alias-block checks; completion context detection is token-aware so completions correctly ignore strings, comments, and heredocs while still handling Erlang atom modules and dotted prefixes (#50)
+- **CI lints the entire codebase** — linting now runs over the whole codebase on every pipeline rather than only the diffed files, so latent issues are caught going forward (#64)
+
+### Fixed
+
+- **Sigil formatting** — the persistent formatter now wires plugin-advertised sigils into `Code.format_string!/2`, so `~H` and other plugin sigils (e.g. `Phoenix.LiveView.HTMLFormatter`) are formatted inside `.ex`/`.exs` files; whole-file plugin formatting stays scoped to plugins that match the file extension (#55)
+- **Umbrella formatter config resolution** — child apps without their own `.formatter.exs` now search up to the LSP project root and use the umbrella root config (#50, closes #35, #34)
+- **Alias merging for unopened files** — alias merging previously returned `nil` for any file the editor hadn't explicitly opened, breaking `lookupThroughUse`/`lookupThroughUseOf` for headless clients; these now resolve via the lazy document store (#62)
+
 ## [0.6.0] - 2026-04-22
 
 ### Added
