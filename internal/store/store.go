@@ -7,10 +7,39 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
-	_ "github.com/mattn/go-sqlite3"
+	sqlite3 "github.com/mattn/go-sqlite3"
 	"github.com/remoteoss/dexter/internal/parser"
 )
+
+// walSizeLimitBytes caps the on-disk size of the SQLite WAL file. SQLite does
+// not shrink the -wal file on its own: after a checkpoint it reuses the frames
+// in place, so without a size limit the file stays parked at its all-time
+// high-water mark forever (we have seen multi-GB -wal files from a single large
+// reindex). PRAGMA journal_size_limit tells SQLite to truncate the WAL back
+// down to this size after each checkpoint.
+const walSizeLimitBytes = 64 * 1024 * 1024 // 64 MiB
+
+// driverName is a SQLite driver variant registered with a ConnectHook that
+// applies journal_size_limit to every pooled connection. database/sql opens
+// connections lazily and may create new ones over the lifetime of the pool, so
+// a one-shot PRAGMA after Open would not cover later connections; the hook
+// guarantees every connection is capped.
+const driverName = "sqlite3_dexter"
+
+var registerDriverOnce sync.Once
+
+func registerDriver() {
+	registerDriverOnce.Do(func() {
+		sql.Register(driverName, &sqlite3.SQLiteDriver{
+			ConnectHook: func(conn *sqlite3.SQLiteConn) error {
+				_, err := conn.Exec(fmt.Sprintf("PRAGMA journal_size_limit = %d", walSizeLimitBytes), nil)
+				return err
+			},
+		})
+	})
+}
 
 type Store struct {
 	db *sql.DB
@@ -83,7 +112,8 @@ func Open(projectRoot string) (*Store, error) {
 	}
 
 	dbPath := DBPath(projectRoot)
-	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=5000&_foreign_keys=ON")
+	registerDriver()
+	db, err := sql.Open(driverName, dbPath+"?_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=5000&_foreign_keys=ON")
 	if err != nil {
 		return nil, err
 	}
@@ -123,11 +153,24 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// Checkpoint runs a TRUNCATE WAL checkpoint: it flushes committed WAL frames
+// into the main database file and then shrinks the -wal file back to zero
+// bytes. Call it after a large indexing pass so the WAL does not linger at its
+// high-water mark for the lifetime of the process. It is best-effort — if
+// another connection is mid-read the checkpoint may complete only partially,
+// in which case a later checkpoint (or the journal_size_limit applied on every
+// connection) reclaims the rest.
+func (s *Store) Checkpoint() error {
+	_, err := s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	return err
+}
+
 // SetBulkPragmas configures SQLite for maximum write throughput. Safe only
 // when the database is fresh and throwaway-on-crash (e.g. a forced full
-// rebuild): synchronous=OFF skips all fsyncs, journal_mode=OFF eliminates
-// WAL writes entirely, a large cache keeps pages in RAM during index
-// creation, and temp_store=MEMORY keeps sort temporaries off disk.
+// rebuild): synchronous=OFF skips all fsyncs, journal_mode=MEMORY keeps the
+// rollback journal in RAM so no -wal file is written during the bulk load, a
+// large cache keeps pages in RAM during index creation, and temp_store=MEMORY
+// keeps sort temporaries off disk.
 func (s *Store) SetBulkPragmas() error {
 	for _, pragma := range []string{
 		"PRAGMA synchronous = OFF",

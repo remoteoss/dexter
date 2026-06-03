@@ -233,6 +233,13 @@ func (s *Server) backgroundReindex() {
 			}
 		}
 
+		// Collapse the WAL back to disk now that the (potentially large) reindex
+		// is complete, so the -wal file does not stay parked at its high-water
+		// mark for the lifetime of the LSP process.
+		if err := s.store.Checkpoint(); err != nil {
+			log.Printf("Warning: WAL checkpoint after reindex: %v", err)
+		}
+
 		elapsed := time.Since(start).Round(time.Millisecond)
 		log.Printf("Background reindex: %d files updated (%s)", reindexed, elapsed)
 
