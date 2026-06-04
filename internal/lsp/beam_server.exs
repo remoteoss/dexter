@@ -170,14 +170,13 @@ defmodule Dexter.Formatter do
     explicit_locals = Keyword.get(raw_opts, :locals_without_parens, [])
     all_locals_without_parens = Enum.uniq(import_deps_locals ++ explicit_locals)
 
+    # Pass the full .formatter.exs through (minus our computed keys, set below)
+    # so non-standard options reach plugins, matching `mix format` behavior.
+    # `Code.format_string!/2` ignores options it doesn't recognize, and plugins
+    # such as Phoenix.LiveView.HTMLFormatter need keys like :attribute_formatters,
+    # :heex_line_length, :inline_matcher, and :migrate_eex_to_curly_interpolation.
     format_opts =
       raw_opts
-      |> Keyword.take([
-        :line_length,
-        :normalize_bitstring_modifiers,
-        :normalize_charlists_as_sigils,
-        :force_do_end_blocks
-      ])
       |> Keyword.put(:locals_without_parens, all_locals_without_parens)
 
     active_plugins = Enum.filter(plugins, &Code.ensure_loaded?/1)

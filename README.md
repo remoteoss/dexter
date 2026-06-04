@@ -508,6 +508,12 @@ Plugins ([`Styler`](https://github.com/remoteoss/elixir-styler), `Phoenix.LiveVi
 your project's `_build/dev/lib`. So as long as your formatter plugins are installed and compiled, everything is ready to
 go.
 
+**Non-standard formatter options:** Dexter passes your `.formatter.exs` options through to plugins as-is, matching `mix
+format`. So plugin-specific options like `Phoenix.LiveView.HTMLFormatter`'s `:heex_line_length`, `:attribute_formatters`,
+and `:inline_matcher` are honored. One caveat: the persistent process runs outside `Mix`, so a plugin that resolves
+config at format time via `Mix.*` or `Application.get_env/2` (e.g. `CanonicalTailwind` looking up its Tailwind binary)
+won't see it — inline that config directly in `.formatter.exs` instead (e.g. `canonical_tailwind: [binary: "PATH"]`).
+
 If the persistent process can't start, dexter falls back to running `mix format` directly.
 
 **Syntax errors** found by the formatter are surfaced as LSP diagnostics pointing to the exact line and column, with a warning at the hint location (e.g. "the `do` on line 52 does not have a matching `end`"). Diagnostics clear on the next successful format (which again, is nearly instantaneous!).
