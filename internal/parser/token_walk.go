@@ -34,6 +34,59 @@ func ScanForwardToBlockDo(tokens []Token, n, from int) (doIdx, nextPos int, hasD
 	return -1, n, false
 }
 
+// ScanForwardToMacroCallBlockDo reports whether a block-opening `do` follows a
+// bare macro call head starting at `from` (the token just after the macro name).
+//
+// Unlike ScanForwardToBlockDo, it does not blindly scan to the next statement
+// keyword. A bare macro call's `do` belongs to the same logical statement, so we
+// track bracket depth — a `do` nested inside parens/brackets/braces opens a
+// nested construct's block, not the macro's — and we treat an end-of-line at
+// bracket depth zero as a statement separator: once one is seen, any token other
+// than `do` begins a new statement and the scan stops. This prevents an
+// assignment or plain function call (`changeset = build_changeset(...)`) from
+// being mistaken for a macro-with-do-block just because a later statement on a
+// following line happens to open a `do`.
+//
+// A line that ends in a comma at bracket depth zero is an exception: a dangling
+// comma is never a valid statement terminator in Elixir, so it marks a multi-line
+// keyword-argument head (`test "x",\n  async: true do`) and the scan continues.
+func ScanForwardToMacroCallBlockDo(tokens []Token, n, from int) (doIdx, nextPos int, hasDo bool) {
+	scanDepth := 0
+	seenEOLAtZero := false
+	lastSigKind := TokEOL
+	for k := from; k < n; k++ {
+		switch tokens[k].Kind {
+		case TokDo:
+			if scanDepth == 0 {
+				return k, k + 1, true
+			}
+			lastSigKind = TokDo
+		case TokEOL, TokComment:
+			// A trailing comma means the head continues on the next line, so this
+			// is not a statement boundary. Comments do not reset lastSigKind.
+			if scanDepth == 0 && lastSigKind != TokComma {
+				seenEOLAtZero = true
+			}
+		case TokOpenParen, TokOpenBracket, TokOpenBrace:
+			scanDepth++
+			seenEOLAtZero = false
+			lastSigKind = tokens[k].Kind
+		case TokCloseParen, TokCloseBracket, TokCloseBrace:
+			scanDepth--
+			lastSigKind = tokens[k].Kind
+		case TokEOF:
+			return -1, k, false
+		default:
+			// At depth 0, after an end-of-line, any non-do token starts a new statement.
+			if scanDepth == 0 && seenEOLAtZero {
+				return -1, k, false
+			}
+			lastSigKind = tokens[k].Kind
+		}
+	}
+	return -1, n, false
+}
+
 // TrackBlockDepth updates the block depth counter for do/fn/end tokens.
 func TrackBlockDepth(kind TokenKind, depth *int) {
 	switch kind {

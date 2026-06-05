@@ -667,41 +667,10 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 								// macro_name :atom
 								emit = true
 							default:
-								// Scan forward to see if TokDo follows the arguments.
-								// In Elixir, `do` can follow across EOLs and blank lines
-								// but not past an intervening statement. We track whether
-								// we've seen EOL at bracket depth 0: once we have, the
-								// only token that can continue the expression is `do`.
-								scanDepth := 0
-								seenEOLAtZero := false
-								for k := j; k < n; k++ {
-									switch tokens[k].Kind {
-									case TokDo:
-										if scanDepth == 0 {
-											emit = true
-										}
-									case TokEOL, TokComment:
-										if scanDepth == 0 {
-											seenEOLAtZero = true
-										}
-									case TokOpenParen, TokOpenBracket, TokOpenBrace:
-										scanDepth++
-										seenEOLAtZero = false
-									case TokCloseParen, TokCloseBracket, TokCloseBrace:
-										scanDepth--
-									case TokEOF:
-										k = n
-									default:
-										// At depth 0, after seeing EOL, any non-do
-										// token means a new statement started.
-										if scanDepth == 0 && seenEOLAtZero {
-											k = n // stop
-										}
-									}
-									if emit {
-										break
-									}
-								}
+								// Scan forward to see if a block-opening `do` follows the
+								// arguments, respecting bracket depth and statement boundaries.
+								_, _, hasDo := ScanForwardToMacroCallBlockDo(tokens, n, j)
+								emit = hasDo
 							}
 						}
 						if emit {

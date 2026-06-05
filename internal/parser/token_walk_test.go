@@ -100,6 +100,87 @@ func TestScanForwardToBlockDo_StopsAtStatementBoundary(t *testing.T) {
 	}
 }
 
+func TestScanForwardToMacroCallBlockDo(t *testing.T) {
+	// firstIdentAfter returns the index just after the first ident matching name.
+	firstIdentAfter := func(tokens []Token, source []byte, name string) int {
+		for i, tok := range tokens {
+			if tok.Kind == TokIdent && string(source[tok.Start:tok.End]) == name {
+				return i + 1
+			}
+		}
+		return -1
+	}
+
+	tests := []struct {
+		name   string
+		source string
+		ident  string
+		wantDo bool
+	}{
+		{
+			name:   "macro with do on same line",
+			source: "describe \"users\" do\n  :ok\nend\n",
+			ident:  "describe",
+			wantDo: true,
+		},
+		{
+			name:   "macro with do on its own continuation line",
+			source: "describe \"x\"\ndo\n  :ok\nend\n",
+			ident:  "describe",
+			wantDo: true,
+		},
+		{
+			name:   "macro with multi-line keyword-arg head",
+			source: "test \"x\",\n  async: true do\n  :ok\nend\n",
+			ident:  "test",
+			wantDo: true,
+		},
+		{
+			name:   "macro with keyword head split across several lines",
+			source: "test \"x\",\n  async: true,\n  tags: [:foo] do\n  :ok\nend\n",
+			ident:  "test",
+			wantDo: true,
+		},
+		{
+			name:   "non-trailing comma does not bridge to a later statement's do",
+			source: "foo a,\n  b\n\nx = case y do\n  :ok -> :ok\nend\n",
+			ident:  "foo",
+			wantDo: false,
+		},
+		{
+			name:   "assignment whose later statement opens a do",
+			source: "changeset = build_changeset(a, b)\n\nsocket =\n  case foo(changeset) do\n    :ok -> :ok\n  end\n",
+			ident:  "changeset",
+			wantDo: false,
+		},
+		{
+			name:   "call whose argument fn body opens a do",
+			source: "paginate_async(socket, fn page ->\n  case Rpc.call(x) do\n    :ok -> :ok\n  end\nend)\n",
+			ident:  "paginate_async",
+			wantDo: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			source := []byte(tt.source)
+			tokens := Tokenize(source)
+			n := len(tokens)
+			from := firstIdentAfter(tokens, source, tt.ident)
+			if from < 0 {
+				t.Fatalf("ident %q not found in source", tt.ident)
+			}
+			doIdx, _, hasDo := ScanForwardToMacroCallBlockDo(tokens, n, from)
+			if hasDo != tt.wantDo {
+				t.Errorf("hasDo = %v, want %v (doIdx=%d)", hasDo, tt.wantDo, doIdx)
+			}
+			if hasDo && tokens[doIdx].Kind != TokDo {
+				t.Errorf("doIdx points to %v, want TokDo", tokens[doIdx].Kind)
+			}
+		})
+	}
+}
+
 func TestScanKeywordOptionValue(t *testing.T) {
 	source := []byte("alias Foo.Bar, as: Baz")
 	tokens := Tokenize(source)

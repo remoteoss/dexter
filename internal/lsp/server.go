@@ -3149,7 +3149,7 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 			if i+1 < n && tokens[i+1].Kind == parser.TokColon {
 				continue
 			}
-			doIdx, nextPos, hasDoBlock := parser.ScanForwardToBlockDo(tokens, n, i+1)
+			doIdx, nextPos, hasDoBlock := parser.ScanForwardToMacroCallBlockDo(tokens, n, i+1)
 			if !hasDoBlock {
 				continue
 			}
@@ -3157,10 +3157,12 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 			lineIdx := tok.Line - 1
 			indent := tokCol(tok)
 
-			// Extract the argument between the macro name and `do` from source bytes
+			// Extract the argument between the macro name and `do` from source bytes.
+			// Collapse internal whitespace so a multi-line keyword-arg head renders
+			// as a single-line outline label.
 			label := macroName
 			argBytes := source[tok.End:tokens[doIdx].Start]
-			arg := strings.TrimSpace(string(argBytes))
+			arg := strings.Join(strings.Fields(string(argBytes)), " ")
 			if len(arg) >= 2 && arg[0] == '"' && arg[len(arg)-1] == '"' {
 				arg = arg[1 : len(arg)-1]
 			}

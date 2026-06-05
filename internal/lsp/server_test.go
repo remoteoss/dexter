@@ -4084,6 +4084,93 @@ end
 	}
 }
 
+// TestDocumentSymbol_NoLocalVarsOrCalls reproduces issue #69: local variable
+// assignments and ordinary function calls inside a function body were surfacing
+// as document symbols because the scan for a macro's `do` block crossed statement
+// boundaries and latched onto a later `case ... do`.
+func TestDocumentSymbol_NoLocalVarsOrCalls(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule Web.OpportunitiesLive do
+  def handle_params(unsigned_params, _uri, socket) do
+    changeset = build_changeset(search_form_data, unsigned_params, scopes, context)
+
+    socket =
+      case Ecto.Changeset.apply_action(changeset, :update) do
+        {:ok, search_form_data} ->
+          paginate_async(socket, unsigned_params, [per_page: @per_page], fn page, per_page ->
+            params = build_es_query_params(search_form_data, page, per_page)
+
+            case Rpc.call("rb.search", [live_action]) do
+              {:ok, result} -> result
+              {:error, reason} -> {0, []}
+            end
+          end)
+
+        {:error, _changeset} ->
+          socket
+      end
+
+    {:noreply, socket}
+  end
+end
+`
+	docURI := "file:///test/opportunities_live.ex"
+	server.docs.Set(docURI, content)
+
+	symbols := documentSymbols(t, server, docURI)
+	handleParams := findSymbol(symbols, "handle_params/3")
+	if handleParams == nil {
+		t.Fatal("expected handle_params/3 symbol")
+	}
+
+	// The function body must not produce any child symbols: neither the
+	// `changeset = ...` assignment nor the `paginate_async(...)` call.
+	if len(handleParams.Children) != 0 {
+		t.Errorf("expected no children for handle_params/3, got %v", collectNames(handleParams.Children))
+	}
+
+	// Belt and suspenders: neither offending construct from the screenshot
+	// (issue #69) should surface as a symbol anywhere in the tree.
+	var walk func(syms []protocol.DocumentSymbol)
+	walk = func(syms []protocol.DocumentSymbol) {
+		for _, s := range syms {
+			if strings.Contains(s.Name, "build_changeset") || strings.Contains(s.Name, "paginate_async") {
+				t.Errorf("local var/call leaked into symbols: %q", s.Name)
+			}
+			walk(s.Children)
+		}
+	}
+	walk(symbols)
+}
+
+// TestDocumentSymbol_SplitLineMacroHead verifies that an ExUnit macro whose
+// keyword-argument head spans multiple lines (trailing comma continuation) is
+// still captured as a symbol.
+func TestDocumentSymbol_SplitLineMacroHead(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule MyAppTest do
+  use ExUnit.Case
+
+  test "creates a user",
+       tags: [:integration] do
+    assert true
+  end
+end
+`
+	docURI := "file:///test/my_split_test.exs"
+	server.docs.Set(docURI, content)
+
+	symbols := documentSymbols(t, server, docURI)
+	want := `test "creates a user", tags: [:integration]`
+	if findSymbol(symbols, want) == nil {
+		t.Errorf("expected split-line test macro %q to be captured; got %v", want, collectNames(symbols[0].Children))
+	}
+}
+
 func TestDocumentSymbol_BrokenCode(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
