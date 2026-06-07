@@ -309,7 +309,7 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 			defLine := tok.Line
 			i++
 			j := nextSig(i)
-			if j >= n || tokens[j].Kind != TokIdent {
+			if j >= n || !isValidFuncNameToken(tokens[j].Kind) {
 				i = j
 				goto extractRefsForLine
 			}
@@ -817,6 +817,17 @@ func NextSigToken(tokens []Token, n, from int) int {
 		from++
 	}
 	return from
+}
+
+// isValidFuncNameToken reports whether a token kind can appear as a function
+// name after def/defp/defmacro/defmacrop/defguard/defguardp/defdelegate.
+// In addition to ordinary identifiers (TokIdent), this includes tokens like
+// TokDefstruct and TokDefprotocol that are used as function names in the
+// stdlib (e.g. `defmacro defstruct(fields)` in Kernel).
+func isValidFuncNameToken(kind TokenKind) bool {
+	return kind == TokIdent ||
+		kind == TokDefstruct || kind == TokDefexception ||
+		kind == TokDefprotocol || kind == TokDefimpl
 }
 
 func CollectModuleName(source []byte, tokens []Token, n, i int) (string, int) {

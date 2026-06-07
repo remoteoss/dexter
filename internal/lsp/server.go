@@ -2325,29 +2325,77 @@ func funcKey(name string, arity int) string {
 var elixirKeywords = []string{"do", "end"}
 
 var elixirFormSnippets = map[string]string{
-	"do":        "do\n\t$0\nend",
-	"defmodule": "defmodule ${1:Name} do\n\t$0\nend",
-	"def":       "def ${1:name}(${2:params}) do\n\t$0\nend",
-	"defp":      "defp ${1:name}(${2:params}) do\n\t$0\nend",
-	"defmacro":  "defmacro ${1:name}(${2:params}) do\n\t$0\nend",
-	"defmacrop": "defmacrop ${1:name}(${2:params}) do\n\t$0\nend",
-	"for":       "for ${1:pattern} <- ${2:enumerable} do\n\t$0\nend",
-	"with":      "with ${1:pattern} <- ${2:expression} do\n\t$0\nend",
-	"case":      "case ${1:expression} do\n\t${2:pattern} ->\n\t\t$0\nend",
-	"cond":      "cond do\n\t${1:condition} ->\n\t\t$0\nend",
-	"if":        "if ${1:condition} do\n\t$0\nelse\n\t${2}\nend",
-	"unless":    "unless ${1:condition} do\n\t$0\nend",
-	"receive":   "receive do\n\t${1:pattern} ->\n\t\t$0\nend",
-	"try":       "try do\n\t$0\nrescue\n\t${1:exception} ->\n\t\t${2:handler}\nend",
-	"quote":     "quote do\n\t$0\nend",
-	"fn":        "fn ${1:args} -> $0 end",
-	"test":      "test \"${1:description}\" do\n\t$0\nend",
-	"describe":  "describe \"${1:description}\" do\n\t$0\nend",
+	"do":             "do\n\t$0\nend",
+	"defmodule":      "defmodule ${1:Name} do\n\t$0\nend",
+	"def":            "def ${1:name}(${2:params}) do\n\t$0\nend",
+	"defp":           "defp ${1:name}(${2:params}) do\n\t$0\nend",
+	"defmacro":       "defmacro ${1:name}(${2:params}) do\n\t$0\nend",
+	"defmacrop":      "defmacrop ${1:name}(${2:params}) do\n\t$0\nend",
+	"defstruct":      "defstruct [${1:fields}]$0",
+	"defexception":   "defexception [${1:fields}]$0",
+	"defprotocol":    "defprotocol ${1:Name} do\n\t$0\nend",
+	"defimpl":        "defimpl ${1:Protocol}, for: ${2:Type} do\n\t$0\nend",
+	"defdelegate":    "defdelegate ${1:func}(${2:args}), to: ${3:module}$0",
+	"defguard":       "defguard ${1:name}(${2:args}) when ${3:condition}$0",
+	"defguardp":      "defguardp ${1:name}(${2:args}) when ${3:condition}$0",
+	"defoverridable": "defoverridable ${1:name}: ${2:arity}$0",
+	"for":            "for ${1:pattern} <- ${2:enumerable} do\n\t$0\nend",
+	"with":           "with ${1:pattern} <- ${2:expression} do\n\t$0\nend",
+	"case":           "case ${1:expression} do\n\t${2:pattern} ->\n\t\t$0\nend",
+	"cond":           "cond do\n\t${1:condition} ->\n\t\t$0\nend",
+	"if":             "if ${1:condition} do\n\t$0\nelse\n\t${2}\nend",
+	"unless":         "unless ${1:condition} do\n\t$0\nend",
+	"receive":        "receive do\n\t${1:pattern} ->\n\t\t$0\nend",
+	"try":            "try do\n\t$0\nrescue\n\t${1:exception} ->\n\t\t${2:handler}\nend",
+	"quote":          "quote do\n\t$0\nend",
+	"fn":             "fn ${1:args} -> $0 end",
+}
+
+// noParenFuncs are macros conventionally written without parentheses in Elixir,
+// such as ExUnit's test/describe. When generating completion snippets or plain
+// call text, these names produce `name arg1, arg2` instead of `name(arg1, arg2)`.
+var noParenFuncs = map[string]bool{
+	"test":            true,
+	"describe":        true,
+	"assert":          true,
+	"refute":          true,
+	"assert_raise":    true,
+	"assert_receive":  true,
+	"assert_received": true,
+	"refute_receive":  true,
+	"refute_received": true,
+	"setup":           true,
+	"setup_all":       true,
+	"catch_error":     true,
+	"catch_exit":      true,
+	"catch_throw":     true,
+}
+
+// doBlockSnippets provides custom snippet templates for functions that take
+// do/end blocks. These are applied when the function is in scope via the
+// import/use-chain (unlike elixirFormSnippets which are global special forms).
+var doBlockSnippets = map[string]string{
+	"test":         "test \"${1:description}\" do\n\t$0\nend",
+	"describe":     "describe \"${1:description}\" do\n\t$0\nend",
+	"setup":        "setup do\n\t$0\nend",
+	"setup_all":    "setup_all do\n\t$0\nend",
+	"assert_raise": "assert_raise ${1:exception} do\n\t$0\nend",
 }
 
 func applySnippet(item *protocol.CompletionItem, name string, arity int, params string, inPipe bool, useSnippets bool) {
 	item.Label = fmt.Sprintf("%s/%d", name, arity)
 	item.FilterText = name
+
+	// Check for a do-block snippet template first. These provide full
+	// do/end block structure (e.g. `test "..." do ... end`) and take
+	// priority over auto-generated arg lists.
+	if useSnippets {
+		if tmpl, ok := doBlockSnippets[name]; ok {
+			item.InsertTextFormat = protocol.InsertTextFormatSnippet
+			item.InsertText = tmpl
+			return
+		}
+	}
 
 	snippetArity := arity
 	snippetParams := params
@@ -2364,9 +2412,13 @@ func applySnippet(item *protocol.CompletionItem, name string, arity int, params 
 		}
 	}
 
+	noParen := noParenFuncs[name]
+
 	if !useSnippets {
 		if snippetArity > 0 {
-			item.InsertText = functionCallText(name, snippetArity, snippetParams, paramStartIndex)
+			item.InsertText = functionCallText(name, snippetArity, snippetParams, paramStartIndex, noParen)
+		} else if noParen {
+			item.InsertText = name
 		} else {
 			item.InsertText = name + "()"
 		}
@@ -2375,21 +2427,23 @@ func applySnippet(item *protocol.CompletionItem, name string, arity int, params 
 
 	if snippetArity > 0 {
 		item.InsertTextFormat = protocol.InsertTextFormatSnippet
-		item.InsertText = functionSnippet(name, snippetArity, snippetParams, paramStartIndex)
+		item.InsertText = functionSnippet(name, snippetArity, snippetParams, paramStartIndex, noParen)
+	} else if noParen {
+		item.InsertText = name
 	} else {
 		item.InsertText = name + "()"
 	}
 }
 
-func functionSnippet(name string, arity int, params string, paramStartIndex int) string {
-	return buildCallText(name, arity, params, true, paramStartIndex)
+func functionSnippet(name string, arity int, params string, paramStartIndex int, noParen bool) string {
+	return buildCallText(name, arity, params, true, paramStartIndex, noParen)
 }
 
-func functionCallText(name string, arity int, params string, paramStartIndex int) string {
-	return buildCallText(name, arity, params, false, paramStartIndex)
+func functionCallText(name string, arity int, params string, paramStartIndex int, noParen bool) string {
+	return buildCallText(name, arity, params, false, paramStartIndex, noParen)
 }
 
-func buildCallText(name string, arity int, params string, snippet bool, paramStartIndex int) string {
+func buildCallText(name string, arity int, params string, snippet bool, paramStartIndex int, noParen bool) string {
 	if paramStartIndex < 1 {
 		paramStartIndex = 1
 	}
@@ -2408,6 +2462,12 @@ func buildCallText(name string, arity int, params string, snippet bool, paramSta
 		} else {
 			args = append(args, paramName)
 		}
+	}
+	if noParen {
+		if snippet {
+			return name + " " + strings.Join(args, ", ") + "$0"
+		}
+		return name + " " + strings.Join(args, ", ")
 	}
 	call := name + "(" + strings.Join(args, ", ") + ")"
 	if snippet {
