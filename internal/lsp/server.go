@@ -1758,6 +1758,21 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 				}
 			}
 		}
+		// Plain keyword completions (e.g., "do", "end"). These don't
+		// expand to snippets; they just insert the keyword itself so
+		// that pressing Enter doesn't replace the keyword with a
+		// VS Code word-based suggestion.
+		for _, kw := range elixirKeywords {
+			if strings.HasPrefix(kw, funcPrefix) && !seen[kw] {
+				seen[kw] = true
+				items = append(items, protocol.CompletionItem{
+					Label:     kw,
+					Kind:      protocol.CompletionItemKindKeyword,
+					Detail:    "keyword",
+					Preselect: true,
+				})
+			}
+		}
 	}
 
 	if len(items) == 0 {
@@ -2110,6 +2125,9 @@ func (s *Server) addCompletionsFromUsing(moduleName, funcPrefix string, seen map
 		if !strings.HasPrefix(funcName, funcPrefix) {
 			continue
 		}
+		if useSnippets && elixirFormSnippets[funcName] != "" {
+			continue
+		}
 		for _, d := range defs {
 			key := funcKey(funcName, d.arity)
 			if !seen[key] {
@@ -2137,6 +2155,9 @@ func (s *Server) addCompletionsFromUsing(moduleName, funcPrefix string, seen map
 		for _, r := range results {
 			key := funcKey(r.Function, r.Arity)
 			if strings.HasPrefix(r.Function, funcPrefix) && !seen[key] {
+				if useSnippets && elixirFormSnippets[r.Function] != "" {
+					continue
+				}
 				seen[key] = true
 				item := protocol.CompletionItem{
 					Label:  r.Function,
@@ -2298,17 +2319,30 @@ func funcKey(name string, arity int) string {
 	return name + "/" + strconv.Itoa(arity)
 }
 
+// elixirKeywords are plain keyword completions (no snippet expansion).
+// They prevent VS Code from falling back to word-based completions when the
+// user types a keyword like "do" or "end" and presses Enter.
+var elixirKeywords = []string{"do", "end"}
+
 var elixirFormSnippets = map[string]string{
-	"for":     "for ${1:pattern} <- ${2:enumerable} do\n\t$0\nend",
-	"with":    "with ${1:pattern} <- ${2:expression} do\n\t$0\nend",
-	"case":    "case ${1:expression} do\n\t${2:pattern} ->\n\t\t$0\nend",
-	"cond":    "cond do\n\t${1:condition} ->\n\t\t$0\nend",
-	"if":      "if ${1:condition} do\n\t$0\nend",
-	"unless":  "unless ${1:condition} do\n\t$0\nend",
-	"receive": "receive do\n\t${1:pattern} ->\n\t\t$0\nend",
-	"try":     "try do\n\t$0\nrescue\n\t${1:exception} ->\n\t\t${2:handler}\nend",
-	"quote":   "quote do\n\t$0\nend",
-	"fn":      "fn ${1:args} -> $0 end",
+	"do":        "do\n\t$0\nend",
+	"defmodule": "defmodule ${1:Name} do\n\t$0\nend",
+	"def":       "def ${1:name}(${2:params}) do\n\t$0\nend",
+	"defp":      "defp ${1:name}(${2:params}) do\n\t$0\nend",
+	"defmacro":  "defmacro ${1:name}(${2:params}) do\n\t$0\nend",
+	"defmacrop": "defmacrop ${1:name}(${2:params}) do\n\t$0\nend",
+	"for":       "for ${1:pattern} <- ${2:enumerable} do\n\t$0\nend",
+	"with":      "with ${1:pattern} <- ${2:expression} do\n\t$0\nend",
+	"case":      "case ${1:expression} do\n\t${2:pattern} ->\n\t\t$0\nend",
+	"cond":      "cond do\n\t${1:condition} ->\n\t\t$0\nend",
+	"if":        "if ${1:condition} do\n\t$0\nelse\n\t${2}\nend",
+	"unless":    "unless ${1:condition} do\n\t$0\nend",
+	"receive":   "receive do\n\t${1:pattern} ->\n\t\t$0\nend",
+	"try":       "try do\n\t$0\nrescue\n\t${1:exception} ->\n\t\t${2:handler}\nend",
+	"quote":     "quote do\n\t$0\nend",
+	"fn":        "fn ${1:args} -> $0 end",
+	"test":      "test \"${1:description}\" do\n\t$0\nend",
+	"describe":  "describe \"${1:description}\" do\n\t$0\nend",
 }
 
 func applySnippet(item *protocol.CompletionItem, name string, arity int, params string, inPipe bool, useSnippets bool) {

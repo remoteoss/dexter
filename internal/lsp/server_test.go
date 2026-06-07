@@ -556,16 +556,24 @@ func TestCompletion_ElixirFormSnippets(t *testing.T) {
 		label   string
 		snippet string
 	}{
+		{"d", "do", "do\n\t$0\nend"},
+		{"defmod", "defmodule", "defmodule ${1:Name} do\n\t$0\nend"},
+		{"def", "def", "def ${1:name}(${2:params}) do\n\t$0\nend"},
+		{"def", "defp", "defp ${1:name}(${2:params}) do\n\t$0\nend"},
+		{"defm", "defmacro", "defmacro ${1:name}(${2:params}) do\n\t$0\nend"},
+		{"defmacr", "defmacrop", "defmacrop ${1:name}(${2:params}) do\n\t$0\nend"},
 		{"fo", "for", "for ${1:pattern} <- ${2:enumerable} do\n\t$0\nend"},
 		{"wi", "with", "with ${1:pattern} <- ${2:expression} do\n\t$0\nend"},
 		{"cas", "case", "case ${1:expression} do\n\t${2:pattern} ->\n\t\t$0\nend"},
 		{"con", "cond", "cond do\n\t${1:condition} ->\n\t\t$0\nend"},
-		{"i", "if", "if ${1:condition} do\n\t$0\nend"},
+		{"i", "if", "if ${1:condition} do\n\t$0\nelse\n\t${2}\nend"},
 		{"unl", "unless", "unless ${1:condition} do\n\t$0\nend"},
 		{"rec", "receive", "receive do\n\t${1:pattern} ->\n\t\t$0\nend"},
 		{"tr", "try", "try do\n\t$0\nrescue\n\t${1:exception} ->\n\t\t${2:handler}\nend"},
 		{"quo", "quote", "quote do\n\t$0\nend"},
 		{"f", "fn", "fn ${1:args} -> $0 end"},
+		{"te", "test", "test \"${1:description}\" do\n\t$0\nend"},
+		{"des", "describe", "describe \"${1:description}\" do\n\t$0\nend"},
 	}
 
 	for _, tt := range tests {
@@ -608,6 +616,14 @@ func TestCompletion_ElixirFormSnippets_NoDuplicateWithKernel(t *testing.T) {
   defmacro unless(condition, clauses) do
     :ok
   end
+
+  defmacro def(call, expr) do
+    :ok
+  end
+
+  defmacro defmodule(alias, do_block) do
+    :ok
+  end
 end
 `)
 
@@ -636,6 +652,31 @@ end
 			}
 		}
 	}
+
+	// Verify def appears as form snippet, not as imported def/2
+	server.docs.Set(uri, "  de")
+	items = completionAt(t, server, uri, 0, 4)
+
+	count = 0
+	for _, item := range items {
+		if item.Label == "def" || item.Label == "def/2" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("expected exactly 1 'def' completion, got %d", count)
+	}
+
+	for _, item := range items {
+		if item.Label == "def" {
+			if item.Kind != protocol.CompletionItemKindKeyword {
+				t.Errorf("expected Keyword kind for 'def', got %v", item.Kind)
+			}
+			if item.InsertText != elixirFormSnippets["def"] {
+				t.Errorf("expected form snippet for 'def', got %q", item.InsertText)
+			}
+		}
+	}
 }
 
 func TestCompletion_ElixirFormSnippets_NoSnippetSupport(t *testing.T) {
@@ -651,6 +692,65 @@ func TestCompletion_ElixirFormSnippets_NoSnippetSupport(t *testing.T) {
 		if item.Label == "for" {
 			t.Error("form snippets should not appear when client lacks snippet support")
 		}
+	}
+}
+
+func TestCompletion_DoKeyword(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, "  defmodule Foo do")
+	items := completionAt(t, server, uri, 0, 17)
+
+	var found bool
+	for _, item := range items {
+		if item.Label == "do" {
+			found = true
+			if item.Kind != protocol.CompletionItemKindKeyword {
+				t.Errorf("expected Keyword kind for 'do', got %v", item.Kind)
+			}
+			if item.InsertText != elixirFormSnippets["do"] {
+				t.Errorf("expected form snippet for 'do', got %q", item.InsertText)
+			}
+			if item.InsertTextFormat != protocol.InsertTextFormatSnippet {
+				t.Error("expected InsertTextFormatSnippet for 'do'")
+			}
+			break
+		}
+	}
+	if !found {
+		t.Error("expected 'do' in completions")
+	}
+}
+
+func TestCompletion_DoKeyword_NoSnippetSupport(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+	server.snippetSupport = false
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, "  defmodule Foo do")
+	items := completionAt(t, server, uri, 0, 17)
+
+	var found bool
+	for _, item := range items {
+		if item.Label == "do" {
+			found = true
+			if item.Kind != protocol.CompletionItemKindKeyword {
+				t.Errorf("expected Keyword kind for 'do', got %v", item.Kind)
+			}
+			if !item.Preselect {
+				t.Error("expected 'do' item to have Preselect=true")
+			}
+			if item.InsertText != "" {
+				t.Errorf("expected no InsertText for 'do' without snippet support, got %q", item.InsertText)
+			}
+			break
+		}
+	}
+	if !found {
+		t.Error("expected 'do' in completions")
 	}
 }
 
@@ -1648,6 +1748,57 @@ end`
 	}
 	if !found {
 		t.Errorf("expected use MyApp.MoxBase with mod: MyApp.CustomMock; got %+v", calls)
+	}
+}
+
+func TestCompletion_UseInjectedSkippedForFormSnippet(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	// Module that exports `if` (name overlaps with elixirFormSnippets)
+	indexFile(t, server.store, server.projectRoot, "lib/custom_if.ex", `defmodule MyApp.CustomIf do
+  alias MyApp.CustomIf
+
+  defmacro __using__(_opts) do
+    quote do
+      import CustomIf
+    end
+  end
+
+  defmacro if(condition, clauses), do: {:if, condition, clauses}
+end
+`)
+
+	uri := "file:///test.ex"
+	server.docs.Set(uri, `defmodule MyApp.Test do
+  use MyApp.CustomIf
+
+  i
+end`)
+
+	// col=3 — cursor after "i" (prefix "i")
+	items := completionAt(t, server, uri, 3, 3)
+
+	var count int
+	for _, item := range items {
+		if item.Label == "if" || item.Label == "if/2" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("expected exactly 1 'if' completion via use-injection, got %d", count)
+	}
+
+	// The one we get should be the form snippet, not the function-call form
+	for _, item := range items {
+		if item.Label == "if" {
+			if item.Kind != protocol.CompletionItemKindKeyword {
+				t.Errorf("expected Keyword kind for 'if', got %v", item.Kind)
+			}
+			if item.InsertText != elixirFormSnippets["if"] {
+				t.Errorf("expected form snippet for 'if', got %q", item.InsertText)
+			}
+		}
 	}
 }
 
