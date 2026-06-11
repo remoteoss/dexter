@@ -529,7 +529,7 @@ end
 
 func TestApplySnippet_PipeGenericParamNamesPreserveOriginalIndex(t *testing.T) {
 	var item protocol.CompletionItem
-	applySnippet(&item, "call", 3, "", true, true)
+	applySnippet(&item, "call", 3, "", "def", true, true)
 
 	if item.Label != "call/3" {
 		t.Fatalf("expected label call/3, got %q", item.Label)
@@ -1843,7 +1843,7 @@ func TestCompletion_DoBlockSnippets(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
 
-	// Module exporting functions whose names match doBlockSnippets templates.
+	// Module exporting macros whose names match doBlockSnippets templates.
 	// When imported, these should produce the custom do/end block snippet
 	// instead of an auto-generated arg list like test(${1:arg1}, ${2:arg2}).
 	indexFile(t, server.store, server.projectRoot, "lib/test_macros.ex", `defmodule MyApp.TestMacros do
@@ -1891,6 +1891,58 @@ end
 					found = true
 					if item.InsertText != tt.snippet {
 						t.Errorf("expected snippet %q, got %q", tt.snippet, item.InsertText)
+					}
+					if item.InsertTextFormat != protocol.InsertTextFormatSnippet {
+						t.Error("expected InsertTextFormatSnippet")
+					}
+					break
+				}
+			}
+			if !found {
+				t.Errorf("expected to find completion item %q", tt.label)
+			}
+		})
+	}
+}
+
+func TestCompletion_DoBlockSnippets_RequireMacroKind(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/plain_helpers.ex", `defmodule MyApp.PlainHelpers do
+  def test(description, block) do
+    :ok
+  end
+
+  def setup(block) do
+    :ok
+  end
+end
+`)
+
+	uri := "file:///test.ex"
+
+	tests := []struct {
+		prefix string
+		label  string
+		text   string
+	}{
+		{"tes", "test/2", "test ${1:description}, ${2:block}$0"},
+		{"set", "setup/1", "setup ${1:block}$0"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.label, func(t *testing.T) {
+			doc := "import MyApp.PlainHelpers\n  " + tt.prefix
+			server.docs.Set(uri, doc)
+			items := completionAt(t, server, uri, 1, uint32(2+len(tt.prefix)))
+
+			var found bool
+			for _, item := range items {
+				if item.Label == tt.label {
+					found = true
+					if item.InsertText != tt.text {
+						t.Errorf("expected normal call snippet %q, got %q", tt.text, item.InsertText)
 					}
 					if item.InsertTextFormat != protocol.InsertTextFormatSnippet {
 						t.Error("expected InsertTextFormatSnippet")

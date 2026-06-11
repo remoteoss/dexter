@@ -1535,7 +1535,7 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 							Kind:   protocol.CompletionItemKindFunction,
 							Detail: fmt.Sprintf(":%s.%s/%d", erlModule, e.Function, e.Arity),
 						}
-						applySnippet(&item, e.Function, e.Arity, e.Params, inPipe, s.snippetSupport)
+						applySnippet(&item, e.Function, e.Arity, e.Params, "", inPipe, s.snippetSupport)
 						items = append(items, item)
 					}
 				}
@@ -1597,7 +1597,7 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 					"line":     r.Line,
 				},
 			}
-			applySnippet(&item, r.Function, r.Arity, r.Params, inPipe, s.snippetSupport)
+			applySnippet(&item, r.Function, r.Arity, r.Params, r.Kind, inPipe, s.snippetSupport)
 			items = append(items, item)
 		}
 
@@ -1685,7 +1685,7 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 					Kind:   kindToCompletionItemKind(bf.Kind),
 					Detail: bf.Kind,
 				}
-				applySnippet(&item, bf.Name, bf.Arity, bf.Params, inPipe, s.snippetSupport)
+				applySnippet(&item, bf.Name, bf.Arity, bf.Params, bf.Kind, inPipe, s.snippetSupport)
 				items = append(items, item)
 			}
 		}
@@ -1713,7 +1713,7 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 							"line":     r.Line,
 						},
 					}
-					applySnippet(&item, r.Function, r.Arity, r.Params, inPipe, s.snippetSupport)
+					applySnippet(&item, r.Function, r.Arity, r.Params, r.Kind, inPipe, s.snippetSupport)
 					items = append(items, item)
 				}
 			}
@@ -2141,7 +2141,7 @@ func (s *Server) addCompletionsFromUsing(moduleName, funcPrefix string, seen map
 						"line":     d.line,
 					},
 				}
-				applySnippet(&item, funcName, d.arity, d.params, inPipe, useSnippets)
+				applySnippet(&item, funcName, d.arity, d.params, d.kind, inPipe, useSnippets)
 				*items = append(*items, item)
 			}
 		}
@@ -2168,7 +2168,7 @@ func (s *Server) addCompletionsFromUsing(moduleName, funcPrefix string, seen map
 						"line":     r.Line,
 					},
 				}
-				applySnippet(&item, r.Function, r.Arity, r.Params, inPipe, useSnippets)
+				applySnippet(&item, r.Function, r.Arity, r.Params, r.Kind, inPipe, useSnippets)
 				*items = append(*items, item)
 			}
 		}
@@ -2382,14 +2382,14 @@ var doBlockSnippets = map[string]string{
 	"assert_raise": "assert_raise ${1:exception} do\n\t$0\nend",
 }
 
-func applySnippet(item *protocol.CompletionItem, name string, arity int, params string, inPipe bool, useSnippets bool) {
+func applySnippet(item *protocol.CompletionItem, name string, arity int, params string, kind string, inPipe bool, useSnippets bool) {
 	item.Label = fmt.Sprintf("%s/%d", name, arity)
 	item.FilterText = name
 
 	// Check for a do-block snippet template first. These provide full
 	// do/end block structure (e.g. `test "..." do ... end`) and take
 	// priority over auto-generated arg lists.
-	if useSnippets {
+	if useSnippets && isMacroKind(kind) {
 		if tmpl, ok := doBlockSnippets[name]; ok {
 			item.InsertTextFormat = protocol.InsertTextFormatSnippet
 			item.InsertText = tmpl
@@ -2433,6 +2433,10 @@ func applySnippet(item *protocol.CompletionItem, name string, arity int, params 
 	} else {
 		item.InsertText = name + "()"
 	}
+}
+
+func isMacroKind(kind string) bool {
+	return kind == "defmacro" || kind == "defmacrop"
 }
 
 func functionSnippet(name string, arity int, params string, paramStartIndex int, noParen bool) string {
