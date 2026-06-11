@@ -78,7 +78,10 @@ func FindVariableOccurrencesWithTree(root *tree_sitter.Node, src []byte, line, c
 		return occurrences
 	}
 
-	skipRoot := resolved.scope.Kind() == "stab_clause"
+	// A def-family call (scope.Kind() == "call" here, since with/for calls are
+	// handled above) is the scope root, so skip the def-boundary check on it —
+	// otherwise collection would bail immediately on the very scope it chose.
+	skipRoot := resolved.scope.Kind() == "stab_clause" || resolved.scope.Kind() == "call"
 	collectVariableOccurrences(resolved.scope, src, resolved.varName, &occurrences, skipRoot)
 	return occurrences
 }
@@ -114,16 +117,27 @@ func NameExistsInScopeOf(root *tree_sitter.Node, src []byte, line, col uint, new
 }
 
 // findFirstNonCallIdentifier returns the first identifier node in the subtree
-// matching name that is not a function name in a call expression.
+// matching name that is not a function name in a call expression. Nested
+// function definitions (def/defp/etc.) are independent scopes, so they are not
+// descended into — a same-named binding inside one is not a collision in the
+// scope rooted at node. (The root itself may be such a def call when renaming a
+// function-local; that is the chosen scope and is always searched.)
 func findFirstNonCallIdentifier(node *tree_sitter.Node, src []byte, name string) *tree_sitter.Node {
+	return findFirstNonCallIdentifierInScope(node, src, name, true)
+}
+
+func findFirstNonCallIdentifierInScope(node *tree_sitter.Node, src []byte, name string, isRoot bool) *tree_sitter.Node {
 	if node == nil {
+		return nil
+	}
+	if !isRoot && definesNestedScope(node, src) {
 		return nil
 	}
 	if node.Kind() == "identifier" && node.Utf8Text(src) == name && !isFunctionNameInCall(node, src) {
 		return node
 	}
 	for i := uint(0); i < uint(node.ChildCount()); i++ {
-		if found := findFirstNonCallIdentifier(node.Child(i), src, name); found != nil {
+		if found := findFirstNonCallIdentifierInScope(node.Child(i), src, name, false); found != nil {
 			return found
 		}
 	}
@@ -289,6 +303,44 @@ func isDefinitionKeyword(name string) bool {
 	return defKeywords[name]
 }
 
+// moduleKeywords are the keywords that open a module body — an independent
+// variable scope. Variables bound directly in a module body belong only to
+// that module, not to sibling modules or the surrounding script.
+var moduleKeywords = map[string]bool{
+	"defmodule": true, "defprotocol": true, "defimpl": true,
+}
+
+// isFunctionDefinitionCall reports whether node is a def/defp/defmacro/etc.
+// call — the boundary of an independent variable scope. Variables inside a
+// function definition do not leak to (and cannot reference) an enclosing
+// module/script scope, so traversals rooted at an outer scope must not descend
+// into these.
+func isFunctionDefinitionCall(node *tree_sitter.Node, src []byte) bool {
+	if node.Kind() != "call" || node.ChildCount() == 0 {
+		return false
+	}
+	first := node.Child(0)
+	return first.Kind() == "identifier" && functionKeywords[first.Utf8Text(src)]
+}
+
+// isModuleDefinitionCall reports whether node is a defmodule/defprotocol/defimpl
+// call, which opens a module-body scope.
+func isModuleDefinitionCall(node *tree_sitter.Node, src []byte) bool {
+	if node.Kind() != "call" || node.ChildCount() == 0 {
+		return false
+	}
+	first := node.Child(0)
+	return first.Kind() == "identifier" && moduleKeywords[first.Utf8Text(src)]
+}
+
+// definesNestedScope reports whether node is a call that introduces its own
+// variable scope — a function or module definition. A traversal rooted at an
+// outer scope (a module body, or the whole file) must not descend into these,
+// or a rename/collision check would wrongly reach into an unrelated scope.
+func definesNestedScope(node *tree_sitter.Node, src []byte) bool {
+	return isFunctionDefinitionCall(node, src) || isModuleDefinitionCall(node, src)
+}
+
 // isAssignmentTarget returns true if node is on the left-hand side of a `=`
 // binary operator, meaning it is unambiguously a variable binding.
 func isAssignmentTarget(node *tree_sitter.Node, src []byte) bool {
@@ -309,14 +361,21 @@ func isAssignmentTarget(node *tree_sitter.Node, src []byte) bool {
 // at the cursor position is ambiguous (could be a zero-arity function call)
 // and should not be treated as a variable.
 func variableDefinedInScope(scope *tree_sitter.Node, src []byte, varName string, cursorLine, cursorCol uint) bool {
-	return identifierExistsElsewhere(scope, src, varName, cursorLine, cursorCol)
+	return identifierExistsElsewhere(scope, src, varName, cursorLine, cursorCol, true)
 }
 
 // identifierExistsElsewhere returns true if an identifier matching name
 // exists anywhere in the subtree at a position different from (line, col).
-// It skips function names in calls and definition keywords.
-func identifierExistsElsewhere(node *tree_sitter.Node, src []byte, name string, line, col uint) bool {
+// It skips function names in calls and definition keywords. Nested function
+// definitions are independent scopes and are not descended into (isRoot guards
+// the chosen scope itself, which may be such a def call) — otherwise a bare
+// top-level call sharing a name with a function-local would be misread as a
+// variable.
+func identifierExistsElsewhere(node *tree_sitter.Node, src []byte, name string, line, col uint, isRoot bool) bool {
 	if node == nil {
+		return false
+	}
+	if !isRoot && definesNestedScope(node, src) {
 		return false
 	}
 	if node.Kind() == "identifier" && node.Utf8Text(src) == name && !isFunctionNameInCall(node, src) {
@@ -326,7 +385,7 @@ func identifierExistsElsewhere(node *tree_sitter.Node, src []byte, name string, 
 		}
 	}
 	for i := uint(0); i < uint(node.ChildCount()); i++ {
-		if identifierExistsElsewhere(node.Child(i), src, name, line, col) {
+		if identifierExistsElsewhere(node.Child(i), src, name, line, col, false) {
 			return true
 		}
 	}
@@ -363,12 +422,23 @@ func findEnclosingScope(node *tree_sitter.Node, src []byte, varName string) *tre
 			if firstChild.Kind() == "identifier" && functionKeywords[firstChild.Utf8Text(src)] {
 				return current
 			}
+			// A module body (defmodule/defprotocol/defimpl) is its own scope:
+			// module-level bindings belong to this module, not to sibling
+			// modules or the surrounding script.
+			if firstChild.Kind() == "identifier" && moduleKeywords[firstChild.Utf8Text(src)] {
+				return current
+			}
 			// with/for/etc.: scope boundary unless cursor is on clause 0's rhs (outer scope).
 			if callHasDoBlock(current) && callArgumentPatternsBindVariable(current, src, varName) {
 				if cursorNeedsWithScope(current, prev, node, src, varName) {
 					return current
 				}
 			}
+		}
+		// Reached the file root without an inner scope: top-level script
+		// bindings (e.g. config/runtime.exs) are scoped to the whole file.
+		if current.Kind() == "source" {
+			return current
 		}
 		prev = current
 		current = current.Parent()
@@ -461,6 +531,15 @@ func collectVariableOccurrences(node *tree_sitter.Node, src []byte, varName stri
 		// the outer variable and must be traversed.
 		if node.Kind() == "call" && callHasDoBlock(node) && callArgumentPatternsBindVariable(node, src, varName) {
 			collectPatternExpressionOccurrences(node, src, varName, out)
+			return
+		}
+
+		// Function and module definitions introduce their own variable scope.
+		// When collecting from an outer scope — e.g. the whole file for a
+		// top-level script binding, or a module body — do not descend into a
+		// nested definition, or a rename would wrongly touch same-named bindings
+		// that live in that separate scope.
+		if definesNestedScope(node, src) {
 			return
 		}
 	}

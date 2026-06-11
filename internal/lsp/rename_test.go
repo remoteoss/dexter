@@ -1267,6 +1267,49 @@ end
 	}
 }
 
+func TestRename_Module_PlainAliasUpdatesRequireInSameFile(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	defContent := `defmodule SharedLib.Values.ServiceEndpointConfig do
+  defmacro __using__(_), do: :ok
+end
+`
+	// A config script that aliases the module by its plain (last-segment) name
+	// and then refers to it by that short name in a `require`.
+	callerContent := `import Config
+
+alias SharedLib.Values.ServiceEndpointConfig
+
+require ServiceEndpointConfig
+`
+	callerPath := filepath.Join(server.projectRoot, "config", "runtime.exs")
+	indexFile(t, server.store, server.projectRoot, "lib/service_endpoint_config.ex", defContent)
+	indexFile(t, server.store, server.projectRoot, "config/runtime.exs", callerContent)
+
+	callerURI := "file://" + callerPath
+	server.docs.Set(callerURI, callerContent)
+
+	// Rename the alias on the alias line (line 2). Column 20 is the start of
+	// "ServiceEndpointConfig" in "alias SharedLib.Values.ServiceEndpointConfig".
+	edit := renameAt(t, server, callerURI, 2, uint32(len("alias SharedLib.Values.")), "PublicEndpointConfig")
+	if edit == nil {
+		t.Fatal("expected non-nil edit")
+	}
+
+	edits := collectEdits(edit, callerPath)
+
+	// The alias declaration's full module reference must be updated.
+	if !hasEdit(edits, "SharedLib.Values.PublicEndpointConfig") {
+		t.Errorf("expected alias line full-module edit to SharedLib.Values.PublicEndpointConfig; edits=%+v", edits)
+	}
+	// The `require` referencing the short alias name must also be updated, and
+	// only its short-name segment (line 4) — not turned into the full module.
+	if !editsContainLine(edits, 4) || !hasEdit(edits, "PublicEndpointConfig") {
+		t.Errorf("expected `require` short-name on line 4 to be renamed to PublicEndpointConfig; edits=%+v", edits)
+	}
+}
+
 func TestRename_Module_AliasAsPreserved(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()

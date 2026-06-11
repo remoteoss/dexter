@@ -427,8 +427,8 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 			j := nextSig(i)
 			modName, k := collectModuleName(j)
 			if modName != "" {
-				resolved := resolveModule(modName, currentModule())
-				if !strings.Contains(resolved, "__MODULE__") {
+				resolved := ResolveModuleRef(modName, aliases, currentModule())
+				if resolved != "" {
 					refs = append(refs, Reference{Module: resolved, Line: importLine, FilePath: path, Kind: "import"})
 					injectors[resolved] = true
 				}
@@ -442,8 +442,8 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 			j := nextSig(i)
 			modName, k := collectModuleName(j)
 			if modName != "" {
-				resolved := resolveModule(modName, currentModule())
-				if !strings.Contains(resolved, "__MODULE__") {
+				resolved := ResolveModuleRef(modName, aliases, currentModule())
+				if resolved != "" {
 					refs = append(refs, Reference{Module: resolved, Line: useLine, FilePath: path, Kind: "use"})
 					injectors[resolved] = true
 				}
@@ -464,8 +464,8 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 
 			// Check for require Module, as: Name
 			if asName, nextPos, ok := ScanKeywordOptionValue(source, tokens, n, k, "as"); ok {
-				resolved := resolveModule(modName, cm)
-				if !strings.Contains(resolved, "__MODULE__") {
+				resolved := ResolveModuleRef(modName, aliases, cm)
+				if resolved != "" {
 					aliases[asName] = resolved
 					refs = append(refs, Reference{Module: resolved, Line: requireLine, FilePath: path, Kind: "require"})
 				}
@@ -474,8 +474,8 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 			}
 
 			// Simple require (no as:) — still emit reference but no alias
-			resolved := resolveModule(modName, cm)
-			if !strings.Contains(resolved, "__MODULE__") {
+			resolved := ResolveModuleRef(modName, aliases, cm)
+			if resolved != "" {
 				refs = append(refs, Reference{Module: resolved, Line: requireLine, FilePath: path, Kind: "require"})
 			}
 			i = k

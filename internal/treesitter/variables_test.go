@@ -1380,3 +1380,180 @@ end`)
 		}
 	}
 }
+
+func TestFindVariableOccurrences_TopLevelScript(t *testing.T) {
+	// Config scripts (e.g. config/runtime.exs) bind variables at the file's
+	// top level, with no enclosing def/defmodule. These must still be
+	// renameable — the whole file is the variable's scope.
+	src := []byte(`import Config
+
+environment = System.get_env("ENVIRONMENT", "dev")
+config :app, env: environment
+`)
+
+	// Cursor on the binding site "environment" at line 2, col 0.
+	occs := FindVariableOccurrences(src, 2, 0)
+	if len(occs) != 2 {
+		t.Fatalf("expected 2 occurrences of top-level 'environment', got %d: %+v", len(occs), occs)
+	}
+	if occs[0].Line != 2 {
+		t.Errorf("occ[0] line: expected 2 (binding), got %d", occs[0].Line)
+	}
+	if occs[1].Line != 3 {
+		t.Errorf("occ[1] line: expected 3 (reference), got %d", occs[1].Line)
+	}
+
+	// Cursor on the reference "environment" at line 3 resolves to the same set.
+	refOccs := FindVariableOccurrences(src, 3, uint(len("config :app, env: ")))
+	if len(refOccs) != 2 {
+		t.Fatalf("expected 2 occurrences from reference site, got %d: %+v", len(refOccs), refOccs)
+	}
+}
+
+func TestFindVariableOccurrences_TopLevelDoesNotCrossDefBoundary(t *testing.T) {
+	// A top-level script binding is scoped to the whole file, but def/defp
+	// bodies are independent scopes. Renaming a top-level variable must not
+	// touch a same-named local inside a nested function.
+	src := []byte(`config = load_config()
+
+defmodule App do
+  def start do
+    config = build()
+    use(config)
+  end
+end
+
+apply(config)
+`)
+
+	// Cursor on the top-level binding "config" at line 0, col 0.
+	occs := FindVariableOccurrences(src, 0, 0)
+	if len(occs) != 2 {
+		t.Fatalf("expected 2 occurrences of top-level 'config' (line 0 + line 9), got %d: %+v", len(occs), occs)
+	}
+	for _, occ := range occs {
+		if occ.Line == 4 || occ.Line == 5 {
+			t.Errorf("top-level rename leaked into def body at line %d: %+v", occ.Line, occs)
+		}
+	}
+	if occs[0].Line != 0 {
+		t.Errorf("occ[0] line: expected 0 (binding), got %d", occs[0].Line)
+	}
+	if occs[1].Line != 9 {
+		t.Errorf("occ[1] line: expected 9 (reference), got %d", occs[1].Line)
+	}
+}
+
+func TestNameExistsInScopeOf_TopLevelDoesNotCrossDefBoundary(t *testing.T) {
+	// Collision detection for a top-level rename must use the same scope rules
+	// as collection: a same-named binding inside a def body is a separate scope
+	// and must not be reported as a collision.
+	src := []byte(`config = load_config()
+
+defmodule App do
+  def start do
+    other = build()
+    use(other)
+  end
+end
+
+apply(config)
+`)
+	root, cleanup := parseElixir(src)
+	defer cleanup()
+
+	// Renaming top-level "config" to "other" is safe: "other" only exists as a
+	// def-local, which is a different scope.
+	if NameExistsInScopeOf(root, src, 0, 0, "other") {
+		t.Error("false-positive collision: 'other' is a def-local, not in the top-level scope")
+	}
+}
+
+func TestFindVariableOccurrences_ModuleBodyVarsAreSeparateScopes(t *testing.T) {
+	// A variable bound directly in a module body is scoped to that module.
+	// Renaming it must not touch a same-named module-body binding in a sibling
+	// module.
+	src := []byte(`defmodule A do
+  port = 4000
+  IO.puts(port)
+end
+
+defmodule B do
+  port = 5000
+  IO.puts(port)
+end
+`)
+
+	// Cursor on the "port" binding in module A (line 1).
+	occs := FindVariableOccurrences(src, 1, 2)
+	if len(occs) != 2 {
+		t.Fatalf("expected 2 occurrences within module A, got %d: %+v", len(occs), occs)
+	}
+	for _, occ := range occs {
+		if occ.Line >= 5 {
+			t.Errorf("module A 'port' rename leaked into module B at line %d: %+v", occ.Line, occs)
+		}
+	}
+}
+
+func TestFindVariableOccurrences_TopLevelVarDoesNotCrossModuleBoundary(t *testing.T) {
+	// A top-level script binding must not leak into a same-named binding inside
+	// a module body — module bodies are independent scopes.
+	src := []byte(`config = load()
+
+defmodule A do
+  config = 1
+  IO.puts(config)
+end
+
+use_it(config)
+`)
+
+	// Cursor on the top-level "config" binding (line 0).
+	occs := FindVariableOccurrences(src, 0, 0)
+	if len(occs) != 2 {
+		t.Fatalf("expected 2 occurrences (line 0 binding + line 7 reference), got %d: %+v", len(occs), occs)
+	}
+	for _, occ := range occs {
+		if occ.Line == 3 || occ.Line == 4 {
+			t.Errorf("top-level 'config' rename leaked into module body at line %d: %+v", occ.Line, occs)
+		}
+	}
+}
+
+func TestFindVariableOccurrences_TopLevelBareCallSharedWithDefLocal(t *testing.T) {
+	// A parenless bare zero-arity call at the top level (e.g. a config DSL
+	// reference) whose name coincides with a local inside a def body must not be
+	// treated as a variable — the def-local is a separate scope and must not
+	// make the top-level reference look "bound".
+	src := []byte(`config :app, value: helper
+
+defmodule App do
+  def start do
+    helper = 1
+    use(helper)
+  end
+end
+`)
+
+	// Cursor on top-level "helper" at line 0.
+	occs := FindVariableOccurrences(src, 0, uint(len("config :app, value: ")))
+	if occs != nil {
+		t.Errorf("top-level bare call 'helper' misclassified as variable: %+v", occs)
+	}
+}
+
+func TestFindVariableOccurrences_TopLevelBareCallNotVariable(t *testing.T) {
+	// A bare zero-arity call at the top level (not bound anywhere) must not be
+	// mistaken for a variable, even though the file root is now a valid scope.
+	src := []byte(`import Config
+
+config :app, value: some_helper()
+`)
+
+	// Cursor on "some_helper" at line 2.
+	occs := FindVariableOccurrences(src, 2, uint(len("config :app, value: ")))
+	if occs != nil {
+		t.Errorf("expected nil for bare top-level call, got %d occurrences: %+v", len(occs), occs)
+	}
+}
