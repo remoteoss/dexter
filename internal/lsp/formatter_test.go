@@ -423,6 +423,96 @@ func TestFormatterServer_NonStandardOptionReachesPlugin(t *testing.T) {
 	}
 }
 
+func createMixConfigFormatterFixture(t *testing.T) string {
+	t.Helper()
+	mixRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(mixRoot, "lib"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(mixRoot, "mix.exs"),
+		[]byte(`defmodule MixConfigFormatter.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :mix_config_formatter,
+      version: "0.1.0",
+      elixir: "~> 1.18"
+    ]
+  end
+end
+`),
+		0644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(mixRoot, ".formatter.exs"),
+		[]byte("[plugins: [Dexter.MixConfigFormatter], inputs: [\"{lib,test}/**/*.{ex,exs}\"]]\n"),
+		0644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(mixRoot, "lib", "mix_config_formatter.ex"),
+		[]byte(`defmodule Dexter.MixConfigFormatter do
+  def features(_opts), do: [extensions: [".ex"]]
+
+  def format(input, _opts) do
+    _ = Mix.Project.config()
+    String.replace(input, ":needs_mix", ":mix_started")
+  end
+end
+`),
+		0644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("mix", "compile")
+	cmd.Dir = mixRoot
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("could not compile Mix config formatter fixture: %v\n%s", err, out)
+	}
+	return mixRoot
+}
+
+func TestFormatterServer_PluginCanCallMixProjectConfig(t *testing.T) {
+	if _, err := exec.LookPath("mix"); err != nil {
+		t.Skip("mix not available in PATH")
+	}
+
+	mixRoot := createMixConfigFormatterFixture(t)
+	storeDir := t.TempDir()
+	s, err := store.Open(storeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+
+	server := NewServer(s, mixRoot)
+	if p, err := exec.LookPath("mix"); err == nil {
+		server.mixBin = p
+	}
+
+	filePath := filepath.Join(mixRoot, "lib", "example.ex")
+	docURI := string(uri.File(filePath))
+	server.docs.Set(docURI, "defmodule Example do\n  def value, do: :needs_mix\nend\n")
+
+	edits, err := server.Formatting(context.Background(), &protocol.DocumentFormattingParams{
+		TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(docURI)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if edits == nil {
+		t.Fatal("expected formatting edits from Mix config formatter plugin, got nil")
+	}
+	if !strings.Contains(edits[0].NewText, ":mix_started") {
+		t.Errorf("expected formatter plugin to run after calling Mix.Project.config/0, got:\n%s", edits[0].NewText)
+	}
+}
+
 func TestFormatterServer_BasicProject(t *testing.T) {
 	if _, err := exec.LookPath("mix"); err != nil {
 		t.Skip("mix not available in PATH")

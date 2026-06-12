@@ -55,6 +55,10 @@
 # corrupting our binary protocol framing.
 :io.setopts(:standard_io, encoding: :latin1)
 
+# Formatter plugins can call Mix APIs at format time. This starts Mix's own
+# lightweight supervisor tree, but does not load the user's mix.exs project.
+:ok = Mix.start()
+
 [project_root_arg] = System.argv()
 
 # In umbrella apps, _build and deps live at the umbrella root, not in
