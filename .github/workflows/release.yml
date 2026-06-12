@@ -74,13 +74,26 @@ jobs:
           merge-multiple: true
       - name: Generate checksums
         run: cd artifacts && sha256sum *.tar.gz > checksums.txt
+      - name: Extract release notes
+        run: |
+          version="${RELEASE_TAG#v}"
+          awk -v version="$version" '
+            $0 ~ "^## \\[" version "\\]( - |$)" { in_section = 1; next }
+            in_section && /^## \[/ { exit }
+            in_section { print }
+          ' CHANGELOG.md > release-notes.md
+
+          if ! awk 'NF { found = 1 } END { exit !found }' release-notes.md; then
+            echo "No CHANGELOG.md notes found for ${RELEASE_TAG}"
+            exit 1
+          fi
       - name: Create release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "${{ env.RELEASE_TAG }}" \
             --title "${{ env.RELEASE_TAG }}" \
-            --generate-notes \
+            --notes-file release-notes.md \
             artifacts/*.tar.gz \
             artifacts/checksums.txt
 

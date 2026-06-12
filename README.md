@@ -598,11 +598,11 @@ make release VERSION=0.2.0
 
 # 2. Push the branch and merge it into main
 
-# 3. Tag and push the tag
+# 3. Review CHANGELOG.md, then tag and push the tag
 make tag VERSION=0.2.0
 ```
 
-This updates the version in `internal/version/version.go` on a release branch. After merging to main, `make tag` creates and pushes the git tag. Users can then upgrade via mise:
+This updates the version in `internal/version/version.go` on a release branch. After merging to main, review the matching `CHANGELOG.md` entry because the GitHub release notes are published from that section. Then `make tag` creates and pushes the git tag. Users can then upgrade via mise:
 
 ```sh
 mise upgrade aqua:remoteoss/dexter
