@@ -37,10 +37,10 @@ jobs:
     env:
       CGO_ENABLED: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ env.RELEASE_TAG }}
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
       - name: Build
@@ -53,7 +53,7 @@ jobs:
           mkdir "$name"
           cp dexter "$name/"
           tar czf "${name}.tar.gz" "$name"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: dexter-${{ matrix.goos }}-${{ matrix.goarch }}
           path: "*.tar.gz"
@@ -63,11 +63,11 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ env.RELEASE_TAG }}
           fetch-depth: 0
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: artifacts
           pattern: dexter-*
@@ -96,22 +96,3 @@ jobs:
             --notes-file release-notes.md \
             artifacts/*.tar.gz \
             artifacts/checksums.txt
-
-  update-homebrew:
-    needs: release
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ env.RELEASE_TAG }}
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          pattern: dexter-*
-          merge-multiple: true
-      - name: Update Homebrew formula
-        env:
-          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          VERSION: ${{ env.RELEASE_TAG }}
-          ARTIFACTS_DIR: artifacts
-        run: scripts/update-homebrew-formula.sh
