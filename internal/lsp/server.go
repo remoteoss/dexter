@@ -22,7 +22,6 @@ import (
 	"go.lsp.dev/jsonrpc2"
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
-	"go.uber.org/zap"
 
 	"github.com/remoteoss/dexter/internal/parser"
 	"github.com/remoteoss/dexter/internal/stdlib"
@@ -136,24 +135,6 @@ type stdinoutCloser struct {
 
 func (s stdinoutCloser) Close() error { return nil }
 
-// Serve starts the LSP server on the given reader/writer (typically stdin/stdout).
-func Serve(in io.Reader, out io.Writer, s *store.Store, projectRoot string) error {
-	server := NewServer(s, projectRoot)
-
-	logger, _ := zap.NewProduction()
-	stream := jsonrpc2.NewStream(stdinoutCloser{in, out})
-	conn := jsonrpc2.NewConn(stream)
-	server.client = protocol.ClientDispatcher(conn, logger)
-	server.conn = conn
-
-	handler := protocol.ServerHandler(server, nil)
-	ctx := context.Background()
-
-	conn.Go(ctx, handler)
-	<-conn.Done()
-	return conn.Err()
-}
-
 // backgroundReindex runs in the background. If the index is empty it does a
 // full init, otherwise it does an incremental mtime-based update.
 func (s *Server) backgroundReindex() {
@@ -164,98 +145,110 @@ func (s *Server) backgroundReindex() {
 			return
 		}
 		defer s.reindexing.Unlock()
+		s.reindexWorkspace()
+	}()
+}
 
-		start := time.Now()
-		reindexed := 0
-		isEmpty := s.store.IsEmpty()
+// ReindexWorkspace runs the same full-or-incremental reindex as
+// backgroundReindex, but blocking, and reports how many files were updated.
+func (s *Server) ReindexWorkspace() (int, time.Duration) {
+	s.reindexing.Lock()
+	defer s.reindexing.Unlock()
+	return s.reindexWorkspace()
+}
 
-		if isEmpty {
-			log.Printf("No index found, building from scratch...")
-			if s.client != nil {
-				if err := s.client.ShowMessage(context.Background(), &protocol.ShowMessageParams{
-					Type:    protocol.MessageTypeInfo,
-					Message: "Dexter: building index for the first time, go-to-definition will be available shortly...",
-				}); err != nil {
-					log.Printf("ShowMessage: %v", err)
-				}
-			}
-		}
+func (s *Server) reindexWorkspace() (int, time.Duration) {
+	start := time.Now()
+	reindexed := 0
+	isEmpty := s.store.IsEmpty()
 
-		seen := make(map[string]struct{})
-		walkAndIndex := func(root string, indexRefs bool) {
-			_ = parser.WalkElixirFiles(root, func(path string, d fs.DirEntry) error {
-				seen[path] = struct{}{}
-
-				if !isEmpty {
-					info, err := d.Info()
-					if err != nil {
-						return nil
-					}
-					storedMtime, found := s.store.GetFileMtime(path)
-					currentMtime := info.ModTime().UnixNano()
-					if found && storedMtime == currentMtime {
-						return nil
-					}
-				}
-
-				defs, refs, err := parser.ParseFile(path)
-				if err != nil {
-					return nil
-				}
-				if !indexRefs {
-					refs = nil
-				}
-				if err := s.store.IndexFileWithRefs(path, defs, refs); err != nil {
-					log.Printf("Warning: reindex %s: %v", path, err)
-				}
-				reindexed++
-				return nil
-			})
-		}
-
-		// Index stdlib first (definitions only).
-		if s.stdlibRoot != "" {
-			walkAndIndex(s.stdlibRoot, false)
-		}
-
-		walkAndIndex(s.projectRoot, true)
-
-		// Prune store entries for files no longer on disk
-		if storedPaths, err := s.store.ListFilePaths(); err == nil {
-			var toRemove []string
-			for _, storedPath := range storedPaths {
-				if _, ok := seen[storedPath]; !ok {
-					toRemove = append(toRemove, storedPath)
-				}
-			}
-			if len(toRemove) > 0 {
-				_ = s.store.RemoveFiles(toRemove)
-			}
-		}
-
-		// Collapse the WAL back to disk now that the (potentially large) reindex
-		// is complete, so the -wal file does not stay parked at its high-water
-		// mark for the lifetime of the LSP process.
-		if err := s.store.Checkpoint(); err != nil {
-			log.Printf("Warning: WAL checkpoint after reindex: %v", err)
-		}
-
-		elapsed := time.Since(start).Round(time.Millisecond)
-		log.Printf("Background reindex: %d files updated (%s)", reindexed, elapsed)
-
-		if isEmpty && s.client != nil {
+	if isEmpty {
+		log.Printf("No index found, building from scratch...")
+		if s.client != nil {
 			if err := s.client.ShowMessage(context.Background(), &protocol.ShowMessageParams{
 				Type:    protocol.MessageTypeInfo,
-				Message: fmt.Sprintf("Dexter: index built (%d files in %s)", reindexed, elapsed),
+				Message: "Dexter: building index for the first time, go-to-definition will be available shortly...",
 			}); err != nil {
 				log.Printf("ShowMessage: %v", err)
 			}
 		}
-	}()
+	}
+
+	seen := make(map[string]struct{})
+	walkAndIndex := func(root string, indexRefs bool) {
+		_ = parser.WalkElixirFiles(root, func(path string, d fs.DirEntry) error {
+			seen[path] = struct{}{}
+
+			if !isEmpty {
+				info, err := d.Info()
+				if err != nil {
+					return nil
+				}
+				storedMtime, found := s.store.GetFileMtime(path)
+				currentMtime := info.ModTime().UnixNano()
+				if found && storedMtime == currentMtime {
+					return nil
+				}
+			}
+
+			defs, refs, err := parser.ParseFile(path)
+			if err != nil {
+				return nil
+			}
+			if !indexRefs {
+				refs = nil
+			}
+			if err := s.store.IndexFileWithRefs(path, defs, refs); err != nil {
+				log.Printf("Warning: reindex %s: %v", path, err)
+			}
+			reindexed++
+			return nil
+		})
+	}
+
+	// Index stdlib first (definitions only).
+	if s.stdlibRoot != "" {
+		walkAndIndex(s.stdlibRoot, false)
+	}
+
+	walkAndIndex(s.projectRoot, true)
+
+	// Prune store entries for files no longer on disk
+	if storedPaths, err := s.store.ListFilePaths(); err == nil {
+		var toRemove []string
+		for _, storedPath := range storedPaths {
+			if _, ok := seen[storedPath]; !ok {
+				toRemove = append(toRemove, storedPath)
+			}
+		}
+		if len(toRemove) > 0 {
+			_ = s.store.RemoveFiles(toRemove)
+		}
+	}
+
+	// Collapse the WAL back to disk now that the (potentially large) reindex
+	// is complete, so the -wal file does not stay parked at its high-water
+	// mark for the lifetime of the LSP process.
+	if err := s.store.Checkpoint(); err != nil {
+		log.Printf("Warning: WAL checkpoint after reindex: %v", err)
+	}
+
+	elapsed := time.Since(start).Round(time.Millisecond)
+	log.Printf("Background reindex: %d files updated (%s)", reindexed, elapsed)
+
+	if isEmpty && s.client != nil {
+		if err := s.client.ShowMessage(context.Background(), &protocol.ShowMessageParams{
+			Type:    protocol.MessageTypeInfo,
+			Message: fmt.Sprintf("Dexter: index built (%d files in %s)", reindexed, elapsed),
+		}); err != nil {
+			log.Printf("ShowMessage: %v", err)
+		}
+	}
+	return reindexed, elapsed
 }
 
-// watchGitHead polls .git/HEAD mtime and triggers reindex on branch switches.
-func (s *Server) watchGitHead() {
+// WatchGitHead polls .git/HEAD mtime and triggers reindex on branch switches.
+func (s *Server) WatchGitHead() {
 	go func() {
 		headPath := filepath.Join(s.projectRoot, ".git", "HEAD")
 		var lastMtime int64
@@ -397,7 +390,7 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 	if !s.initialized {
 		s.initialized = true
 		s.backgroundReindex()
-		s.watchGitHead()
+		s.WatchGitHead()
 	}
 
 	if params.Capabilities.Window != nil && params.Capabilities.Window.ShowDocument != nil {
@@ -1870,7 +1863,7 @@ func (s *Server) lookupThroughUseOf(fullModule, functionName string) []store.Loo
 	if err != nil || len(modResults) == 0 {
 		return nil
 	}
-	fileText, _, ok := s.readFileText(modResults[0].FilePath)
+	fileText, _, ok := s.ReadFileText(modResults[0].FilePath)
 	if !ok {
 		return nil
 	}
@@ -4274,7 +4267,7 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*pro
 	specPrefix := "@spec " + functionName
 	callbackPrefix := "@callback " + functionName
 	for filePath := range defFilePaths {
-		fileText, _, ok := s.readFileText(filePath)
+		fileText, _, ok := s.ReadFileText(filePath)
 		if !ok {
 			continue
 		}
@@ -4308,7 +4301,7 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*pro
 		if r.Kind != "import" {
 			continue
 		}
-		lineText, ok := s.getFileLine(r.FilePath, r.Line)
+		lineText, ok := s.FileLine(r.FilePath, r.Line)
 		if !ok {
 			continue
 		}
@@ -4318,7 +4311,7 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*pro
 		}
 	}
 	for filePath := range importFilePaths {
-		fileText, _, ok := s.readFileText(filePath)
+		fileText, _, ok := s.ReadFileText(filePath)
 		if !ok {
 			continue
 		}
@@ -4341,7 +4334,7 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*pro
 				if s.isDepsFile(del.FilePath) {
 					continue
 				}
-				fileText, open, ok := s.readFileText(del.FilePath)
+				fileText, open, ok := s.ReadFileText(del.FilePath)
 				if !ok {
 					continue
 				}
@@ -4587,7 +4580,7 @@ func (mr *moduleRename) readFiles() map[string]moduleFileInfo {
 	resultsCh := make(chan fileResult, len(mr.sitesByFile))
 	for fp := range mr.sitesByFile {
 		go func() {
-			text, open, ok := mr.server.readFileText(fp)
+			text, open, ok := mr.server.ReadFileText(fp)
 			if ok {
 				resultsCh <- fileResult{fp, strings.Split(text, "\n"), open}
 			} else {
@@ -4896,7 +4889,7 @@ func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string) *
 	resultsCh := make(chan fileResult, len(sitesByFile))
 	for fp := range sitesByFile {
 		go func() {
-			text, open, ok := s.readFileText(fp)
+			text, open, ok := s.ReadFileText(fp)
 			if ok {
 				resultsCh <- fileResult{fp, strings.Split(text, "\n"), open}
 			} else {
@@ -5075,11 +5068,11 @@ func isDepsFileUncached(filePath string) bool {
 	}
 }
 
-// readFileText returns the contents of filePath, preferring the in-memory
+// ReadFileText returns the contents of filePath, preferring the in-memory
 // document store for editor-owned (didOpen) buffers. The second return
 // indicates whether the file is currently open in the editor — transient
 // entries loaded from disk via GetOrLoad are NOT reported as open.
-func (s *Server) readFileText(filePath string) (text string, open bool, ok bool) {
+func (s *Server) ReadFileText(filePath string) (text string, open bool, ok bool) {
 	uri := string(uri.File(filePath))
 	if t, found := s.docs.GetIfOpen(uri); found {
 		return t, true, true
@@ -5090,12 +5083,12 @@ func (s *Server) readFileText(filePath string) (text string, open bool, ok bool)
 	return "", false, false
 }
 
-// getFileLine returns the text of line lineNum (1-based) from the file at
+// FileLine returns the text of line lineNum (1-based) from the file at
 // filePath, preferring the in-memory document store for editor-owned
 // buffers. Transient entries loaded via GetOrLoad fall through to the
 // disk path. For closed files, only reads up to the target line instead
 // of the whole file.
-func (s *Server) getFileLine(filePath string, lineNum int) (string, bool) {
+func (s *Server) FileLine(filePath string, lineNum int) (string, bool) {
 	// Editor-owned buffer: extract the single line from memory
 	uri := string(uri.File(filePath))
 	if text, ok := s.docs.GetIfOpen(uri); ok {
@@ -5135,7 +5128,7 @@ func (s *Server) findBareCallRefs(module, functionName string) []store.Reference
 	}
 	var refs []store.ReferenceResult
 	for filePath := range defFilePaths {
-		fileText, _, ok := s.readFileText(filePath)
+		fileText, _, ok := s.ReadFileText(filePath)
 		if !ok {
 			continue
 		}
@@ -5227,7 +5220,7 @@ func (s *Server) SignatureHelp(ctx context.Context, params *protocol.SignatureHe
 	}
 
 	// Read the definition file, preferring the in-memory doc store
-	fileText, _, ok2 := s.readFileText(result.FilePath)
+	fileText, _, ok2 := s.ReadFileText(result.FilePath)
 	if !ok2 {
 		return nil, nil
 	}
@@ -5432,7 +5425,7 @@ func (s *Server) PrepareCallHierarchy(ctx context.Context, params *protocol.Call
 
 	r := defResults[0]
 	nameCol := 0
-	if defLine, ok := s.getFileLine(r.FilePath, r.Line); ok {
+	if defLine, ok := s.FileLine(r.FilePath, r.Line); ok {
 		if col := findTokenColumn(defLine, functionName); col >= 0 {
 			nameCol = col
 		}
@@ -5514,7 +5507,7 @@ func (s *Server) IncomingCalls(ctx context.Context, params *protocol.CallHierarc
 		}
 
 		nameCol := 0
-		if defLine, ok := s.getFileLine(r.FilePath, callerLine); ok {
+		if defLine, ok := s.FileLine(r.FilePath, callerLine); ok {
 			if col := findTokenColumn(defLine, callerFunc); col >= 0 {
 				nameCol = col
 			}
@@ -5604,7 +5597,7 @@ func (s *Server) OutgoingCalls(ctx context.Context, params *protocol.CallHierarc
 		}
 
 		nameCol := 0
-		if defLine, ok := s.getFileLine(td.FilePath, td.Line); ok {
+		if defLine, ok := s.FileLine(td.FilePath, td.Line); ok {
 			if col := findTokenColumn(defLine, key.function); col >= 0 {
 				nameCol = col
 			}

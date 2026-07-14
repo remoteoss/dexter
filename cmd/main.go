@@ -1,17 +1,23 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io/fs"
 	"log"
+	"net"
+	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	dexter_lsp "github.com/remoteoss/dexter/internal/lsp"
+	dexter_mcp "github.com/remoteoss/dexter/internal/mcp"
 	"github.com/remoteoss/dexter/internal/parser"
 	"github.com/remoteoss/dexter/internal/stdlib"
 	"github.com/remoteoss/dexter/internal/store"
@@ -100,6 +106,7 @@ func main() {
 		},
 	}
 
+	var lspMCPListen string
 	lspCmd := &cobra.Command{
 		Use:   "lsp [path]",
 		Short: "Start the LSP server (stdio)",
@@ -109,10 +116,33 @@ func main() {
 			if err != nil {
 				return err
 			}
-			cmdLSP(projectRoot)
+			cmdLSP(projectRoot, lspMCPListen)
 			return nil
 		},
 	}
+	lspCmd.Flags().StringVar(&lspMCPListen, "mcp-listen", "", "Also serve MCP over streamable HTTP on this address, sharing the LSP session")
+
+	var mcpListen string
+	var mcpInstructions bool
+	mcpCmd := &cobra.Command{
+		Use:   "mcp [path]",
+		Short: "Start the MCP server (stdio)",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if mcpInstructions {
+				fmt.Print(dexter_mcp.Instructions)
+				return nil
+			}
+			projectRoot, err := resolvePath(args, 0)
+			if err != nil {
+				return err
+			}
+			cmdMCP(projectRoot, mcpListen)
+			return nil
+		},
+	}
+	mcpCmd.Flags().StringVar(&mcpListen, "listen", "", "Serve MCP over streamable HTTP on this address instead of stdio")
+	mcpCmd.Flags().BoolVar(&mcpInstructions, "instructions", false, "Print the MCP instructions file and exit")
 
 	versionCmd := &cobra.Command{
 		Use:   "version",
@@ -122,7 +152,7 @@ func main() {
 		},
 	}
 
-	rootCmd.AddCommand(initCmd, reindexCmd, lookupCmd, referencesCmd, lspCmd, versionCmd)
+	rootCmd.AddCommand(initCmd, reindexCmd, lookupCmd, referencesCmd, lspCmd, mcpCmd, versionCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -498,9 +528,57 @@ func cmdReferences(projectRoot string, module string, function string) {
 	}
 }
 
-func cmdLSP(projectRoot string) {
+func cmdLSP(projectRoot string, mcpListen string) {
 	projectRoot = findProjectRoot(projectRoot)
 
+	s := openStoreForServer(projectRoot)
+	defer func() {
+		if err := s.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to close store: %v\n", err)
+		}
+	}()
+
+	log.SetOutput(os.Stderr)
+	log.Printf("Dexter LSP v%s starting (root: %s)", version.Version, projectRoot)
+
+	server := dexter_lsp.NewServer(s, projectRoot)
+
+	// Attached MCP mode: serve MCP over HTTP from the same process, sharing
+	// the live LSP server so tools see open editor buffers and warm caches.
+	// The LSP connection's lifetime is authoritative: when it ends, the MCP
+	// listener goes with it.
+	var httpSrv *http.Server
+	if mcpListen != "" {
+		ln, err := net.Listen("tcp", mcpListen)
+		if err != nil {
+			fatal(err)
+		}
+		log.Printf("MCP server listening on %s", ln.Addr())
+		h := dexter_mcp.NewHandler(dexter_mcp.Config{LSP: server, Store: s, ProjectRoot: projectRoot})
+		httpSrv = &http.Server{Handler: dexter_mcp.HTTPHandler(h)}
+		go func() {
+			if err := httpSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
+				log.Printf("MCP server error: %v", err)
+			}
+		}()
+	}
+
+	serveErr := dexter_lsp.Serve(server, os.Stdin, os.Stdout)
+
+	if httpSrv != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = httpSrv.Shutdown(shutdownCtx)
+	}
+	if serveErr != nil {
+		fatal(serveErr)
+	}
+}
+
+// openStoreForServer opens the index with the recovery behavior long-running
+// servers need: a corrupted database or an index version mismatch triggers a
+// full rebuild instead of an error.
+func openStoreForServer(projectRoot string) *store.Store {
 	const maxOpenAttempts = 3
 	var s *store.Store
 	for attempt := 1; ; attempt++ {
@@ -532,16 +610,59 @@ func cmdLSP(projectRoot string) {
 			fatal(openErr)
 		}
 	}
+	return s
+}
+
+// cmdMCP starts the headless MCP server. Logs go to stderr; stdout belongs to
+// the MCP stdio transport.
+func cmdMCP(projectRoot string, listen string) {
+	projectRoot = findProjectRoot(projectRoot)
+
+	log.SetOutput(os.Stderr)
+	s := openStoreForServer(projectRoot)
 	defer func() {
 		if err := s.Close(); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to close store: %v\n", err)
 		}
 	}()
 
-	log.SetOutput(os.Stderr)
-	log.Printf("Dexter LSP v%s starting (root: %s)", version.Version, projectRoot)
+	server := dexter_lsp.NewServer(s, projectRoot)
+	if root, ok := stdlib.Resolve(s, "", projectRoot); ok {
+		server.SetStdlibRoot(root)
+	}
 
-	if err := dexter_lsp.Serve(os.Stdin, os.Stdout, s, projectRoot); err != nil {
+	// Serve only once the index reflects the current tree: an empty index is
+	// built from scratch, an existing one gets a fast incremental update.
+	server.ReindexWorkspace()
+	server.WatchGitHead()
+
+	h := dexter_mcp.NewHandler(dexter_mcp.Config{LSP: server, Store: s, ProjectRoot: projectRoot})
+
+	log.Printf("Dexter MCP v%s starting (root: %s)", version.Version, projectRoot)
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if listen != "" {
+		ln, err := net.Listen("tcp", listen)
+		if err != nil {
+			fatal(err)
+		}
+		log.Printf("MCP server listening on %s", ln.Addr())
+		httpSrv := &http.Server{Handler: dexter_mcp.HTTPHandler(h)}
+		go func() {
+			<-ctx.Done()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = httpSrv.Shutdown(shutdownCtx)
+		}()
+		if err := httpSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			fatal(err)
+		}
+		return
+	}
+
+	if err := dexter_mcp.RunStdio(ctx, h); err != nil && ctx.Err() == nil {
 		fatal(err)
 	}
 }

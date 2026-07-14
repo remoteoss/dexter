@@ -1313,3 +1313,89 @@ func TestFindProjectRoot(t *testing.T) {
 		}
 	})
 }
+
+func TestListModuleCallbacks(t *testing.T) {
+	s, dir := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	path := writeElixirFile(t, dir, "lib/notifier.ex", `defmodule MyApp.Notifier do
+  @callback deliver(map()) :: :ok | {:error, term()}
+  @callback name() :: String.t()
+  @macrocallback render(term()) :: Macro.t()
+
+  def dispatch(msg) do
+    :ok
+  end
+end
+`)
+
+	defs, _, err := parser.ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IndexFile(path, defs); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := s.ListModuleCallbacks("MyApp.Notifier")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("expected 3 callbacks, got %d: %+v", len(results), results)
+	}
+	kinds := map[string]string{}
+	for _, r := range results {
+		kinds[r.Function] = r.Kind
+		if r.Function == "dispatch" {
+			t.Error("regular function included in callbacks")
+		}
+	}
+	if kinds["deliver"] != "callback" {
+		t.Errorf("deliver kind = %q, want callback", kinds["deliver"])
+	}
+	if kinds["render"] != "macrocallback" {
+		t.Errorf("render kind = %q, want macrocallback", kinds["render"])
+	}
+}
+
+func TestStats(t *testing.T) {
+	s, dir := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	st, err := s.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Files != 0 || st.Definitions != 0 || st.References != 0 {
+		t.Errorf("empty store stats = %+v, want zeros", st)
+	}
+
+	path := writeElixirFile(t, dir, "lib/worker.ex", `defmodule MyApp.Worker do
+  def run do
+    MyApp.Accounts.fetch_user(1)
+  end
+end
+`)
+	defs, refs, err := parser.ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IndexFileWithRefs(path, defs, refs); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err = s.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Files != 1 {
+		t.Errorf("Files = %d, want 1", st.Files)
+	}
+	if st.Definitions < 2 { // module + run
+		t.Errorf("Definitions = %d, want >= 2", st.Definitions)
+	}
+	if st.References < 1 {
+		t.Errorf("References = %d, want >= 1", st.References)
+	}
+}
