@@ -29,6 +29,7 @@ A fast, full-featured Elixir LSP optimized for large Elixir codebases.
   - [Look up definitions](#look-up-definitions)
   - [Find references](#find-references)
   - [Reindexing files manually](#reindexing-files-manually)
+- [MCP server](#mcp-server)
 - [Hover documentation](#hover-documentation)
   - [Cursor-position-aware resolution](#cursor-position-aware-resolution)
 - [Rename](#rename)
@@ -436,6 +437,33 @@ When running as an LSP server, dexter automatically:
 - Reindexes files on save (`textDocument/didSave`)
 - Runs an incremental reindex on startup
 - Watches `.git/HEAD` for branch switches and reindexes when detected
+
+## MCP server
+
+Dexter includes a built-in [Model Context Protocol](https://modelcontextprotocol.io) server, modeled on `gopls mcp`, so AI agents can navigate Elixir codebases through the index instead of grep. Tools cover symbol search, definitions with docs and specs, references, module API summaries, file outlines, behaviour/protocol implementations, call hierarchy, incremental reindexing, and workspace-wide rename (returned as a unified diff for the agent to review and apply).
+
+Register it with your MCP client. For Claude Code:
+
+```sh
+claude mcp add dexter -- dexter mcp
+```
+
+Any client that speaks MCP over stdio works the same way: point it at `dexter mcp`. The server indexes the project on first use, keeps the index fresh across git branch switches, and exposes a `dexter_reindex` tool for agents to call after editing files.
+
+Useful variants:
+
+```sh
+# Serve over streamable HTTP instead of stdio
+dexter mcp --listen localhost:8092
+
+# Print the agent-facing usage guide (save as context for clients that want it)
+dexter mcp --instructions
+
+# Expose MCP from a running LSP session (shares open buffers and caches)
+dexter lsp --mcp-listen=localhost:8092
+```
+
+The MCP server and an editor LSP can run side by side: both read the same `.dexter/dexter.db` index.
 
 ## Hover documentation
 

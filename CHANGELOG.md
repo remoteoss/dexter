@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- **Built-in MCP server** - `dexter mcp` serves the index to AI agents over the Model Context Protocol (stdio, or streamable HTTP with `--listen`), modeled on `gopls mcp`. Ten tools cover workspace overview, fuzzy symbol search, definitions with docs and specs, references (including use-chain injected call sites), module API summaries, file outlines, behaviour/protocol implementations, call hierarchy, incremental reindexing, and workspace-wide rename returned as a unified diff for the agent to apply. A running LSP can expose the same tools from its live session via `dexter lsp --mcp-listen=ADDR`, and `dexter mcp --instructions` prints an agent-facing usage guide
+
 ## [0.7.1] - 2026-06-12
 
 ### Added
