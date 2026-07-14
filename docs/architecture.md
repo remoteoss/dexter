@@ -9,7 +9,8 @@ Dexter is a fast Elixir LSP server. It indexes module and function definitions f
 - `internal/store/` — SQLite layer. Tables: `files` (path + mtime), `definitions` (module, function, kind, line, file_path, delegate_to, delegate_as), `refs` (module, function, line, file_path, kind).
 - `internal/lsp/` — LSP server. `server.go` handles all LSP methods. `elixir.go` contains pure functions for cursor expression extraction, alias/import/use extraction (tokenizer-based), and use-chain parsing. `rename.go` has rename helpers. `hover.go` has hover formatting. `documents.go` is an in-memory open-buffer store.
 - `internal/treesitter/` — Tree-sitter integration for scope-aware variable rename and go-to-references.
-- `internal/mcp/` — Model Context Protocol server (`dexter mcp`). One file per tool, gopls-style; tools are name-based (module/function, not file+position) and call the store plus the exported facade in `internal/lsp/api.go`.
+- `internal/mcp/` — Model Context Protocol server (`dexter mcp`). One file per tool, gopls-style; tools are name-based (module/function, not file+position) and call the store plus the exported facade in `internal/lsp/api.go`. `internal/lsp/renameplan.go` computes renames as pure plans (shared with the LSP apply path) so the MCP rename tool can return a diff without writing.
+- `internal/diff/` — minimal line-based unified diff used by the MCP rename tool.
 
 ## LSP feature map
 

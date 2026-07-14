@@ -4197,189 +4197,37 @@ func (s *Server) Rename(ctx context.Context, params *protocol.RenameParams) (*pr
 // renameFunctionEdits builds a WorkspaceEdit renaming all occurrences of
 // module.functionName to newName across the codebase.
 func (s *Server) renameFunctionEdits(module, functionName, newName string) (*protocol.WorkspaceEdit, error) {
-	// Collect all (filePath, lineNumber) pairs — definitions + references
-	type siteKey struct {
-		filePath string
-		line     int
-	}
-	seen := make(map[siteKey]bool)
-	var sites []renameSite
-
-	addSiteOpts := func(filePath string, line int, includeKeyword bool) {
-		if s.stdlibRoot != "" && strings.HasPrefix(filePath, s.stdlibRoot) {
-			return
-		}
-		if s.isDepsFile(filePath) {
-			return
-		}
-		k := siteKey{filePath, line}
-		if !seen[k] {
-			seen[k] = true
-			sites = append(sites, renameSite{filePath, line, includeKeyword})
-		}
-	}
-	addSite := func(filePath string, line int) {
-		addSiteOpts(filePath, line, false)
-	}
-
-	// Definition sites
-	defResults, err := s.store.LookupFunction(module, functionName)
-	if err != nil {
-		return nil, nil
-	}
-	for _, r := range defResults {
-		addSite(r.FilePath, r.Line)
-	}
-
-	// Direct reference sites (calls, imports — skip alias/use which are module-level)
-	refResults, err := s.store.LookupReferences(module, functionName)
-	if err != nil {
-		return nil, nil
-	}
-	for _, r := range refResults {
-		if r.Kind == "alias" || r.Kind == "use" {
-			continue
-		}
-		addSite(r.FilePath, r.Line)
-	}
-
-	// Transitive refs via __using__ chains
-	for _, mod := range s.findModulesWhoseUsingImports(module) {
-		transitive, err := s.store.LookupReferences(mod, functionName)
-		if err == nil {
-			for _, r := range transitive {
-				if r.Kind == "alias" || r.Kind == "use" {
-					continue
-				}
-				addSite(r.FilePath, r.Line)
-			}
-		}
-	}
-
-	// Collect definition file paths for file-scanning passes below
-	defFilePaths := make(map[string]bool)
-	for _, r := range defResults {
-		defFilePaths[r.FilePath] = true
-	}
-
-	// Scan definition files for @spec/@callback lines and bare intra-module calls
-	// (none of these are indexed in the store).
-	specPrefix := "@spec " + functionName
-	callbackPrefix := "@callback " + functionName
-	for filePath := range defFilePaths {
-		fileText, _, ok := s.ReadFileText(filePath)
-		if !ok {
-			continue
-		}
-		// @spec and @callback lines
-		for i, line := range strings.Split(fileText, "\n") {
-			trimmed := strings.TrimSpace(line)
-			if strings.HasPrefix(trimmed, specPrefix) {
-				rest := trimmed[len(specPrefix):]
-				if len(rest) == 0 || rest[0] == '(' || rest[0] == ' ' || rest[0] == '\t' {
-					addSite(filePath, i+1)
-				}
-			}
-			if strings.HasPrefix(trimmed, callbackPrefix) {
-				rest := trimmed[len(callbackPrefix):]
-				if len(rest) == 0 || rest[0] == '(' || rest[0] == ' ' || rest[0] == '\t' {
-					addSite(filePath, i+1)
-				}
-			}
-		}
-		// Bare calls: functionName(...) and |> functionName
-		for _, lineNum := range FindBareFunctionCalls(fileText, functionName) {
-			addSite(filePath, lineNum)
-		}
-	}
-
-	// Scan all files that import the module for `import Module, only: [functionName: N]` lines,
-	// then also scan those files for bare calls (which aren't indexed as references).
-	importRefs, _ := s.store.LookupReferences(module, "")
-	importFilePaths := make(map[string]bool)
-	for _, r := range importRefs {
-		if r.Kind != "import" {
-			continue
-		}
-		lineText, ok := s.FileLine(r.FilePath, r.Line)
-		if !ok {
-			continue
-		}
-		if findTokenColumn(lineText, functionName) >= 0 {
-			addSiteOpts(r.FilePath, r.Line, true)
-			importFilePaths[r.FilePath] = true
-		}
-	}
-	for filePath := range importFilePaths {
-		fileText, _, ok := s.ReadFileText(filePath)
-		if !ok {
-			continue
-		}
-		for _, lineNum := range FindBareFunctionCalls(fileText, functionName) {
-			addSite(filePath, lineNum)
-		}
-	}
+	sites := s.collectFunctionRenameSites(module, functionName)
 
 	edit := s.buildTextEdits(sites, functionName, newName)
 
 	// Update defdelegate lines that forward to this function: add or update
-	// the `as:` option so the facade keeps working after the rename.
-	if s.followDelegates {
-		delegates, err := s.store.LookupDelegatesTo(module, functionName)
-		if err == nil {
-			for _, del := range delegates {
-				if s.stdlibRoot != "" && strings.HasPrefix(del.FilePath, s.stdlibRoot) {
-					continue
-				}
-				if s.isDepsFile(del.FilePath) {
-					continue
-				}
-				fileText, open, ok := s.ReadFileText(del.FilePath)
-				if !ok {
-					continue
-				}
-				fileLines := strings.Split(fileText, "\n")
-				startLine := del.Line - 1
-				if startLine >= len(fileLines) {
-					continue
-				}
-
-				updatedSpan, spanStart, spanEnd := updateDelegateAs(fileLines, startLine, del.Function, newName)
-				// Check if anything actually changed
-				changed := len(updatedSpan) != spanEnd-spanStart
-				if !changed {
-					for i, line := range updatedSpan {
-						if line != fileLines[spanStart+i] {
-							changed = true
-							break
-						}
-					}
-				}
-				if !changed {
-					continue
-				}
-
-				fileURI := protocol.DocumentURI(uri.File(del.FilePath))
-				if open {
-					if edit.Changes == nil {
-						edit.Changes = make(map[protocol.DocumentURI][]protocol.TextEdit)
-					}
-					edit.Changes[fileURI] = append(edit.Changes[fileURI], protocol.TextEdit{
-						Range: protocol.Range{
-							Start: protocol.Position{Line: uint32(spanStart), Character: 0},
-							End:   protocol.Position{Line: uint32(spanEnd - 1), Character: uint32(len(fileLines[spanEnd-1]))},
-						},
-						NewText: strings.Join(updatedSpan, "\n"),
-					})
-				} else {
-					// Closed file: splice updated span into file lines and write back
-					newFileLines := make([]string, 0, len(fileLines)-spanEnd+spanStart+len(updatedSpan))
-					newFileLines = append(newFileLines, fileLines[:spanStart]...)
-					newFileLines = append(newFileLines, updatedSpan...)
-					newFileLines = append(newFileLines, fileLines[spanEnd:]...)
-					_ = os.WriteFile(del.FilePath, []byte(strings.Join(newFileLines, "\n")), 0644)
-				}
+	// the `as:` option so the facade keeps working after the rename. This runs
+	// after buildTextEdits so the spans are computed on post-edit file state.
+	readLines := func(path string) ([]string, bool, bool) {
+		fileText, open, ok := s.ReadFileText(path)
+		if !ok {
+			return nil, false, false
+		}
+		return strings.Split(fileText, "\n"), open, true
+	}
+	for _, de := range s.delegateSpanEdits(module, functionName, newName, readLines) {
+		fileURI := protocol.DocumentURI(uri.File(de.filePath))
+		if de.open {
+			if edit.Changes == nil {
+				edit.Changes = make(map[protocol.DocumentURI][]protocol.TextEdit)
 			}
+			edit.Changes[fileURI] = append(edit.Changes[fileURI], protocol.TextEdit{
+				Range: protocol.Range{
+					Start: protocol.Position{Line: uint32(de.spanStart), Character: 0},
+					End:   protocol.Position{Line: uint32(de.spanEnd - 1), Character: uint32(len(de.fileLines[de.spanEnd-1]))},
+				},
+				NewText: strings.Join(de.updated, "\n"),
+			})
+		} else {
+			// Closed file: splice updated span into file lines and write back
+			newFileLines := spliceLines(de.fileLines, de.spanStart, de.spanEnd, de.updated)
+			_ = os.WriteFile(de.filePath, []byte(strings.Join(newFileLines, "\n")), 0644)
 		}
 	}
 
@@ -4909,31 +4757,6 @@ func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string) *
 		}
 	}
 
-	// applyTokenEdits applies right-to-left token replacements for the given
-	// sites, returning the updated lines. Shared by open and closed file paths.
-	applyTokenEdits := func(origLines []string, fileSites []renameSite) []string {
-		lines := make([]string, len(origLines))
-		copy(lines, origLines)
-
-		for _, site := range fileSites {
-			if site.line-1 >= len(lines) {
-				continue
-			}
-			lineText := lines[site.line-1]
-			var cols []int
-			if site.includeKeyword {
-				cols = findAllTokenColumns(lineText, oldToken)
-			} else {
-				cols = findFunctionTokenColumns(lineText, oldToken)
-			}
-			for i := len(cols) - 1; i >= 0; i-- {
-				lineText = lineText[:cols[i]] + newToken + lineText[cols[i]+len(oldToken):]
-			}
-			lines[site.line-1] = lineText
-		}
-		return lines
-	}
-
 	openChanges := make(map[protocol.DocumentURI][]protocol.TextEdit)
 	var wg sync.WaitGroup
 	var reindexPaths []string
@@ -4950,7 +4773,7 @@ func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string) *
 		}
 
 		// Compute edits once for both TextEdits and reindexing
-		updatedLines := applyTokenEdits(fi.lines, fileSites)
+		updatedLines := applyTokenEditsToLines(fi.lines, fileSites, oldToken, newToken)
 
 		if fi.open {
 			// Open buffer: build TextEdits for the editor AND capture updated

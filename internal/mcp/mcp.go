@@ -112,6 +112,12 @@ func NewServer(h *Handler) *mcp.Server {
 		Description: "Force an immediate incremental reindex. The index already updates automatically as files change; use this only when a lookup seems stale. The only tool that writes, and it writes only dexter's own index database.",
 	}, h.reindexHandler)
 
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "dexter_rename_symbol",
+		Annotations: readOnly,
+		Description: "Rename an Elixir module or function across the whole workspace. Returns the change as a unified diff plus file renames; nothing is written until you apply it. Apply the diff, perform the file renames, then call dexter_reindex.",
+	}, h.renameHandler)
+
 	return srv
 }
 

@@ -456,7 +456,7 @@ When running as an LSP server, dexter automatically:
 
 ## MCP server
 
-Dexter includes a built-in [Model Context Protocol](https://modelcontextprotocol.io) server, modeled on `gopls mcp`, so AI agents can navigate Elixir codebases through the index instead of grep. Tools cover symbol search, definitions with docs and specs, references, module API summaries, file outlines, behaviour/protocol implementations, call hierarchy, and incremental reindexing.
+Dexter includes a built-in [Model Context Protocol](https://modelcontextprotocol.io) server, modeled on `gopls mcp`, so AI agents can navigate Elixir codebases through the index instead of grep. Tools cover symbol search, definitions with docs and specs, references, module API summaries, file outlines, behaviour/protocol implementations, call hierarchy, incremental reindexing, and workspace-wide rename (returned as a unified diff for the agent to review and apply).
 
 Register it with your MCP client. For Claude Code:
 

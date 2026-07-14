@@ -664,7 +664,7 @@ func TestIntegration_MCPStdio_EmptyIndexBuildsOnStartup(t *testing.T) {
 func TestIntegration_MCPInstructions(t *testing.T) {
 	binary := buildDexter(t)
 	out := runDexter(t, binary, t.TempDir(), "mcp", "--instructions")
-	for _, want := range []string{"dexter_workspace", "dexter_reindex"} {
+	for _, want := range []string{"dexter_workspace", "dexter_reindex", "dexter_rename_symbol"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("instructions missing %q", want)
 		}

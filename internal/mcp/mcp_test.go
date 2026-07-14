@@ -145,6 +145,7 @@ func TestListTools(t *testing.T) {
 		"dexter_module_api",
 		"dexter_references",
 		"dexter_reindex",
+		"dexter_rename_symbol",
 		"dexter_search",
 		"dexter_workspace",
 	}
