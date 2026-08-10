@@ -1,6 +1,9 @@
 package parser
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 // parseTextFromTokens is the token-stream replacement for the line-based ParseText.
 // It walks a []Token stream from the tokenizer and produces identical Definition
@@ -814,6 +817,17 @@ func TokenAtOffset(tokens []Token, byteOffset int) int {
 
 func TokenText(source []byte, t Token) string {
 	return string(source[t.Start:t.End])
+}
+
+// Returns the sigil characters for the given TokSigil.
+// For example, given `~H"..."` this returns "H".
+func Sigil(source []byte, t Token) string {
+	if t.Kind != TokSigil {
+		panic(fmt.Sprintf("Sigil() called with %s", t.Kind))
+	}
+
+	end := scanSigilCharacters(source, t.Start+1)
+	return string(source[t.Start+1 : end])
 }
 
 func NextSigToken(tokens []Token, n, from int) int {

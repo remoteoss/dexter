@@ -1870,6 +1870,16 @@ func ModuleAttributeAtCursor(tokens []parser.Token, source []byte, lineStarts []
 	}
 
 	tok := tokens[idx]
+
+	// walk to the document root and make sure we aren't inside a HEEX node;
+	// if we are, `@x` is a macro that expands to `assigns.x` and shouldn't
+	// be counted as a module attribute
+	for t := tok.Parent; t > -1; t = tokens[t].Parent {
+		if tokens[t].Kind == parser.TokSigil && parser.Sigil(source, tokens[t]) == "H" {
+			return ""
+		}
+	}
+
 	if tok.Kind != parser.TokAttr {
 		return ""
 	}

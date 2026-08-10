@@ -1,6 +1,7 @@
 package treesitter
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
@@ -1559,5 +1560,84 @@ config :app, value: some_helper()
 	if occs != nil {
 		t.Errorf("expected nil for bare top-level call, got %d occurrences: %+v", len(occs), occs)
 
+	}
+}
+
+func TestFindVariableOccurences_HEEXAttributeAssignConfusion(t *testing.T) {
+	src := []byte(`defmodule Foo do
+  @a "a"
+
+  def call do
+    @a
+  end
+
+  def render(assigns) do
+    ~H"""
+    {@a}
+    """
+  end
+end
+`)
+
+	// Cursor on "some_helper" at line 1 (0-indexed).
+	got := FindVariableOccurrences(src, 1, 3)
+	want := []VariableOccurrence{
+		{Line: 1, StartCol: 3, EndCol: 4}, // @a "a"
+		{Line: 4, StartCol: 5, EndCol: 6}, // @a (within `def call`)
+		// @a within the `~H` HEEX template shouldn't be included
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("got: %+v\nwant: %+v\n", got, want)
+	}
+}
+
+func TestFindVariableOccurences_HEEXBindings(t *testing.T) {
+	// FIX: implement stub
+}
+
+func TestFindTokenOccurences_HEEXFunctionModuleNodes(t *testing.T) {
+	src := []byte(`defmodule MyApp do
+  alias MyApp.Components
+
+  def render(assigns) do
+    # plain string interpolation should work as well
+	  "#{Components.button()}"
+    "#{button()}"
+
+  	~H"""
+    <!-- button -->
+    <.button />
+    <.button></.button>
+    <Components.button />
+    <Components.button></Components.button>
+    """
+  end
+end`)
+
+	got := FindTokenOccurrences(src, "Components")
+	want := []VariableOccurrence{
+		{Line: 1, StartCol: 14, EndCol: 24},
+		{Line: 5, StartCol: 6, EndCol: 16},
+		{Line: 12, StartCol: 5, EndCol: 15},
+		{Line: 13, StartCol: 5, EndCol: 15},
+		{Line: 13, StartCol: 25, EndCol: 35},
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("got: %+v\nwant: %+v\n", got, want)
+	}
+
+	got = FindTokenOccurrences(src, "button")
+	want = []VariableOccurrence{
+		{Line: 5, StartCol: 17, EndCol: 23},
+		{Line: 6, StartCol: 7, EndCol: 13},
+		{Line: 10, StartCol: 6, EndCol: 12},
+		{Line: 11, StartCol: 6, EndCol: 12},
+		{Line: 11, StartCol: 16, EndCol: 22},
+		{Line: 12, StartCol: 16, EndCol: 22},
+		{Line: 13, StartCol: 16, EndCol: 22},
+		{Line: 13, StartCol: 36, EndCol: 42},
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("got: %+v\nwant: %+v\n", got, want)
 	}
 }

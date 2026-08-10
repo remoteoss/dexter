@@ -724,6 +724,20 @@ func scanHeredocContent(source []byte, i, line int, delim byte, lineStarts *[]in
 	return i, line, false
 }
 
+func scanSigilCharacters(source []byte, i int) int {
+	firstLetter := source[i]
+	i++
+
+	// Multi-char sigils: continue reading uppercase letters/numbers
+	if isUpper(firstLetter) {
+		for i < len(source) && (isUpper(source[i]) || isDigit(source[i])) {
+			i++
+		}
+	}
+
+	return i
+}
+
 // scanSigil scans from the start of a sigil to its closing delimiter, including any trailing
 // modifier letters. Returns new position and updated line count, adding any tokens encountered
 // along the way if `tokens` is provided.
@@ -736,21 +750,18 @@ func scanSigil(source []byte, i, line int, lineStarts *[]int, tokens *[]Token) (
 	// letters mean the content is "raw" — backslash is NOT an escape character.
 	start := i
 	startLine := line
-	sigilLetter := source[i+1]
-	i += 2 // consume ~ and first letter
-	// Multi-char sigils: continue reading uppercase letters/numbers
-	if isUpper(sigilLetter) {
-		for i < len(source) && (isUpper(source[i]) || isDigit(source[i])) {
-			i++
-		}
-	}
+	i++ // consume ~
 
+	i = scanSigilCharacters(source, i)
 	sigilChars := string(source[start+1 : i])
+
 	if i == len(source) {
 		return i, line
 	}
 
-	escapes := isLower(sigilLetter) // only lowercase sigils process escapes
+	// only lowercase sigils process escapes
+	// (this means HEEX's sigil_H won't double-tokenize interpolations)
+	escapes := isLower([]byte(sigilChars)[0])
 	openCh := source[i]
 
 	var contentsStart, contentsEnd int

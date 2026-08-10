@@ -1243,6 +1243,7 @@ func TestModuleAttributeAtCursor(t *testing.T) {
 		{"inside string ignored", `  x = "has @fake_attr inside"`, 0, 14, ""},
 		{"inside comment ignored", "  # @fake_attr comment", 0, 5, ""},
 		{"multiline second line", "first_line\n  @my_attr value", 1, 5, "my_attr"},
+		{"HEEX", `~H"""\n{@a}\n"""`, 1, 2, ""},
 	}
 
 	for _, tt := range tests {

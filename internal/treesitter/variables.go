@@ -553,11 +553,22 @@ func collectStabArgs(stabClause *TreeNode, src []byte, varName string, out *[]Va
 //
 //	@foo       → unary_operator("@") → identifier("foo")
 //	@foo value → unary_operator("@") → call → identifier("foo") …
+//
+// Within HEEX trees (regardless of nesting depth), the `@` symbol is instead a
+// macro that expands `@x` to `assigns.x`. Within HEEX trees, this returns `false`.
 func isModuleAttributeIdent(node *TreeNode, src []byte) bool {
 	parent := node.Parent()
 	if parent == nil {
 		return false
 	}
+
+	// walk to the document root and make sure we aren't nested within any HEEX trees
+	for t := node.Tree.Root; t != nil; t = t.Tree.Root {
+		if t.Tree.Language == LangHeex {
+			return false
+		}
+	}
+
 	if isAtUnaryOp(parent, src) {
 		return true
 	}
@@ -649,11 +660,12 @@ func collectTokenOccurrences(node *TreeNode, src []byte, token string, out *[]Va
 	kind := node.Kind()
 
 	// Skip subtrees that can't contain meaningful identifier references
-	if kind == "string" || kind == "comment" || kind == "charlist" {
+	if kind == "comment" || kind == "charlist" {
 		return
 	}
 
-	if kind == "identifier" && node.Utf8Text(src) == token {
+	if (kind == "identifier" /* Elixir */ || kind == "function" /* HEEX */) &&
+		node.Utf8Text(src) == token {
 		*out = append(*out, VariableOccurrence{
 			Line:     uint(node.StartPosition().Row),
 			StartCol: uint(node.StartPosition().Column),
@@ -664,7 +676,7 @@ func collectTokenOccurrences(node *TreeNode, src []byte, token string, out *[]Va
 	// Alias nodes may contain dotted names like "MyApp.Repo". Match if the
 	// full text equals token, or if a dot-separated segment matches. When a
 	// segment matches, report only that segment's column range.
-	if kind == "alias" {
+	if kind == "alias" /* Elixir */ || kind == "module" /* HEEX */ {
 		text := node.Utf8Text(src)
 		if text == token {
 			*out = append(*out, VariableOccurrence{
