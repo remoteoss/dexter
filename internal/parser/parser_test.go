@@ -2726,6 +2726,39 @@ func TestTokenAtOffset(t *testing.T) {
 	}
 }
 
+func TestTokenAtOffsetHEEX(t *testing.T) {
+	src := []byte(`~H"""
+foo
+<% bar %>
+<% "#{baz} garply" %>
+"""`)
+	tokens := Tokenize(src)
+
+	tests := []struct {
+		name   string
+		offset int
+		want   string
+	}{
+		// foo is plain heredoc contents
+		{"foo (plain)", 6, "~H\"\"\"\nfoo\n<% bar %>\n<% \"#{baz} garply\" %>\n\"\"\""},
+		{"bar (interpolated)", 13, "bar"},
+		{"baz (nested interpolated)", 26, "baz"},
+		// garply is plain string contents
+		{"garply (plain)", 31, "\"#{baz} garply\""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			idx := TokenAtOffset(tokens, tt.offset)
+			if idx < 0 {
+				t.Fatalf("TokenAtOffset(%d) returned -1", tt.offset)
+			}
+			if TokenText(src, tokens[idx]) != tt.want {
+				t.Errorf("TokenText(src, TokenAtOffset(%d)) = %v, want %v", tt.offset, TokenText(src, tokens[idx]), tt.want)
+			}
+		})
+	}
+}
+
 func TestLineColToOffset(t *testing.T) {
 	source := []byte("defmodule Foo do\n  def bar, do: :ok\nend\n")
 	result := TokenizeFull(source)

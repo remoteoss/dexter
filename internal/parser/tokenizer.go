@@ -79,12 +79,16 @@ const (
 
 // Token is a lexed token from an Elixir source file.
 // Start and End are byte offsets into the source; source[Start:End] is the token text.
-// Line is 1-based.
+// Line is 1-based. If the token is interpolated within another token, Parent will indicate
+// the index of its nearest parent. Container tokens are emitted [Container A B C], where
+// Container[Start:End] indicates the full range and A, B, and C's ranges are strictly
+// within the container's range. Top-level tokens have a Parent of -1.
 type Token struct {
-	Kind  TokenKind
-	Start int
-	End   int
-	Line  int
+	Kind   TokenKind
+	Start  int
+	End    int
+	Line   int
+	Parent int
 }
 
 // TokenResult holds the output of Tokenize: the token stream and a line-starts
@@ -142,7 +146,33 @@ func Tokenize(source []byte) []Token {
 
 func TokenizeFull(source []byte) TokenResult {
 	_, _, _, result := tokenizeUntil(source, nil, nil)
+	assignParents(result.Tokens)
 	return result
+}
+
+// isContainer returns true if a token can enclose interpolated child tokens.
+func isContainer(k TokenKind) bool {
+	return k == TokString || k == TokHeredoc || k == TokSigil
+}
+
+// assignParents sets each token's Parent to the index of its innermost
+// enclosing container (TokString/TokHeredoc/TokSigil), or -1 at top level.
+func assignParents(tokens []Token) {
+	var stack []int // indices of still-open container tokens only
+	for i := range tokens {
+		// drop containers that ended before this token begins
+		for len(stack) > 0 && tokens[stack[len(stack)-1]].End <= tokens[i].Start {
+			stack = stack[:len(stack)-1]
+		}
+		if len(stack) > 0 {
+			tokens[i].Parent = stack[len(stack)-1]
+		} else {
+			tokens[i].Parent = -1
+		}
+		if isContainer(tokens[i].Kind) {
+			stack = append(stack, i)
+		}
+	}
 }
 
 // tokenizeUntil tokenizes the given source until the given terminator is reached
@@ -845,14 +875,14 @@ func scanSigil(source []byte, i, line int, lineStarts *[]int, tokens *[]Token) (
 			// empty sigil
 			*tokens = append(*tokens, Token{Kind: TokSigil, Start: start, End: i, Line: line})
 		} else {
-			scanSigilContents(sigilChars, source, start, i, contentsStart, contentsEnd, startLine, lineStarts, tokens)
+			scanSigilContents(sigilChars, source, start, i, contentsStart, contentsEnd, startLine, tokens)
 		}
 	}
 
 	return i, line
 }
 
-func scanSigilContents(sigilChars string, source []byte, start, end, contentsStart, contentsEnd, line int, lineStarts *[]int, tokens *[]Token) {
+func scanSigilContents(sigilChars string, source []byte, start, end, contentsStart, contentsEnd, line int, tokens *[]Token) {
 	// always emit a token for the sigil
 	*tokens = append(*tokens, Token{Kind: TokSigil, Start: start, End: end, Line: line})
 

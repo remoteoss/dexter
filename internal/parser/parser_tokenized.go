@@ -787,17 +787,26 @@ func LineColToOffset(lineStarts []int, line, col int) int {
 // TokenAtOffset returns the index of the token containing byteOffset, or -1
 // if the offset falls in a gap between tokens (whitespace) or is out of range.
 // Uses binary search for O(log n) lookup.
+//
+// If the offset lies within a TokString, TokSigil, or TokHeredoc, their contents
+// will be scanned to see if a more specific interpolated token contains the offset.
 func TokenAtOffset(tokens []Token, byteOffset int) int {
-	lo, hi := 0, len(tokens)-1
+	lo, hi, cand := 0, len(tokens)-1, -1
+	// binary search to find the right-most token that starts before target offset
 	for lo <= hi {
 		mid := lo + (hi-lo)/2
-		t := tokens[mid]
-		if byteOffset < t.Start {
-			hi = mid - 1
-		} else if byteOffset >= t.End {
+		if tokens[mid].Start <= byteOffset {
+			cand = mid
 			lo = mid + 1
 		} else {
-			return mid
+			hi = mid - 1
+		}
+	}
+	// if we're within a container and the token doesn't contain the target offset,
+	// we need to climb up to the nearest container that *does* contain it
+	for i := cand; i >= 0; i = tokens[i].Parent {
+		if tokens[i].End > byteOffset {
+			return i
 		}
 	}
 	return -1

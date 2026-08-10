@@ -2301,6 +2301,26 @@ TokEOF (52:52)
 	}
 }
 
+func TestStringNestedInsideHEEX(t *testing.T) {
+	src := `~H"""
+<% "#{foo} bar" %>
+"""`
+	want := `TokSigil (0:28) "~H\"\"\"\n<% \"#{foo} bar\" %>\n\"\"\""
+TokEOL (5:6)
+TokHEEXOpenExpr (6:8) "<%"
+TokString (9:21) "\"#{foo} bar\""
+TokIdent (12:15) "foo"
+TokHEEXCloseExpr (22:24) "%>"
+TokEOL (24:25)
+TokEOF (28:28)
+`
+	tokens := Tokenize([]byte(src))
+	got := DebugTokens([]byte(src), tokens)
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("TokenizeHeex(src)  (-want +got)\n\n%.512s\n\n%s", src, diff)
+	}
+}
+
 func FuzzTokenizeHeex(f *testing.F) {
 	f.Fuzz(func(t *testing.T, src string) {
 		err := withTimeout(2_000, func() {
