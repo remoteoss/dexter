@@ -93,6 +93,8 @@ func TestTree_NestingRules(t *testing.T) {
   <style><%= six() %>{seven()}</style>
   <div phx-no-curly-interpolation><%= eight() %>{nine()}</div>
   <.foo phx-no-curly-interpolation><% ten() %>{eleven()}</.foo>
+
+  <div>{twelve()}</div>
   """
 end`)
 
@@ -124,6 +126,10 @@ end`)
 		"nine()":           false,
 		"ten()":            true,
 		"eleven()":         false,
+		// A normal tag following the interpolation-suppressing tags above must
+		// have its curly interpolation parsed: the suppressing tags must not leak
+		// their `interpolate: false` state to later siblings.
+		"twelve()": true,
 	}
 	for text, shouldParse := range want {
 		if shouldParse && !exprs[text] {

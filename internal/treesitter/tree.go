@@ -302,8 +302,8 @@ func (v *parseVisitor) onNode(node *tree_sitter.Node) {
 	// `phx-no-curly-interpolation` attribute. Curly interpolation is always enabled
 	// on the tag itself e.g. "<div phx-no-curly-interpolation id={component_id()} />".
 	if v.tree.Language == LangHeex &&
-		node.Kind() == "partial_expression_value" || node.Kind() == "ending_expression_value" ||
-		(node.Kind() == "expression_value" && (node.Parent().Kind() == "directive" || v.curlyInterpolate())) {
+		(node.Kind() == "partial_expression_value" || node.Kind() == "ending_expression_value" ||
+			(node.Kind() == "expression_value" && (node.Parent().Kind() == "directive" || v.curlyInterpolate()))) {
 		if tree := newTree(LangElixir, v.src[node.StartByte():node.EndByte()], v.parsers); tree != nil {
 			tree.Root = &TreeNode{Tree: v.tree, Node: node}
 			v.tree.Branches[node.Id()] = tree
@@ -416,13 +416,19 @@ func visitTree(root *tree_sitter.Node, v visitor) {
 			continue
 		}
 
+		// This node is a leaf: its subtree is fully visited, so leave it before
+		// moving on. onLeave must fire exactly once per node, regardless of
+		// whether the node has a following sibling.
+		v.onLeave(cursor.Node())
+
 		// traverse via siblings, if possible
 		for !cursor.GotoNextSibling() {
-			// move back up and recurse, returning once we're back to the root
-			v.onLeave(cursor.Node())
+			// move back up, returning once we're back above the root
 			if !cursor.GotoParent() {
 				return
 			}
+			// the parent's subtree is now fully visited too
+			v.onLeave(cursor.Node())
 		}
 	}
 }

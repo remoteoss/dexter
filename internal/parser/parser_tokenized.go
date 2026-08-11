@@ -653,7 +653,12 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 		case TokIdent:
 			cm := currentModule()
 			if cm != "" && len(injectors) > 0 {
-				isStatementStart := i == 0 ||
+				// couldBeginCall reports whether this identifier sits where a bare
+				// call to an injected (import/use) module could start: at the head
+				// of a line, or as the first token inside an interpolation/EEx
+				// opener (`{`, `<%`, `<%=`). The call-shape check below
+				// decides whether a reference is actually emitted.
+				couldBeginCall := i == 0 ||
 					tokens[i-1].Kind == TokEOL ||
 					tokens[i-1].Kind == TokComment ||
 					tokens[i-1].Kind == TokHEEXOpenExpr
@@ -662,11 +667,11 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 				isHEEXComponent := i > 1 &&
 					tokens[i-1].Kind == TokDot &&
 					(tokens[i-2].Kind == TokHEEXOpenTag || tokens[i-2].Kind == TokHEEXCloseTag)
-				if isStatementStart || isHEEXComponent {
+				if couldBeginCall || isHEEXComponent {
 					name := tokenText(tok)
 					emit := !elixirKeyword[name]
 
-					if emit && isStatementStart {
+					if emit && couldBeginCall {
 						j := i + 1
 						if j < n {
 							switch tokens[j].Kind {
@@ -738,7 +743,7 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 						// we only need to check for bare HEEX function components e.g. "<.foo />", as module-prefixed
 						// calls e.g. "<Foo.bar />" are already handled by `extractModuleRefs` above
 					case TokHEEXOpenTag, TokHEEXCloseTag:
-						if j+2 <= lineEnd && tokens[j+1].Kind == TokDot && tokens[j+2].Kind == TokIdent {
+						if j+2 < lineEnd && tokens[j+1].Kind == TokDot && tokens[j+2].Kind == TokIdent {
 							name := tokenText(tokens[j+2])
 							if !elixirKeyword[name] {
 								for mod := range injectors {

@@ -50,6 +50,45 @@ end
 	}
 }
 
+// TestHEEX_NestedLoops: nested `for` loops parse as flat sibling directives in
+// HEEX; the depth stack must assign each binding to its own body. The inner
+// binding is confined to the inner body, the outer binding spans both.
+func TestHEEX_NestedLoops(t *testing.T) {
+	src := []byte(`defmodule Foo do
+  def render(assigns) do
+    ~H"""
+    <%= for x <- @xs do %>
+      <%= for y <- @ys do %>
+        {x}{y}
+      <% end %>
+    <% end %>
+    """
+  end
+end
+`)
+
+	// Inner binding `y` (line 4): its own body use only, never the outer {x}.
+	gotY := FindVariableOccurrences(src, 4, 14)
+	wantY := []VariableOccurrence{
+		{Line: 4, StartCol: 14, EndCol: 15}, // for y <- ...
+		{Line: 5, StartCol: 12, EndCol: 13}, // {y}
+	}
+	if !slices.Equal(gotY, wantY) {
+		t.Fatalf("inner y: got %+v\nwant %+v", gotY, wantY)
+	}
+
+	// Outer binding `x` (line 3): its binding site + the {x} inside the inner
+	// loop body (the inner loop is nested within the outer body).
+	gotX := FindVariableOccurrences(src, 3, 12)
+	wantX := []VariableOccurrence{
+		{Line: 3, StartCol: 12, EndCol: 13}, // for x <- ...
+		{Line: 5, StartCol: 9, EndCol: 10},  // {x}
+	}
+	if !slices.Equal(gotX, wantX) {
+		t.Fatalf("outer x: got %+v\nwant %+v", gotX, wantX)
+	}
+}
+
 // TestHEEX_ClosingDirectiveTrailingCode: a closing directive may legally carry
 // code after `end` (e.g. `<% end\n  log(item) %>`). That trailing code is a
 // sibling AFTER the block, so a reference in it belongs to the outer scope, not

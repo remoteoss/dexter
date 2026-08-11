@@ -181,6 +181,17 @@ func assignParents(tokens []Token) {
 // open/close curly braces. Returns the byte offset and line number that tokenizing
 // stopped along with the token result. Returns `true` if the provided terminator
 // appeared and was consumed.
+//
+// Two invariants keep the nesting-depth accounting correct, and callers must uphold
+// them if they introduce new opener/terminator pairs:
+//   - The caller must have already consumed the outermost opener, i.e. `source`
+//     begins *inside* the delimited region (see the `source[start:]` call sites),
+//     so the opening delimiter is never re-counted here.
+//   - Neither `opener` nor `terminator` may be a prefix of the other. Otherwise a
+//     single position could satisfy both `HasPrefix` checks below and the depth
+//     would be silently miscounted. This is enforced with a panic; today's pairs —
+//     `{`/`}` and `<%`/`%>` — satisfy it, which is why the checks below can be
+//     mutually exclusive (`else if`).
 func tokenizeUntil(source, opener, terminator []byte) (int, int, bool, TokenResult) {
 	tokenCapacity := len(source) / 8
 	lineCapacity := 64
@@ -197,6 +208,10 @@ func tokenizeUntil(source, opener, terminator []byte) (int, int, bool, TokenResu
 	if opener != nil && bytes.ContainsRune(opener, '\n') {
 		panic("Opener may not contain newline")
 	}
+	if opener != nil && terminator != nil &&
+		(bytes.HasPrefix(opener, terminator) || bytes.HasPrefix(terminator, opener)) {
+		panic("Opener and terminator may not share a prefix")
+	}
 
 	tokens := make([]Token, 0, tokenCapacity)
 	lineStarts := make([]int, 1, lineCapacity)
@@ -211,9 +226,7 @@ func tokenizeUntil(source, opener, terminator []byte) (int, int, bool, TokenResu
 
 		if opener != nil && bytes.HasPrefix(source[i:], opener) {
 			nestingLevel++
-		}
-
-		if terminator != nil && bytes.HasPrefix(source[i:], terminator) {
+		} else if terminator != nil && bytes.HasPrefix(source[i:], terminator) {
 			if nestingLevel == 0 {
 				return i, line, true, TokenResult{Tokens: tokens, LineStarts: lineStarts}
 			}
@@ -725,6 +738,9 @@ func scanHeredocContent(source []byte, i, line int, delim byte, lineStarts *[]in
 }
 
 func scanSigilCharacters(source []byte, i int) int {
+	if i >= len(source) {
+		return i
+	}
 	firstLetter := source[i]
 	i++
 
@@ -884,7 +900,7 @@ func scanSigil(source []byte, i, line int, lineStarts *[]int, tokens *[]Token) (
 	if tokens != nil {
 		if contentsEnd == contentsStart {
 			// empty sigil
-			*tokens = append(*tokens, Token{Kind: TokSigil, Start: start, End: i, Line: line})
+			*tokens = append(*tokens, Token{Kind: TokSigil, Start: start, End: i, Line: startLine})
 		} else {
 			scanSigilContents(sigilChars, source, start, i, contentsStart, contentsEnd, startLine, tokens)
 		}
