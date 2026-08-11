@@ -39,31 +39,40 @@ func (t *Tree) FindVariableOccurrences(src []byte, line, col uint) []VariableOcc
 
 	var occurrences []VariableOccurrence
 
+	switch {
 	// When the scope is a stab_clause because the body rebinds the variable
 	// (not the args), only collect from the body — the args hold the outer
 	// variable's pin reference, which belongs to a different scope.
-	if resolved.scope.Kind() == "stab_clause" && stabBodyRebindsVariable(resolved.scope, src, resolved.varName) && !stabBindsVariable(resolved.scope, src, resolved.varName) {
+	case resolved.scope.Kind() == "stab_clause" && stabBodyRebindsVariable(resolved.scope, src, resolved.varName) && !stabBindsVariable(resolved.scope, src, resolved.varName):
 		for i := uint(0); i < uint(resolved.scope.ChildCount()); i++ {
 			child := resolved.scope.Child(i)
 			if child.Kind() != "arguments" {
 				collectVariableOccurrences(child, src, resolved.varName, &occurrences, false)
 			}
 		}
-		return occurrences
-	}
 
 	// with/for call scope: use cursor-aware collection to correctly handle
 	// multi-clause patterns where different clauses bind/reference the variable.
-	if resolved.scope.Kind() == "call" && callHasDoBlock(resolved.scope) && callArgumentPatternsBindVariable(resolved.scope, src, resolved.varName) {
+	case resolved.scope.Kind() == "call" && callHasDoBlock(resolved.scope) && callArgumentPatternsBindVariable(resolved.scope, src, resolved.varName):
 		collectWithOccurrences(resolved.scope, resolved.cursorNode, src, resolved.varName, &occurrences)
-		return occurrences
+
+	default:
+		// A def-family call (scope.Kind() == "call" here, since with/for calls are
+		// handled above) is the scope root, so skip the def-boundary check on it —
+		// otherwise collection would bail immediately on the very scope it chose.
+		skipRoot := resolved.scope.Kind() == "stab_clause" || resolved.scope.Kind() == "call"
+		collectVariableOccurrences(resolved.scope, src, resolved.varName, &occurrences, skipRoot)
 	}
 
-	// A def-family call (scope.Kind() == "call" here, since with/for calls are
-	// handled above) is the scope root, so skip the def-boundary check on it —
-	// otherwise collection would bail immediately on the very scope it chose.
-	skipRoot := resolved.scope.Kind() == "stab_clause" || resolved.scope.Kind() == "call"
-	collectVariableOccurrences(resolved.scope, src, resolved.varName, &occurrences, skipRoot)
+	// HEEX scope filter: the Elixir scope model above treats a ~H template as one
+	// continuous AST and over-collects across HEEX directive boundaries. Restrict
+	// occurrences to the HEEX binding range active at the cursor — this also
+	// prunes loop/clause bindings that shadow an outer variable when the cursor is
+	// in the outer scope. No-op for pure Elixir (heexRangesInScope returns nil).
+	if ranges := t.heexRangesInScope(resolved.scope, src); ranges != nil {
+		occurrences = filterOccurrencesByHeexRange(occurrences, src, resolved.varName, resolved.cursorNode.StartByte(), ranges)
+	}
+
 	return occurrences
 }
 
@@ -82,6 +91,27 @@ func (t *Tree) NameExistsInScopeOf(src []byte, line, col uint, newName string) b
 
 	if resolved.moduleAttribute {
 		return moduleAttributeExists(resolved.scope, src, newName)
+	}
+
+	// HEEX: findFirstNonCallIdentifier scans the whole Elixir scope, including
+	// every HEEX branch, but a HEEX binding range confines a variable to its
+	// body. A newName match inside an unrelated loop/clause is invisible from the
+	// cursor and is not a real collision — collision reach must equal rename
+	// reach. Consider every match (not just the first), since the first textual
+	// match may be hidden inside a range while a later, visible one is the real
+	// collision.
+	if ranges := t.heexRangesInScope(resolved.scope, src); ranges != nil {
+		cursorByte := resolved.cursorNode.StartByte()
+		for _, cand := range findAllNonCallIdentifiers(resolved.scope, src, newName) {
+			if !heexCollisionReachable(cursorByte, cand.StartByte(), resolved.varName, newName, ranges) {
+				continue
+			}
+			pos := cand.StartPosition()
+			if len(t.FindVariableOccurrences(src, uint(pos.Row), uint(pos.Column))) > 0 {
+				return true
+			}
+		}
+		return false
 	}
 
 	// Find the first non-call identifier matching newName in the scope.
@@ -123,6 +153,32 @@ func findFirstNonCallIdentifierInScope(node *TreeNode, src []byte, name string, 
 		}
 	}
 	return nil
+}
+
+// findAllNonCallIdentifiers returns every identifier in the subtree matching
+// name that is not a function name in a call (same scoping rules as
+// findFirstNonCallIdentifier, which returns just the first). Used by HEEX
+// collision detection, where the first textual match may be hidden inside an
+// unrelated binding range while a later, visible match is the real collision.
+func findAllNonCallIdentifiers(node *TreeNode, src []byte, name string) []*TreeNode {
+	var out []*TreeNode
+	var walk func(n *TreeNode, isRoot bool)
+	walk = func(n *TreeNode, isRoot bool) {
+		if n == nil {
+			return
+		}
+		if !isRoot && definesNestedScope(n, src) {
+			return
+		}
+		if n.Kind() == "identifier" && n.Utf8Text(src) == name && !isFunctionNameInCall(n, src) {
+			out = append(out, n)
+		}
+		for i := uint(0); i < uint(n.ChildCount()); i++ {
+			walk(n.Child(i), false)
+		}
+	}
+	walk(node, true)
+	return out
 }
 
 // resolvedScope holds the result of locating a variable's scope.
@@ -562,11 +618,10 @@ func isModuleAttributeIdent(node *TreeNode, src []byte) bool {
 		return false
 	}
 
-	// walk to the document root and make sure we aren't nested within any HEEX trees
-	for t := node.Tree.Root; t != nil; t = t.Tree.Root {
-		if t.Tree.Language == LangHeex {
-			return false
-		}
+	// Within HEEX trees the `@` is the assigns-access macro, not a module
+	// attribute, so @x there must not be treated as a renameable attribute.
+	if heexContainer(node) != nil {
+		return false
 	}
 
 	if isAtUnaryOp(parent, src) {
@@ -737,6 +792,22 @@ func (t *Tree) FindVariablesInScope(src []byte, line, col uint) []string {
 	seen := make(map[string]bool)
 	var variables []string
 	collectVariableNames(scope, src, seen, &variables, line, col)
+
+	// HEEX: collectVariableNames walks into ~H sub-trees and harvests every
+	// binding it finds, but a HEEX binding range confines its variable to its
+	// body. Prune names confined to a range that is not active at the cursor
+	// (keeping outer-scope bindings that merely share a name — shadowing), then
+	// surface any in-range binding whose site sits after the cursor textually.
+	// No-op for pure Elixir.
+	if ranges := t.heexRangesInScope(scope, src); ranges != nil {
+		variables = filterHeexScopeVariables(variables, scope, src, cursorNode.StartByte(), ranges)
+		seen = make(map[string]bool, len(variables))
+		for _, name := range variables {
+			seen[name] = true
+		}
+		addHeexScopeVariables(cursorNode.StartByte(), seen, &variables, ranges)
+	}
+
 	return variables
 }
 

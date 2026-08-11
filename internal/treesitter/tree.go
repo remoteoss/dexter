@@ -107,6 +107,43 @@ func (tn *TreeNode) Child(i uint) *TreeNode {
 	return &TreeNode{Tree: tn.Tree, Node: tn.Node.Child(i)}
 }
 
+// RawChild returns the i-th child within the node's own tree, without crossing
+// into a branch sub-tree (unlike Child, which transparently descends into
+// Branches). Use it to walk one language's native structure — e.g. the HEEX
+// tree's own markup nodes — without being pulled into the nested Elixir
+// expression trees hanging off those nodes.
+func (tn *TreeNode) RawChild(i uint) *TreeNode {
+	return &TreeNode{Tree: tn.Tree, Node: tn.Node.Child(i)}
+}
+
+// RawChildCount returns the native tree-sitter child count, ignoring branch
+// sub-trees (unlike ChildCount, which reports 1 at a node linking to a branch).
+// It is the counterpart to RawChild: a `for i < RawChildCount()` loop bound to
+// RawChild(i) walks one language's own structure without crossing into nested
+// sub-trees.
+func (tn *TreeNode) RawChildCount() uint {
+	return tn.Node.ChildCount()
+}
+
+// NamedChild returns the i-th named child of the node (0-based over named
+// children only), or nil if there are fewer than i+1. Like Child, it descends
+// transparently into a branch sub-tree, so a named child of a node linking to a
+// branch is that sub-tree's root.
+func (tn *TreeNode) NamedChild(i uint) *TreeNode {
+	var seen uint
+	for j := uint(0); j < tn.ChildCount(); j++ {
+		c := tn.Child(j)
+		if !c.IsNamed() {
+			continue
+		}
+		if seen == i {
+			return c
+		}
+		seen++
+	}
+	return nil
+}
+
 // StartPosition returns the (row, col) start position of the given node
 // within the top-most root tree.
 func (tn *TreeNode) StartPosition() tree_sitter.Point {

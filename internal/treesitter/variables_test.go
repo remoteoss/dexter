@@ -1591,10 +1591,6 @@ end
 	}
 }
 
-func TestFindVariableOccurences_HEEXBindings(t *testing.T) {
-	// FIX: implement stub
-}
-
 func TestFindTokenOccurences_HEEXFunctionModuleNodes(t *testing.T) {
 	src := []byte(`defmodule MyApp do
   alias MyApp.Components
