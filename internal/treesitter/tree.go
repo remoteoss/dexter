@@ -1,6 +1,7 @@
 package treesitter
 
 import (
+	"cmp"
 	"slices"
 	"unsafe"
 
@@ -25,7 +26,13 @@ type Tree struct {
 	Root     *TreeNode
 	Trunk    *tree_sitter.Tree
 	Branches map[uintptr]*Tree
-	Language Language
+	// branchesByStart holds the same *Tree values as Branches, ordered by trunk
+	// start byte (root-file coordinates). Branches within one tree are disjoint,
+	// non-nested siblings, so this ordering enables a binary-search range scan in
+	// collectHeexRangesInScope instead of a linear scan over the map. Populated
+	// at parse time and sorted once in newTree.
+	branchesByStart []*Tree
+	Language        Language
 }
 
 // TrunkNode returns a TreeNode pointing to the root node of the trunk.
@@ -253,6 +260,13 @@ func newTree(lang Language, src []byte, parsers map[Language]*tree_sitter.Parser
 
 	visitTree(trunk.RootNode(), &parseVisitor{parsers: parsers, src: src, tree: t})
 
+	// visitTree appends branches in pre-order DFS, which is already ascending by
+	// trunk start byte. Sort defensively so the range-scan invariant survives any
+	// future change to traversal order; n is small and this runs once at parse.
+	slices.SortFunc(t.branchesByStart, func(a, b *Tree) int {
+		return cmp.Compare(a.TrunkNode().StartByte(), b.TrunkNode().StartByte())
+	})
+
 	return t
 }
 
@@ -292,6 +306,7 @@ func (v *parseVisitor) onNode(node *tree_sitter.Node) {
 		if tree := newTree(LangHeex, v.src[node.StartByte():node.EndByte()], v.parsers); tree != nil {
 			tree.Root = &TreeNode{Tree: v.tree, Node: node}
 			v.tree.Branches[node.Id()] = tree
+			v.tree.branchesByStart = append(v.tree.branchesByStart, tree)
 		}
 	}
 
@@ -307,6 +322,7 @@ func (v *parseVisitor) onNode(node *tree_sitter.Node) {
 		if tree := newTree(LangElixir, v.src[node.StartByte():node.EndByte()], v.parsers); tree != nil {
 			tree.Root = &TreeNode{Tree: v.tree, Node: node}
 			v.tree.Branches[node.Id()] = tree
+			v.tree.branchesByStart = append(v.tree.branchesByStart, tree)
 		}
 	}
 }

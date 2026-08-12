@@ -144,3 +144,42 @@ end`)
 		t.Errorf("unexpected expression parsed: %+v", text)
 	}
 }
+
+// TestBranchesByStartOrdered verifies that branchesByStart holds exactly the
+// same sub-trees as Branches, sorted ascending by trunk start byte at every
+// level of the tree. collectHeexRangesInScope's binary search depends on this
+// invariant.
+func TestBranchesByStartOrdered(t *testing.T) {
+	src := []byte(`defmodule Foo do
+  def render(assigns) do
+    ~H"""
+    <div id={a()} class={b()}>{c()}</div>
+    <%= for x <- @xs do %>
+      {d()}
+    <% end %>
+    <span>{e()}</span>
+    """
+  end
+end`)
+
+	var check func(tree *Tree)
+	check = func(tree *Tree) {
+		if len(tree.branchesByStart) != len(tree.Branches) {
+			t.Fatalf("branchesByStart len %d != Branches len %d", len(tree.branchesByStart), len(tree.Branches))
+		}
+		var prev uint
+		for i, b := range tree.branchesByStart {
+			start := b.TrunkNode().StartByte()
+			if i > 0 && start < prev {
+				t.Errorf("branchesByStart not ascending at %d: %d < %d", i, start, prev)
+			}
+			prev = start
+			// Every ordered entry must be present in the map by node ID.
+			if tree.Branches[b.Root.Node.Id()] != b {
+				t.Errorf("branchesByStart[%d] not found in Branches map", i)
+			}
+			check(b)
+		}
+	}
+	check(NewTree(src))
+}

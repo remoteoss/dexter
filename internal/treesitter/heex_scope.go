@@ -1,5 +1,7 @@
 package treesitter
 
+import "sort"
+
 // This file adds HEEX-aware variable scoping on top of the pure-Elixir scope
 // model in variables.go. The Elixir model assumes a single continuous AST where
 // a binding construct (for/with/case/fn) owns its body as a descendant do_block
@@ -83,12 +85,19 @@ func (t *Tree) heexRangesInScope(scope *TreeNode, src []byte) []heexBindingRange
 }
 
 func (t *Tree) collectHeexRangesInScope(scopeStart, scopeEnd uint, src []byte, out *[]heexBindingRange) {
-	for _, branch := range t.Branches {
+	// branchesByStart is sorted by trunk start byte, and branches are disjoint,
+	// so ends are ascending too. Binary-search the first branch that can overlap
+	// (trunk ends after scopeStart), then walk forward until a branch starts at
+	// or past scopeEnd, at which point no later branch can overlap either.
+	branches := t.branchesByStart
+	i := sort.Search(len(branches), func(i int) bool {
+		return branches[i].TrunkNode().EndByte() > scopeStart
+	})
+	for ; i < len(branches); i++ {
+		branch := branches[i]
 		trunk := branch.TrunkNode()
-		// Skip a branch whose span is disjoint from the scope: its ranges can
-		// touch neither an in-scope occurrence nor the cursor.
-		if trunk.EndByte() <= scopeStart || trunk.StartByte() >= scopeEnd {
-			continue
+		if trunk.StartByte() >= scopeEnd {
+			break
 		}
 		if branch.Language == LangHeex {
 			*out = append(*out, collectAllHeexBindingRanges(trunk, src)...)
