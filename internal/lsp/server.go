@@ -27,7 +27,6 @@ import (
 	"github.com/remoteoss/dexter/internal/parser"
 	"github.com/remoteoss/dexter/internal/stdlib"
 	"github.com/remoteoss/dexter/internal/store"
-	"github.com/remoteoss/dexter/internal/treesitter"
 	"github.com/remoteoss/dexter/internal/version"
 )
 
@@ -661,7 +660,8 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		// The first occurrence in scope is the definition (pattern/assignment).
 		if tree, src, release, ok := s.docs.GetTree(docURI); ok {
 			defer release()
-			if occs := treesitter.FindVariableOccurrencesWithTree(tree.RootNode(), src, uint(lineNum), uint(col)); len(occs) > 0 {
+
+			if occs := tree.FindVariableOccurrences(src, uint(lineNum), uint(col)); len(occs) > 0 {
 				s.debugf("Definition: returning variable definition at line %d", occs[0].Line)
 				return []protocol.Location{{
 					URI:   params.TextDocument.URI,
@@ -1731,7 +1731,7 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 		var varsInScope []string
 		if tree, src, release, ok := s.docs.GetTree(docURI); ok {
 			defer release()
-			varsInScope = treesitter.FindVariablesInScopeWithTree(tree.RootNode(), src, uint(lineNum), uint(col))
+			varsInScope = tree.FindVariablesInScope(src, uint(lineNum), uint(col))
 		}
 		for _, varName := range varsInScope {
 			if strings.HasPrefix(varName, funcPrefix) && !seen[varName] {
@@ -2785,10 +2785,9 @@ func (s *Server) DocumentHighlight(ctx context.Context, params *protocol.Documen
 		return nil, nil
 	}
 	defer release()
-	root := tree.RootNode()
 
 	// Try scope-aware variable highlight first
-	if occs := treesitter.FindVariableOccurrencesWithTree(root, src, uint(lineNum), uint(col)); len(occs) > 0 {
+	if occs := tree.FindVariableOccurrences(src, uint(lineNum), uint(col)); len(occs) > 0 {
 		var highlights []protocol.DocumentHighlight
 		for _, occ := range occs {
 			highlights = append(highlights, protocol.DocumentHighlight{
@@ -2820,7 +2819,7 @@ func (s *Server) DocumentHighlight(ctx context.Context, params *protocol.Documen
 	}
 
 	// Reuse the same parsed tree for token occurrences
-	occs := treesitter.FindTokenOccurrencesWithTree(root, src, token)
+	occs := tree.FindTokenOccurrences(src, token)
 	if len(occs) == 0 {
 		return nil, nil
 	}
@@ -3704,7 +3703,7 @@ func (s *Server) PrepareRename(ctx context.Context, params *protocol.PrepareRena
 	if moduleRef == "" {
 		if tree, src, release, ok := s.docs.GetTree(docURI); ok {
 			defer release()
-			if occs := treesitter.FindVariableOccurrencesWithTree(tree.RootNode(), src, uint(lineNum), uint(col)); len(occs) > 0 {
+			if occs := tree.FindVariableOccurrences(src, uint(lineNum), uint(col)); len(occs) > 0 {
 				for _, occ := range occs {
 					if occ.Line == uint(lineNum) && uint(col) >= occ.StartCol && uint(col) < occ.EndCol {
 						return &protocol.Range{
@@ -3902,7 +3901,7 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 		// function reference lookup.
 		if tree, src, release, ok := s.docs.GetTree(docURI); ok {
 			defer release()
-			if occs := treesitter.FindVariableOccurrencesWithTree(tree.RootNode(), src, uint(lineNum), uint(col)); len(occs) > 0 {
+			if occs := tree.FindVariableOccurrences(src, uint(lineNum), uint(col)); len(occs) > 0 {
 				var locations []protocol.Location
 				for _, occ := range occs {
 					locations = append(locations, protocol.Location{
@@ -4108,8 +4107,8 @@ func (s *Server) Rename(ctx context.Context, params *protocol.RenameParams) (*pr
 	if moduleRef == "" {
 		if tree, src, release, ok := s.docs.GetTree(docURI); ok {
 			defer release()
-			if occs := treesitter.FindVariableOccurrencesWithTree(tree.RootNode(), src, uint(lineNum), uint(col)); len(occs) > 0 {
-				if treesitter.NameExistsInScopeOf(tree.RootNode(), src, uint(lineNum), uint(col), params.NewName) {
+			if occs := tree.FindVariableOccurrences(src, uint(lineNum), uint(col)); len(occs) > 0 {
+				if tree.NameExistsInScopeOf(src, uint(lineNum), uint(col), params.NewName) {
 					return nil, fmt.Errorf("variable %q already exists in this scope", params.NewName)
 				}
 				changes := make(map[protocol.DocumentURI][]protocol.TextEdit)
@@ -5119,6 +5118,8 @@ func (s *Server) getFileLine(filePath string, lineNum int) (string, bool) {
 			return scanner.Text(), true
 		}
 	}
+	// ignore any scan error
+	_ = scanner.Err()
 	return "", false
 }
 

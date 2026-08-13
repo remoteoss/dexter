@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -2690,6 +2691,70 @@ end`
 	}
 }
 
+func TestDefinition_HEEXFunction(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	src := `defmodule TestLive do
+	use Phoenix.LiveView
+
+  def render(assigns) do
+    ~H"""
+    <.foo />
+    <TestLive.foo />
+    <div class={class()} />
+    """
+  end
+
+	defp foo(_), do: ~H""
+	defp class, do: ""
+end`
+
+	uri := "file://" + filepath.Join(server.projectRoot, "test_live.ex")
+	indexFile(t, server.store, server.projectRoot, "test_live.ex", src)
+	server.docs.Set(uri, src)
+
+	// Cursor on "foo" at line 6 col 6 (the `<.foo />` component inside `render`)
+	locs := definitionAt(t, server, uri, 5, 6)
+	if len(locs) == 0 {
+		t.Fatal("expected go-to-definition for function 'foo'")
+	}
+	// Should jump to line 11 where `foo` is defined
+	if locs[0].Range.Start.Line != 11 {
+		t.Errorf("expected definition on line 9, got line %d", locs[0].Range.Start.Line)
+	}
+
+	// Cursor on "TestLive.foo" at line 7 col 6 (the `TestLive` module of `<TestLive.foo />`)
+	locs = definitionAt(t, server, uri, 6, 6)
+	if len(locs) == 0 {
+		t.Fatal("expected go-to-definition for module 'TestLive'")
+	}
+	// Should jump to line 1 where `TestLive` is defined
+	if locs[0].Range.Start.Line != 0 {
+		t.Errorf("expected definition on line 1, got line %d", locs[0].Range.Start.Line)
+	}
+
+	// Cursor on "TestLive.foo" at line 7 col 15 (the `foo` function of `<TestLive.foo />`)
+	locs = definitionAt(t, server, uri, 6, 15)
+	if len(locs) == 0 {
+		t.Fatal("expected go-to-definition for function 'foo'")
+	}
+	// Should jump to line 11 where `foo` is defined
+	if locs[0].Range.Start.Line != 11 {
+		t.Errorf("expected definition on line 11, got line %d", locs[0].Range.Start.Line)
+	}
+
+	// Cursor on "class()" at line 8 col 16 (the `class()` call of `<div class={class()} />`)
+	locs = definitionAt(t, server, uri, 7, 16)
+	if len(locs) == 0 {
+		t.Fatal("expected go-to-definition for function 'class'")
+	}
+	// Should jump to line 12 where `class` is defined
+	if locs[0].Range.Start.Line != 12 {
+		t.Errorf("expected definition on line 12, got line %d", locs[0].Range.Start.Line)
+	}
+}
+
 func TestHover_AliasInjectedByUse(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
@@ -3337,6 +3402,56 @@ end
 	}
 	if foundBillingRef {
 		t.Error("should NOT return references to MyApp.Billing.TransactionRecord")
+	}
+}
+
+func TestReferences_HEEXNestedReference(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	src := `defmodule App do
+	use Phoenix.LiveView
+
+	def foo(assigns), do: ~H""
+
+	def render(assigns) do
+    ~H"""
+    <.foo />
+    <App.foo />
+    """
+	end
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/app.ex", src)
+
+	uri := "file://" + filepath.Join(server.projectRoot, "lib", "app.ex")
+	server.docs.Set(uri, src)
+
+	tests := []struct {
+		src  string
+		line int
+		col  int
+	}{
+		// Go-to-references on "foo" in the <App.foo /> component (line 9, col 9)
+		{src: "<App.foo />", line: 9, col: 9},
+		// Go-to-references on "foo" in the <.foo /> line (line 8, col 6)
+		{src: "<.foo />", line: 8, col: 6},
+	}
+	for _, tt := range tests {
+
+		locs := referencesAt(t, server, uri, uint32(tt.line-1), uint32(tt.col))
+		if len(locs) == 0 {
+			t.Fatalf("expected references for function %s", tt.src)
+		}
+
+		lines := []uint32{}
+		for _, loc := range locs {
+			lines = append(lines, loc.Range.Start.Line)
+		}
+		slices.Sort(lines)
+		if !slices.Equal(lines, []uint32{7, 8}) {
+			t.Fatalf("expected reference on lines 7 and 8, got lines %v", lines)
+		}
 	}
 }
 

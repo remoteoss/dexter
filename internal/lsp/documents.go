@@ -7,10 +7,10 @@ import (
 	"sync"
 
 	tree_sitter "github.com/tree-sitter/go-tree-sitter"
-	tree_sitter_elixir "github.com/tree-sitter/tree-sitter-elixir/bindings/go"
 	"go.lsp.dev/protocol"
 
 	"github.com/remoteoss/dexter/internal/parser"
+	"github.com/remoteoss/dexter/internal/treesitter"
 )
 
 // defaultMaxTransient caps how many disk-loaded buffers may live in the
@@ -45,7 +45,7 @@ type cachedDoc struct {
 // tree for free and only triggers ts_tree_delete if no handler still
 // holds a reference.
 type refTree struct {
-	tree    *tree_sitter.Tree
+	tree    *treesitter.Tree
 	refs    int
 	retired bool
 }
@@ -76,9 +76,9 @@ func (rt *refTree) retireLocked() {
 // (e.g. Claude Code) can still query references/hover/definition without
 // causing unbounded memory growth.
 type DocumentStore struct {
-	mu     sync.RWMutex
-	docs   map[string]*cachedDoc
-	parser *tree_sitter.Parser
+	mu      sync.RWMutex
+	docs    map[string]*cachedDoc
+	parsers map[treesitter.Language]*tree_sitter.Parser
 
 	// LRU bookkeeping for transient (disk-loaded) entries only. The list
 	// holds URIs in access-order, newest at the front. transientIdx maps
@@ -89,11 +89,9 @@ type DocumentStore struct {
 }
 
 func NewDocumentStore() *DocumentStore {
-	p := tree_sitter.NewParser()
-	_ = p.SetLanguage(tree_sitter.NewLanguage(tree_sitter_elixir.Language()))
 	return &DocumentStore{
 		docs:          make(map[string]*cachedDoc),
-		parser:        p,
+		parsers:       treesitter.AllParsers(),
 		transientList: list.New(),
 		transientIdx:  make(map[string]*list.Element),
 		maxTransient:  defaultMaxTransient,
@@ -149,7 +147,9 @@ func (ds *DocumentStore) CloseAll() {
 	ds.docs = nil
 	ds.transientList = nil
 	ds.transientIdx = nil
-	ds.parser.Close()
+	for _, p := range ds.parsers {
+		p.Close()
+	}
 }
 
 func (ds *DocumentStore) Get(uri string) (string, bool) {
@@ -300,7 +300,7 @@ func (ds *DocumentStore) evictTransientLocked() {
 // Callers must not close the returned tree directly.
 //
 // When ok is false, release is nil and must not be called.
-func (ds *DocumentStore) GetTree(uri string) (*tree_sitter.Tree, []byte, func(), bool) {
+func (ds *DocumentStore) GetTree(uri string) (*treesitter.Tree, []byte, func(), bool) {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	doc, ok := ds.docs[uri]
@@ -309,7 +309,7 @@ func (ds *DocumentStore) GetTree(uri string) (*tree_sitter.Tree, []byte, func(),
 	}
 	if doc.tree == nil {
 		doc.src = []byte(doc.text)
-		doc.tree = &refTree{tree: ds.parser.Parse(doc.src, nil)}
+		doc.tree = &refTree{tree: treesitter.NewTreeWithParsers(doc.src, ds.parsers)}
 	}
 	rt := doc.tree
 	rt.refs++

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -2042,27 +2043,31 @@ func TestParseFile_CharLiteralDoesNotConfuseStringBlanking(t *testing.T) {
 
 func TestParseFile_InterpolationDoesNotConfuseRefExtraction(t *testing.T) {
 	// Bug 2: string interpolation with nested quotes containing module refs
-	path := writeTempFile(t, "defmodule MyApp.Foo do\n  def bar do\n    x = \"hello #{Real.Module.call(\\\"arg\\\"}\"\n    Other.Module.work()\n  end\nend\n")
+	// [2026-07-17] Update: string interpolation is now tokenized and emits references
+	path := writeTempFile(t, `defmodule MyApp.Foo do
+  def bar do
+    x = "hello #{Real.Module.call(\"arg\")}"
+    Other.Module.work()
+  end
+end
+`)
 
 	_, refs, err := ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	for _, r := range refs {
-		if r.Module == "Real.Module" {
-			t.Errorf("should not extract refs from inside string interpolation, got %+v", r)
-		}
-	}
-
-	found := false
+	found := 0
 	for _, r := range refs {
 		if r.Module == "Other.Module" && r.Function == "work" {
-			found = true
+			found++
+		}
+		if r.Module == "Real.Module" && r.Function == "call" {
+			found++
 		}
 	}
-	if !found {
-		t.Errorf("expected Other.Module.work ref; got refs: %+v", refs)
+	if found != 2 {
+		t.Errorf("expected Other.Module and Real.Module refs; got refs: %+v", refs)
 	}
 }
 
@@ -2561,6 +2566,80 @@ end
 	}
 }
 
+func TestParseFile_HEEXReferences(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyAppWeb.PageLive do
+	import MyAppWeb.Components
+
+	# single-line def should generate reference
+  def comp, do: ~H"<.icon />"
+
+  # so should module attribute
+  @attr ~H"<.icon></.icon>"
+
+  def greeting do
+    ~H"""
+    <p id={component_id()}>Hello, world!</p>
+    <.icon />
+    <.icon></.icon>
+    <MyAppWeb.Components.icon />
+    <MyAppWeb.Components.icon></MyAppWeb.Components.icon>
+    """
+  end
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	calls := map[string][]int{}
+	for _, r := range refs {
+		if r.Kind == "call" {
+			mf := r.Module + "." + r.Function
+			calls[mf] = append(calls[mf], r.Line)
+		}
+	}
+
+	want := map[string][]int{
+		"MyAppWeb.Components.icon":         {5, 8, 8, 13, 14, 14, 15, 16, 16},
+		"MyAppWeb.Components.component_id": {12},
+	}
+	for f, ll := range want {
+		if !slices.Equal(calls[f], ll) {
+			t.Errorf("expected %s component references %v, got %v", f, ll, calls[f])
+		}
+	}
+}
+
+func TestParseFile_HEEXNoInjectors(t *testing.T) {
+	// same input module as `TestParseFile_HEEXReferences`, but without `import` injector;
+	// explicit `<Module.function />` components also omitted since they always emit refs
+	path := writeTempFile(t, `defmodule MyAppWeb.PageLive do
+  def comp, do: ~H"<.icon />"
+
+  @attr ~H"<.icon></.icon>"
+
+  def greeting do
+    ~H"""
+    <p id={component_id()}>Hello, world!</p>
+    <.icon />
+    <.icon></.icon>
+    """
+  end
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(refs) > 0 {
+		t.Errorf("expected no references for module without injectors, got %v", refs)
+	}
+}
+
 func TestTokenize_HeredocInterpolationWithNestedString(t *testing.T) {
 	// #{"}"} inside a heredoc must not close the interpolation prematurely.
 	source := []byte("x = \"\"\"\n#{\"}\"}\n\"\"\"")
@@ -2644,6 +2723,39 @@ func TestTokenAtOffset(t *testing.T) {
 	// Offset in whitespace (between tokens) should return -1
 	if idx := TokenAtOffset(tokens, 9); idx >= 0 {
 		t.Errorf("expected -1 for whitespace offset 9, got token kind %v", tokens[idx].Kind)
+	}
+}
+
+func TestTokenAtOffsetHEEX(t *testing.T) {
+	src := []byte(`~H"""
+foo
+<% bar %>
+<% "#{baz} garply" %>
+"""`)
+	tokens := Tokenize(src)
+
+	tests := []struct {
+		name   string
+		offset int
+		want   string
+	}{
+		// foo is plain heredoc contents
+		{"foo (plain)", 6, "~H\"\"\"\nfoo\n<% bar %>\n<% \"#{baz} garply\" %>\n\"\"\""},
+		{"bar (interpolated)", 13, "bar"},
+		{"baz (nested interpolated)", 26, "baz"},
+		// garply is plain string contents
+		{"garply (plain)", 31, "\"#{baz} garply\""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			idx := TokenAtOffset(tokens, tt.offset)
+			if idx < 0 {
+				t.Fatalf("TokenAtOffset(%d) returned -1", tt.offset)
+			}
+			if TokenText(src, tokens[idx]) != tt.want {
+				t.Errorf("TokenText(src, TokenAtOffset(%d)) = %v, want %v", tt.offset, TokenText(src, tokens[idx]), tt.want)
+			}
+		})
 	}
 }
 

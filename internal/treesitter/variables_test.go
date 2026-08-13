@@ -1,6 +1,7 @@
 package treesitter
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
@@ -655,11 +656,11 @@ func TestFindVariableOccurrences_FullWorkerFile(t *testing.T) {
   defdelegate backoff(job), to: MyApp.Oban.EmailWorker
 end`)
 
-	root, cleanup := parseElixir(src)
-	if root == nil {
+	tree := NewTree(src)
+	if tree == nil {
 		t.Fatal("failed to parse")
 	}
-	defer cleanup()
+	defer tree.Close()
 
 	// Find the actual line for "transfer_amount = Money.new" in this test source
 	lines := strings.Split(string(src), "\n")
@@ -675,7 +676,7 @@ end`)
 	}
 	t.Logf("transfer_amount rebind is at line %d: %q", transferLine, lines[transferLine])
 
-	occs := FindVariableOccurrences(src, uint(transferLine), 6)
+	occs := tree.FindVariableOccurrences(src, uint(transferLine), 6)
 	t.Logf("transfer_amount from line %d col 6: %d occs: %+v", transferLine, len(occs), occs)
 	if occs == nil {
 		t.Fatal("expected variable occurrences for 'transfer_amount', got nil")
@@ -1459,12 +1460,15 @@ end
 
 apply(config)
 `)
-	root, cleanup := parseElixir(src)
-	defer cleanup()
+	tree := NewTree(src)
+	if tree == nil {
+		t.Fatal("failed to parse")
+	}
+	defer tree.Close()
 
 	// Renaming top-level "config" to "other" is safe: "other" only exists as a
 	// def-local, which is a different scope.
-	if NameExistsInScopeOf(root, src, 0, 0, "other") {
+	if tree.NameExistsInScopeOf(src, 0, 0, "other") {
 		t.Error("false-positive collision: 'other' is a def-local, not in the top-level scope")
 	}
 }
@@ -1555,5 +1559,81 @@ config :app, value: some_helper()
 	occs := FindVariableOccurrences(src, 2, uint(len("config :app, value: ")))
 	if occs != nil {
 		t.Errorf("expected nil for bare top-level call, got %d occurrences: %+v", len(occs), occs)
+
+	}
+}
+
+func TestFindVariableOccurences_HEEXAttributeAssignConfusion(t *testing.T) {
+	src := []byte(`defmodule Foo do
+  @a "a"
+
+  def call do
+    @a
+  end
+
+  def render(assigns) do
+    ~H"""
+    {@a}
+    """
+  end
+end
+`)
+
+	// Cursor on "some_helper" at line 1 (0-indexed).
+	got := FindVariableOccurrences(src, 1, 3)
+	want := []VariableOccurrence{
+		{Line: 1, StartCol: 3, EndCol: 4}, // @a "a"
+		{Line: 4, StartCol: 5, EndCol: 6}, // @a (within `def call`)
+		// @a within the `~H` HEEX template shouldn't be included
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("got: %+v\nwant: %+v\n", got, want)
+	}
+}
+
+func TestFindTokenOccurences_HEEXFunctionModuleNodes(t *testing.T) {
+	src := []byte(`defmodule MyApp do
+  alias MyApp.Components
+
+  def render(assigns) do
+    # plain string interpolation should work as well
+	  "#{Components.button()}"
+    "#{button()}"
+
+  	~H"""
+    <!-- button -->
+    <.button />
+    <.button></.button>
+    <Components.button />
+    <Components.button></Components.button>
+    """
+  end
+end`)
+
+	got := FindTokenOccurrences(src, "Components")
+	want := []VariableOccurrence{
+		{Line: 1, StartCol: 14, EndCol: 24},
+		{Line: 5, StartCol: 6, EndCol: 16},
+		{Line: 12, StartCol: 5, EndCol: 15},
+		{Line: 13, StartCol: 5, EndCol: 15},
+		{Line: 13, StartCol: 25, EndCol: 35},
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("got: %+v\nwant: %+v\n", got, want)
+	}
+
+	got = FindTokenOccurrences(src, "button")
+	want = []VariableOccurrence{
+		{Line: 5, StartCol: 17, EndCol: 23},
+		{Line: 6, StartCol: 7, EndCol: 13},
+		{Line: 10, StartCol: 6, EndCol: 12},
+		{Line: 11, StartCol: 6, EndCol: 12},
+		{Line: 11, StartCol: 16, EndCol: 22},
+		{Line: 12, StartCol: 16, EndCol: 22},
+		{Line: 13, StartCol: 16, EndCol: 22},
+		{Line: 13, StartCol: 36, EndCol: 42},
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("got: %+v\nwant: %+v\n", got, want)
 	}
 }

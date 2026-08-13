@@ -1870,6 +1870,16 @@ func ModuleAttributeAtCursor(tokens []parser.Token, source []byte, lineStarts []
 	}
 
 	tok := tokens[idx]
+
+	// walk to the document root and make sure we aren't inside a HEEX node;
+	// if we are, `@x` is a macro that expands to `assigns.x` and shouldn't
+	// be counted as a module attribute
+	for t := tok.Parent; t > -1; t = tokens[t].Parent {
+		if tokens[t].Kind == parser.TokSigil && parser.Sigil(source, tokens[t]) == "H" {
+			return ""
+		}
+	}
+
 	if tok.Kind != parser.TokAttr {
 		return ""
 	}
@@ -1952,8 +1962,18 @@ func FindBareFunctionCalls(text string, functionName string) []int {
 			continue
 		}
 
+		dotPrefixed := i > 0 && tokens[i-1].Kind == parser.TokDot
+
+		// Check this is a HEEX function component e.g. "<.foo />"
+		heexFunction := dotPrefixed && i > 1 &&
+			(tokens[i-2].Kind == parser.TokHEEXOpenTag || tokens[i-2].Kind == parser.TokHEEXCloseTag)
+		if heexFunction {
+			seenLines[tok.Line] = true
+			continue
+		}
+
 		// Check this is a bare call (not preceded by dot)
-		if i > 0 && tokens[i-1].Kind == parser.TokDot {
+		if dotPrefixed {
 			continue
 		}
 

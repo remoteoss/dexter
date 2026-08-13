@@ -1,6 +1,9 @@
 package parser
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 // parseTextFromTokens is the token-stream replacement for the line-based ParseText.
 // It walks a []Token stream from the tokenizer and produces identical Definition
@@ -258,8 +261,9 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 			TokCharLiteral, TokAtom, TokNumber, TokOther,
 			TokDot, TokColon, TokOpenParen, TokCloseParen,
 			TokOpenBracket, TokCloseBracket, TokOpenBrace, TokCloseBrace,
-			TokOpenAngle, TokCloseAngle, TokBackslash, TokRightArrow,
-			TokLeftArrow, TokAssoc, TokDoubleColon, TokComma, TokWhen:
+			TokOpenAngle, TokCloseAngle, TokHEEXOpenExpr, TokHEEXCloseExpr,
+			TokBackslash, TokRightArrow, TokLeftArrow, TokAssoc, TokDoubleColon,
+			TokComma, TokWhen:
 			i++
 			continue
 
@@ -649,11 +653,25 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 		case TokIdent:
 			cm := currentModule()
 			if cm != "" && len(injectors) > 0 {
-				isStatementStart := i == 0 || tokens[i-1].Kind == TokEOL || tokens[i-1].Kind == TokComment
-				if isStatementStart {
+				// couldBeginCall reports whether this identifier sits where a bare
+				// call to an injected (import/use) module could start: at the head
+				// of a line, or as the first token inside an interpolation/EEx
+				// opener (`{`, `<%`, `<%=`). The call-shape check below
+				// decides whether a reference is actually emitted.
+				couldBeginCall := i == 0 ||
+					tokens[i-1].Kind == TokEOL ||
+					tokens[i-1].Kind == TokComment ||
+					tokens[i-1].Kind == TokHEEXOpenExpr
+				// we only need to recognize bare function components e.g. "<.foo />" here since module-prefixed
+				// components e.g. "<Foo.bar />" are handled by the TokModule case earlier in the switch statement
+				isHEEXComponent := i > 1 &&
+					tokens[i-1].Kind == TokDot &&
+					(tokens[i-2].Kind == TokHEEXOpenTag || tokens[i-2].Kind == TokHEEXCloseTag)
+				if couldBeginCall || isHEEXComponent {
 					name := tokenText(tok)
-					if !elixirKeyword[name] {
-						emit := false
+					emit := !elixirKeyword[name]
+
+					if emit && couldBeginCall {
 						j := i + 1
 						if j < n {
 							switch tokens[j].Kind {
@@ -673,10 +691,11 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 								emit = hasDo
 							}
 						}
-						if emit {
-							for mod := range injectors {
-								refs = append(refs, Reference{Module: mod, Function: name, Line: tok.Line, FilePath: path, Kind: "call"})
-							}
+					}
+
+					if emit {
+						for mod := range injectors {
+							refs = append(refs, Reference{Module: mod, Function: name, Line: tok.Line, FilePath: path, Kind: "call"})
 						}
 					}
 				}
@@ -706,10 +725,11 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 
 			extractModuleRefs(lineStart, lineEnd)
 
-			// Check for pipe calls on this line
+			// Check for pipe calls and HEEX function components on this line
 			if currentModule() != "" && len(injectors) > 0 {
 				for j := lineStart; j < lineEnd; j++ {
-					if tokens[j].Kind == TokPipe {
+					switch tokens[j].Kind {
+					case TokPipe:
 						pj := nextSig(j + 1)
 						if pj < lineEnd && tokens[pj].Kind == TokIdent {
 							name := tokenText(tokens[pj])
@@ -719,6 +739,20 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 								}
 							}
 						}
+
+						// we only need to check for bare HEEX function components e.g. "<.foo />", as module-prefixed
+						// calls e.g. "<Foo.bar />" are already handled by `extractModuleRefs` above
+					case TokHEEXOpenTag, TokHEEXCloseTag:
+						if j+2 < lineEnd && tokens[j+1].Kind == TokDot && tokens[j+2].Kind == TokIdent {
+							name := tokenText(tokens[j+2])
+							if !elixirKeyword[name] {
+								for mod := range injectors {
+									refs = append(refs, Reference{Module: mod, Function: name, Line: triggerLine, FilePath: path, Kind: "call"})
+								}
+							}
+						}
+
+					default:
 					}
 				}
 			}
@@ -761,17 +795,26 @@ func LineColToOffset(lineStarts []int, line, col int) int {
 // TokenAtOffset returns the index of the token containing byteOffset, or -1
 // if the offset falls in a gap between tokens (whitespace) or is out of range.
 // Uses binary search for O(log n) lookup.
+//
+// If the offset lies within a TokString, TokSigil, or TokHeredoc, their contents
+// will be scanned to see if a more specific interpolated token contains the offset.
 func TokenAtOffset(tokens []Token, byteOffset int) int {
-	lo, hi := 0, len(tokens)-1
+	lo, hi, cand := 0, len(tokens)-1, -1
+	// binary search to find the right-most token that starts before target offset
 	for lo <= hi {
 		mid := lo + (hi-lo)/2
-		t := tokens[mid]
-		if byteOffset < t.Start {
-			hi = mid - 1
-		} else if byteOffset >= t.End {
+		if tokens[mid].Start <= byteOffset {
+			cand = mid
 			lo = mid + 1
 		} else {
-			return mid
+			hi = mid - 1
+		}
+	}
+	// if we're within a container and the token doesn't contain the target offset,
+	// we need to climb up to the nearest container that *does* contain it
+	for i := cand; i >= 0; i = tokens[i].Parent {
+		if tokens[i].End > byteOffset {
+			return i
 		}
 	}
 	return -1
@@ -779,6 +822,17 @@ func TokenAtOffset(tokens []Token, byteOffset int) int {
 
 func TokenText(source []byte, t Token) string {
 	return string(source[t.Start:t.End])
+}
+
+// Returns the sigil characters for the given TokSigil.
+// For example, given `~H"..."` this returns "H".
+func Sigil(source []byte, t Token) string {
+	if t.Kind != TokSigil {
+		panic(fmt.Sprintf("Sigil() called with %s", t.Kind))
+	}
+
+	end := scanSigilCharacters(source, t.Start+1)
+	return string(source[t.Start+1 : end])
 }
 
 func NextSigToken(tokens []Token, n, from int) int {

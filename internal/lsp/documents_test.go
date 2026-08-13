@@ -268,8 +268,8 @@ func TestDocumentStore_GetTree_DiskLoaded(t *testing.T) {
 	if string(src) != contents {
 		t.Fatalf("GetTree src mismatch: got %q want %q", src, contents)
 	}
-	if tree.RootNode().Kind() != "source" {
-		t.Fatalf("expected root node kind 'source', got %q", tree.RootNode().Kind())
+	if tree.Trunk.RootNode().Kind() != "source" {
+		t.Fatalf("expected root node kind 'source', got %q", tree.Trunk.RootNode().Kind())
 	}
 }
 
@@ -470,7 +470,7 @@ func TestDocumentStore_GetTree_SurvivesEviction(t *testing.T) {
 	// Capture the root node kind so we can re-read it after eviction.
 	// Pre-fix, the eviction below would call ts_tree_delete on this tree
 	// and the second RootNode() call would read freed C memory.
-	rootKindBefore := tree.RootNode().Kind()
+	rootKindBefore := tree.Trunk.RootNode().Kind()
 
 	// Force eviction of this URI while we still hold a ref.
 	ds.SetMaxTransient(0)
@@ -480,7 +480,7 @@ func TestDocumentStore_GetTree_SurvivesEviction(t *testing.T) {
 
 	// Walking the tree after eviction must still work - this is the UAF
 	// the refcounting prevents.
-	rootKindAfter := tree.RootNode().Kind()
+	rootKindAfter := tree.Trunk.RootNode().Kind()
 	if rootKindAfter != rootKindBefore {
 		t.Fatalf("tree root kind changed across eviction: got %q want %q", rootKindAfter, rootKindBefore)
 	}
@@ -537,7 +537,7 @@ func TestDocumentStore_GetTree_ConcurrentEvictionStress(t *testing.T) {
 				if !ok {
 					continue
 				}
-				root := tree.RootNode()
+				root := tree.Trunk.RootNode()
 				_ = root.Kind()
 				_ = root.ChildCount()
 				release()
