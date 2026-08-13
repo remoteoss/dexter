@@ -253,6 +253,22 @@ To override the binary path manually, add this to your `settings.json`:
 }
 ```
 
+If Zed shows a *"could not detect Elixir stdlib"* warning on startup — common when Elixir was installed via Homebrew, which ships no stdlib sources — point Dexter at an Elixir source tree matching your version (e.g. a checkout of [elixir-lang/elixir](https://github.com/elixir-lang/elixir)):
+
+```json
+{
+  "lsp": {
+    "dexter": {
+      "initialization_options": {
+        "stdlibPath": "/path/to/elixir/lib"
+      }
+    }
+  }
+}
+```
+
+Equivalently, set the `DEXTER_ELIXIR_LIB_ROOT` environment variable via `lsp.dexter.binary.env`.
+
 ### Emacs
 
 The emacs instructions assume you're using **use-package**.
