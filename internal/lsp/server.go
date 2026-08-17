@@ -67,6 +67,18 @@ type erlangRuntimeCache struct {
 	readyCh     chan struct{}
 }
 
+type structFieldCacheKey struct {
+	buildRoot string
+	module    string
+}
+
+type structFieldCacheEntry struct {
+	fields     []string
+	loaded     bool
+	loading    bool
+	generation uint64 // the structFieldGen value when this entry was created/activated
+}
+
 type Server struct {
 	store           *store.Store
 	docs            *DocumentStore
@@ -85,6 +97,13 @@ type Server struct {
 	erlangBuildRoots   map[string]*erlangBuildRootState // build root → runtime resolution state
 	erlangRuntimeCache map[string]*erlangRuntimeCache   // runtime key → cached OTP modules/exports
 	erlangRuntimeMu    sync.Mutex
+
+	structFieldCache map[structFieldCacheKey]*structFieldCacheEntry
+	structFieldMu    sync.Mutex
+	structFieldGen   uint64
+
+	prewarmingFiles   map[string]bool // docURI → currently prewarming
+	prewarmingFilesMu sync.Mutex
 
 	usingCache   map[string]*usingCacheEntry // module name → parsed __using__ result
 	usingCacheMu sync.RWMutex
@@ -124,6 +143,8 @@ func NewServer(s *store.Store, projectRoot string) *Server {
 		followDelegates:    true,
 		erlangBuildRoots:   make(map[string]*erlangBuildRootState),
 		erlangRuntimeCache: make(map[string]*erlangRuntimeCache),
+		structFieldCache:   make(map[structFieldCacheKey]*structFieldCacheEntry),
+		prewarmingFiles:    make(map[string]bool),
 		usingCache:         make(map[string]*usingCacheEntry),
 		depsCache:          make(map[string]bool),
 	}
@@ -205,6 +226,7 @@ func (s *Server) backgroundReindex() {
 				if !indexRefs {
 					refs = nil
 				}
+				s.invalidateStructFieldCacheForFile(path, defs)
 				if err := s.store.IndexFileWithRefs(path, defs, refs); err != nil {
 					log.Printf("Warning: reindex %s: %v", path, err)
 				}
@@ -229,6 +251,9 @@ func (s *Server) backgroundReindex() {
 				}
 			}
 			if len(toRemove) > 0 {
+				for _, path := range toRemove {
+					s.invalidateStructFieldCacheForFile(path, nil)
+				}
 				_ = s.store.RemoveFiles(toRemove)
 			}
 		}
@@ -433,7 +458,7 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 			RenameProvider:             &protocol.RenameOptions{PrepareProvider: true},
 			CallHierarchyProvider:      true,
 			CompletionProvider: &protocol.CompletionOptions{
-				TriggerCharacters: []string{"."},
+				TriggerCharacters: []string{".", "{", ",", "|", ":", " "},
 				ResolveProvider:   true,
 			},
 			SignatureHelpProvider: &protocol.SignatureHelpOptions{
@@ -488,8 +513,10 @@ func (s *Server) Exit(ctx context.Context) error {
 
 func (s *Server) DidOpen(ctx context.Context, params *protocol.DidOpenTextDocumentParams) error {
 	docURI := string(params.TextDocument.URI)
-	s.docs.Set(docURI, params.TextDocument.Text)
+	text := params.TextDocument.Text
+	s.docs.Set(docURI, text)
 	path := uriToPath(params.TextDocument.URI)
+	s.maybePrewarmStructFields(docURI, path, text)
 
 	// Eagerly start the persistent BEAM process so the first format is instant.
 	// Skip deps and stdlib files — we don't format those.
@@ -508,7 +535,9 @@ func (s *Server) DidChange(ctx context.Context, params *protocol.DidChangeTextDo
 	if len(params.ContentChanges) > 0 {
 		// Full sync mode — last change contains the full text
 		text := params.ContentChanges[len(params.ContentChanges)-1].Text
-		s.docs.Set(string(params.TextDocument.URI), text)
+		docURI := string(params.TextDocument.URI)
+		s.docs.Set(docURI, text)
+		s.maybePrewarmStructFields(docURI, uriToPath(params.TextDocument.URI), text)
 	}
 	return nil
 }
@@ -557,6 +586,7 @@ func (s *Server) DidSave(ctx context.Context, params *protocol.DidSaveTextDocume
 			return
 		}
 
+		s.invalidateStructFieldCacheForFile(path, defs)
 		if err := s.store.IndexFileWithRefs(path, defs, refs); err != nil {
 			log.Printf("Error indexing %s: %v", path, err)
 		}
@@ -1208,6 +1238,479 @@ func (s *Server) getErlangExports(ctx context.Context, filePath, module string) 
 	return exports
 }
 
+func (s *Server) structFieldBuildRoot(filePath string) string {
+	if filePath != "" {
+		return s.findBuildRoot(filepath.Dir(filePath))
+	}
+	return s.findBuildRoot(s.projectRoot)
+}
+
+// resolveVariableTypeFromExCk checks if a variable was assigned from a module
+// function call and queries the ExCk chunk to determine if the function's return
+// type is a struct. Returns the fully-qualified struct module name or "".
+func (s *Server) resolveVariableTypeFromExCk(ctx context.Context, tf *TokenizedFile, filePath, varName string, lineNum, col int) string {
+	calls := tf.VariableFunctionCalls(lineNum, col)
+	if len(calls) == 0 {
+		return ""
+	}
+
+	// Find the call for this variable.
+	var call *VariableFunctionCall
+	for i := range calls {
+		if calls[i].VarName == varName {
+			call = &calls[i]
+			break
+		}
+	}
+	if call == nil {
+		return ""
+	}
+
+	// Fast path: for bare local calls (Module == "__MODULE__"), check the
+	// @spec return type before querying the BEAM. This works even when the
+	// module hasn't been compiled yet.
+	if call.Module == "__MODULE__" {
+		if structRef := findSpecReturnType(tf.tokens, tf.source, call.Function, call.Arity); structRef != "" {
+			aliases := tf.ExtractAliasesInScope(call.Line)
+			s.mergeAliasesFromUseTokenized(tf, aliases)
+			resolvedModule := tf.ResolveModuleExpr(structRef, call.Line)
+			if fullModule := s.resolveModuleWithNesting(resolvedModule, aliases, filePath, call.Line); fullModule != "" {
+				if s.debug {
+					s.debugf("Spec return type struct: %s/%d -> %s", call.Function, call.Arity, fullModule)
+				}
+				return fullModule
+			}
+		}
+	}
+
+	// Resolve the module reference through aliases.
+	aliases := tf.ExtractAliasesInScope(call.Line)
+	s.mergeAliasesFromUseTokenized(tf, aliases)
+	resolvedModule := tf.ResolveModuleExpr(call.Module, call.Line)
+	fullCallModule := s.resolveModuleWithNesting(resolvedModule, aliases, filePath, call.Line)
+	if fullCallModule == "" {
+		return ""
+	}
+
+	buildRoot := s.structFieldBuildRoot(filePath)
+	if buildRoot == "" {
+		return ""
+	}
+
+	bp := s.getBeamProcess(ctx, buildRoot)
+	if bp == nil {
+		return ""
+	}
+	if err := bp.Ready(ctx); err != nil {
+		return ""
+	}
+
+	structModule, err := bp.ReturnTypeStruct(ctx, fullCallModule, call.Function, call.Arity)
+	if err == nil && structModule != "" {
+		if s.debug {
+			s.debugf("ExCk return type struct: %s.%s/%d -> %s", fullCallModule, call.Function, call.Arity, structModule)
+		}
+		return structModule
+	}
+
+	// BEAM inference gave up (typically because Elixir's compile-time type
+	// inferencer collapses to :term through Repo/normalize/with wrappers).
+	// Fall back to parsing the source @spec of the target function.
+	if specModule := s.resolveCrossModuleSpecReturnStruct(fullCallModule, call.Function, call.Arity); specModule != "" {
+		if s.debug {
+			s.debugf("Cross-module @spec struct: %s.%s/%d -> %s", fullCallModule, call.Function, call.Arity, specModule)
+		}
+		return specModule
+	}
+
+	return ""
+}
+
+// resolveCrossModuleSpecReturnStruct reads the source file of callModule and
+// looks for a @spec for `function` whose return type contains a struct (either
+// directly as Module.t() or wrapped in {:ok, ...}). Used as a fallback when
+// BEAM ExCk inference returns nothing because Elixir's compile-time inferencer
+// couldn't deduce a richer return type.
+func (s *Server) resolveCrossModuleSpecReturnStruct(callModule, function string, arity int) string {
+	modResults, err := s.store.LookupModule(callModule)
+	if err != nil || len(modResults) == 0 {
+		return ""
+	}
+	modDef := modResults[0]
+	text, _, ok := s.readFileText(modDef.FilePath)
+	if !ok {
+		return ""
+	}
+	tf := NewTokenizedFile(text)
+
+	// Scope to the target module: start from the module's opening line so we
+	// don't pick up a same-named function's @spec from an earlier module in
+	// the file. modDef.Line is 1-based; convert to a byte offset.
+	startOffset := 0
+	if startLine := modDef.Line - 1; startLine >= 0 && startLine < len(tf.lineStarts) {
+		startOffset = tf.lineStarts[startLine]
+	}
+
+	// Try the exact call arity first; if absent, try arity+1 to handle
+	// default-argument functions (def f(a, b \\ []) generates f/1 and f/2
+	// but only one @spec, usually for the higher arity).
+	structRef, specOffset := findSpecReturnTypeAfter(tf.tokens, tf.source, function, arity, startOffset)
+	if structRef == "" {
+		structRef, specOffset = findSpecReturnTypeAfter(tf.tokens, tf.source, function, arity+1, startOffset)
+	}
+	if structRef == "" {
+		return ""
+	}
+
+	// Resolve the struct reference using the target file's aliases at the
+	// @spec's line. "__MODULE__" inside a cross-module spec means the
+	// callee's module itself.
+	specLine := 0
+	for ln := len(tf.lineStarts) - 1; ln >= 0; ln-- {
+		if tf.lineStarts[ln] <= specOffset {
+			specLine = ln
+			break
+		}
+	}
+	if structRef == "__MODULE__" {
+		return callModule
+	}
+	aliases := tf.ExtractAliasesInScope(specLine)
+	s.mergeAliasesFromUseTokenized(tf, aliases)
+	resolved := tf.ResolveModuleExpr(structRef, specLine)
+	return s.resolveModuleWithNesting(resolved, aliases, modDef.FilePath, specLine)
+}
+
+func (s *Server) cachedStructFieldsOrWarm(filePath, module string) ([]string, bool) {
+	return s.cachedStructFieldsOrWarmWithLogging(filePath, module, true)
+}
+
+func (s *Server) prewarmStructFields(filePath, module string) {
+	_, _ = s.cachedStructFieldsOrWarmWithLogging(filePath, module, false)
+}
+
+func (s *Server) cachedStructFieldsOrWarmWithLogging(filePath, module string, logCacheState bool) ([]string, bool) {
+	if module == "" {
+		return nil, false
+	}
+
+	key := structFieldCacheKey{
+		buildRoot: s.structFieldBuildRoot(filePath),
+		module:    module,
+	}
+
+	s.structFieldMu.Lock()
+	generation := s.structFieldGen
+	if entry := s.structFieldCache[key]; entry != nil {
+		if entry.loaded {
+			fields := append([]string(nil), entry.fields...)
+			s.structFieldMu.Unlock()
+			if s.debug && logCacheState {
+				s.debugf("StructFields cache hit")
+				s.debugf("  module=%s", key.module)
+				s.debugf("  fields=%d", len(fields))
+			}
+			return fields, true
+		}
+		if entry.loading {
+			if entry.generation == generation {
+				// A goroutine with the current generation is already warming this entry.
+				s.structFieldMu.Unlock()
+				if s.debug && logCacheState {
+					s.debugf("StructFields cache warming")
+					s.debugf("  module=%s", key.module)
+				}
+				return nil, false
+			}
+			// Stale loading: a goroutine started with an older generation but
+			// the cache was invalidated before it finished. Fall through to start
+			// a fresh warm with the current generation.
+		}
+		entry.loading = true
+		entry.generation = s.structFieldGen
+		generation = s.structFieldGen
+	} else {
+		s.structFieldCache[key] = &structFieldCacheEntry{
+			loading:    true,
+			generation: s.structFieldGen,
+		}
+	}
+	s.structFieldMu.Unlock()
+
+	if s.debug && logCacheState {
+		s.debugf("StructFields cache miss")
+		s.debugf("  module=%s", key.module)
+		s.debugf("  buildRoot=%s", key.buildRoot)
+	}
+	s.backgroundWork.Add(1)
+	go s.warmStructFields(key, generation)
+	return nil, false
+}
+
+func (s *Server) warmStructFields(key structFieldCacheKey, generation uint64) {
+	defer s.backgroundWork.Done()
+	var tWarm time.Time
+	if s.debug {
+		tWarm = time.Now()
+		s.debugf("StructFields lookup start")
+		s.debugf("  module=%s", key.module)
+		s.debugf("  buildRoot=%s", key.buildRoot)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), beamWaitTimeout)
+	defer cancel()
+
+	var fields []string
+	status := "ok"
+	var readyElapsed, lookupElapsed, cacheElapsed time.Duration
+
+	bp := s.getBeamProcess(ctx, key.buildRoot)
+	if bp != nil {
+		tReady := s.debugNow()
+		if err := bp.Ready(ctx); err == nil {
+			if s.debug {
+				readyElapsed = time.Since(tReady)
+			}
+			tRequest := s.debugNow()
+			if result, err := bp.StructFields(ctx, key.module); err == nil {
+				fields = result
+				if s.debug {
+					lookupElapsed = time.Since(tRequest)
+				}
+			} else {
+				status = "lookup_error"
+				s.debugf("StructFields lookup failed for %s: %v", key.module, err)
+			}
+		} else {
+			status = "beam_not_ready"
+			if s.debug {
+				readyElapsed = time.Since(tReady)
+				s.debugf("StructFields BEAM not ready for %s: %v", key.module, err)
+			}
+		}
+	} else {
+		status = "no_beam"
+		s.debugf("StructFields no BEAM process for module=%s buildRoot=%s", key.module, key.buildRoot)
+	}
+
+	tCache := s.debugNow()
+	s.structFieldMu.Lock()
+	entry := s.structFieldCache[key]
+	if entry == nil {
+		// Entry was deleted while we were warming — invalidated by another change.
+		s.structFieldMu.Unlock()
+		if s.debug {
+			s.debugf("StructFields lookup discarded")
+			s.debugf("  module=%s", key.module)
+			s.debugf("  reason=entry deleted during lookup")
+			s.debugf("  total=%s", time.Since(tWarm).Round(time.Microsecond))
+		}
+		return
+	}
+	if entry.generation != generation {
+		// Entry was recreated by a newer goroutine — our result is stale.
+		// Don't interfere with the newer goroutine's entry.
+		s.structFieldMu.Unlock()
+		if s.debug {
+			s.debugf("StructFields lookup discarded")
+			s.debugf("  module=%s", key.module)
+			s.debugf("  reason=generation mismatch (entry=%d, goroutine=%d)", entry.generation, generation)
+			s.debugf("  total=%s", time.Since(tWarm).Round(time.Microsecond))
+		}
+		return
+	}
+	entry.fields = fields
+	entry.loaded = true
+	entry.loading = false
+	s.structFieldMu.Unlock()
+	if s.debug {
+		cacheElapsed = time.Since(tCache)
+		s.debugf("StructFields lookup finished")
+		s.debugf("  module=%s", key.module)
+		s.debugf("  status=%s", status)
+		s.debugf("  fields=%d", len(fields))
+		s.debugf("  ready=%s", readyElapsed.Round(time.Microsecond))
+		s.debugf("  lookup=%s", lookupElapsed.Round(time.Microsecond))
+		s.debugf("  cache_write=%s", cacheElapsed.Round(time.Microsecond))
+		s.debugf("  total=%s", time.Since(tWarm).Round(time.Microsecond))
+	}
+}
+
+func (s *Server) clearStructFieldCacheForBuildRoot(buildRoot string) {
+	s.structFieldMu.Lock()
+	removed := 0
+	for key := range s.structFieldCache {
+		if key.buildRoot == buildRoot {
+			delete(s.structFieldCache, key)
+			removed++
+		}
+	}
+	if removed > 0 {
+		s.structFieldGen++
+	}
+	s.structFieldMu.Unlock()
+}
+
+func moduleNamesFromDefs(defs []parser.Definition) []string {
+	seen := make(map[string]bool)
+	var modules []string
+	for _, def := range defs {
+		if def.Module == "" {
+			continue
+		}
+		if !seen[def.Module] {
+			seen[def.Module] = true
+			modules = append(modules, def.Module)
+		}
+	}
+	return modules
+}
+
+func (s *Server) invalidateStructFieldCacheForFile(filePath string, newDefs []parser.Definition) {
+	modules := make(map[string]bool)
+	if oldModules, err := s.store.LookupModulesInFile(filePath); err == nil {
+		for _, module := range oldModules {
+			modules[module] = true
+		}
+	}
+	for _, module := range moduleNamesFromDefs(newDefs) {
+		modules[module] = true
+	}
+	if len(modules) == 0 {
+		return
+	}
+
+	removed := 0
+	s.structFieldMu.Lock()
+	for key := range s.structFieldCache {
+		if modules[key.module] {
+			delete(s.structFieldCache, key)
+			removed++
+		}
+	}
+	if removed > 0 {
+		s.structFieldGen++
+	}
+	s.structFieldMu.Unlock()
+
+	if s.debug && removed > 0 {
+		s.debugf("StructFields cache invalidated")
+		s.debugf("  file=%s", filePath)
+		s.debugf("  modules=%d", len(modules))
+		s.debugf("  entries=%d", removed)
+	}
+}
+
+func (s *Server) maybePrewarmStructFields(docURI, filePath, text string) {
+	if filePath == "" || !parser.IsElixirFile(filePath) || !s.isProjectFile(filePath) || s.isDepsFile(filePath) {
+		return
+	}
+	// Trigger prewarm for files that contain struct literals (%Module{}) or
+	// variable assignments to function calls (Module.func()). The cheap
+	// %-check catches the common struct-literal case; without it we still
+	// prewarm, but only if there's an = sign (assignment) that could be
+	// a variable-to-function-call pattern. This avoids prewarming files
+	// that are purely module definitions with no runnable code.
+	if !strings.Contains(text, "%") && !strings.Contains(text, "=") {
+		return
+	}
+
+	// Avoid piling up goroutines on rapid keystrokes: skip if a prewarm
+	// for this document is already in flight. The next change event after
+	// the current one finishes will trigger a fresh prewarm with the latest
+	// text.
+	s.prewarmingFilesMu.Lock()
+	if s.prewarmingFiles[docURI] {
+		s.prewarmingFilesMu.Unlock()
+		return
+	}
+	s.prewarmingFiles[docURI] = true
+	s.prewarmingFilesMu.Unlock()
+
+	s.backgroundWork.Add(1)
+	go func() {
+		defer s.backgroundWork.Done()
+		defer func() {
+			s.prewarmingFilesMu.Lock()
+			delete(s.prewarmingFiles, docURI)
+			s.prewarmingFilesMu.Unlock()
+		}()
+		s.prewarmStructFieldsFromText(docURI, filePath, text)
+	}()
+}
+
+func (s *Server) prewarmStructFieldsFromText(_ string, filePath, text string) {
+	tPrewarm := s.debugNow()
+	tf := NewTokenizedFile(text)
+
+	seen := make(map[string]bool)
+	var warmed int
+
+	// Pre-warm from struct literal references (%Module{}).
+	refs := tf.StructModuleRefs()
+	for _, ref := range refs {
+		aliases := tf.ExtractAliasesInScope(ref.Line)
+		s.mergeAliasesFromUseTokenized(tf, aliases)
+		moduleRef := tf.ResolveModuleExpr(ref.ModuleRef, ref.Line)
+		fullModule := s.resolveModuleWithNesting(moduleRef, aliases, filePath, ref.Line)
+		if fullModule == "" || seen[fullModule] {
+			continue
+		}
+		seen[fullModule] = true
+		s.prewarmStructFields(filePath, fullModule)
+		warmed++
+	}
+
+	// Pre-warm from function call return types via ExCk.
+	// Scan the entire file for var = Module.func(...) patterns.
+	calls := tf.AllVariableFunctionCalls()
+	if len(calls) > 0 {
+		buildRoot := s.structFieldBuildRoot(filePath)
+		if buildRoot != "" {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			bp := s.getBeamProcess(ctx, buildRoot)
+			if bp != nil && bp.Ready(ctx) == nil {
+				type excResult struct {
+					structModule string
+				}
+				results := make([]excResult, len(calls))
+				var wg sync.WaitGroup
+				for i, call := range calls {
+					aliases := tf.ExtractAliasesInScope(call.Line)
+					s.mergeAliasesFromUseTokenized(tf, aliases)
+					resolvedModule := tf.ResolveModuleExpr(call.Module, call.Line)
+					fullCallModule := s.resolveModuleWithNesting(resolvedModule, aliases, filePath, call.Line)
+					if fullCallModule == "" {
+						continue
+					}
+					wg.Add(1)
+					go func(idx int, mod, fn string, arity int) {
+						defer wg.Done()
+						structModule, err := bp.ReturnTypeStruct(ctx, mod, fn, arity)
+						if err == nil && structModule != "" {
+							results[idx] = excResult{structModule: structModule}
+						}
+					}(i, fullCallModule, call.Function, call.Arity)
+				}
+				wg.Wait()
+				for _, res := range results {
+					if res.structModule == "" || seen[res.structModule] {
+						continue
+					}
+					seen[res.structModule] = true
+					s.prewarmStructFields(filePath, res.structModule)
+					warmed++
+				}
+			}
+			cancel()
+		}
+	}
+
+	if s.debug && warmed > 0 {
+		s.debugf("StructFields prewarm queued=%d (%s)", warmed, time.Since(tPrewarm).Round(time.Microsecond))
+	}
+}
+
 func lineRange(line int) protocol.Range {
 	return protocol.Range{
 		Start: protocol.Position{Line: uint32(line), Character: 0},
@@ -1446,13 +1949,158 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 		return nil, nil
 	}
 
+	if isSpaceCompletionTrigger(params) && !lineCouldBeStructValueSpaceTrigger(lines, lineNum, col) {
+		return nil, nil
+	}
+
 	tf := s.docs.GetTokenizedFile(docURI)
 	if tf == nil {
 		tf = NewTokenizedFile(text)
 	}
 
+	if structCtx, ok := tf.StructCompletionContextAtCursor(lineNum, col); ok {
+		tStruct := s.debugNow()
+		aliases := tf.ExtractAliasesInScope(lineNum)
+		s.mergeAliasesFromUseTokenized(tf, aliases)
+		moduleRef := tf.ResolveModuleExpr(structCtx.ModuleRef, lineNum)
+		fullModule := s.resolveModuleWithNesting(moduleRef, aliases, filePath, lineNum)
+		if s.debug {
+			s.debugf("Completion struct context")
+			s.debugf("  moduleRef=%s", structCtx.ModuleRef)
+			s.debugf("  resolved=%s", fullModule)
+			s.debugf("  prefix=%q", structCtx.FieldPrefix)
+		}
+		fields, ready := s.cachedStructFieldsOrWarm(filePath, fullModule)
+		if !ready || len(fields) == 0 {
+			if s.debug {
+				s.debugf("Completion struct fields unavailable")
+				s.debugf("  module=%s", fullModule)
+				s.debugf("  ready=%v", ready)
+				s.debugf("  fields=%d", len(fields))
+				s.debugf("  elapsed=%s", time.Since(tStruct).Round(time.Microsecond))
+			}
+			if fullModule != "" && !ready {
+				// Cache is warming — signal the client to re-query.
+				return &protocol.CompletionList{IsIncomplete: true}, nil
+			}
+			return nil, nil
+		}
+
+		prefixRange := protocol.Range{
+			Start: protocol.Position{Line: uint32(lineNum), Character: uint32(structCtx.StartCol)},
+			End:   protocol.Position{Line: uint32(lineNum), Character: uint32(col)},
+		}
+		var items []protocol.CompletionItem
+		for _, field := range fields {
+			if !strings.HasPrefix(field, structCtx.FieldPrefix) {
+				continue
+			}
+			items = append(items, protocol.CompletionItem{
+				Label:  field,
+				Kind:   protocol.CompletionItemKindField,
+				Detail: fullModule + " struct field",
+				TextEdit: &protocol.TextEdit{
+					Range:   prefixRange,
+					NewText: field + ": ",
+				},
+			})
+		}
+		if len(items) == 0 {
+			if s.debug {
+				s.debugf("Completion struct fields no matches")
+				s.debugf("  module=%s", fullModule)
+				s.debugf("  prefix=%q", structCtx.FieldPrefix)
+				s.debugf("  fields=%d", len(fields))
+				s.debugf("  elapsed=%s", time.Since(tStruct).Round(time.Microsecond))
+			}
+			return nil, nil
+		}
+		if s.debug {
+			s.debugf("Completion struct fields returned")
+			s.debugf("  module=%s", fullModule)
+			s.debugf("  prefix=%q", structCtx.FieldPrefix)
+			s.debugf("  items=%d", len(items))
+			s.debugf("  cached_fields=%d", len(fields))
+			s.debugf("  elapsed=%s", time.Since(tStruct).Round(time.Microsecond))
+		}
+		return &protocol.CompletionList{
+			IsIncomplete: false,
+			Items:        items,
+		}, nil
+	}
+
+	// "variable." or "variable.field_prefix" — struct field access on a typed variable.
+	if fieldAccess, ok := tf.VariableFieldAccessAtCursor(lineNum, col); ok {
+		fullModule := ""
+
+		// Tier 1: check pattern-match inference (pure tokens, no BEAM needed).
+		varStructTypes := tf.VariableStructTypes(lineNum, col)
+		if structModule, ok := varStructTypes[fieldAccess.VariableName]; ok {
+			aliases := tf.ExtractAliasesInScope(lineNum)
+			s.mergeAliasesFromUseTokenized(tf, aliases)
+			resolvedModule := tf.ResolveModuleExpr(structModule, lineNum)
+			fullModule = s.resolveModuleWithNesting(resolvedModule, aliases, filePath, lineNum)
+		}
+
+		// Tier 2: check ExCk return type inference for function call assignments.
+		if fullModule == "" {
+			fullModule = s.resolveVariableTypeFromExCk(ctx, tf, filePath, fieldAccess.VariableName, lineNum, col)
+		}
+
+		if fullModule != "" {
+			tStruct := s.debugNow()
+			if s.debug {
+				s.debugf("Completion variable struct type")
+				s.debugf("  variable=%s", fieldAccess.VariableName)
+				s.debugf("  resolved=%s", fullModule)
+				s.debugf("  fieldPrefix=%q", fieldAccess.FieldPrefix)
+			}
+			fields, ready := s.cachedStructFieldsOrWarm(filePath, fullModule)
+			if ready && len(fields) > 0 {
+				fieldPrefixRange := protocol.Range{
+					Start: protocol.Position{Line: uint32(lineNum), Character: uint32(fieldAccess.StartCol)},
+					End:   protocol.Position{Line: uint32(lineNum), Character: uint32(col)},
+				}
+				var items []protocol.CompletionItem
+				for _, field := range fields {
+					if !strings.HasPrefix(field, fieldAccess.FieldPrefix) {
+						continue
+					}
+					items = append(items, protocol.CompletionItem{
+						Label:  field,
+						Kind:   protocol.CompletionItemKindField,
+						Detail: fullModule + " struct field",
+						TextEdit: &protocol.TextEdit{
+							Range:   fieldPrefixRange,
+							NewText: field,
+						},
+					})
+				}
+				if len(items) > 0 {
+					if s.debug {
+						s.debugf("Completion variable struct fields returned")
+						s.debugf("  variable=%s", fieldAccess.VariableName)
+						s.debugf("  module=%s", fullModule)
+						s.debugf("  items=%d", len(items))
+						s.debugf("  elapsed=%s", time.Since(tStruct).Round(time.Microsecond))
+					}
+					return &protocol.CompletionList{
+						IsIncomplete: false,
+						Items:        items,
+					}, nil
+				}
+			}
+			// Cache is warming — signal the client to re-query so the next
+			// keystroke hits the warm cache.
+			if !ready {
+				return &protocol.CompletionList{IsIncomplete: true}, nil
+			}
+		}
+	}
+
 	completionCtx := tf.CompletionContextAtCursor(lineNum, col)
 	prefix, afterDot, prefixStartCol := completionCtx.Prefix, completionCtx.AfterDot, completionCtx.StartCol
+	structValueContext := tf.StructValueContextAtCursor(lineNum, col)
 
 	// Inside a multi-line alias block: complete child module segments under the parent.
 	if aliasParent, inBlock := tf.ExtractAliasBlockParent(lineNum); inBlock {
@@ -1493,7 +2141,7 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 		}, nil
 	}
 
-	if prefix == "" && !afterDot {
+	if prefix == "" && !afterDot && !structValueContext {
 		return nil, nil
 	}
 
@@ -1570,6 +2218,7 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 
 	// "Module.func." or "variable." — dot after a function call result or
 	// map/struct field access. We have no type info to complete the result.
+	// (Variable struct types were already handled by VariableFieldAccessAtCursor above.)
 	if afterDot && (funcPrefix != "" || moduleRef == "") {
 		return nil, nil
 	}
@@ -1673,8 +2322,36 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 		for _, r := range results {
 			addModuleItem(r.Module, "module")
 		}
-	} else if funcPrefix != "" {
+	} else if funcPrefix != "" || structValueContext {
 		seen := make(map[string]bool)
+
+		addVariableCompletion := func(varName string) {
+			if !isCompletableVariableName(varName) || !strings.HasPrefix(varName, funcPrefix) || seen[varName] {
+				return
+			}
+			seen[varName] = true
+			item := protocol.CompletionItem{
+				Label:  varName,
+				Kind:   protocol.CompletionItemKindVariable,
+				Detail: "variable",
+			}
+			// In struct value positions a variable is the likely target; sort it first.
+			if structValueContext {
+				item.SortText = "000_" + varName
+			}
+			items = append(items, item)
+		}
+
+		// Variables are usually the intended target in bare value positions.
+		if tree, src, release, ok := s.docs.GetTree(docURI); ok {
+			defer release()
+			for _, varName := range treesitter.FindVariablesInScopeWithTree(tree.RootNode(), src, uint(lineNum), uint(col)) {
+				addVariableCompletion(varName)
+			}
+		}
+		for _, varName := range tf.VariableNamesBeforeCursor(lineNum, col) {
+			addVariableCompletion(varName)
+		}
 
 		for _, bf := range tf.FindBufferFunctions() {
 			key := funcKey(bf.Name, bf.Arity)
@@ -1743,7 +2420,6 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 				})
 			}
 		}
-
 		if s.snippetSupport {
 			for name, snippet := range elixirFormSnippets {
 				if strings.HasPrefix(name, funcPrefix) && !seen[name] {
@@ -1783,6 +2459,83 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 		IsIncomplete: len(items) >= 100,
 		Items:        items,
 	}, nil
+}
+
+func isSpaceCompletionTrigger(params *protocol.CompletionParams) bool {
+	return params.Context != nil &&
+		params.Context.TriggerKind == protocol.CompletionTriggerKindTriggerCharacter &&
+		params.Context.TriggerCharacter == " "
+}
+
+// lineCouldBeStructValueSpaceTrigger is a cheap pre-filter that returns true
+// if the cursor looks like it's inside a struct value position (e.g. after
+// "name: " inside %User{...}). It checks the current line for the ": " pattern
+// and scans backwards through preceding lines for the "%Module{" opening.
+// False positives are acceptable — they just let the space trigger through to
+// the token-based StructValueContextAtCursor check.
+func lineCouldBeStructValueSpaceTrigger(lines []string, lineNum, col int) bool {
+	if lineNum < 0 || lineNum >= len(lines) || col <= 0 {
+		return false
+	}
+	line := lines[lineNum]
+	if col > len(line) {
+		col = len(line)
+	}
+	before := line[:col]
+	if len(before) == 0 || before[len(before)-1] != ' ' {
+		return false
+	}
+
+	colonIdx := strings.LastIndexByte(before, ':')
+	if colonIdx < 0 || (colonIdx > 0 && before[colonIdx-1] == ':') {
+		return false
+	}
+	for i := colonIdx + 1; i < len(before); i++ {
+		if before[i] != ' ' && before[i] != '\t' {
+			return false
+		}
+	}
+
+	// Build the full text from the start of the document up to the colon
+	// so we can find the %Module{ opening even when it spans multiple lines.
+	var buf strings.Builder
+	for l := 0; l < lineNum; l++ {
+		buf.WriteString(lines[l])
+		buf.WriteByte('\n')
+	}
+	buf.WriteString(line[:colonIdx])
+	fullBefore := buf.String()
+
+	braceIdx := strings.LastIndexByte(fullBefore, '{')
+	if braceIdx < 0 {
+		return false
+	}
+	i := braceIdx - 1
+	for i >= 0 && (fullBefore[i] == ' ' || fullBefore[i] == '\t' || fullBefore[i] == '\n') {
+		i--
+	}
+	if i < 0 || !isStructModuleRefByte(fullBefore[i]) {
+		return false
+	}
+	for i >= 0 && isStructModuleRefByte(fullBefore[i]) {
+		i--
+	}
+	for i >= 0 && (fullBefore[i] == ' ' || fullBefore[i] == '\t' || fullBefore[i] == '\n') {
+		i--
+	}
+	return i >= 0 && fullBefore[i] == '%'
+}
+
+func isStructModuleRefByte(b byte) bool {
+	return (b >= 'A' && b <= 'Z') ||
+		(b >= 'a' && b <= 'z') ||
+		(b >= '0' && b <= '9') ||
+		b == '_' ||
+		b == '.'
+}
+
+func isCompletableVariableName(name string) bool {
+	return name != "" && !strings.HasPrefix(name, "_")
 }
 
 // cachedUsing returns the parsed __using__ body for the given module name.
@@ -2750,12 +3503,14 @@ func (s *Server) DidChangeWatchedFiles(ctx context.Context, params *protocol.Did
 					return
 				}
 
+				s.invalidateStructFieldCacheForFile(filePath, defs)
 				if err := s.store.IndexFileWithRefs(filePath, defs, refs); err != nil {
 					log.Printf("Error indexing %s: %v", filePath, err)
 				}
 			}(path)
 		case protocol.FileChangeTypeDeleted:
 			go func(filePath string) {
+				s.invalidateStructFieldCacheForFile(filePath, nil)
 				if err := s.store.RemoveFile(filePath); err != nil {
 					log.Printf("Error removing %s from index: %v", filePath, err)
 				}

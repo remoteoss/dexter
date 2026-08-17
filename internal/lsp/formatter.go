@@ -45,11 +45,13 @@ const (
 
 	formatterOpFormat byte = 0x00
 
-	codeIntelOpErlangSource   byte = 0x00
-	codeIntelOpErlangDocs     byte = 0x01
-	codeIntelOpWarmOTPModules byte = 0x02
-	codeIntelOpErlangExports  byte = 0x03
-	codeIntelOpRuntimeInfo    byte = 0x04
+	codeIntelOpErlangSource     byte = 0x00
+	codeIntelOpErlangDocs       byte = 0x01
+	codeIntelOpWarmOTPModules   byte = 0x02
+	codeIntelOpErlangExports    byte = 0x03
+	codeIntelOpRuntimeInfo      byte = 0x04
+	codeIntelOpStructFields     byte = 0x05
+	codeIntelOpReturnTypeStruct byte = 0x06
 
 	beamNotificationOTPModulesReady  byte = 0x00
 	beamNotificationOTPModulesFailed byte = 0x01
@@ -657,6 +659,82 @@ func (bp *beamProcess) ErlangExports(ctx context.Context, module string) ([]Erla
 	return exports, err
 }
 
+// StructFields asks the BEAM's CodeIntel service for the fields of a compiled
+// Elixir struct module.
+func (bp *beamProcess) StructFields(ctx context.Context, module string) ([]string, error) {
+	var fields []string
+	var payload bytes.Buffer
+	_ = binary.Write(&payload, binary.BigEndian, uint16(len(module)))
+	payload.WriteString(module)
+
+	err := bp.doRequest(ctx, serviceCodeIntel, codeIntelOpStructFields, payload.Bytes(), func(status byte, payload []byte) error {
+		if status != 0 {
+			if len(payload) > 0 {
+				return fmt.Errorf("struct fields failed: %s", strings.TrimSpace(string(payload)))
+			}
+			return fmt.Errorf("struct fields failed")
+		}
+
+		reader := bytes.NewReader(payload)
+		var fieldCount uint16
+		if err := binary.Read(reader, binary.BigEndian, &fieldCount); err != nil {
+			return fmt.Errorf("read field count: %w", err)
+		}
+		fields = make([]string, 0, fieldCount)
+		for i := 0; i < int(fieldCount); i++ {
+			var fieldLen uint16
+			if err := binary.Read(reader, binary.BigEndian, &fieldLen); err != nil {
+				return fmt.Errorf("read field length: %w", err)
+			}
+			fieldBuf := make([]byte, fieldLen)
+			if _, err := io.ReadFull(reader, fieldBuf); err != nil {
+				return fmt.Errorf("read field: %w", err)
+			}
+			fields = append(fields, string(fieldBuf))
+		}
+		return nil
+	})
+	return fields, err
+}
+
+// ReturnTypeStruct queries the ExCk chunk of a compiled module to determine if
+// a function's return type is a struct. Returns the struct module name (e.g.
+// "MyApp.User") or empty string if the return type is not a single struct type.
+// Gracefully returns empty string if the ExCk chunk is not available.
+func (bp *beamProcess) ReturnTypeStruct(ctx context.Context, module, function string, arity int) (string, error) {
+	var payload bytes.Buffer
+	_ = binary.Write(&payload, binary.BigEndian, uint16(len(module)))
+	payload.WriteString(module)
+	_ = binary.Write(&payload, binary.BigEndian, uint16(len(function)))
+	payload.WriteString(function)
+	payload.WriteByte(byte(arity))
+
+	var structModule string
+	err := bp.doRequest(ctx, serviceCodeIntel, codeIntelOpReturnTypeStruct, payload.Bytes(), func(status byte, respPayload []byte) error {
+		if status != 0 {
+			// Non-zero status means lookup failed (e.g. old Elixir without ExCk).
+			// Treat as graceful "not a struct".
+			return nil
+		}
+
+		reader := bytes.NewReader(respPayload)
+		var nameLen uint16
+		if err := binary.Read(reader, binary.BigEndian, &nameLen); err != nil {
+			return fmt.Errorf("read struct module name length: %w", err)
+		}
+		if nameLen == 0 {
+			return nil
+		}
+		nameBuf := make([]byte, nameLen)
+		if _, err := io.ReadFull(reader, nameBuf); err != nil {
+			return fmt.Errorf("read struct module name: %w", err)
+		}
+		structModule = string(nameBuf)
+		return nil
+	})
+	return structModule, err
+}
+
 // FormatError represents a formatting failure (e.g. syntax error in the source).
 // The persistent process is still alive — this is not a protocol/crash error.
 type FormatError struct {
@@ -938,6 +1016,7 @@ func (s *Server) evictBeam(bp *beamProcess, reason string) {
 
 	if buildRoot != "" {
 		log.Printf("BEAM: evicting process for %s (pid %d): %s", buildRoot, bp.cmd.process.Pid, reason)
+		s.clearStructFieldCacheForBuildRoot(buildRoot)
 	} else {
 		log.Printf("BEAM: evicting untracked process (pid %d): %s", bp.cmd.process.Pid, reason)
 	}
