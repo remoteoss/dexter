@@ -115,17 +115,26 @@ func (s *Server) CollectReferences(module, function string) []store.ReferenceRes
 	return out
 }
 
+// WithReindexLock runs fn while holding the reindex lock, serializing it with
+// ReindexWorkspace and the background reindexes. The MCP file watcher wraps
+// its index writes in it so they cannot interleave with a concurrent
+// workspace reindex's walk-and-prune.
+func (s *Server) WithReindexLock(fn func()) {
+	s.reindexing.Lock()
+	defer s.reindexing.Unlock()
+	fn()
+}
+
 // RenameSummary reports what a rename changed on disk.
 type RenameSummary struct {
 	FilesChanged []string
 	FilesMoved   map[string]string // old path → new path (conventional module renames)
 }
 
-// RenameFunction renames module.functionName to newName across the workspace,
-// writing every change to disk. It performs the same validation as the LSP
-// rename. Edits the LSP path would hand to an editor as TextEdits (open
-// buffers in attached mode) are written to disk too, since an MCP caller has
-// no editor to deliver them to.
+// RenameFunction renames module.functionName to newName across the workspace
+// with the same validation and on-disk semantics as the LSP rename. It returns
+// once the index reflects the rename. Open-buffer edits are delivered per
+// deliverEdits.
 func (s *Server) RenameFunction(module, functionName, newName string) (RenameSummary, error) {
 	if !isValidFunctionName(newName) {
 		return RenameSummary{}, fmt.Errorf("invalid function name %q: must match [a-z_][a-z0-9_?!]*", newName)
@@ -145,9 +154,12 @@ func (s *Server) RenameFunction(module, functionName, newName string) (RenameSum
 	if err != nil {
 		return RenameSummary{}, err
 	}
-	if err := s.writeEditsToDisk(edit); err != nil {
+	if err := s.deliverEdits(edit); err != nil {
 		return RenameSummary{}, err
 	}
+	// The machinery reindexes what it wrote in the background; callers are
+	// promised an up-to-date index.
+	s.backgroundWork.Wait()
 	return RenameSummary{FilesChanged: files}, nil
 }
 
@@ -168,18 +180,27 @@ func (s *Server) RenameModule(oldModule, newModule string) (RenameSummary, error
 	if err != nil {
 		return RenameSummary{}, err
 	}
-	if err := s.writeEditsToDisk(edit); err != nil {
+	if err := s.deliverEdits(edit); err != nil {
 		return RenameSummary{}, err
 	}
+	s.backgroundWork.Wait()
 	return RenameSummary{FilesChanged: files, FilesMoved: moved}, nil
 }
 
-// writeEditsToDisk applies a WorkspaceEdit's TextEdits to their files on disk
-// and reindexes them. The rename machinery only produces TextEdits for open
-// editor buffers; headless servers have none, so this is usually a no-op.
-func (s *Server) writeEditsToDisk(edit *protocol.WorkspaceEdit) error {
-	if edit == nil {
+// deliverEdits routes a WorkspaceEdit's TextEdits to whoever owns the
+// documents. The rename machinery only produces TextEdits for open editor
+// buffers; with a live LSP client (attached mode) they are forwarded as a
+// workspace/applyEdit request so the editor applies them and syncs back via
+// didChange, exactly as an editor-initiated rename would. Without a client
+// they are written to disk directly; headless servers have no open buffers,
+// so that path is a defensive no-op in practice.
+func (s *Server) deliverEdits(edit *protocol.WorkspaceEdit) error {
+	if edit == nil || len(edit.Changes) == 0 {
 		return nil
+	}
+	if s.client != nil {
+		_, err := s.client.ApplyEdit(context.Background(), &protocol.ApplyWorkspaceEditParams{Edit: *edit})
+		return err
 	}
 	for docURI, edits := range edit.Changes {
 		path := uriToPath(docURI)

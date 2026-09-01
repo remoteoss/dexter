@@ -1,6 +1,7 @@
 package lsp
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -52,9 +53,8 @@ func TestApplyTextEdits(t *testing.T) {
 	}
 }
 
-// A rename requested through the exported API must land on disk even for
-// files an editor holds open (attached mode), since the caller has no editor
-// to deliver TextEdits to.
+// Without a live client, a rename requested through the exported API must
+// land on disk even for files marked open (the defensive fallback path).
 func TestRenameFunction_WritesOpenBuffers(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
@@ -90,5 +90,56 @@ end
 	results, err := server.store.LookupFunction("MyApp.Accounts", "get_user")
 	if err != nil || len(results) == 0 {
 		t.Errorf("index not updated after rename: %v, %v", results, err)
+	}
+}
+
+// fakeClient records ApplyEdit requests; other client methods are never
+// called by the rename path.
+type fakeClient struct {
+	protocol.Client
+	applied *protocol.WorkspaceEdit
+}
+
+func (f *fakeClient) ApplyEdit(_ context.Context, params *protocol.ApplyWorkspaceEditParams) (bool, error) {
+	f.applied = &params.Edit
+	return true, nil
+}
+
+// With a live client (attached mode), open-buffer edits go to the editor via
+// workspace/applyEdit; dexter must not write those files behind its back.
+func TestRenameFunction_ForwardsOpenBufferEditsToClient(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+	fc := &fakeClient{}
+	server.client = fc
+
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", `defmodule MyApp.Accounts do
+  def fetch_user(id), do: id
+end
+`)
+	openSrc := `defmodule MyApp.Caller do
+  def go(id), do: MyApp.Accounts.fetch_user(id)
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/caller.ex", openSrc)
+	openPath := filepath.Join(server.projectRoot, "lib/caller.ex")
+	server.docs.Set(string(uri.File(openPath)), openSrc)
+
+	if _, err := server.RenameFunction("MyApp.Accounts", "fetch_user", "get_user"); err != nil {
+		t.Fatal(err)
+	}
+
+	if fc.applied == nil {
+		t.Fatal("no workspace/applyEdit request reached the client")
+	}
+	if len(fc.applied.Changes) != 1 {
+		t.Errorf("ApplyEdit carried %d files, want 1", len(fc.applied.Changes))
+	}
+	data, err := os.ReadFile(openPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "get_user") {
+		t.Error("open buffer's file was written to disk despite a live client")
 	}
 }

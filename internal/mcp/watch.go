@@ -12,6 +12,7 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 
+	"github.com/remoteoss/dexter/internal/lsp"
 	"github.com/remoteoss/dexter/internal/parser"
 	"github.com/remoteoss/dexter/internal/store"
 )
@@ -25,23 +26,25 @@ const debounceWindow = 300 * time.Millisecond
 // it watches the project tree directly (fsnotify).
 type Watcher struct {
 	fsw    *fsnotify.Watcher
+	server *lsp.Server
 	store  *store.Store
 	root   string
-	resync func() // full incremental reindex, used when events were lost
 	wg     sync.WaitGroup
 }
 
 // WatchFiles watches projectRoot recursively and incrementally reindexes
-// Elixir files as they change. resync is invoked when the watcher loses
-// events (queue overflow) and the whole tree must be reconciled. Callers
-// should treat an error as degraded service, not fatal: the index still
-// updates on startup, on git branch switches, and via dexter_reindex.
-func WatchFiles(s *store.Store, projectRoot string, resync func()) (*Watcher, error) {
+// Elixir files as they change. Index writes hold the server's reindex lock so
+// they cannot interleave with a concurrent workspace reindex's walk-and-prune
+// (which would drop a file indexed after the walk passed its directory). On
+// event overflow the whole workspace is reindexed. Callers should treat an
+// error as degraded service, not fatal: the index still updates on startup,
+// on git branch switches, and via dexter_reindex.
+func WatchFiles(server *lsp.Server, s *store.Store, projectRoot string) (*Watcher, error) {
 	fsw, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
 	}
-	w := &Watcher{fsw: fsw, store: s, root: projectRoot, resync: resync}
+	w := &Watcher{fsw: fsw, server: server, store: s, root: projectRoot}
 	if err := w.watchTree(projectRoot); err != nil {
 		_ = fsw.Close()
 		return nil, err
@@ -114,9 +117,9 @@ func (w *Watcher) loop() {
 			if !ok {
 				return
 			}
-			if errors.Is(err, fsnotify.ErrEventOverflow) && w.resync != nil {
+			if errors.Is(err, fsnotify.ErrEventOverflow) {
 				log.Printf("Warning: file watcher overflowed, reindexing workspace")
-				w.resync()
+				w.server.ReindexWorkspace()
 				continue
 			}
 			log.Printf("Warning: file watcher: %v", err)
@@ -125,7 +128,7 @@ func (w *Watcher) loop() {
 			timerC = nil
 			batch := pending
 			pending = make(map[string]struct{})
-			w.apply(batch)
+			w.server.WithReindexLock(func() { w.apply(batch) })
 		}
 	}
 }

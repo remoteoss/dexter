@@ -1,11 +1,13 @@
 package mcp
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/remoteoss/dexter/internal/lsp"
 	"github.com/remoteoss/dexter/internal/store"
 )
 
@@ -25,6 +27,11 @@ func eventually(t *testing.T, what string, cond func() bool) {
 }
 
 func setupWatcher(t *testing.T) (*store.Store, string) {
+	s, root, _ := setupWatcherWithServer(t)
+	return s, root
+}
+
+func setupWatcherWithServer(t *testing.T) (*store.Store, string, *lsp.Server) {
 	t.Helper()
 	root := t.TempDir()
 	s, err := store.Open(root)
@@ -33,7 +40,8 @@ func setupWatcher(t *testing.T) (*store.Store, string) {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 
-	w, err := WatchFiles(s, root, nil)
+	server := lsp.NewServer(s, root)
+	w, err := WatchFiles(server, s, root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,7 +50,7 @@ func setupWatcher(t *testing.T) (*store.Store, string) {
 			t.Errorf("closing watcher: %v", err)
 		}
 	})
-	return s, root
+	return s, root, server
 }
 
 func writeFile(t *testing.T, root, rel, content string) string {
@@ -149,5 +157,33 @@ func TestWatcher_SkipsDepsAndNonElixir(t *testing.T) {
 	}
 	if r, _ := s.LookupModule("NotElixir"); len(r) != 0 {
 		t.Error("non-Elixir file was indexed")
+	}
+}
+
+// Watcher writes hold the reindex lock, so files created while a workspace
+// reindex runs can never be indexed between its walk and its prune (which
+// would remove them with their create event already consumed).
+func TestWatcher_SerializesWithWorkspaceReindex(t *testing.T) {
+	s, root, server := setupWatcherWithServer(t)
+	writeFile(t, root, "lib/base.ex", "defmodule MyApp.Base do\nend\n")
+	eventually(t, "base file", moduleIndexed(s, "MyApp.Base"))
+
+	const n = 12
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < n; i++ {
+			server.ReindexWorkspace()
+		}
+	}()
+	for i := 0; i < n; i++ {
+		writeFile(t, root, fmt.Sprintf("lib/race_%d.ex", i), fmt.Sprintf("defmodule MyApp.Race%d do\nend\n", i))
+		time.Sleep(20 * time.Millisecond)
+	}
+	<-done
+
+	for i := 0; i < n; i++ {
+		mod := fmt.Sprintf("MyApp.Race%d", i)
+		eventually(t, mod+" to survive concurrent reindexes", moduleIndexed(s, mod))
 	}
 }
