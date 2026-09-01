@@ -9,7 +9,7 @@ import (
 )
 
 func (s *Server) hoverFromFile(function string, result store.LookupResult) (*protocol.Hover, error) {
-	text, _, ok := s.readFileText(result.FilePath)
+	text, _, ok := s.ReadFileText(result.FilePath)
 	if !ok {
 		return nil, nil
 	}
