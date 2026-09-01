@@ -98,11 +98,12 @@ end
 type fakeClient struct {
 	protocol.Client
 	applied *protocol.WorkspaceEdit
+	reject  bool
 }
 
 func (f *fakeClient) ApplyEdit(_ context.Context, params *protocol.ApplyWorkspaceEditParams) (bool, error) {
 	f.applied = &params.Edit
-	return true, nil
+	return !f.reject, nil
 }
 
 // With a live client (attached mode), open-buffer edits go to the editor via
@@ -141,5 +142,29 @@ end
 	}
 	if strings.Contains(string(data), "get_user") {
 		t.Error("open buffer's file was written to disk despite a live client")
+	}
+}
+
+// An editor may refuse a workspace edit (applied: false); the rename must
+// report failure, not success, when open-buffer edits were not applied.
+func TestRenameFunction_ReportsRejectedApplyEdit(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+	server.client = &fakeClient{reject: true}
+
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", `defmodule MyApp.Accounts do
+  def fetch_user(id), do: id
+end
+`)
+	openSrc := `defmodule MyApp.Caller do
+  def go(id), do: MyApp.Accounts.fetch_user(id)
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/caller.ex", openSrc)
+	openPath := filepath.Join(server.projectRoot, "lib/caller.ex")
+	server.docs.Set(string(uri.File(openPath)), openSrc)
+
+	if _, err := server.RenameFunction("MyApp.Accounts", "fetch_user", "get_user"); err == nil {
+		t.Fatal("rename reported success despite the editor rejecting the edit")
 	}
 }

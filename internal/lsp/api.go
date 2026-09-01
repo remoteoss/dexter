@@ -199,7 +199,10 @@ func (s *Server) deliverEdits(edit *protocol.WorkspaceEdit) error {
 		return nil
 	}
 	if s.client != nil {
-		_, err := s.client.ApplyEdit(context.Background(), &protocol.ApplyWorkspaceEditParams{Edit: *edit})
+		applied, err := s.client.ApplyEdit(context.Background(), &protocol.ApplyWorkspaceEditParams{Edit: *edit})
+		if err == nil && !applied {
+			err = fmt.Errorf("editor did not apply the rename edits for open files")
+		}
 		return err
 	}
 	for docURI, edits := range edit.Changes {
