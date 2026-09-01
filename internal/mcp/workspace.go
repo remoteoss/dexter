@@ -44,7 +44,7 @@ func (h *Handler) workspaceHandler(ctx context.Context, req *mcp.CallToolRequest
 	if stored := h.store.GetIndexVersion(); stored != version.IndexVersion {
 		fmt.Fprintf(&b, "WARNING: index version %d does not match this binary (%d). Restart dexter mcp to rebuild.\n", stored, version.IndexVersion)
 	}
-	fmt.Fprintf(&b, "\nThe index updates automatically on git branch switches. After you edit, create, or delete Elixir files, call dexter_reindex before trusting lookups.\n")
+	fmt.Fprintf(&b, "\nThe index updates automatically as files change and on git branch switches; dexter_reindex forces an immediate update.\n")
 
 	return textResult(b.String()), nil, nil
 }

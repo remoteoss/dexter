@@ -3,6 +3,7 @@ module github.com/remoteoss/dexter
 go 1.26.1
 
 require (
+	github.com/fsnotify/fsnotify v1.10.1
 	github.com/mattn/go-sqlite3 v1.14.38
 	github.com/modelcontextprotocol/go-sdk v1.6.1
 	github.com/spf13/cobra v1.10.2

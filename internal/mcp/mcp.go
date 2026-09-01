@@ -109,7 +109,7 @@ func NewServer(h *Handler) *mcp.Server {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "dexter_reindex",
 		Annotations: &mcp.ToolAnnotations{DestructiveHint: new(bool), IdempotentHint: true, OpenWorldHint: new(bool)},
-		Description: "Update dexter's index after creating, editing, or deleting Elixir files so lookups stay accurate. Incremental and fast; the only tool that writes, and it writes only dexter's own index database.",
+		Description: "Force an immediate incremental reindex. The index already updates automatically as files change; use this only when a lookup seems stale. The only tool that writes, and it writes only dexter's own index database.",
 	}, h.reindexHandler)
 
 	return srv

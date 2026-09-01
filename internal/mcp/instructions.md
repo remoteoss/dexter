@@ -16,9 +16,9 @@ Which tool for which question:
 - What a specific file defines: `dexter_file_outline`
 - Project layout and index freshness: `dexter_workspace`
 
-After you create, edit, or delete Elixir files by any means, call
-`dexter_reindex` (fast, incremental) so results stay accurate. Git branch
-switches are picked up automatically.
+The index updates automatically: file changes are watched (fsnotify) and git
+branch switches are detected. If a lookup ever seems stale, `dexter_reindex`
+forces an immediate incremental update.
 
 Elixir specifics: modules are not tied to files (use `dexter_file_outline` for
 a file, `dexter_definition` for a module); pass fully-qualified module names,
