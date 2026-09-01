@@ -15,6 +15,8 @@ Which tool for which question:
 - Implementations of a behaviour or protocol: `dexter_implementations`
 - What a specific file defines: `dexter_file_outline`
 - Project layout and index freshness: `dexter_workspace`
+- Rename a module or function everywhere: `dexter_rename_symbol` (writes the
+  changes; review with `git diff`)
 
 The index updates automatically: file changes are watched (fsnotify) and git
 branch switches are detected. If a lookup ever seems stale, `dexter_reindex`

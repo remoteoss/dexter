@@ -615,7 +615,7 @@ func TestIntegration_MCPStdio(t *testing.T) {
 	for _, tool := range tools.Tools {
 		names[tool.Name] = true
 	}
-	for _, want := range []string{"dexter_workspace", "dexter_search", "dexter_definition", "dexter_references", "dexter_module_api", "dexter_file_outline", "dexter_implementations", "dexter_call_hierarchy", "dexter_reindex"} {
+	for _, want := range []string{"dexter_workspace", "dexter_search", "dexter_definition", "dexter_references", "dexter_module_api", "dexter_file_outline", "dexter_implementations", "dexter_call_hierarchy", "dexter_reindex", "dexter_rename_symbol"} {
 		if !names[want] {
 			t.Errorf("tool %s not advertised; got %v", want, names)
 		}
@@ -664,7 +664,7 @@ func TestIntegration_MCPStdio_EmptyIndexBuildsOnStartup(t *testing.T) {
 func TestIntegration_MCPInstructions(t *testing.T) {
 	binary := buildDexter(t)
 	out := runDexter(t, binary, t.TempDir(), "mcp", "--instructions")
-	for _, want := range []string{"dexter_workspace", "dexter_reindex"} {
+	for _, want := range []string{"dexter_workspace", "dexter_reindex", "dexter_rename_symbol"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("instructions missing %q", want)
 		}

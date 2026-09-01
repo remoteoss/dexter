@@ -2,7 +2,9 @@ package lsp
 
 import (
 	"context"
+	"fmt"
 	"io"
+	"os"
 	"sort"
 	"strings"
 
@@ -111,4 +113,117 @@ func (s *Server) CollectReferences(module, function string) []store.ReferenceRes
 		return out[i].Line < out[j].Line
 	})
 	return out
+}
+
+// RenameSummary reports what a rename changed on disk.
+type RenameSummary struct {
+	FilesChanged []string
+	FilesMoved   map[string]string // old path → new path (conventional module renames)
+}
+
+// RenameFunction renames module.functionName to newName across the workspace,
+// writing every change to disk. It performs the same validation as the LSP
+// rename. Edits the LSP path would hand to an editor as TextEdits (open
+// buffers in attached mode) are written to disk too, since an MCP caller has
+// no editor to deliver them to.
+func (s *Server) RenameFunction(module, functionName, newName string) (RenameSummary, error) {
+	if !isValidFunctionName(newName) {
+		return RenameSummary{}, fmt.Errorf("invalid function name %q: must match [a-z_][a-z0-9_?!]*", newName)
+	}
+	defs, err := s.store.LookupFunction(module, functionName)
+	if err != nil {
+		return RenameSummary{}, err
+	}
+	if len(defs) == 0 {
+		return RenameSummary{}, fmt.Errorf("function %s.%s not found in the index", module, functionName)
+	}
+	if existing, err := s.store.LookupFunction(module, newName); err == nil && len(existing) > 0 {
+		return RenameSummary{}, fmt.Errorf("function %s.%s already exists", module, newName)
+	}
+
+	edit, files, err := s.renameFunctionEdits(module, functionName, newName)
+	if err != nil {
+		return RenameSummary{}, err
+	}
+	if err := s.writeEditsToDisk(edit); err != nil {
+		return RenameSummary{}, err
+	}
+	return RenameSummary{FilesChanged: files}, nil
+}
+
+// RenameModule renames oldModule (and its submodules) to newModule across the
+// workspace, writing changes and conventional file moves to disk.
+func (s *Server) RenameModule(oldModule, newModule string) (RenameSummary, error) {
+	if !isValidModuleName(newModule) {
+		return RenameSummary{}, fmt.Errorf("invalid module name %q: must be CamelCase segments separated by dots", newModule)
+	}
+	if defs, err := s.store.LookupModule(oldModule); err != nil || len(defs) == 0 {
+		if err != nil {
+			return RenameSummary{}, err
+		}
+		return RenameSummary{}, fmt.Errorf("module %s not found in the index", oldModule)
+	}
+
+	edit, moved, files, err := s.renameModuleEdits(context.Background(), oldModule, newModule, "")
+	if err != nil {
+		return RenameSummary{}, err
+	}
+	if err := s.writeEditsToDisk(edit); err != nil {
+		return RenameSummary{}, err
+	}
+	return RenameSummary{FilesChanged: files, FilesMoved: moved}, nil
+}
+
+// writeEditsToDisk applies a WorkspaceEdit's TextEdits to their files on disk
+// and reindexes them. The rename machinery only produces TextEdits for open
+// editor buffers; headless servers have none, so this is usually a no-op.
+func (s *Server) writeEditsToDisk(edit *protocol.WorkspaceEdit) error {
+	if edit == nil {
+		return nil
+	}
+	for docURI, edits := range edit.Changes {
+		path := uriToPath(docURI)
+		text, _, ok := s.ReadFileText(path)
+		if !ok {
+			return fmt.Errorf("reading %s to apply rename edits", path)
+		}
+		if err := os.WriteFile(path, []byte(applyTextEdits(text, edits)), 0644); err != nil {
+			return err
+		}
+	}
+	if len(edit.Changes) > 0 {
+		paths := make([]string, 0, len(edit.Changes))
+		for docURI := range edit.Changes {
+			paths = append(paths, uriToPath(docURI))
+		}
+		s.reindexPaths(paths)
+	}
+	return nil
+}
+
+// applyTextEdits applies non-overlapping TextEdits to text. Positions use the
+// same line/byte-column convention the rename machinery produces them in.
+func applyTextEdits(text string, edits []protocol.TextEdit) string {
+	sorted := make([]protocol.TextEdit, len(edits))
+	copy(sorted, edits)
+	sort.Slice(sorted, func(i, j int) bool {
+		a, b := sorted[i].Range.Start, sorted[j].Range.Start
+		if a.Line != b.Line {
+			return a.Line > b.Line
+		}
+		return a.Character > b.Character
+	})
+
+	lines := strings.Split(text, "\n")
+	for _, e := range sorted {
+		start, end := e.Range.Start, e.Range.End
+		if int(start.Line) >= len(lines) || int(end.Line) >= len(lines) {
+			continue
+		}
+		prefix := lines[start.Line][:start.Character]
+		suffix := lines[end.Line][end.Character:]
+		replacement := strings.Split(prefix+e.NewText+suffix, "\n")
+		lines = append(lines[:start.Line], append(replacement, lines[end.Line+1:]...)...)
+	}
+	return strings.Join(lines, "\n")
 }

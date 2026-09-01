@@ -145,6 +145,7 @@ func TestListTools(t *testing.T) {
 		"dexter_module_api",
 		"dexter_references",
 		"dexter_reindex",
+		"dexter_rename_symbol",
 		"dexter_search",
 		"dexter_workspace",
 	}
@@ -176,7 +177,7 @@ func TestListTools(t *testing.T) {
 		if a.OpenWorldHint == nil || *a.OpenWorldHint {
 			t.Errorf("tool %s not marked closed-world", tool.Name)
 		}
-		wantReadOnly := tool.Name != "dexter_reindex"
+		wantReadOnly := tool.Name != "dexter_reindex" && tool.Name != "dexter_rename_symbol"
 		if a.ReadOnlyHint != wantReadOnly {
 			t.Errorf("tool %s ReadOnlyHint = %v, want %v", tool.Name, a.ReadOnlyHint, wantReadOnly)
 		}

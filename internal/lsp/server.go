@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -4172,7 +4173,8 @@ func (s *Server) Rename(ctx context.Context, params *protocol.RenameParams) (*pr
 				if existing, err := s.store.LookupFunction(fullModule, params.NewName); err == nil && len(existing) > 0 {
 					return nil, fmt.Errorf("function %s.%s already exists", fullModule, params.NewName)
 				}
-				return s.renameFunctionEdits(fullModule, functionName, params.NewName)
+				edit, _, err := s.renameFunctionEdits(fullModule, functionName, params.NewName)
+				return edit, err
 			}
 		} else if moduleRef != "" {
 			fullModule := resolveModule(moduleRef, aliases)
@@ -4186,7 +4188,8 @@ func (s *Server) Rename(ctx context.Context, params *protocol.RenameParams) (*pr
 				if !isValidModuleName(newModule) {
 					return nil, fmt.Errorf("invalid module name %q: must be CamelCase segments separated by dots", params.NewName)
 				}
-				return s.renameModuleEdits(ctx, fullModule, newModule, uriToPath(params.TextDocument.URI))
+				edit, _, _, err := s.renameModuleEdits(ctx, fullModule, newModule, uriToPath(params.TextDocument.URI))
+				return edit, err
 			}
 		}
 	}
@@ -4195,8 +4198,9 @@ func (s *Server) Rename(ctx context.Context, params *protocol.RenameParams) (*pr
 }
 
 // renameFunctionEdits builds a WorkspaceEdit renaming all occurrences of
-// module.functionName to newName across the codebase.
-func (s *Server) renameFunctionEdits(module, functionName, newName string) (*protocol.WorkspaceEdit, error) {
+// module.functionName to newName across the codebase. The second return lists
+// every file it edited.
+func (s *Server) renameFunctionEdits(module, functionName, newName string) (*protocol.WorkspaceEdit, []string, error) {
 	// Collect all (filePath, lineNumber) pairs — definitions + references
 	type siteKey struct {
 		filePath string
@@ -4225,7 +4229,7 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*pro
 	// Definition sites
 	defResults, err := s.store.LookupFunction(module, functionName)
 	if err != nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	for _, r := range defResults {
 		addSite(r.FilePath, r.Line)
@@ -4234,7 +4238,7 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*pro
 	// Direct reference sites (calls, imports — skip alias/use which are module-level)
 	refResults, err := s.store.LookupReferences(module, functionName)
 	if err != nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	for _, r := range refResults {
 		if r.Kind == "alias" || r.Kind == "use" {
@@ -4322,6 +4326,11 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*pro
 
 	edit := s.buildTextEdits(sites, functionName, newName)
 
+	changedFiles := make(map[string]bool, len(sites))
+	for _, site := range sites {
+		changedFiles[site.filePath] = true
+	}
+
 	// Update defdelegate lines that forward to this function: add or update
 	// the `as:` option so the facade keeps working after the rename.
 	if s.followDelegates {
@@ -4359,6 +4368,7 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*pro
 					continue
 				}
 
+				changedFiles[del.FilePath] = true
 				fileURI := protocol.DocumentURI(uri.File(del.FilePath))
 				if open {
 					if edit.Changes == nil {
@@ -4383,7 +4393,12 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*pro
 		}
 	}
 
-	return edit, nil
+	files := make([]string, 0, len(changedFiles))
+	for fp := range changedFiles {
+		files = append(files, fp)
+	}
+	sort.Strings(files)
+	return edit, files, nil
 }
 
 // renameModuleEdits builds a WorkspaceEdit renaming oldModule to newModule,
@@ -4393,14 +4408,16 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*pro
 // parallel goroutines. Only open buffers are included in the returned
 // WorkspaceEdit, keeping the response small and avoiding editor freezes.
 // Files following the naming convention are also renamed/moved.
-func (s *Server) renameModuleEdits(ctx context.Context, oldModule, newModule, triggerFilePath string) (*protocol.WorkspaceEdit, error) {
+// renameModuleEdits' extra returns list the files it moved (old path to new
+// path, open and closed alike) and the files it edited.
+func (s *Server) renameModuleEdits(ctx context.Context, oldModule, newModule, triggerFilePath string) (*protocol.WorkspaceEdit, map[string]string, []string, error) {
 	mr := s.buildModuleRename(oldModule, newModule)
 
 	// Check for collisions: verify that none of the target module names
 	// (including submodules) already exist, and that no destination file
 	// paths are occupied.
 	if err := mr.checkCollisions(); err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 
 	mr.collectSites()
@@ -4436,7 +4453,19 @@ func (s *Server) renameModuleEdits(ctx context.Context, oldModule, newModule, tr
 		}
 	}
 
-	return &protocol.WorkspaceEdit{Changes: openChanges}, nil
+	moved := make(map[string]string, len(movedFiles)+len(openMovedFiles))
+	for from, to := range movedFiles {
+		moved[from] = to
+	}
+	for from, to := range openMovedFiles {
+		moved[from] = to
+	}
+	files := make([]string, 0, len(mr.sitesByFile))
+	for fp := range mr.sitesByFile {
+		files = append(files, fp)
+	}
+	sort.Strings(files)
+	return &protocol.WorkspaceEdit{Changes: openChanges}, moved, files, nil
 }
 
 // moduleRename holds the state for a module rename operation.
