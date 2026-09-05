@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -92,9 +93,10 @@ type Server struct {
 	depsCache   map[string]bool // dir → whether files in that dir are deps
 	depsCacheMu sync.RWMutex
 
-	conn                  jsonrpc2.Conn // raw connection for server-initiated requests not on the Client interface
-	showDocumentSupported bool          // client supports window/showDocument (LSP 3.16+)
-	snippetSupport        bool          // client supports snippet insert text in completions
+	conn                   jsonrpc2.Conn // raw connection for server-initiated requests not on the Client interface
+	showDocumentSupported  bool          // client supports window/showDocument (LSP 3.16+)
+	renameFileOpsSupported bool          // client applies rename resource operations in a WorkspaceEdit
+	snippetSupport         bool          // client supports snippet insert text in completions
 
 	reindexing          sync.Mutex // serializes concurrent backgroundReindex calls
 	notifiedOTPMismatch sync.Once  // prevents repeated OTP mismatch warnings
@@ -146,7 +148,7 @@ func Serve(in io.Reader, out io.Writer, s *store.Store, projectRoot string) erro
 	server.client = protocol.ClientDispatcher(conn, logger)
 	server.conn = conn
 
-	handler := protocol.ServerHandler(server, nil)
+	handler := server.renameHandler(protocol.ServerHandler(server, nil))
 	ctx := context.Background()
 
 	conn.Go(ctx, handler)
@@ -402,6 +404,17 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 
 	if params.Capabilities.Window != nil && params.Capabilities.Window.ShowDocument != nil {
 		s.showDocumentSupported = params.Capabilities.Window.ShowDocument.Support
+	}
+	// Resource operations only exist inside documentChanges, so advertising
+	// them implies documentChanges support. Neovim, for one, lists
+	// resourceOperations without setting the separate documentChanges flag.
+	if ws := params.Capabilities.Workspace; ws != nil && ws.WorkspaceEdit != nil {
+		for _, op := range ws.WorkspaceEdit.ResourceOperations {
+			if op == "rename" {
+				s.renameFileOpsSupported = true
+				break
+			}
+		}
 	}
 	if params.Capabilities.TextDocument != nil && params.Capabilities.TextDocument.Completion != nil &&
 		params.Capabilities.TextDocument.Completion.CompletionItem != nil {
@@ -4082,7 +4095,17 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 	return locations, nil
 }
 
+// Rename implements the protocol.Server interface. It exists only to satisfy
+// the generated dispatcher; Serve intercepts textDocument/rename before that
+// dispatcher runs so the reply can carry resource operations, which
+// protocol.WorkspaceEdit cannot express.
 func (s *Server) Rename(ctx context.Context, params *protocol.RenameParams) (*protocol.WorkspaceEdit, error) {
+	edit, err := s.RenameEdit(ctx, params)
+	return edit.toProtocol(), err
+}
+
+// RenameEdit computes the workspace edit for a textDocument/rename request.
+func (s *Server) RenameEdit(ctx context.Context, params *protocol.RenameParams) (*WorkspaceEdit, error) {
 	docURI := string(params.TextDocument.URI)
 	text, ok := s.docs.GetOrLoad(docURI)
 	if !ok {
@@ -4122,7 +4145,7 @@ func (s *Server) Rename(ctx context.Context, params *protocol.RenameParams) (*pr
 						NewText: params.NewName,
 					})
 				}
-				return &protocol.WorkspaceEdit{Changes: changes}, nil
+				return &WorkspaceEdit{Changes: changes}, nil
 			}
 		}
 	}
@@ -4159,7 +4182,7 @@ func (s *Server) Rename(ctx context.Context, params *protocol.RenameParams) (*pr
 						})
 					}
 				}
-				return &protocol.WorkspaceEdit{Changes: changes}, nil
+				return &WorkspaceEdit{Changes: changes}, nil
 			}
 		}
 
@@ -4193,7 +4216,7 @@ func (s *Server) Rename(ctx context.Context, params *protocol.RenameParams) (*pr
 				if !isValidModuleName(newModule) {
 					return nil, fmt.Errorf("invalid module name %q: must be CamelCase segments separated by dots", params.NewName)
 				}
-				return s.renameModuleEdits(ctx, fullModule, newModule, uriToPath(params.TextDocument.URI))
+				return s.renameModuleEdits(fullModule, newModule)
 			}
 		}
 	}
@@ -4203,7 +4226,7 @@ func (s *Server) Rename(ctx context.Context, params *protocol.RenameParams) (*pr
 
 // renameFunctionEdits builds a WorkspaceEdit renaming all occurrences of
 // module.functionName to newName across the codebase.
-func (s *Server) renameFunctionEdits(module, functionName, newName string) (*protocol.WorkspaceEdit, error) {
+func (s *Server) renameFunctionEdits(module, functionName, newName string) (*WorkspaceEdit, error) {
 	// Collect all (filePath, lineNumber) pairs — definitions + references
 	type siteKey struct {
 		filePath string
@@ -4399,8 +4422,9 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*pro
 // Files not currently open in the editor are written directly to disk in
 // parallel goroutines. Only open buffers are included in the returned
 // WorkspaceEdit, keeping the response small and avoiding editor freezes.
-// Files following the naming convention are also renamed/moved.
-func (s *Server) renameModuleEdits(ctx context.Context, oldModule, newModule, triggerFilePath string) (*protocol.WorkspaceEdit, error) {
+// Files following the naming convention are also renamed/moved: closed ones
+// by the server, open ones by the client through rename operations.
+func (s *Server) renameModuleEdits(oldModule, newModule string) (*WorkspaceEdit, error) {
 	mr := s.buildModuleRename(oldModule, newModule)
 
 	// Check for collisions: verify that none of the target module names
@@ -4414,36 +4438,56 @@ func (s *Server) renameModuleEdits(ctx context.Context, oldModule, newModule, tr
 
 	fileCache := mr.readFiles()
 
-	movedFiles, openMovedFiles, showDocumentPath := mr.moveConventionalFiles(fileCache, triggerFilePath)
+	movedFiles, clientRenames := mr.moveConventionalFiles(fileCache)
 	openChanges := mr.applyEdits(fileCache, movedFiles)
-	mr.reindex(fileCache, movedFiles, openMovedFiles)
+	mr.reindex(fileCache, movedFiles, clientRenames)
 
-	// For open files that were moved: send showDocument so the editor opens
-	// the new path, then delete the old file in the background.
-	if s.showDocumentSupported && s.conn != nil {
-		for oldPath, newPath := range openMovedFiles {
-			showURI := protocol.URI(string(uri.File(newPath)))
-			takeFocus := newPath == showDocumentPath
-			go func() {
-				var result protocol.ShowDocumentResult
-				_ = protocol.Call(context.Background(), s.conn, "window/showDocument", &protocol.ShowDocumentParams{
-					URI:       showURI,
-					TakeFocus: takeFocus,
-				}, &result)
-				// Delete old file after the editor has been redirected
-				_ = os.Remove(oldPath)
-				_ = s.store.RemoveFile(oldPath)
-			}()
+	if len(clientRenames) == 0 {
+		return &WorkspaceEdit{Changes: openChanges}, nil
+	}
+	return renamesToDocumentChanges(openChanges, clientRenames), nil
+}
+
+// renamesToDocumentChanges folds the open buffers' text edits and the file
+// moves the client must perform into a single ordered documentChanges list.
+//
+// Each renamed file's text edits come immediately before its rename
+// operation: the client edits the buffer in place and then moves it, so the
+// buffer follows the file and no stale copy is left behind to be saved back
+// over the rename. Text edits and moves cannot be split across `changes` and
+// `documentChanges` because a client that understands documentChanges ignores
+// `changes` entirely.
+func renamesToDocumentChanges(openChanges map[protocol.DocumentURI][]protocol.TextEdit, clientRenames map[string]string) *WorkspaceEdit {
+	renamedPaths := make([]string, 0, len(clientRenames))
+	for oldPath := range clientRenames {
+		renamedPaths = append(renamedPaths, oldPath)
+	}
+	sort.Strings(renamedPaths)
+
+	changes := make([]interface{}, 0, len(openChanges)+len(clientRenames))
+	renamedURIs := make(map[protocol.DocumentURI]bool, len(clientRenames))
+	for _, oldPath := range renamedPaths {
+		oldURI := pathToURI(oldPath)
+		renamedURIs[oldURI] = true
+		if edits := openChanges[oldURI]; len(edits) > 0 {
+			changes = append(changes, textDocumentEdit(oldURI, edits))
 		}
-	} else if len(openMovedFiles) > 0 {
-		// Client doesn't support showDocument — still clean up old files
-		for oldPath := range openMovedFiles {
-			_ = os.Remove(oldPath)
-			_ = s.store.RemoveFile(oldPath)
-		}
+		changes = append(changes, newRenameFile(oldPath, clientRenames[oldPath]))
 	}
 
-	return &protocol.WorkspaceEdit{Changes: openChanges}, nil
+	otherURIs := make([]string, 0, len(openChanges))
+	for fileURI := range openChanges {
+		if !renamedURIs[fileURI] {
+			otherURIs = append(otherURIs, string(fileURI))
+		}
+	}
+	sort.Strings(otherURIs)
+	for _, u := range otherURIs {
+		fileURI := protocol.DocumentURI(u)
+		changes = append(changes, textDocumentEdit(fileURI, openChanges[fileURI]))
+	}
+
+	return &WorkspaceEdit{DocumentChanges: changes}
 }
 
 // moduleRename holds the state for a module rename operation.
@@ -4620,6 +4664,9 @@ func (mr *moduleRename) findModuleEdits(lineText string, token string) []moduleE
 		}
 		return results
 	}
+	if results := mr.findGroupedAliasEdits(lineText, token, newToken); results != nil {
+		return results
+	}
 	oldSuffix := token
 	newSuffix := newToken
 	for {
@@ -4645,6 +4692,50 @@ func (mr *moduleRename) findModuleEdits(lineText string, token string) []moduleE
 		}
 	}
 	return nil
+}
+
+// findGroupedAliasEdits handles `alias Prefix.{A, B}` (and the require/import
+// forms), where the module name is written once as the prefix and each member
+// is indexed as its own reference — so the reference's full name never appears
+// on the line.
+//
+// Which half moves depends on the rename: renaming the prefix rewrites the
+// prefix, renaming a member rewrites that member inside the braces. Sites for
+// the other members on the same line find nothing once the prefix is rewritten,
+// so a group is only edited once.
+func (mr *moduleRename) findGroupedAliasEdits(lineText, token, newToken string) []moduleEditResult {
+	dot := strings.LastIndexByte(token, '.')
+	if dot <= 0 {
+		return nil
+	}
+	prefix, member := token[:dot], token[dot+1:]
+	prefixCol, groupStart, groupEnd := findGroupedAlias(lineText, prefix)
+	if prefixCol < 0 {
+		return nil
+	}
+	memberCols := findAllTokenColumns(lineText[groupStart:groupEnd], member)
+	if len(memberCols) == 0 {
+		return nil
+	}
+
+	newDot := strings.LastIndexByte(newToken, '.')
+	if newDot <= 0 {
+		// The member lost its namespace; a grouped alias cannot express that.
+		return nil
+	}
+	if newPrefix := newToken[:newDot]; newPrefix != prefix {
+		return []moduleEditResult{{prefixCol, len(prefix), newPrefix}}
+	}
+
+	newMember := newToken[newDot+1:]
+	if newMember == member {
+		return nil
+	}
+	results := make([]moduleEditResult, 0, len(memberCols))
+	for _, col := range memberCols {
+		results = append(results, moduleEditResult{groupStart + col, len(member), newMember})
+	}
+	return results
 }
 
 type moduleEditResult struct {
@@ -4703,14 +4794,21 @@ func (mr *moduleRename) conventionalNewPath(r store.LookupResult) (string, bool)
 	return filepath.Join(prefix, filepath.FromSlash(newSuffix)), true
 }
 
-// moveConventionalFiles moves files that follow the naming convention to their
-// new paths, applying edits in the process. Open files are NOT moved on disk —
-// they are left for applyEdits to handle via TextEdits so the editor buffer
-// stays in sync. Returns moved files, paths that need showDocument calls
-// (open files that were moved), and the path to show for the trigger file.
-func (mr *moduleRename) moveConventionalFiles(fileCache map[string]moduleFileInfo, triggerFilePath string) (movedFiles map[string]string, openMovedFiles map[string]string, showDocumentPath string) {
+// moveConventionalFiles moves files that follow the naming convention to
+// their new paths, applying edits in the process.
+//
+// Files open in the editor are NOT moved here when the client can apply
+// rename resource operations: the client owns the buffer, so it must move the
+// file itself (see renamesToDocumentChanges). Moving it behind the client's
+// back leaves the editor with a modified buffer pointing at a deleted path,
+// and saving that buffer recreates the old file with the new module name.
+//
+// Returns the files moved on disk, the moves left to the client, the open
+// files moved on disk anyway (fallback clients, which need showDocument and a
+// deferred delete), and the path to show for the trigger file.
+func (mr *moduleRename) moveConventionalFiles(fileCache map[string]moduleFileInfo) (movedFiles, clientRenames map[string]string) {
 	movedFiles = make(map[string]string)
-	openMovedFiles = make(map[string]string)
+	clientRenames = make(map[string]string)
 	for _, r := range mr.allModuleDefs {
 		if _, ok := mr.moduleRenames[r.Module]; !ok {
 			continue
@@ -4724,26 +4822,21 @@ func (mr *moduleRename) moveConventionalFiles(fileCache map[string]moduleFileInf
 			continue
 		}
 
-		// Open files: write the new file to disk but DON'T delete the old one
-		// or mark it in movedFiles. Instead track it in openMovedFiles so that
-		// applyEdits still produces TextEdits for the editor buffer, and we
-		// send showDocument to redirect the editor to the new path.
 		if fi.open {
-			updatedLines := mr.applyEditsToLines(fi.lines, mr.sitesByFile[r.FilePath])
-			content := strings.Join(updatedLines, "\n")
-			if err := os.MkdirAll(filepath.Dir(newPath), 0755); err != nil {
-				log.Printf("Rename: cannot create dir for %s: %v", newPath, err)
+			// Client applies rename operations: leave both paths untouched.
+			// applyEdits still emits TextEdits for the old URI, and the rename
+			// operation queued after them carries the edited buffer to the new
+			// path.
+			if mr.server.renameFileOpsSupported {
+				mr.server.debugf("Rename: %s → %s (client-applied)", r.FilePath, newPath)
+				clientRenames[r.FilePath] = newPath
 				continue
 			}
-			if err := os.WriteFile(newPath, []byte(content), 0644); err != nil {
-				log.Printf("Rename: cannot write %s: %v", newPath, err)
-				continue
-			}
-			mr.server.debugf("Rename: %s → %s (open, deferred delete)", r.FilePath, newPath)
-			openMovedFiles[r.FilePath] = newPath
-			if r.FilePath == triggerFilePath && showDocumentPath == "" {
-				showDocumentPath = newPath
-			}
+			// Client cannot move the file and we must not do it behind its
+			// back: deleting a path the editor still has open leaves a buffer
+			// that recreates the file on the next save. Rename the contents in
+			// place and leave the file where it is.
+			log.Printf("Rename: leaving %s in place — client cannot apply rename operations and the file is open", r.FilePath)
 			continue
 		}
 
@@ -4758,13 +4851,14 @@ func (mr *moduleRename) moveConventionalFiles(fileCache map[string]moduleFileInf
 			log.Printf("Rename: cannot write %s: %v", newPath, err)
 			continue
 		}
+
 		if err := os.Remove(r.FilePath); err != nil {
 			log.Printf("Rename: cannot remove %s: %v", r.FilePath, err)
 		}
 		mr.server.debugf("Rename: %s → %s", r.FilePath, newPath)
 		movedFiles[r.FilePath] = newPath
 	}
-	return movedFiles, openMovedFiles, showDocumentPath
+	return movedFiles, clientRenames
 }
 
 // applyEdits applies text edits to all non-moved files: open buffers get
@@ -4783,12 +4877,24 @@ func (mr *moduleRename) applyEdits(fileCache map[string]moduleFileInfo, movedFil
 		}
 		if fi.open {
 			fileURI := protocol.DocumentURI(uri.File(fp))
+			// Each site is matched against the original line, so two sites can
+			// resolve to the same span — `alias Old.{A, B}` is one reference
+			// per member but a single edit to the shared prefix. The on-disk
+			// path rewrites the line as it goes and never sees the second
+			// match; TextEdits are all relative to the original text, so
+			// overlapping ones have to be dropped here or the editor applies
+			// the replacement twice.
+			claimed := make(map[int][]moduleEditResult)
 			for _, es := range sites {
 				if es.line-1 >= len(fi.lines) {
 					continue
 				}
 				lineText := fi.lines[es.line-1]
 				for _, e := range mr.findModuleEdits(lineText, es.token) {
+					if overlapsClaimed(claimed[es.line], e) {
+						continue
+					}
+					claimed[es.line] = append(claimed[es.line], e)
 					openChanges[fileURI] = append(openChanges[fileURI], protocol.TextEdit{
 						Range: protocol.Range{
 							Start: protocol.Position{Line: uint32(es.line - 1), Character: uint32(e.col)},
@@ -4813,9 +4919,28 @@ func (mr *moduleRename) applyEdits(fileCache map[string]moduleFileInfo, movedFil
 	return openChanges
 }
 
+// overlapsClaimed reports whether e covers any column already taken by an
+// edit on the same line.
+func overlapsClaimed(claimed []moduleEditResult, e moduleEditResult) bool {
+	for _, c := range claimed {
+		if e.col < c.col+c.length && c.col < e.col+e.length {
+			return true
+		}
+	}
+	return false
+}
+
 // reindex re-parses all touched files asynchronously after the rename.
-func (mr *moduleRename) reindex(fileCache map[string]moduleFileInfo, movedFiles map[string]string, openMovedFiles map[string]string) {
+//
+// movedFiles were moved on disk by the server, so their new paths are read
+// back from disk. clientRenames have not moved yet — the client applies them
+// when it receives the reply — so their new paths are indexed from the text
+// the edits produce.
+func (mr *moduleRename) reindex(fileCache map[string]moduleFileInfo, movedFiles, clientRenames map[string]string) {
 	for oldPath := range movedFiles {
+		_ = mr.server.store.RemoveFile(oldPath)
+	}
+	for oldPath := range clientRenames {
 		_ = mr.server.store.RemoveFile(oldPath)
 	}
 
@@ -4839,8 +4964,8 @@ func (mr *moduleRename) reindex(fileCache map[string]moduleFileInfo, movedFiles 
 		}
 		updatedLines := mr.applyEditsToLines(fi.lines, mr.sitesByFile[fp])
 		updatedText := strings.Join(updatedLines, "\n")
-		if newPath, moved := openMovedFiles[fp]; moved {
-			// Open file that was moved: reindex at the new path
+		if newPath, moved := clientRenames[fp]; moved {
+			// Open file the client is about to move: index at the new path
 			openReindexes = append(openReindexes, textReindex{newPath, updatedText})
 		} else if fi.open {
 			openReindexes = append(openReindexes, textReindex{fp, updatedText})
@@ -4849,11 +4974,15 @@ func (mr *moduleRename) reindex(fileCache map[string]moduleFileInfo, movedFiles 
 		}
 	}
 
-	// Also reindex open moved files that had no edit sites (e.g. the file
+	// Also index client-renamed files that had no edit sites (e.g. the file
 	// only contained the defmodule line which is already in allModuleDefs)
-	for oldPath, newPath := range openMovedFiles {
-		if _, hasSites := mr.sitesByFile[oldPath]; !hasSites {
-			reindexPaths = append(reindexPaths, newPath)
+	for oldPath, newPath := range clientRenames {
+		if _, hasSites := mr.sitesByFile[oldPath]; hasSites {
+			continue
+		}
+		if fi, ok := fileCache[oldPath]; ok {
+			updatedLines := mr.applyEditsToLines(fi.lines, nil)
+			openReindexes = append(openReindexes, textReindex{newPath, strings.Join(updatedLines, "\n")})
 		}
 	}
 
@@ -4880,7 +5009,7 @@ type renameSite struct {
 // buildTextEdits creates a WorkspaceEdit replacing all whole-token occurrences
 // of oldToken with newToken. Open buffers are returned in the WorkspaceEdit;
 // closed files are written directly to disk in parallel goroutines.
-func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string) *protocol.WorkspaceEdit {
+func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string) *WorkspaceEdit {
 	// Group sites by file
 	sitesByFile := make(map[string][]renameSite, len(sites))
 	for _, site := range sites {
@@ -5012,7 +5141,7 @@ func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string) *
 		}
 	}()
 
-	return &protocol.WorkspaceEdit{Changes: openChanges}
+	return &WorkspaceEdit{Changes: openChanges}
 }
 
 // reindexPaths re-parses and reindexes a specific set of files sequentially.

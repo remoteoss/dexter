@@ -2,11 +2,14 @@ package lsp
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
+	"go.lsp.dev/jsonrpc2"
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
 )
@@ -323,9 +326,9 @@ func TestIsValidModuleName(t *testing.T) {
 
 // === Integration helpers ===
 
-func renameAt(t *testing.T, server *Server, docURI string, line, col uint32, newName string) *protocol.WorkspaceEdit {
+func renameAt(t *testing.T, server *Server, docURI string, line, col uint32, newName string) *WorkspaceEdit {
 	t.Helper()
-	result, err := server.Rename(context.Background(), &protocol.RenameParams{
+	result, err := server.RenameEdit(context.Background(), &protocol.RenameParams{
 		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
 			TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(docURI)},
 			Position:     protocol.Position{Line: line, Character: col},
@@ -352,12 +355,34 @@ func prepareRenameAt(t *testing.T, server *Server, docURI string, line, col uint
 	return result
 }
 
-func collectEdits(edit *protocol.WorkspaceEdit, filePath string) []protocol.TextEdit {
+func collectEdits(edit *WorkspaceEdit, filePath string) []protocol.TextEdit {
 	if edit == nil {
 		return nil
 	}
 	fileURI := protocol.DocumentURI(uri.File(filePath))
-	return edit.Changes[fileURI]
+	if edits, ok := edit.Changes[fileURI]; ok {
+		return edits
+	}
+	for _, change := range edit.DocumentChanges {
+		if tde, ok := change.(TextDocumentEdit); ok && tde.TextDocument.URI == fileURI {
+			return tde.Edits
+		}
+	}
+	return nil
+}
+
+// renameOp returns the rename operation for filePath in the edit, if any.
+func renameOp(edit *WorkspaceEdit, filePath string) *RenameFile {
+	if edit == nil {
+		return nil
+	}
+	oldURI := protocol.DocumentURI(uri.File(filePath))
+	for _, change := range edit.DocumentChanges {
+		if rf, ok := change.(RenameFile); ok && rf.OldURI == oldURI {
+			return &rf
+		}
+	}
+	return nil
 }
 
 func hasEdit(edits []protocol.TextEdit, newText string) bool {
@@ -378,6 +403,50 @@ func editsContainLine(edits []protocol.TextEdit, lineNum uint32) bool {
 	return false
 }
 
+// expectClientRename asserts the edit asks the client to move oldPath to
+// newPath, and that the server left both paths alone: the editor owns an open
+// buffer, so it must perform the move itself.
+func expectClientRename(t *testing.T, edit *WorkspaceEdit, oldPath, newPath string) {
+	t.Helper()
+	op := renameOp(edit, oldPath)
+	if op == nil {
+		t.Fatalf("expected a rename operation for %s, got %+v", oldPath, edit)
+	}
+	if want := protocol.DocumentURI(uri.File(newPath)); op.NewURI != want {
+		t.Errorf("rename target = %s, want %s", op.NewURI, want)
+	}
+	if _, err := os.Stat(oldPath); err != nil {
+		t.Errorf("server removed %s — the client has it open and must move it itself", oldPath)
+	}
+	if _, err := os.Stat(newPath); err == nil {
+		t.Errorf("server created %s — the client performs the move", newPath)
+	}
+}
+
+// bufferAfterEdits returns what content becomes once the edit's text edits for
+// filePath are applied, i.e. what the editor's buffer ends up holding.
+func bufferAfterEdits(t *testing.T, edit *WorkspaceEdit, filePath, content string) string {
+	t.Helper()
+	edits := collectEdits(edit, filePath)
+	sorted := make([]protocol.TextEdit, len(edits))
+	copy(sorted, edits)
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].Range.Start.Line != sorted[j].Range.Start.Line {
+			return sorted[i].Range.Start.Line > sorted[j].Range.Start.Line
+		}
+		return sorted[i].Range.Start.Character > sorted[j].Range.Start.Character
+	})
+	lines := strings.Split(content, "\n")
+	for _, e := range sorted {
+		l := int(e.Range.Start.Line)
+		if l >= len(lines) || e.Range.End.Line != e.Range.Start.Line {
+			t.Fatalf("unexpected edit range %+v", e.Range)
+		}
+		lines[l] = lines[l][:e.Range.Start.Character] + e.NewText + lines[l][e.Range.End.Character:]
+	}
+	return strings.Join(lines, "\n")
+}
+
 // fileContains checks whether the file at path contains the given substring.
 // Used to verify server-side writes for files not open in the editor.
 func fileContains(filePath, substr string) bool {
@@ -390,7 +459,7 @@ func fileContains(filePath, substr string) bool {
 
 // hasRename returns true if the rename result (either in WorkspaceEdit or
 // written directly to disk) contains newText for the given file.
-func hasRename(edit *protocol.WorkspaceEdit, filePath, newText string) bool {
+func hasRename(edit *WorkspaceEdit, filePath, newText string) bool {
 	if hasEdit(collectEdits(edit, filePath), newText) {
 		return true
 	}
@@ -1490,16 +1559,12 @@ end
 		t.Fatal("expected non-nil edit")
 	}
 
-	// File should have been written to new path and old path removed
+	// The file is open, so the edit must ask the client to move it and the
+	// server must not touch either path.
 	newPath := filepath.Join(server.projectRoot, "lib", "auth.ex")
-	if _, err := os.Stat(newPath); os.IsNotExist(err) {
-		t.Error("expected new file auth.ex to exist")
-	}
-	if _, err := os.Stat(oldPath); err == nil {
-		t.Error("expected old file accounts.ex to be removed")
-	}
-	if !fileContains(newPath, "defmodule MyApp.Auth") {
-		t.Errorf("expected new file to contain 'defmodule MyApp.Auth'")
+	expectClientRename(t, edit, oldPath, newPath)
+	if got := bufferAfterEdits(t, edit, oldPath, content); !strings.Contains(got, "defmodule MyApp.Auth") {
+		t.Errorf("expected buffer to contain 'defmodule MyApp.Auth', got:\n%s", got)
 	}
 }
 
@@ -1517,15 +1582,13 @@ end
 	defURI := "file://" + oldPath
 	server.docs.Set(defURI, content)
 
-	renameAt(t, server, defURI, 0, 20, "AuthTest")
+	edit := renameAt(t, server, defURI, 0, 20, "AuthTest")
 
 	// File should be renamed preserving the .exs extension
 	newPath := filepath.Join(server.projectRoot, "test", "auth_test.exs")
-	if _, err := os.Stat(newPath); os.IsNotExist(err) {
-		t.Error("expected file renamed to auth_test.exs (preserving .exs extension)")
-	}
-	if !fileContains(newPath, "defmodule MyApp.AuthTest") {
-		t.Errorf("expected 'defmodule MyApp.AuthTest' in new file")
+	expectClientRename(t, edit, oldPath, newPath)
+	if got := bufferAfterEdits(t, edit, oldPath, content); !strings.Contains(got, "defmodule MyApp.AuthTest") {
+		t.Errorf("expected buffer to contain 'defmodule MyApp.AuthTest', got:\n%s", got)
 	}
 }
 
@@ -1550,26 +1613,23 @@ end
 	indexFile(t, server.store, server.projectRoot, "lib/docusign.ex", defContent)
 	indexFile(t, server.store, server.projectRoot, "lib/web.ex", callerContent)
 
-	// Test 1: rename from the def file (open)
+	// Test 1: rename from the def file (open — the client moves it)
 	t.Run("from def file", func(t *testing.T) {
 		defURI := "file://" + oldPath
 		server.docs.Set(defURI, defContent)
 
-		renameAt(t, server, defURI, 0, 16, "Docusigns")
+		edit := renameAt(t, server, defURI, 0, 16, "Docusigns")
 
 		newPath := filepath.Join(server.projectRoot, "lib", "docusigns.ex")
-		if _, err := os.Stat(newPath); os.IsNotExist(err) {
-			t.Error("expected file renamed to docusigns.ex")
-		}
-		if !fileContains(newPath, "defmodule MyApp.Docusigns") {
-			data, _ := os.ReadFile(newPath)
-			t.Errorf("expected 'defmodule MyApp.Docusigns', got:\n%s", string(data))
+		expectClientRename(t, edit, oldPath, newPath)
+		if got := bufferAfterEdits(t, edit, oldPath, defContent); !strings.Contains(got, "defmodule MyApp.Docusigns") {
+			t.Errorf("expected 'defmodule MyApp.Docusigns', got:\n%s", got)
 		}
 	})
 
-	// Clean up test 1's renamed file and re-index with original content for test 2
-	_ = os.Remove(filepath.Join(server.projectRoot, "lib", "docusigns.ex"))
-	_ = server.store.RemoveFile(filepath.Join(server.projectRoot, "lib", "docusigns.ex"))
+	// Re-index with original content for test 2, and close the def file so it
+	// takes the closed-file path (moved on disk by the server)
+	server.docs.Close("file://" + oldPath)
 	indexFile(t, server.store, server.projectRoot, "lib/docusign.ex", defContent)
 
 	// Test 2: rename from a caller file via alias (def file is closed)
@@ -1831,12 +1891,10 @@ end
 end
 `)
 
-	renameAt(t, server, defURI, 0, 16, "Enterprises")
+	edit := renameAt(t, server, defURI, 0, 16, "Enterprises")
 
-	// Root file should be renamed
-	if _, err := os.Stat(filepath.Join(server.projectRoot, "lib", "enterprises.ex")); os.IsNotExist(err) {
-		t.Error("expected root module file renamed to enterprises.ex")
-	}
+	// Root file is open — the client renames it
+	expectClientRename(t, edit, defPath, filepath.Join(server.projectRoot, "lib", "enterprises.ex"))
 
 	// Submodule file is closed — should be moved to new directory on disk
 	newSubPath := filepath.Join(server.projectRoot, "lib", "enterprises", "do_something.ex")
@@ -1938,16 +1996,14 @@ end
 		t.Errorf("expected last segment range starting at col 16, got %d", r.Start.Character)
 	}
 
-	renameAt(t, server, defURI, 0, 16, "CostCalculatorZ")
+	edit := renameAt(t, server, defURI, 0, 16, "CostCalculatorZ")
 
-	// Check the renamed file has the full qualified name
+	// The open file moves via the client, and its buffer gets the full
+	// qualified name
 	newPath := filepath.Join(server.projectRoot, "lib", "cost_calculator_z.ex")
-	newContent, err := os.ReadFile(newPath)
-	if err != nil {
-		t.Fatalf("cannot read new file: %v", err)
-	}
-	if !strings.Contains(string(newContent), "defmodule MyApp.CostCalculatorZ do") {
-		t.Errorf("expected 'defmodule MyApp.CostCalculatorZ do', got:\n%s", newContent)
+	expectClientRename(t, edit, defPath, newPath)
+	if got := bufferAfterEdits(t, edit, defPath, content); !strings.Contains(got, "defmodule MyApp.CostCalculatorZ do") {
+		t.Errorf("expected 'defmodule MyApp.CostCalculatorZ do', got:\n%s", got)
 	}
 }
 
@@ -2774,5 +2830,367 @@ end
 	}
 	if !hasCorrectEdit {
 		t.Errorf("expected edit containing 'Approvals' in child file, got: %v", childEdits)
+	}
+}
+
+// Regression: renaming a module from the file that defines it used to move
+// that file on disk while the editor still held the buffer, and hand the
+// editor TextEdits for the now-deleted path. Neovim applied the edits to the
+// stale buffer, and the next save (`:w`, `:wa`, format-on-save) recreated the
+// old file holding the new module name — two files defining the same module,
+// and the project stopped compiling.
+func TestRename_Module_OpenFileMovedByClientNotServer(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule MyApp.Accounts do
+  def list_users, do: []
+end
+`
+	oldPath := filepath.Join(server.projectRoot, "lib", "accounts.ex")
+	newPath := filepath.Join(server.projectRoot, "lib", "auth.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", content)
+	defURI := "file://" + oldPath
+	server.docs.Set(defURI, content)
+
+	edit := renameAt(t, server, defURI, 0, 20, "Auth")
+	if edit == nil {
+		t.Fatal("expected non-nil edit")
+	}
+
+	// The server must not touch a file the editor has open.
+	if _, err := os.Stat(oldPath); err != nil {
+		t.Error("server deleted accounts.ex while the editor had it open")
+	}
+	if _, err := os.Stat(newPath); err == nil {
+		t.Error("server created auth.ex; the client performs the move")
+	}
+
+	// A client that applies documentChanges ignores changes entirely, so
+	// nothing may be left there.
+	if len(edit.Changes) != 0 {
+		t.Errorf("changes must be empty when documentChanges is used, got %v", edit.Changes)
+	}
+
+	// The buffer's edits must come before its rename operation, so the edited
+	// buffer travels to the new path.
+	oldURI := protocol.DocumentURI(uri.File(oldPath))
+	editIdx, renameIdx := -1, -1
+	for i, change := range edit.DocumentChanges {
+		switch c := change.(type) {
+		case TextDocumentEdit:
+			if c.TextDocument.URI == oldURI {
+				editIdx = i
+			}
+		case RenameFile:
+			if c.OldURI == oldURI {
+				renameIdx = i
+			}
+		}
+	}
+	if editIdx < 0 {
+		t.Fatalf("expected text edits for %s, got %+v", oldPath, edit.DocumentChanges)
+	}
+	if renameIdx < 0 {
+		t.Fatalf("expected a rename operation for %s, got %+v", oldPath, edit.DocumentChanges)
+	}
+	if editIdx > renameIdx {
+		t.Error("text edits must precede the rename operation for the same file")
+	}
+	if got := bufferAfterEdits(t, edit, oldPath, content); !strings.Contains(got, "defmodule MyApp.Auth") {
+		t.Errorf("expected the buffer to become 'defmodule MyApp.Auth', got:\n%s", got)
+	}
+}
+
+// A client that cannot apply rename operations gets the module renamed in
+// place. The file keeps its old name, but nothing is deleted underneath an
+// open buffer, so no save can resurrect a duplicate module.
+func TestRename_Module_OpenFileLeftInPlaceWithoutRenameOps(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+	server.renameFileOpsSupported = false
+
+	content := `defmodule MyApp.Accounts do
+  def list_users, do: []
+end
+`
+	oldPath := filepath.Join(server.projectRoot, "lib", "accounts.ex")
+	newPath := filepath.Join(server.projectRoot, "lib", "auth.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", content)
+	defURI := "file://" + oldPath
+	server.docs.Set(defURI, content)
+
+	edit := renameAt(t, server, defURI, 0, 20, "Auth")
+
+	if _, err := os.Stat(oldPath); err != nil {
+		t.Error("expected accounts.ex to stay in place")
+	}
+	if _, err := os.Stat(newPath); err == nil {
+		t.Error("expected no auth.ex — the file cannot move while the client holds it")
+	}
+	if len(edit.DocumentChanges) != 0 {
+		t.Errorf("expected no resource operations, got %+v", edit.DocumentChanges)
+	}
+	if got := bufferAfterEdits(t, edit, oldPath, content); !strings.Contains(got, "defmodule MyApp.Auth") {
+		t.Errorf("expected the buffer to become 'defmodule MyApp.Auth', got:\n%s", got)
+	}
+}
+
+// The wire format is what the editor actually acts on, and a wrong JSON tag
+// would be invisible to every other test here.
+func TestWorkspaceEdit_RenameOperationJSON(t *testing.T) {
+	edit := &WorkspaceEdit{
+		DocumentChanges: []interface{}{
+			textDocumentEdit(protocol.DocumentURI("file:///p/lib/accounts.ex"), []protocol.TextEdit{{
+				Range:   protocol.Range{Start: protocol.Position{Line: 0, Character: 16}, End: protocol.Position{Line: 0, Character: 24}},
+				NewText: "Auth",
+			}}),
+			newRenameFile("/p/lib/accounts.ex", "/p/lib/auth.ex"),
+		},
+	}
+
+	data, err := json.Marshal(edit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Changes         map[string]interface{} `json:"changes"`
+		DocumentChanges []struct {
+			Kind         string `json:"kind"`
+			OldURI       string `json:"oldUri"`
+			NewURI       string `json:"newUri"`
+			TextDocument *struct {
+				URI     string      `json:"uri"`
+				Version interface{} `json:"version"`
+			} `json:"textDocument"`
+			Edits   []protocol.TextEdit `json:"edits"`
+			Options *struct {
+				Overwrite bool `json:"overwrite"`
+			} `json:"options"`
+		} `json:"documentChanges"`
+	}
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Changes != nil {
+		t.Errorf("changes must be omitted, got %v", got.Changes)
+	}
+	if len(got.DocumentChanges) != 2 {
+		t.Fatalf("expected 2 documentChanges, got %s", data)
+	}
+	first := got.DocumentChanges[0]
+	if first.TextDocument == nil || first.TextDocument.URI != "file:///p/lib/accounts.ex" {
+		t.Errorf("first change should be a text document edit, got %s", data)
+	}
+	if first.TextDocument != nil && first.TextDocument.Version != nil {
+		t.Errorf("version must be null, got %v", first.TextDocument.Version)
+	}
+	if len(first.Edits) != 1 {
+		t.Errorf("expected the text edit to survive, got %s", data)
+	}
+	second := got.DocumentChanges[1]
+	if second.Kind != "rename" {
+		t.Errorf("kind = %q, want \"rename\"", second.Kind)
+	}
+	if second.OldURI != "file:///p/lib/accounts.ex" || second.NewURI != "file:///p/lib/auth.ex" {
+		t.Errorf("rename URIs = %s → %s", second.OldURI, second.NewURI)
+	}
+	if second.Options == nil || !second.Options.Overwrite {
+		t.Errorf("expected overwrite:true, got %s", data)
+	}
+}
+
+// The rename request must be answered by our own handler: the generated
+// dispatcher marshals a protocol.WorkspaceEdit, which has nowhere to put
+// resource operations, so a mis-wired handler would silently drop every file
+// move.
+func TestRenameHandler_RepliesWithResourceOperations(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule MyApp.Accounts do
+  def list_users, do: []
+end
+`
+	oldPath := filepath.Join(server.projectRoot, "lib", "accounts.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", content)
+	defURI := "file://" + oldPath
+	server.docs.Set(defURI, content)
+
+	call, err := jsonrpc2.NewCall(jsonrpc2.NewNumberID(1), protocol.MethodTextDocumentRename, &protocol.RenameParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(defURI)},
+			Position:     protocol.Position{Line: 0, Character: 20},
+		},
+		NewName: "Auth",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var replied interface{}
+	nextCalled := false
+	handler := server.renameHandler(func(context.Context, jsonrpc2.Replier, jsonrpc2.Request) error {
+		nextCalled = true
+		return nil
+	})
+	err = handler(context.Background(), func(_ context.Context, result interface{}, err error) error {
+		replied = result
+		return err
+	}, call)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nextCalled {
+		t.Error("rename must not fall through to the generated dispatcher")
+	}
+
+	edit, ok := replied.(*WorkspaceEdit)
+	if !ok {
+		t.Fatalf("replied with %T, want *WorkspaceEdit", replied)
+	}
+	if renameOp(edit, oldPath) == nil {
+		t.Errorf("reply carries no rename operation: %+v", edit.DocumentChanges)
+	}
+}
+
+// Regression: `alias Old.{A, B}` names the module once, as the prefix before
+// the brace, while the index records one reference per member. Matching a
+// member's full name against the line found nothing, so grouped aliases kept
+// pointing at the old module and the project stopped compiling.
+func TestRename_Module_GroupedAlias(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/shared_lib.ex", `defmodule SharedLib do
+  def start, do: :ok
+end
+`)
+	indexFile(t, server.store, server.projectRoot, "lib/shared_lib/worker.ex", `defmodule SharedLib.Worker do
+  def call, do: :ok
+end
+`)
+	indexFile(t, server.store, server.projectRoot, "lib/shared_lib/config.ex", `defmodule SharedLib.Config do
+  def get, do: :ok
+end
+`)
+	callerContent := `defmodule MyApp.Runner do
+  alias SharedLib.{Config, Worker}
+  require SharedLib.{Config, Worker}
+
+  def run do
+    Config.get()
+    Worker.call()
+  end
+end
+`
+	callerPath := filepath.Join(server.projectRoot, "lib", "runner.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/runner.ex", callerContent)
+
+	defPath := filepath.Join(server.projectRoot, "lib", "shared_lib.ex")
+	defURI := "file://" + defPath
+	server.docs.Set(defURI, `defmodule SharedLib do
+  def start, do: :ok
+end
+`)
+
+	renameAt(t, server, defURI, 0, 10, "CoreLib")
+
+	// The caller is closed, so the server rewrites it on disk
+	got, err := os.ReadFile(callerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"alias CoreLib.{Config, Worker}", "require CoreLib.{Config, Worker}"} {
+		if !strings.Contains(string(got), want) {
+			t.Errorf("expected %q, got:\n%s", want, got)
+		}
+	}
+	if strings.Contains(string(got), "SharedLib") {
+		t.Errorf("SharedLib should be gone, got:\n%s", got)
+	}
+}
+
+// Renaming a member of a grouped alias rewrites the member, not the prefix.
+func TestRename_Module_GroupedAliasMemberRenamed(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/shared_lib/worker.ex", `defmodule SharedLib.Worker do
+  def call, do: :ok
+end
+`)
+	indexFile(t, server.store, server.projectRoot, "lib/shared_lib/config.ex", `defmodule SharedLib.Config do
+  def get, do: :ok
+end
+`)
+	callerContent := `defmodule MyApp.Runner do
+  alias SharedLib.{Config, Worker}
+
+  def run, do: Worker.call()
+end
+`
+	callerPath := filepath.Join(server.projectRoot, "lib", "runner.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/runner.ex", callerContent)
+
+	defPath := filepath.Join(server.projectRoot, "lib", "shared_lib", "worker.ex")
+	defURI := "file://" + defPath
+	server.docs.Set(defURI, `defmodule SharedLib.Worker do
+  def call, do: :ok
+end
+`)
+
+	renameAt(t, server, defURI, 0, 20, "Job")
+
+	got, err := os.ReadFile(callerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "alias SharedLib.{Config, Job}") {
+		t.Errorf("expected 'alias SharedLib.{Config, Job}', got:\n%s", got)
+	}
+}
+
+// Regression: every member of `alias Old.{A, B, C}` is its own indexed
+// reference, but they share one edit to the prefix. TextEdits are all relative
+// to the original buffer, so emitting the same span once per member made the
+// editor apply the replacement repeatedly (Old → NewNewNew...).
+func TestRename_Module_GroupedAliasInOpenBufferEditedOnce(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/shared_lib.ex", `defmodule SharedLib do
+  def start, do: :ok
+end
+`)
+	for _, sub := range []string{"Config", "Worker", "Job"} {
+		indexFile(t, server.store, server.projectRoot,
+			"lib/shared_lib/"+strings.ToLower(sub)+".ex",
+			"defmodule SharedLib."+sub+" do\n  def call, do: :ok\nend\n")
+	}
+
+	callerContent := `defmodule MyApp.Runner do
+  alias SharedLib.{Config, Job, Worker}
+
+  def run, do: {Config.call(), Job.call(), Worker.call()}
+end
+`
+	callerPath := filepath.Join(server.projectRoot, "lib", "runner.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/runner.ex", callerContent)
+	callerURI := "file://" + callerPath
+	server.docs.Set(callerURI, callerContent)
+
+	defPath := filepath.Join(server.projectRoot, "lib", "shared_lib.ex")
+	defURI := "file://" + defPath
+	server.docs.Set(defURI, `defmodule SharedLib do
+  def start, do: :ok
+end
+`)
+
+	edit := renameAt(t, server, defURI, 0, 10, "CoreLib")
+
+	got := bufferAfterEdits(t, edit, callerPath, callerContent)
+	if !strings.Contains(got, "alias CoreLib.{Config, Job, Worker}") {
+		t.Errorf("expected 'alias CoreLib.{Config, Job, Worker}', got:\n%s", got)
 	}
 }
