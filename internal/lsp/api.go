@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -29,7 +30,7 @@ func Serve(server *Server, in io.Reader, out io.Writer) error {
 	server.client = protocol.ClientDispatcher(conn, logger)
 	server.conn = conn
 
-	handler := protocol.ServerHandler(server, nil)
+	handler := server.renameHandler(protocol.ServerHandler(server, nil))
 	ctx := context.Background()
 
 	conn.Go(ctx, handler)
@@ -176,7 +177,7 @@ func (s *Server) RenameModule(oldModule, newModule string) (RenameSummary, error
 		return RenameSummary{}, fmt.Errorf("module %s not found in the index", oldModule)
 	}
 
-	edit, moved, files, err := s.renameModuleEdits(context.Background(), oldModule, newModule, "")
+	edit, moved, files, err := s.renameModuleEdits(oldModule, newModule)
 	if err != nil {
 		return RenameSummary{}, err
 	}
@@ -187,39 +188,66 @@ func (s *Server) RenameModule(oldModule, newModule string) (RenameSummary, error
 	return RenameSummary{FilesChanged: files, FilesMoved: moved}, nil
 }
 
-// deliverEdits routes a WorkspaceEdit's TextEdits to whoever owns the
-// documents. The rename machinery only produces TextEdits for open editor
-// buffers; with a live LSP client (attached mode) they are forwarded as a
-// workspace/applyEdit request so the editor applies them and syncs back via
-// didChange, exactly as an editor-initiated rename would. Without a client
-// they are written to disk directly; headless servers have no open buffers,
-// so that path is a defensive no-op in practice.
-func (s *Server) deliverEdits(edit *protocol.WorkspaceEdit) error {
-	if edit == nil || len(edit.Changes) == 0 {
+// deliverEdits carries out a WorkspaceEdit on behalf of a caller that is not
+// an editor. With a live LSP client (attached mode) the whole edit is
+// forwarded as a workspace/applyEdit request: the editor owns the open
+// buffers, and for a file it has open it owns the move too, so it applies
+// everything and syncs back via didChange exactly as an editor-initiated
+// rename would. Without a client there is no editor to ask, so the edit is
+// carried out on disk; headless servers have no open buffers and never move a
+// file through the client, so that path is a defensive no-op in practice.
+func (s *Server) deliverEdits(edit *WorkspaceEdit) error {
+	if edit.empty() {
 		return nil
 	}
-	if s.client != nil {
-		applied, err := s.client.ApplyEdit(context.Background(), &protocol.ApplyWorkspaceEditParams{Edit: *edit})
-		if err == nil && !applied {
-			err = fmt.Errorf("editor did not apply the rename edits for open files")
+	if s.conn != nil {
+		applied, err := s.applyEdit(context.Background(), "dexter rename", edit)
+		if err != nil {
+			return err
 		}
-		return err
+		if !applied {
+			return fmt.Errorf("editor did not apply the rename edits for open files")
+		}
+		return nil
 	}
-	for docURI, edits := range edit.Changes {
-		path := uriToPath(docURI)
+
+	edits := edit.textEditsByPath()
+	renames := edit.fileRenames()
+	for path, fileEdits := range edits {
 		text, _, ok := s.ReadFileText(path)
 		if !ok {
 			return fmt.Errorf("reading %s to apply rename edits", path)
 		}
-		if err := os.WriteFile(path, []byte(applyTextEdits(text, edits)), 0644); err != nil {
+		if err := os.WriteFile(path, []byte(applyTextEdits(text, fileEdits)), 0644); err != nil {
 			return err
 		}
 	}
-	if len(edit.Changes) > 0 {
-		paths := make([]string, 0, len(edit.Changes))
-		for docURI := range edit.Changes {
-			paths = append(paths, uriToPath(docURI))
+	// Renames come after the edits, so an edited file is moved with its new
+	// contents — the same order the client applies documentChanges in.
+	for from, to := range renames {
+		if err := os.MkdirAll(filepath.Dir(to), 0755); err != nil {
+			return err
 		}
+		if err := os.Rename(from, to); err != nil {
+			return err
+		}
+		_ = s.store.RemoveFile(from)
+	}
+
+	paths := make([]string, 0, len(edits)+len(renames))
+	for path := range edits {
+		if to, moved := renames[path]; moved {
+			paths = append(paths, to)
+		} else {
+			paths = append(paths, path)
+		}
+	}
+	for from, to := range renames {
+		if _, edited := edits[from]; !edited {
+			paths = append(paths, to)
+		}
+	}
+	if len(paths) > 0 {
 		s.reindexPaths(paths)
 	}
 	return nil

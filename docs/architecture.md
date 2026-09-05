@@ -83,6 +83,22 @@ Call sites are attributed to the **injecting module** in the store (not the defi
 
 `buildTextEdits` uses `findFunctionTokenColumns` to skip keyword-syntax occurrences (`resource_type: value`) — only `::` type separators pass through. Import-only sites use `findAllTokenColumns` since their keyword keys ARE function names.
 
+### Who moves a file
+
+A module rename also moves files whose names follow the module naming convention, and who performs the move depends on whether the editor holds the file:
+
+- **Closed files** — the server writes the new path and deletes the old one. This keeps large renames off the wire.
+- **Open files** — the client moves them, through a `rename` resource operation in the reply's `documentChanges`, ordered right after that file's own TextEdits so the edited buffer travels to the new path. The server touches neither path. Moving an open file server-side leaves the editor holding a modified buffer pointing at a deleted path, and the next save recreates the old file with the new module name — two files defining the same module.
+- **Open files, client without `resourceOperations: ["rename"]`** — the module is renamed in place and the file keeps its old name. Nothing is deleted underneath a live buffer.
+
+`protocol.WorkspaceEdit` from `go.lsp.dev/protocol` types `documentChanges` as `[]TextDocumentEdit` and cannot carry resource operations, so `internal/lsp/workspace_edit.go` defines the wire types and `renameHandler` answers `textDocument/rename` ahead of the generated dispatcher. A client that understands `documentChanges` ignores `changes` entirely, so once one file moves, every edit in the reply goes through `documentChanges`.
+
+For a rename the MCP server asked for rather than an editor, `deliverEdits` plays the part the editor would: attached to a live session it forwards the whole edit as `workspace/applyEdit` — over the raw connection, since `protocol.ApplyWorkspaceEditParams` drops resource operations for the same reason — and headless it carries out the edits and moves on disk itself. Headless has no open buffers, so it never produces a client-side move; that branch is defensive.
+
+### Grouped aliases
+
+`alias Old.{A, B}` (and the `require`/`import` forms) names the module once, as the prefix, while the index records one reference per member — so a member's full name never appears on the line. `findGroupedAliasEdits` handles both directions: renaming the prefix rewrites the prefix, renaming a member rewrites that member inside the braces. Since every member on the line resolves to the same prefix edit, `applyEdits` drops TextEdits that overlap one already emitted for that line; the on-disk path rewrites the line as it goes and never sees the second match.
+
 ## Key design decisions
 
 - **Tokenizer instead of tree-sitter for indexing** — a hand-rolled tokenizer + walker replaced the original regex-based parser for both file indexing and runtime `__using__` parsing. The tokenizer handles heredocs, sigils, multi-line expressions, and comments as opaque tokens, eliminating fragile line-joining heuristics. Tree-sitter is only used for scope-aware variable operations in files already opened by the editor.

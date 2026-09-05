@@ -2,11 +2,14 @@ package lsp
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"go.lsp.dev/jsonrpc2"
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
 )
@@ -93,17 +96,37 @@ end
 	}
 }
 
-// fakeClient records ApplyEdit requests; other client methods are never
-// called by the rename path.
-type fakeClient struct {
-	protocol.Client
-	applied *protocol.WorkspaceEdit
+// fakeConn records workspace/applyEdit requests. The edit is captured as the
+// JSON that actually goes over the wire, because that is the only place the
+// resource operations survive — protocol.Client.ApplyEdit's typed params
+// would drop them.
+type fakeConn struct {
+	jsonrpc2.Conn
+	applied *WorkspaceEdit
+	raw     map[string]interface{}
 	reject  bool
 }
 
-func (f *fakeClient) ApplyEdit(_ context.Context, params *protocol.ApplyWorkspaceEditParams) (bool, error) {
-	f.applied = &params.Edit
-	return !f.reject, nil
+func (f *fakeConn) Call(_ context.Context, method string, params, result interface{}) (jsonrpc2.ID, error) {
+	if method != protocol.MethodWorkspaceApplyEdit {
+		return jsonrpc2.ID{}, nil
+	}
+	p, ok := params.(*applyWorkspaceEditParams)
+	if !ok {
+		return jsonrpc2.ID{}, fmt.Errorf("applyEdit params were %T", params)
+	}
+	f.applied = p.Edit
+	data, err := json.Marshal(p)
+	if err != nil {
+		return jsonrpc2.ID{}, err
+	}
+	if err := json.Unmarshal(data, &f.raw); err != nil {
+		return jsonrpc2.ID{}, err
+	}
+	if res, ok := result.(*protocol.ApplyWorkspaceEditResponse); ok {
+		res.Applied = !f.reject
+	}
+	return jsonrpc2.ID{}, nil
 }
 
 // With a live client (attached mode), open-buffer edits go to the editor via
@@ -111,8 +134,8 @@ func (f *fakeClient) ApplyEdit(_ context.Context, params *protocol.ApplyWorkspac
 func TestRenameFunction_ForwardsOpenBufferEditsToClient(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
-	fc := &fakeClient{}
-	server.client = fc
+	fc := &fakeConn{}
+	server.conn = fc
 
 	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", `defmodule MyApp.Accounts do
   def fetch_user(id), do: id
@@ -150,7 +173,7 @@ end
 func TestRenameFunction_ReportsRejectedApplyEdit(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
-	server.client = &fakeClient{reject: true}
+	server.conn = &fakeConn{reject: true}
 
 	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", `defmodule MyApp.Accounts do
   def fetch_user(id), do: id
@@ -166,5 +189,103 @@ end
 
 	if _, err := server.RenameFunction("MyApp.Accounts", "fetch_user", "get_user"); err == nil {
 		t.Fatal("rename reported success despite the editor rejecting the edit")
+	}
+}
+
+// An agent renaming a module whose file the editor has open: the move belongs
+// to the editor, so it has to travel in the applyEdit request as a rename
+// resource operation. protocol.ApplyWorkspaceEditParams cannot carry one, so a
+// deliverEdits that reaches for the typed client would silently move nothing.
+func TestRenameModule_ForwardsFileMoveToClient(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+	fc := &fakeConn{}
+	server.conn = fc
+
+	src := `defmodule MyApp.Accounts do
+  def list_users, do: []
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", src)
+	oldPath := filepath.Join(server.projectRoot, "lib/accounts.ex")
+	newPath := filepath.Join(server.projectRoot, "lib/auth.ex")
+	server.docs.Set(string(uri.File(oldPath)), src)
+
+	summary, err := server.RenameModule("MyApp.Accounts", "MyApp.Auth")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if fc.applied == nil {
+		t.Fatal("no workspace/applyEdit request reached the editor")
+	}
+	var renamed *RenameFile
+	for _, change := range fc.applied.DocumentChanges {
+		if rf, ok := change.(RenameFile); ok {
+			renamed = &rf
+		}
+	}
+	if renamed == nil {
+		t.Fatalf("applyEdit carried no rename operation: %+v", fc.applied.DocumentChanges)
+	}
+	if want := protocol.DocumentURI(uri.File(newPath)); renamed.NewURI != want {
+		t.Errorf("rename target = %s, want %s", renamed.NewURI, want)
+	}
+
+	// The operation has to survive marshaling — that is what the editor reads.
+	edit, _ := fc.raw["edit"].(map[string]interface{})
+	changes, _ := edit["documentChanges"].([]interface{})
+	foundKind := false
+	for _, c := range changes {
+		if m, ok := c.(map[string]interface{}); ok && m["kind"] == "rename" {
+			foundKind = true
+		}
+	}
+	if !foundKind {
+		t.Errorf("no rename operation in the marshaled request: %v", fc.raw)
+	}
+
+	// The editor performs the move, so dexter must have left both paths alone.
+	if _, err := os.Stat(oldPath); err != nil {
+		t.Error("dexter removed the file the editor has open")
+	}
+	if _, err := os.Stat(newPath); err == nil {
+		t.Error("dexter created the destination; the editor performs the move")
+	}
+	if summary.FilesMoved[oldPath] != newPath {
+		t.Errorf("summary reports moves %v, want %s → %s", summary.FilesMoved, oldPath, newPath)
+	}
+}
+
+// Headless, no editor: nothing is open, so dexter carries out the whole edit
+// itself and the summary still reports the move.
+func TestRenameModule_HeadlessMovesFilesItself(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", `defmodule MyApp.Accounts do
+  def list_users, do: []
+end
+`)
+	oldPath := filepath.Join(server.projectRoot, "lib/accounts.ex")
+	newPath := filepath.Join(server.projectRoot, "lib/auth.ex")
+
+	summary, err := server.RenameModule("MyApp.Accounts", "MyApp.Auth")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(oldPath); err == nil {
+		t.Error("expected accounts.ex to be gone")
+	}
+	data, err := os.ReadFile(newPath)
+	if err != nil {
+		t.Fatalf("expected auth.ex on disk: %v", err)
+	}
+	if !strings.Contains(string(data), "defmodule MyApp.Auth") {
+		t.Errorf("expected 'defmodule MyApp.Auth', got:\n%s", data)
+	}
+	if summary.FilesMoved[oldPath] != newPath {
+		t.Errorf("summary reports moves %v, want %s → %s", summary.FilesMoved, oldPath, newPath)
 	}
 }
