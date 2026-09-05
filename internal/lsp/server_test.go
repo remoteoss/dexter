@@ -29,6 +29,9 @@ func setupTestServer(t *testing.T) (*Server, func()) {
 
 	server := NewServer(s, dir)
 	server.snippetSupport = true
+	// Match real editors (Neovim, VS Code, Helix, Zed): they all apply rename
+	// resource operations. Fallback behaviour has its own tests.
+	server.renameFileOpsSupported = true
 
 	// Resolve the mix binary so formatting tests work
 	if p, err := exec.LookPath("mix"); err == nil {

@@ -65,6 +65,43 @@ func findFunctionTokenColumns(lineText, token string) []int {
 	return result
 }
 
+// findGroupedAlias locates a grouped alias/require/import of the form
+// `prefix.{A, B}` in lineText. It returns the column where prefix starts and
+// the span of the text between the braces, or -1 when the line holds no such
+// group for prefix.
+//
+// findAllTokenColumns cannot be used for this: the match would end at '{',
+// whose following character is an identifier char, so the boundary check
+// would reject every group.
+func findGroupedAlias(lineText, prefix string) (prefixCol, groupStart, groupEnd int) {
+	needle := prefix + ".{"
+	start := 0
+	for {
+		idx := strings.Index(lineText[start:], needle)
+		if idx < 0 {
+			return -1, -1, -1
+		}
+		abs := start + idx
+		// Only the leading boundary matters — the trailing one is the brace.
+		if abs > 0 {
+			if r, _ := utf8.DecodeLastRuneInString(lineText[:abs]); r != utf8.RuneError && isRenameIdentChar(r) {
+				start = abs + 1
+				continue
+			}
+		}
+		open := abs + len(needle)
+		end := strings.IndexByte(lineText[open:], '}')
+		if end < 0 {
+			// Multi-line group: the members continue on following lines, so
+			// take the rest of this one.
+			end = len(lineText)
+		} else {
+			end = open + end
+		}
+		return abs, open, end
+	}
+}
+
 // isTokenBoundary returns true when the substring [pos, pos+length) in s is
 // not immediately preceded or followed by an identifier character.
 func isTokenBoundary(s string, pos, length int) bool {
