@@ -155,8 +155,8 @@ type fileEntry struct {
 }
 
 // statFilesParallel stats paths across all cores and returns the entries whose
-// stat succeeded. Order is not preserved: rows are keyed by path, so insertion
-// order does not affect any query result.
+// stat succeeded, in the order they were given. Nothing depends on that order —
+// rows are keyed by path — but the walk order is the cheapest one to keep.
 func statFilesParallel(paths []string) []fileEntry {
 	if len(paths) == 0 {
 		return nil

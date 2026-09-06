@@ -542,22 +542,27 @@ func (b *Batch) indexFile(path string, mtimeNano int64, defs []parser.Definition
 	}
 
 	if b.insertOnly {
+		// Reset the buffer before checking the error: the chunk boundary is an
+		// exact-multiple test, so a buffer left full would never match again and
+		// the rest of the batch would silently fall back to flushPending.
 		for _, d := range defs {
 			b.defArgs = append(b.defArgs, d.Module, d.Function, d.Arity, d.Kind, d.Line, d.FilePath, d.DelegateTo, d.DelegateAs, d.Params)
 			if len(b.defArgs) == defColumns*defChunkRows {
-				if _, err := b.defChunkStmt.Exec(b.defArgs...); err != nil {
+				_, err := b.defChunkStmt.Exec(b.defArgs...)
+				b.defArgs = b.defArgs[:0]
+				if err != nil {
 					return err
 				}
-				b.defArgs = b.defArgs[:0]
 			}
 		}
 		for _, r := range refs {
 			b.refArgs = append(b.refArgs, r.Module, r.Function, r.Line, r.FilePath, r.Kind)
 			if len(b.refArgs) == refColumns*refChunkRows {
-				if _, err := b.refChunkStmt.Exec(b.refArgs...); err != nil {
+				_, err := b.refChunkStmt.Exec(b.refArgs...)
+				b.refArgs = b.refArgs[:0]
+				if err != nil {
 					return err
 				}
-				b.refArgs = b.refArgs[:0]
 			}
 		}
 		return nil
