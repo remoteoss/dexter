@@ -5388,7 +5388,7 @@ func TestOutgoingCalls(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
 
-	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", `defmodule MyApp.Accounts do
+	const accountsSource = `defmodule MyApp.Accounts do
   def create(attrs) do
     MyApp.Repo.insert(attrs)
     MyApp.Mailer.send(attrs)
@@ -5398,7 +5398,30 @@ func TestOutgoingCalls(t *testing.T) {
     MyApp.Repo.all()
   end
 end
-`)
+`
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", accountsSource)
+
+	// Simulate an index created before parser-level ref deduplication. Outgoing
+	// call hierarchy should not return the same line range twice.
+	accountsPath := filepath.Join(server.projectRoot, "lib/accounts.ex")
+	defs, refs, err := parser.ParseText(accountsPath, accountsSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicated := false
+	for _, ref := range refs {
+		if ref.Module == "MyApp.Repo" && ref.Function == "insert" {
+			refs = append(refs, ref)
+			duplicated = true
+			break
+		}
+	}
+	if !duplicated {
+		t.Fatal("test setup did not find the Repo.insert reference to duplicate")
+	}
+	if err := server.store.IndexFileWithRefs(accountsPath, defs, refs); err != nil {
+		t.Fatal(err)
+	}
 
 	indexFile(t, server.store, server.projectRoot, "lib/repo.ex", `defmodule MyApp.Repo do
   def insert(attrs) do
@@ -5418,7 +5441,6 @@ end
 `)
 
 	// Open the accounts file in the doc store so PrepareCallHierarchy can read it
-	accountsPath := filepath.Join(server.projectRoot, "lib/accounts.ex")
 	accountsContent, _ := os.ReadFile(accountsPath)
 	accountsURI := string(uri.File(accountsPath))
 	server.docs.Set(accountsURI, string(accountsContent))
@@ -5454,6 +5476,9 @@ end
 	names := make(map[string]bool)
 	for _, c := range calls {
 		names[c.To.Name] = true
+		if c.To.Name == "MyApp.Repo.insert" && len(c.FromRanges) != 1 {
+			t.Errorf("Repo.insert FromRanges = %d, want 1 unique line", len(c.FromRanges))
+		}
 	}
 	if !names["MyApp.Repo.insert"] {
 		t.Error("expected outgoing call to MyApp.Repo.insert")
