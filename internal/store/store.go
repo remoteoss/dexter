@@ -222,6 +222,14 @@ func migrate(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
+	// idx_refs_function_kind was retired: no query leads with `function`, so
+	// SQLite never chose it (the two queries that filter on function/kind both
+	// lead with file_path and use idx_refs_file_path). On a 3.9M-row index it
+	// cost 80 MB and a share of every index rebuild. Drop it from databases
+	// that still carry it; this changes no query plan.
+	if _, err := db.Exec(`DROP INDEX IF EXISTS idx_refs_function_kind`); err != nil {
+		return err
+	}
 	return createIndexes(db)
 }
 
@@ -235,7 +243,6 @@ func createIndexes(db dbExecer) error {
 		CREATE INDEX IF NOT EXISTS idx_definitions_file_path_line ON definitions(file_path, line);
 		CREATE INDEX IF NOT EXISTS idx_refs_module_function ON refs(module, function);
 		CREATE INDEX IF NOT EXISTS idx_refs_file_path ON refs(file_path);
-		CREATE INDEX IF NOT EXISTS idx_refs_function_kind ON refs(function, kind);
 		CREATE INDEX IF NOT EXISTS idx_definitions_delegate_to ON definitions(delegate_to);
 	`)
 	return err
@@ -367,6 +374,18 @@ func (s *Store) IndexFileWithRefs(path string, defs []parser.Definition, refs []
 	return tx.Commit()
 }
 
+// Row counts for the multi-row INSERT statements used by the bulk path. Each
+// chunk stays under 900 bound parameters, which is below even the legacy
+// SQLITE_MAX_VARIABLE_NUMBER of 999, so the batch size never depends on how
+// the driver's SQLite was compiled.
+const (
+	defColumns   = 9
+	refColumns   = 5
+	maxBindVars  = 900
+	defChunkRows = maxBindVars / defColumns // 100
+	refChunkRows = maxBindVars / refColumns // 180
+)
+
 // Batch wraps multiple IndexFile operations in a single SQLite transaction
 // with shared prepared statements.
 type Batch struct {
@@ -377,6 +396,36 @@ type Batch struct {
 	delDefStmt *sql.Stmt // nil in insert-only mode
 	delRefStmt *sql.Stmt // nil in insert-only mode
 	insertOnly bool
+
+	// Multi-row INSERT buffers, used in insert-only mode only. A cold index
+	// writes ~4.4M rows through one connection, and the writer is the
+	// bottleneck of the whole indexing pipeline; batching turns ~4.4M cgo
+	// crossings into a few tens of thousands. Incremental reindexing keeps the
+	// row-at-a-time path, where a file's DELETE must stay ordered ahead of its
+	// INSERTs and the row count is far too small to matter.
+	defChunkStmt *sql.Stmt
+	refChunkStmt *sql.Stmt
+	defArgs      []interface{}
+	refArgs      []interface{}
+}
+
+// multiRowInsert builds "INSERT INTO <table> (<cols>) VALUES (?,..),(?,..)" for
+// exactly rows tuples of n placeholders each.
+func multiRowInsert(table, columns string, n, rows int) string {
+	var b strings.Builder
+	b.WriteString("INSERT INTO ")
+	b.WriteString(table)
+	b.WriteString(" (")
+	b.WriteString(columns)
+	b.WriteString(") VALUES ")
+	tuple := "(?" + strings.Repeat(",?", n-1) + ")"
+	for i := 0; i < rows; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(tuple)
+	}
+	return b.String()
 }
 
 func (s *Store) BeginBatch() (*Batch, error) {
@@ -438,6 +487,25 @@ func (s *Store) beginBatch(insertOnly bool) (*Batch, error) {
 			_ = tx.Rollback()
 			return nil, err
 		}
+	} else {
+		b.defChunkStmt, err = tx.Prepare(multiRowInsert(
+			"definitions",
+			"module, function, arity, kind, line, file_path, delegate_to, delegate_as, params",
+			defColumns, defChunkRows))
+		if err != nil {
+			b.closeStmts()
+			_ = tx.Rollback()
+			return nil, err
+		}
+		b.refChunkStmt, err = tx.Prepare(multiRowInsert(
+			"refs", "module, function, line, file_path, kind", refColumns, refChunkRows))
+		if err != nil {
+			b.closeStmts()
+			_ = tx.Rollback()
+			return nil, err
+		}
+		b.defArgs = make([]interface{}, 0, defColumns*defChunkRows)
+		b.refArgs = make([]interface{}, 0, refColumns*refChunkRows)
 	}
 
 	return b, nil
@@ -473,6 +541,28 @@ func (b *Batch) indexFile(path string, mtimeNano int64, defs []parser.Definition
 		return err
 	}
 
+	if b.insertOnly {
+		for _, d := range defs {
+			b.defArgs = append(b.defArgs, d.Module, d.Function, d.Arity, d.Kind, d.Line, d.FilePath, d.DelegateTo, d.DelegateAs, d.Params)
+			if len(b.defArgs) == defColumns*defChunkRows {
+				if _, err := b.defChunkStmt.Exec(b.defArgs...); err != nil {
+					return err
+				}
+				b.defArgs = b.defArgs[:0]
+			}
+		}
+		for _, r := range refs {
+			b.refArgs = append(b.refArgs, r.Module, r.Function, r.Line, r.FilePath, r.Kind)
+			if len(b.refArgs) == refColumns*refChunkRows {
+				if _, err := b.refChunkStmt.Exec(b.refArgs...); err != nil {
+					return err
+				}
+				b.refArgs = b.refArgs[:0]
+			}
+		}
+		return nil
+	}
+
 	for _, d := range defs {
 		if _, err := b.defStmt.Exec(d.Module, d.Function, d.Arity, d.Kind, d.Line, d.FilePath, d.DelegateTo, d.DelegateAs, d.Params); err != nil {
 			return err
@@ -488,7 +578,30 @@ func (b *Batch) indexFile(path string, mtimeNano int64, defs []parser.Definition
 	return nil
 }
 
+// flushPending writes any rows left over from a partly filled chunk, one row at
+// a time through the single-row statements.
+func (b *Batch) flushPending() error {
+	for i := 0; i < len(b.defArgs); i += defColumns {
+		if _, err := b.defStmt.Exec(b.defArgs[i : i+defColumns]...); err != nil {
+			return err
+		}
+	}
+	b.defArgs = b.defArgs[:0]
+	for i := 0; i < len(b.refArgs); i += refColumns {
+		if _, err := b.refStmt.Exec(b.refArgs[i : i+refColumns]...); err != nil {
+			return err
+		}
+	}
+	b.refArgs = b.refArgs[:0]
+	return nil
+}
+
 func (b *Batch) Commit() error {
+	if err := b.flushPending(); err != nil {
+		b.closeStmts()
+		_ = b.tx.Rollback()
+		return err
+	}
 	b.closeStmts()
 	return b.tx.Commit()
 }
@@ -502,6 +615,12 @@ func (b *Batch) closeStmts() {
 	_ = b.defStmt.Close()
 	_ = b.refStmt.Close()
 	_ = b.fileStmt.Close()
+	if b.defChunkStmt != nil {
+		_ = b.defChunkStmt.Close()
+	}
+	if b.refChunkStmt != nil {
+		_ = b.refChunkStmt.Close()
+	}
 	if b.delDefStmt != nil {
 		_ = b.delDefStmt.Close()
 	}
@@ -973,9 +1092,15 @@ type ModuleReferenceResult struct {
 // LookupReferencesByPrefix returns all refs whose module equals prefix or starts
 // with prefix + ".". Used for bulk module renames to avoid N+1 queries.
 func (s *Store) LookupReferencesByPrefix(prefix string) ([]ModuleReferenceResult, error) {
+	// A range beats LIKE here: LIKE is case-insensitive by default, so SQLite
+	// cannot convert `module LIKE 'Prefix.%'` into an index range and falls back
+	// to a full scan of refs (3.9M rows on a large monorepo). '/' is '.'+1, so
+	// [prefix+"." , prefix+"/") is exactly the set of names under the prefix,
+	// and idx_refs_module_function serves it. Elixir module names are
+	// case-sensitive, so the stricter comparison is also the correct one.
 	rows, err := s.db.Query(
-		"SELECT module, file_path, line, kind FROM refs WHERE module = ? OR module LIKE ? ORDER BY file_path, line",
-		prefix, prefix+".%",
+		"SELECT module, file_path, line, kind FROM refs WHERE module = ? OR (module >= ? AND module < ?) ORDER BY file_path, line",
+		prefix, prefix+".", prefix+"/",
 	)
 	if err != nil {
 		return nil, err
@@ -997,9 +1122,10 @@ func (s *Store) LookupReferencesByPrefix(prefix string) ([]ModuleReferenceResult
 // or starts with prefix + ".". The Module field is populated on each result.
 // Used for bulk module renames to replace N per-module LookupModule calls with one.
 func (s *Store) LookupModulesByPrefix(prefix string) ([]LookupResult, error) {
+	// Range rather than LIKE, for the same reason as LookupReferencesByPrefix.
 	rows, err := s.db.Query(
-		"SELECT module, file_path, line, kind, arity, delegate_to, delegate_as FROM definitions WHERE function = '' AND (module = ? OR module LIKE ?) AND kind IN ('module', 'defprotocol', 'defimpl') ORDER BY module",
-		prefix, prefix+".%",
+		"SELECT module, file_path, line, kind, arity, delegate_to, delegate_as FROM definitions WHERE function = '' AND (module = ? OR (module >= ? AND module < ?)) AND kind IN ('module', 'defprotocol', 'defimpl') ORDER BY module",
+		prefix, prefix+".", prefix+"/",
 	)
 	if err != nil {
 		return nil, err

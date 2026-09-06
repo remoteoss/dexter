@@ -149,6 +149,54 @@ func findProjectRoot(path string) string {
 	return store.FindProjectRoot(path, "mix.exs")
 }
 
+type fileEntry struct {
+	path      string
+	mtimeNano int64
+}
+
+// statFilesParallel stats paths across all cores and returns the entries whose
+// stat succeeded. Order is not preserved: rows are keyed by path, so insertion
+// order does not affect any query result.
+func statFilesParallel(paths []string) []fileEntry {
+	if len(paths) == 0 {
+		return nil
+	}
+	workers := runtime.NumCPU()
+	if workers > len(paths) {
+		workers = len(paths)
+	}
+	out := make([]fileEntry, len(paths))
+	ok := make([]bool, len(paths))
+	var wg sync.WaitGroup
+	var next atomic.Int64
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				i := int(next.Add(1)) - 1
+				if i >= len(paths) {
+					return
+				}
+				info, err := os.Stat(paths[i])
+				if err != nil {
+					continue
+				}
+				out[i] = fileEntry{path: paths[i], mtimeNano: info.ModTime().UnixNano()}
+				ok[i] = true
+			}
+		}()
+	}
+	wg.Wait()
+	entries := out[:0]
+	for i := range out {
+		if ok[i] {
+			entries = append(entries, out[i])
+		}
+	}
+	return entries
+}
+
 func cmdInit(projectRoot string, force bool, profile bool) {
 	dbPath := store.DBPath(projectRoot)
 	if _, err := os.Stat(dbPath); err == nil {
@@ -180,35 +228,28 @@ func cmdInit(projectRoot string, force bool, profile bool) {
 	start := time.Now()
 
 	// Phase 1: collect file paths and mtimes
-	type fileEntry struct {
-		path      string
-		mtimeNano int64
-	}
-	var files []fileEntry
-	var stdlibFiles []fileEntry
+	// The walk itself is a single-threaded directory traversal, but DirEntry.Info()
+	// costs one lstat per file — ~70k serialized syscalls on a large monorepo, which
+	// dominated this phase. Collect the paths first, then stat them in parallel.
+	var filePaths []string
 	err = parser.WalkElixirFiles(projectRoot, func(path string, d fs.DirEntry) error {
-		info, err := d.Info()
-		if err != nil {
-			return nil
-		}
-		files = append(files, fileEntry{path: path, mtimeNano: info.ModTime().UnixNano()})
+		filePaths = append(filePaths, path)
 		return nil
 	})
 	if err != nil {
 		fatal(err)
 	}
+	var stdlibPaths []string
 	var stdlibRoot string
 	if root, ok := stdlib.Resolve(s, "", projectRoot); ok {
 		stdlibRoot = root
 		_ = parser.WalkElixirFiles(stdlibRoot, func(path string, d fs.DirEntry) error {
-			info, err := d.Info()
-			if err != nil {
-				return nil
-			}
-			stdlibFiles = append(stdlibFiles, fileEntry{path: path, mtimeNano: info.ModTime().UnixNano()})
+			stdlibPaths = append(stdlibPaths, path)
 			return nil
 		})
 	}
+	files := statFilesParallel(filePaths)
+	stdlibFiles := statFilesParallel(stdlibPaths)
 	prof.log("  walk: %s (%s files)\n", prof.since(start).Round(time.Millisecond), formatInt(len(files)+len(stdlibFiles)))
 
 	// Parse stdlib files in parallel (definitions only — refs are not indexed for stdlib).
