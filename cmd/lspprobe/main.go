@@ -59,6 +59,7 @@ func main() {
 		asJSON  = flag.Bool("json", false, "emit JSON (stable ordering, for diffing two builds)")
 		counts  = flag.Bool("counts", false, "print only how many locations each probe returned")
 		timeout = flag.Duration("timeout", 60*time.Second, "per-request timeout")
+		settle  = flag.Duration("settle", 0, "wait after initialize before probing, to let background indexing and cache warm-up finish")
 		verbose = flag.Bool("v", false, "pass the server's stderr through")
 	)
 	flag.Parse()
@@ -89,6 +90,13 @@ func main() {
 	}
 	defer client.Close()
 	client.SetTimeout(*timeout)
+
+	// Background work (reindex, cache warm-up) races a probe that fires the
+	// instant the server is up. A real editor waits; -settle makes a
+	// measurement comparable to one.
+	if *settle > 0 {
+		time.Sleep(*settle)
+	}
 
 	want := func(m string) bool { return *method == "all" || *method == m }
 
