@@ -94,7 +94,7 @@ A module rename also moves files whose names follow the module naming convention
 
 `protocol.WorkspaceEdit` from `go.lsp.dev/protocol` types `documentChanges` as `[]TextDocumentEdit` and cannot carry resource operations, so `internal/lsp/workspace_edit.go` defines the wire types and `renameHandler` answers `textDocument/rename` ahead of the generated dispatcher. A client that understands `documentChanges` ignores `changes` entirely, so once one file moves, every edit in the reply goes through `documentChanges`.
 
-For a rename the MCP server asked for rather than an editor, `deliverEdits` plays the part the editor would: attached to a live session it forwards the whole edit as `workspace/applyEdit` — over the raw connection, since `protocol.ApplyWorkspaceEditParams` drops resource operations for the same reason — and headless it carries out the edits and moves on disk itself. Headless has no open buffers, so it never produces a client-side move; that branch is defensive.
+For a rename the MCP server asked for rather than an editor, the builders keep every affected file and move in one `WorkspaceEdit`. In attached mode, `deliverEdits` forwards that complete edit as `workspace/applyEdit` — over the raw connection, since `protocol.ApplyWorkspaceEditParams` drops resource operations — and updates buffers and the index only after the editor accepts it. A rejected edit therefore leaves closed files untouched too. In headless mode, `deliverEdits` applies the same complete edit and moves on disk itself.
 
 ### Grouped aliases
 
