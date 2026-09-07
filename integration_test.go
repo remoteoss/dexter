@@ -3,6 +3,9 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +14,7 @@ import (
 	"time"
 
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
+	"go.lsp.dev/uri"
 
 	"github.com/remoteoss/dexter/internal/store"
 )
@@ -685,6 +689,10 @@ func TestIntegration_LSPWithMCPListen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -692,11 +700,30 @@ func TestIntegration_LSPWithMCPListen(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
+	go func() { _, _ = io.Copy(io.Discard, stdout) }()
 	t.Cleanup(func() {
 		_ = stdin.Close()
 		_ = cmd.Process.Kill()
 		_, _ = cmd.Process.Wait()
 	})
+
+	// Attached MCP deliberately waits until initialize has populated the live
+	// client's capabilities before it starts accepting requests.
+	initialize, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "initialize",
+		"params": map[string]any{
+			"rootUri":      string(uri.File(root)),
+			"capabilities": map[string]any{},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fmt.Fprintf(stdin, "Content-Length: %d\r\n\r\n%s", len(initialize), initialize); err != nil {
+		t.Fatal(err)
+	}
 
 	// Parse the bound address from stderr.
 	addrCh := make(chan string, 1)
