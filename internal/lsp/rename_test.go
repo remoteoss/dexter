@@ -1628,7 +1628,9 @@ end
 	})
 
 	// Re-index with original content for test 2, and close the def file so it
-	// takes the closed-file path (moved on disk by the server)
+	// takes the closed-file path (moved on disk by the server). Wait for the
+	// first rename's asynchronous index bookkeeping before restoring it.
+	server.backgroundWork.Wait()
 	server.docs.Close("file://" + oldPath)
 	indexFile(t, server.store, server.projectRoot, "lib/docusign.ex", defContent)
 
