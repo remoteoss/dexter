@@ -1156,6 +1156,17 @@ func skipToEndOfStatement(tokens []parser.Token, n, from int) int {
 // its `quote do` block, and extracts imports/uses/inline-defs/aliases from it.
 // Uses the tokenizer for correct heredoc and multi-line handling.
 func parseHelperQuoteBlock(lines []string, helperName string, fileAliases map[string]string) (imported []string, inlineDefs map[string][]inlineDef, transUses []string, optBindings []optBinding, aliases map[string]string) {
+	imported, inlineDefs, transUses, _, optBindings, aliases = parseHelperQuoteBlockDetailed(lines, helperName, fileAliases, make(map[string]bool))
+	return
+}
+
+func parseHelperQuoteBlockDetailed(lines []string, helperName string, fileAliases map[string]string, visited map[string]bool) (imported []string, inlineDefs map[string][]inlineDef, transUses []string, transUseCalls []UseCall, optBindings []optBinding, aliases map[string]string) {
+	if visited[helperName] {
+		return
+	}
+	visited[helperName] = true
+	defer delete(visited, helperName)
+
 	source := []byte(strings.Join(lines, "\n"))
 	tokens := parser.Tokenize(source)
 	n := len(tokens)
@@ -1195,9 +1206,8 @@ func parseHelperQuoteBlock(lines []string, helperName string, fileAliases map[st
 		switch tokens[i].Kind {
 		case parser.TokIdent:
 			if string(source[tokens[i].Start:tokens[i].End]) == "quote" {
-				j := tokNextSig(tokens, n, i+1)
-				if j < n && tokens[j].Kind == parser.TokDo {
-					quoteBodyStart = j + 1
+				if _, nextPos, hasDo := parser.ScanForwardToBlockDo(tokens, n, i+1); hasDo {
+					quoteBodyStart = nextPos
 				}
 			}
 		}
@@ -1226,9 +1236,17 @@ func parseHelperQuoteBlock(lines []string, helperName string, fileAliases map[st
 
 		case parser.TokUse:
 			j := tokNextSig(tokens, n, i+1)
-			mod, _ := tokCollectModuleName(source, tokens, n, j)
+			mod, k := tokCollectModuleName(source, tokens, n, j)
 			if mod != "" {
-				transUses = append(transUses, resolveAlias(mod))
+				resolved := resolveAlias(mod)
+				transUses = append(transUses, resolved)
+				call := UseCall{Module: resolved}
+				nk := tokNextSig(tokens, n, k)
+				if nk < n && tokens[nk].Kind == parser.TokComma {
+					call.Opts = tokCollectKeywordModuleOpts(source, tokens, n, nk+1, fileAliases)
+					call.Which, call.WhichKey = tokCollectDispatchAtom(source, tokens, n, nk+1)
+				}
+				transUseCalls = append(transUseCalls, call)
 			}
 
 		case parser.TokAlias:
@@ -1295,6 +1313,38 @@ func parseHelperQuoteBlock(lines []string, helperName string, fileAliases map[st
 				})
 			}
 			i = skipToEndOfStatement(tokens, n, nextPos) - 1
+
+		case parser.TokIdent:
+			if parser.TokenText(source, tok) != "unquote" {
+				continue
+			}
+			j := tokNextSig(tokens, n, i+1)
+			if j >= n || tokens[j].Kind != parser.TokOpenParen {
+				continue
+			}
+			j = tokNextSig(tokens, n, j+1)
+			if j >= n || tokens[j].Kind != parser.TokIdent {
+				continue
+			}
+			nestedName := parser.TokenText(source, tokens[j])
+			k := tokNextSig(tokens, n, j+1)
+			if k >= n || tokens[k].Kind != parser.TokOpenParen {
+				continue
+			}
+			nestedImports, nestedDefs, nestedUses, nestedCalls, nestedBindings, nestedAliases := parseHelperQuoteBlockDetailed(lines, nestedName, fileAliases, visited)
+			imported = append(imported, nestedImports...)
+			for name, defs := range nestedDefs {
+				inlineDefs[name] = append(inlineDefs[name], defs...)
+			}
+			transUses = append(transUses, nestedUses...)
+			transUseCalls = append(transUseCalls, nestedCalls...)
+			optBindings = append(optBindings, nestedBindings...)
+			for short, full := range nestedAliases {
+				if aliases == nil {
+					aliases = make(map[string]string)
+				}
+				aliases[short] = full
+			}
 		}
 	}
 	return
@@ -1397,13 +1447,28 @@ func tokCollectDispatchAtom(source []byte, tokens []parser.Token, n, pos int) (w
 	}
 	switch tokens[i].Kind {
 	case parser.TokAtom:
-		return strings.TrimPrefix(parser.TokenText(source, tokens[i]), ":"), ""
+		return dispatchAtomName(parser.TokenText(source, tokens[i])), ""
+	case parser.TokOpenBrace:
+		j := tokNextSig(tokens, n, i+1)
+		if j < n && tokens[j].Kind == parser.TokAtom {
+			return dispatchAtomName(parser.TokenText(source, tokens[j])), ""
+		}
 	case parser.TokIdent:
 		if i+1 < n && tokens[i+1].Kind == parser.TokColon {
 			return "", parser.TokenText(source, tokens[i])
 		}
 	}
 	return "", ""
+}
+
+func dispatchAtomName(text string) string {
+	name := strings.TrimPrefix(text, ":")
+	if len(name) >= 2 && name[0] == '"' && name[len(name)-1] == '"' {
+		if unquoted, err := strconv.Unquote(name); err == nil {
+			return unquoted
+		}
+	}
+	return name
 }
 
 // tokCollectKeywordModuleOpts scans tokens starting at pos for keyword pairs
@@ -1458,13 +1523,23 @@ type usingBody struct {
 	imports     []string               // modules imported, source order
 	inlineDefs  map[string][]inlineDef // function name → defs in the quote do block
 	transUses   []string               // modules used inside the body (double-use chains)
+	transCalls  []UseCall              // transitive uses with dispatch atom and opts preserved
 	optBindings []optBinding           // dynamic imports/uses resolved from opts
 	aliases     map[string]string      // alias short name → full module
 }
 
 func (b *usingBody) isEmpty() bool {
 	return b == nil || (len(b.imports) == 0 && len(b.inlineDefs) == 0 &&
-		len(b.transUses) == 0 && len(b.optBindings) == 0 && len(b.aliases) == 0)
+		len(b.transUses) == 0 && len(b.transCalls) == 0 && len(b.optBindings) == 0 && len(b.aliases) == 0)
+}
+
+func (b *usingBody) hasTransCall(moduleName string) bool {
+	for i := range b.transCalls {
+		if b.transCalls[i].Module == moduleName {
+			return true
+		}
+	}
+	return false
 }
 
 // usingDispatchParam reports the parameter name of an atom-dispatch __using__
@@ -1553,6 +1628,53 @@ func applyDispatchesOn(source []byte, tokens []parser.Token, n, from int, param 
 	return false
 }
 
+// sourceForModule limits runtime __using__ parsing to one module in files that
+// define multiple modules. Leading newlines preserve the original token line
+// numbers used for definition locations.
+func sourceForModule(text, moduleName string) (string, bool) {
+	source := []byte(text)
+	tokens := parser.Tokenize(source)
+	type frame struct {
+		name  string
+		depth int
+		start int
+	}
+	var stack []frame
+	depth := 0
+
+	for i := 0; i < len(tokens); i++ {
+		switch tokens[i].Kind {
+		case parser.TokDo, parser.TokFn:
+			parser.TrackBlockDepth(tokens[i].Kind, &depth)
+		case parser.TokEnd:
+			prevDepth := depth
+			parser.TrackBlockDepth(tokens[i].Kind, &depth)
+			if len(stack) == 0 || stack[len(stack)-1].depth != prevDepth {
+				continue
+			}
+			closed := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			if closed.name == moduleName {
+				prefix := strings.Repeat("\n", tokens[closed.start].Line-1)
+				return prefix + string(source[tokens[closed.start].Start:tokens[i].End]), true
+			}
+		case parser.TokDefmodule:
+			parent := ""
+			if len(stack) > 0 {
+				parent = stack[len(stack)-1].name
+			}
+			name, nextPos, hasDo := tokParseModuleDef(source, tokens, i+1, parent)
+			if name == "" || !hasDo {
+				continue
+			}
+			depth++
+			stack = append(stack, frame{name: name, depth: depth, start: i})
+			i = nextPos - 1
+		}
+	}
+	return "", false
+}
+
 // parseDispatchBodies parses every `def name do quote do ... end end` in text
 // into its own usingBody, keyed by function name. Callers select one by the
 // literal atom at the `use` site, so nothing is merged across targets.
@@ -1583,11 +1705,12 @@ func parseDispatchBodies(text string) map[string]*usingBody {
 		}
 		seen[name] = true
 
-		imported, inlineDefs, transUses, optBindings, aliases := parseHelperQuoteBlock(lines, name, fileAliases)
+		imported, inlineDefs, transUses, transCalls, optBindings, aliases := parseHelperQuoteBlockDetailed(lines, name, fileAliases, make(map[string]bool))
 		body := &usingBody{
 			imports:     imported,
 			inlineDefs:  inlineDefs,
 			transUses:   transUses,
+			transCalls:  transCalls,
 			optBindings: optBindings,
 			aliases:     aliases,
 		}
@@ -1620,6 +1743,11 @@ type inlineDef struct {
 // Uses the tokenizer so that heredocs, multi-line expressions, and comments are
 // handled correctly without line-joining heuristics.
 func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inlineDef, transUses []string, optBindings []optBinding, aliases map[string]string) {
+	imported, inlineDefs, transUses, _, optBindings, aliases = parseUsingBodyDetailed(text)
+	return
+}
+
+func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[string][]inlineDef, transUses []string, transCalls []UseCall, optBindings []optBinding, aliases map[string]string) {
 	source := []byte(text)
 	tokens := parser.Tokenize(source)
 	n := len(tokens)
@@ -1836,7 +1964,15 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 			// use Module
 			modName, k := collectModuleName(j)
 			if modName != "" {
-				transUses = append(transUses, resolveAlias(modName))
+				resolved := resolveAlias(modName)
+				transUses = append(transUses, resolved)
+				call := UseCall{Module: resolved}
+				nk := nextSig(k)
+				if nk < n && tokens[nk].Kind == parser.TokComma {
+					call.Opts = tokCollectKeywordModuleOpts(source, tokens, n, nk+1, fileAliases)
+					call.Which, call.WhichKey = tokCollectDispatchAtom(source, tokens, n, nk+1)
+				}
+				transCalls = append(transCalls, call)
 			}
 			i = k
 
@@ -1982,13 +2118,14 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 			// helper_name(opts) where helper_name is a def/defp in the same file.
 			// Only at statement start to avoid matching function calls inside expressions.
 			if isStmtStart && j < n && tokens[j].Kind == parser.TokOpenParen && !parser.IsElixirKeyword(identName) {
-				helperImported, helperDefs, helperTransUses, helperBindings, helperAliases := parseHelperQuoteBlock(lines, identName, fileAliases)
+				helperImported, helperDefs, helperTransUses, helperCalls, helperBindings, helperAliases := parseHelperQuoteBlockDetailed(lines, identName, fileAliases, make(map[string]bool))
 				if helperImported != nil {
 					imported = append(imported, helperImported...)
 					for hk, hv := range helperDefs {
 						inlineDefs[hk] = append(inlineDefs[hk], hv...)
 					}
 					transUses = append(transUses, helperTransUses...)
+					transCalls = append(transCalls, helperCalls...)
 					optBindings = append(optBindings, helperBindings...)
 				}
 				for hk, hv := range helperAliases {

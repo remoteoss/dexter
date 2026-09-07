@@ -62,9 +62,11 @@ def controller do
 end
 ```
 
-`usingDispatchParam` recognises this only when `apply/3` targets `__MODULE__` **and** dispatches on that clause's own parameter — a literal function name or another module is not atom dispatch. When it matches, `parseDispatchBodies` parses each `def name do quote do ... end end` in the file into its own `usingBody`, stored in `usingCacheEntry.dispatch` keyed by function name. Nothing is merged across targets.
+`usingDispatchParam` recognises this only when `apply/3` targets `__MODULE__` **and** dispatches on that clause's own parameter — a literal function name or another module is not atom dispatch. Runtime parsing is scoped to the indexed module when a file defines multiple modules. When dispatch matches, `parseDispatchBodies` parses each `def name do quote do ... end end` in that module into its own `usingBody`, stored in `usingCacheEntry.dispatch` keyed by function name. Nothing is merged across targets.
 
-Selection happens at lookup time from the literal atom at the `use` site (`UseCall.Which`, or `UseCall.WhichKey` for the `use Mod, live_view: opts` form). `entry.bodyFor(which)` returns the matching body, or nil when the atom names no target — injecting nothing rather than guessing. A `use` that passes no literal atom resolves through the ordinary body, so the feature is purely additive.
+Selection happens at lookup time from the literal atom at the `use` site (`UseCall.Which`, or `UseCall.WhichKey` for the `use Mod, live_view: opts` form). `entry.bodyFor(which)` returns the matching body, or nil when the atom names no target — injecting nothing rather than guessing. A `use` that passes no literal atom resolves through the ordinary body, so the feature is purely additive. Completion, injected-alias merging, callback lookup, definitions, and references all select the same body.
+
+Transitive uses retain their complete `UseCall`, including the dispatch atom and keyword options. Visited keys include both module and dispatch target, which permits legitimate same-module chains such as `:api_controller` using `:controller` while still breaking real cycles. Local quoted helpers invoked with `unquote(helper())` are followed recursively.
 
 The token walker cannot evaluate conditionals, so a `use` nested in a compile-time branch (`on_ee do use X end`) is included unconditionally. This over-includes candidate names; it never removes one.
 

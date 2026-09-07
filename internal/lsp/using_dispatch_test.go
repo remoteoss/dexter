@@ -265,3 +265,146 @@ end`
 		t.Fatalf("expected the call site in page_controller.ex, got %d locations", len(locs))
 	}
 }
+
+func TestDispatch_CompletionUsesSelectedBody(t *testing.T) {
+	server, cleanup := setupDispatchServer(t)
+	defer cleanup()
+
+	uri := "file://" + filepath.Join(server.projectRoot, "lib/caller.ex")
+	server.docs.Set(uri, `defmodule MyApp.PageController do
+  use MyAppWeb, :controller
+
+  assign_d
+end`)
+
+	items := completionAt(t, server, uri, 3, 10)
+	if !hasCompletionItem(items, "assign_defaults") {
+		t.Fatal("expected completion from the selected dispatch body")
+	}
+
+	server.docs.Set(uri, `defmodule MyApp.PageController do
+  use MyAppWeb, :controller
+
+  for
+end`)
+	items = completionAt(t, server, uri, 3, 5)
+	if hasCompletionItem(items, "format_money") {
+		t.Fatal("completion leaked from a different dispatch body")
+	}
+}
+
+func TestDispatch_MergesAliasesFromSelectedBody(t *testing.T) {
+	server, cleanup := setupDispatchServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/router_helpers.ex", `defmodule MyApp.Router.Helpers do
+  def page_path(conn, action), do: {conn, action}
+end`)
+	indexFile(t, server.store, server.projectRoot, "lib/aliased_web.ex", `defmodule MyApp.AliasedWeb do
+  def controller do
+    quote do
+      alias MyApp.Router.Helpers, as: Routes
+    end
+  end
+
+  defmacro __using__(which) when is_atom(which), do: apply(__MODULE__, which, [])
+end`)
+
+	src := `defmodule MyApp.PageController do
+  use MyApp.AliasedWeb, :controller
+
+  def index(conn), do: Routes.page_path(conn, :index)
+end`
+	if got := callerDefinition(t, server, src, 3, 31); len(got) == 0 {
+		t.Fatal("expected alias injected by selected dispatch body to resolve")
+	}
+}
+
+func TestDispatch_FollowsNestedDispatchOnSameModule(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/nested_web.ex", `defmodule MyApp.NestedWeb do
+  def controller do
+    quote do
+      import MyApp.ControllerHelpers
+    end
+  end
+
+  def api_controller do
+    quote do
+      use MyApp.NestedWeb, :controller
+    end
+  end
+
+  defmacro __using__(which) when is_atom(which), do: apply(__MODULE__, which, [])
+end`)
+	indexFile(t, server.store, server.projectRoot, "lib/controller_helpers.ex", controllerHelpersSrc)
+
+	src := `defmodule MyApp.APIController do
+  use MyApp.NestedWeb, :api_controller
+
+  def index(conn), do: assign_defaults(conn)
+end`
+	if got := callerDefinition(t, server, src, 3, 23); len(got) == 0 {
+		t.Fatal("expected nested use to retain its dispatch atom")
+	}
+}
+
+func TestDispatch_FollowsQuotedLocalHelper(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/composed_web.ex", `defmodule MyApp.ComposedWeb do
+  def controller do
+    quote do
+      unquote(shared_helpers())
+    end
+  end
+
+  defp shared_helpers do
+    quote location: :keep do
+      import MyApp.ControllerHelpers
+    end
+  end
+
+  defmacro __using__(which) when is_atom(which), do: apply(__MODULE__, which, [])
+end`)
+	indexFile(t, server.store, server.projectRoot, "lib/controller_helpers.ex", controllerHelpersSrc)
+
+	src := `defmodule MyApp.PageController do
+  use MyApp.ComposedWeb, :controller
+
+  def index(conn), do: assign_defaults(conn)
+end`
+	if got := callerDefinition(t, server, src, 3, 23); len(got) == 0 {
+		t.Fatal("expected dispatched quote to include its local quoted helper")
+	}
+}
+
+func TestDispatch_DoesNotReadTargetsFromSiblingModule(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/multiple.ex", `defmodule MyAppWeb do
+  defmacro __using__(which) when is_atom(which), do: apply(__MODULE__, which, [])
+end
+
+defmodule SharedLib.OtherWeb do
+  def controller do
+    quote do
+      import MyApp.ControllerHelpers
+    end
+  end
+end`)
+	indexFile(t, server.store, server.projectRoot, "lib/controller_helpers.ex", controllerHelpersSrc)
+
+	src := `defmodule MyApp.PageController do
+  use MyAppWeb, :controller
+
+  def index(conn), do: assign_defaults(conn)
+end`
+	if got := callerDefinition(t, server, src, 3, 23); len(got) != 0 {
+		t.Fatal("dispatch target from a sibling module leaked into MyAppWeb")
+	}
+}
