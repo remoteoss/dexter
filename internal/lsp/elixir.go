@@ -1326,6 +1326,23 @@ func extractUsesFromTokens(source []byte, tokens []parser.Token) []string {
 type UseCall struct {
 	Module string            // the module being used (alias-resolved)
 	Opts   map[string]string // keyword args: opt_key → module name (alias-resolved)
+
+	// Which is the literal atom passed as the second argument, e.g. "controller"
+	// for `use MyAppWeb, :controller`. WhichKey is the first keyword key, e.g.
+	// "live_view" for `use MyAppWeb, live_view: :no_sentry_context`. Both feed
+	// atom-dispatch __using__ resolution and are empty otherwise.
+	Which    string
+	WhichKey string
+}
+
+// dispatchAtom is the name an atom-dispatch __using__ dispatches on, preferring
+// the bare atom form. Empty when the `use` passes no literal atom, which keeps
+// dispatch resolution off unless the target is named explicitly.
+func (u UseCall) dispatchAtom() string {
+	if u.Which != "" {
+		return u.Which
+	}
+	return u.WhichKey
 }
 
 // ExtractUsesWithOpts parses all `use Module` and `use Module, key: Val`
@@ -1354,13 +1371,39 @@ func extractUsesWithOptsFromTokens(source []byte, tokens []parser.Token, aliases
 		nk := tokNextSig(tokens, n, k)
 		if nk < n && tokens[nk].Kind == parser.TokComma {
 			opts := tokCollectKeywordModuleOpts(source, tokens, n, nk+1, aliases)
-			calls = append(calls, UseCall{Module: module, Opts: opts})
+			which, whichKey := tokCollectDispatchAtom(source, tokens, n, nk+1)
+			calls = append(calls, UseCall{Module: module, Opts: opts, Which: which, WhichKey: whichKey})
 		} else {
 			calls = append(calls, UseCall{Module: module})
 		}
 		i = k
 	}
 	return calls
+}
+
+// tokCollectDispatchAtom reads the second argument of a `use` call for the two
+// shapes an atom-dispatch __using__ accepts:
+//
+//	use MyAppWeb, :controller                     → which "controller"
+//	use MyAppWeb, live_view: :no_sentry_context   → whichKey "live_view"
+//
+// Only a literal atom (or literal keyword key) is reported. A variable or a
+// computed value yields empty strings, so the caller resolves nothing rather
+// than guessing.
+func tokCollectDispatchAtom(source []byte, tokens []parser.Token, n, pos int) (which, whichKey string) {
+	i := tokNextSig(tokens, n, pos)
+	if i >= n {
+		return "", ""
+	}
+	switch tokens[i].Kind {
+	case parser.TokAtom:
+		return strings.TrimPrefix(parser.TokenText(source, tokens[i]), ":"), ""
+	case parser.TokIdent:
+		if i+1 < n && tokens[i+1].Kind == parser.TokColon {
+			return "", parser.TokenText(source, tokens[i])
+		}
+	}
+	return "", ""
 }
 
 // tokCollectKeywordModuleOpts scans tokens starting at pos for keyword pairs
@@ -1406,6 +1449,156 @@ func tokCollectKeywordModuleOpts(source []byte, tokens []parser.Token, n, pos in
 		i++
 	}
 	return result
+}
+
+// usingBody is everything a single `quote do` block injects into a consumer
+// module. A plain `__using__` has exactly one; an atom-dispatch entrypoint has
+// one per dispatch target.
+type usingBody struct {
+	imports     []string               // modules imported, source order
+	inlineDefs  map[string][]inlineDef // function name → defs in the quote do block
+	transUses   []string               // modules used inside the body (double-use chains)
+	optBindings []optBinding           // dynamic imports/uses resolved from opts
+	aliases     map[string]string      // alias short name → full module
+}
+
+func (b *usingBody) isEmpty() bool {
+	return b == nil || (len(b.imports) == 0 && len(b.inlineDefs) == 0 &&
+		len(b.transUses) == 0 && len(b.optBindings) == 0 && len(b.aliases) == 0)
+}
+
+// usingDispatchParam reports the parameter name of an atom-dispatch __using__
+// clause, i.e. one whose entire body delegates to a sibling function named by
+// the atom the consumer passed:
+//
+//	defmacro __using__(which) when is_atom(which), do: apply(__MODULE__, which, [])
+//	defmacro __using__([{which, opts}]) when is_atom(which), do: apply(__MODULE__, which, [opts])
+//
+// It returns "" unless apply/3 targets __MODULE__ *and* dispatches on that
+// clause's own parameter. A literal function name or another module means the
+// call is not atom dispatch and must not be treated as such.
+func usingDispatchParam(source []byte, tokens []parser.Token) string {
+	n := len(tokens)
+	for i := 0; i < n; i++ {
+		if tokens[i].Kind != parser.TokDefmacro {
+			continue
+		}
+		j := tokNextSig(tokens, n, i+1)
+		if j >= n || tokens[j].Kind != parser.TokIdent || parser.TokenText(source, tokens[j]) != "__using__" {
+			continue
+		}
+		param, after := usingClauseParam(source, tokens, n, j+1)
+		if param == "" {
+			continue
+		}
+		if applyDispatchesOn(source, tokens, n, after, param) {
+			return param
+		}
+	}
+	return ""
+}
+
+// usingClauseParam reads the first parameter name of a __using__ clause,
+// accepting both `__using__(which)` and `__using__([{which, opts}])`. It
+// returns the name and the index to continue scanning from. A wildcard or
+// pattern that binds no plain name yields "".
+func usingClauseParam(source []byte, tokens []parser.Token, n, from int) (string, int) {
+	i := tokNextSig(tokens, n, from)
+	if i >= n || tokens[i].Kind != parser.TokOpenParen {
+		return "", from
+	}
+	// Skip list/tuple wrappers of the [{which, opts}] form to reach the first ident.
+	i = tokNextSig(tokens, n, i+1)
+	for i < n && (tokens[i].Kind == parser.TokOpenBracket || tokens[i].Kind == parser.TokOpenBrace) {
+		i = tokNextSig(tokens, n, i+1)
+	}
+	if i >= n || tokens[i].Kind != parser.TokIdent {
+		return "", from
+	}
+	name := parser.TokenText(source, tokens[i])
+	if name == "" || strings.HasPrefix(name, "_") {
+		return "", from
+	}
+	return name, i + 1
+}
+
+// applyDispatchesOn reports whether an `apply(__MODULE__, <param>, ...)` call
+// appears in the clause body starting at from, before the next __using__ clause.
+func applyDispatchesOn(source []byte, tokens []parser.Token, n, from int, param string) bool {
+	for i := from; i < n; i++ {
+		// Stop at the next clause so one clause's body cannot vouch for another.
+		if tokens[i].Kind == parser.TokDefmacro || tokens[i].Kind == parser.TokDef {
+			return false
+		}
+		if tokens[i].Kind != parser.TokIdent || parser.TokenText(source, tokens[i]) != "apply" {
+			continue
+		}
+		j := tokNextSig(tokens, n, i+1)
+		if j >= n || tokens[j].Kind != parser.TokOpenParen {
+			continue
+		}
+		j = tokNextSig(tokens, n, j+1)
+		if j >= n || tokens[j].Kind != parser.TokModule || parser.TokenText(source, tokens[j]) != "__MODULE__" {
+			continue
+		}
+		j = tokNextSig(tokens, n, j+1)
+		if j >= n || tokens[j].Kind != parser.TokComma {
+			continue
+		}
+		j = tokNextSig(tokens, n, j+1)
+		if j < n && tokens[j].Kind == parser.TokIdent && parser.TokenText(source, tokens[j]) == param {
+			return true
+		}
+	}
+	return false
+}
+
+// parseDispatchBodies parses every `def name do quote do ... end end` in text
+// into its own usingBody, keyed by function name. Callers select one by the
+// literal atom at the `use` site, so nothing is merged across targets.
+func parseDispatchBodies(text string) map[string]*usingBody {
+	source := []byte(text)
+	tokens := parser.Tokenize(source)
+	if usingDispatchParam(source, tokens) == "" {
+		return nil
+	}
+
+	lines := strings.Split(text, "\n")
+	fileAliases := extractAliasesFromTokens(source, tokens, -1)
+
+	n := len(tokens)
+	seen := make(map[string]bool)
+	bodies := make(map[string]*usingBody)
+	for i := 0; i < n; i++ {
+		if tokens[i].Kind != parser.TokDef {
+			continue
+		}
+		j := tokNextSig(tokens, n, i+1)
+		if j >= n || tokens[j].Kind != parser.TokIdent {
+			continue
+		}
+		name := parser.TokenText(source, tokens[j])
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+
+		imported, inlineDefs, transUses, optBindings, aliases := parseHelperQuoteBlock(lines, name, fileAliases)
+		body := &usingBody{
+			imports:     imported,
+			inlineDefs:  inlineDefs,
+			transUses:   transUses,
+			optBindings: optBindings,
+			aliases:     aliases,
+		}
+		if !body.isEmpty() {
+			bodies[name] = body
+		}
+	}
+	if len(bodies) == 0 {
+		return nil
+	}
+	return bodies
 }
 
 // inlineDef records a function or macro defined directly inside a __using__
