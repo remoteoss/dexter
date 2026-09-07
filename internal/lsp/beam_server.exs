@@ -846,7 +846,7 @@ defmodule Dexter.CodeIntel do
   end
 
   defp take_string(binary, size) when byte_size(binary) >= size do
-    <<value::binary-size(size), rest::binary>> = binary
+    <<value::binary-size(^size), rest::binary>> = binary
     {:ok, value, rest}
   end
 
@@ -989,7 +989,7 @@ defmodule Dexter.Loop do
   end
 
   defp take_string(binary, size) when byte_size(binary) >= size do
-    <<value::binary-size(size), rest::binary>> = binary
+    <<value::binary-size(^size), rest::binary>> = binary
     {:ok, value, rest}
   end
 
