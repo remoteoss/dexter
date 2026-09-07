@@ -1,14 +1,54 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/remoteoss/dexter/internal/lsptest"
 )
+
+func TestLSP_ColdStartBuildsInServer(t *testing.T) {
+	binary := buildDexter(t)
+	root := scaffoldProject(t)
+
+	var stderr bytes.Buffer
+	client, err := lsptest.Start(binary, root, &stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	path := filepath.Join(root, "lib/my_app/workers/direct_worker.ex")
+	line, char := lsptest.FindT(t, path, "get", 1)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		locations, err := client.Definition(path, line, char)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := lsptest.Lines(root, locations); reflect.DeepEqual(got, []string{"lib/my_app/repo.ex:2"}) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("definition never became available after cold LSP startup")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	client.Close()
+	logs := stderr.String()
+	if strings.Contains(logs, "Index version mismatch") {
+		t.Errorf("cold LSP startup rebuilt through cmdInit before serving:\n%s", logs)
+	}
+	if !strings.Contains(logs, "No index found, building from scratch") {
+		t.Errorf("cold LSP startup did not use the server's background build:\n%s", logs)
+	}
+}
 
 // These tests drive a real dexter LSP server over stdio through internal/lsptest
 // and assert on the wire results. They cover the paths that unit tests cannot

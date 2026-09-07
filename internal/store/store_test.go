@@ -1630,3 +1630,77 @@ end
 		t.Errorf("removing the only file left %d rows behind", remaining)
 	}
 }
+
+// Leaving WAL needs exclusive access, so journal_mode fails whenever another
+// connection has the database open. It is applied first so that failure leaves
+// the connection exactly as it was — the ordering used to be the other way
+// round, and a locked database was left with fsync disabled for the rest of the
+// process.
+func TestSetBulkPragmas_LockedDatabaseChangesNothing(t *testing.T) {
+	dir := t.TempDir()
+
+	s1, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s1.Close() }()
+
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s2.Close() }()
+
+	synchronous := func(s *Store) int {
+		t.Helper()
+		var v int
+		if err := s.db.QueryRow("PRAGMA synchronous").Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+
+	before := synchronous(s1)
+
+	// Hold a read transaction open on the second connection, the way an LSP
+	// handler serving a query would.
+	tx, err := s2.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := tx.QueryRow("SELECT COUNT(*) FROM files").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := s1.SetBulkPragmas(); err == nil {
+		t.Fatal("SetBulkPragmas should fail while another connection holds the database")
+	}
+
+	if got := synchronous(s1); got != before {
+		t.Errorf("synchronous = %d after a failed SetBulkPragmas, want %d unchanged", got, before)
+	}
+}
+
+func TestSetBulkPragmas_AppliesWhenExclusive(t *testing.T) {
+	dir := t.TempDir()
+
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+
+	if err := s.SetBulkPragmas(); err != nil {
+		t.Fatalf("SetBulkPragmas on an exclusive database: %v", err)
+	}
+
+	var mode string
+	if err := s.db.QueryRow("PRAGMA journal_mode").Scan(&mode); err != nil {
+		t.Fatal(err)
+	}
+	if mode != "memory" {
+		t.Errorf("journal_mode = %q, want memory", mode)
+	}
+}

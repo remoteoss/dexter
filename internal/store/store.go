@@ -172,10 +172,18 @@ func (s *Store) Checkpoint() error {
 // rollback journal in RAM so no -wal file is written during the bulk load, a
 // large cache keeps pages in RAM during index creation, and temp_store=MEMORY
 // keeps sort temporaries off disk.
+//
+// journal_mode goes first because it is the only one of the four that can fail:
+// leaving WAL needs exclusive access, so any other open connection makes it
+// return "database is locked". Applying it first means a locked database changes
+// nothing at all. With synchronous first, that failure used to leave fsync
+// disabled on the connection for the rest of the process — harmless in a CLI
+// that exits, not harmless in a server. The LSP does not call this on its live
+// pool at all; see indexer.Options.InProcess.
 func (s *Store) SetBulkPragmas() error {
 	for _, pragma := range []string{
-		"PRAGMA synchronous = OFF",
 		"PRAGMA journal_mode = MEMORY",
+		"PRAGMA synchronous = OFF",
 		"PRAGMA cache_size = -2000000",
 		"PRAGMA temp_store = MEMORY",
 	} {
@@ -319,6 +327,27 @@ func (s *Store) CreateIndexes() error {
 	return createIndexes(s.db)
 }
 
+// IndexNames returns the names of dexter's own indexes, as the database
+// currently has them. The bulk load drops them before writing and recreates
+// them after, so tests use this to check that they came back.
+func (s *Store) IndexNames() ([]string, error) {
+	rows, err := s.db.Query("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%' ORDER BY name")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	return names, rows.Err()
+}
+
 // GetIndexVersion returns the index version stored in the database, or 0 if
 // none has been recorded yet (e.g. an index created before versioning was added).
 func (s *Store) GetIndexVersion() int {
@@ -357,10 +386,16 @@ func (s *Store) SetStdlibRoot(root string) error {
 	return err
 }
 
+// IsEmpty reports whether the index holds no files. It answers false when the
+// query itself fails, because every caller uses this to decide whether a
+// destructive or insert-only path is safe: a database too broken to count is
+// the one case where those paths must not run. migrate() only issues CREATE
+// ... IF NOT EXISTS, so it succeeds on a store whose `files` pages are corrupt
+// and this is the first place that notices.
 func (s *Store) IsEmpty() bool {
 	var count int
-	_ = s.db.QueryRow("SELECT COUNT(*) FROM files").Scan(&count)
-	return count == 0
+	err := s.db.QueryRow("SELECT COUNT(*) FROM files").Scan(&count)
+	return err == nil && count == 0
 }
 
 func (s *Store) GetFileMtime(path string) (int64, bool) {
