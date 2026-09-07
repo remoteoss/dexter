@@ -16,6 +16,7 @@ import (
 	"github.com/remoteoss/dexter/internal/parser"
 	"github.com/remoteoss/dexter/internal/stdlib"
 	"github.com/remoteoss/dexter/internal/store"
+	"github.com/remoteoss/dexter/internal/version"
 )
 
 func setupTestServer(t *testing.T) (*Server, func()) {
@@ -6119,5 +6120,169 @@ end`)
 	}
 	if !strings.Contains(hover.Contents.Value, "Creates a new account") {
 		t.Errorf("expected doc content, got %q", hover.Contents.Value)
+	}
+}
+
+// An empty index goes through the same pipeline as `dexter init`: parse on
+// every core, one bulk transaction, indexes rebuilt at the end. The server used
+// to have its own slower implementation of this.
+func TestServer_backgroundReindex_EmptyIndexUsesFullBuild(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	writeTestFile(t, server.projectRoot, "lib/accounts.ex", `defmodule MyApp.Accounts do
+  def create_user(attrs), do: SharedLib.Worker.perform(attrs)
+end`)
+	writeTestFile(t, server.projectRoot, "lib/worker.ex", `defmodule SharedLib.Worker do
+  def perform(attrs), do: attrs
+end`)
+
+	if !server.store.IsEmpty() {
+		t.Fatal("store should start empty")
+	}
+
+	server.backgroundReindex()
+	server.backgroundWork.Wait()
+
+	results, err := server.store.LookupFunction("MyApp.Accounts", "create_user")
+	if err != nil || len(results) == 0 {
+		t.Fatalf("create_user not indexed: %v", err)
+	}
+	if results, _ := server.store.LookupFunction("SharedLib.Worker", "perform"); len(results) == 0 {
+		t.Error("perform not indexed")
+	}
+
+	// Only the full build records the index version. The incremental fallback
+	// never has, so this is what distinguishes the two paths.
+	if got := server.store.GetIndexVersion(); got != version.IndexVersion {
+		t.Errorf("index version = %d, want %d — the full build path did not run", got, version.IndexVersion)
+	}
+}
+
+// The prune step deletes every stored path the walk did not see. A full build
+// does not populate `seen`, so running the prune after one would delete the
+// index that was just written.
+func TestServer_backgroundReindex_FullBuildDoesNotPrune(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	writeTestFile(t, server.projectRoot, "lib/kept.ex", `defmodule Kept do
+  def here, do: :ok
+end`)
+
+	server.backgroundReindex()
+	server.backgroundWork.Wait()
+
+	paths, err := server.store.ListFilePaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) == 0 {
+		t.Fatal("every file was pruned after the full build")
+	}
+	if results, _ := server.store.LookupFunction("Kept", "here"); len(results) == 0 {
+		t.Error("Kept.here was pruned after the full build")
+	}
+}
+
+// A second reindex on a populated index takes the incremental path, and must
+// still prune. This is the other side of the branch above.
+func TestServer_backgroundReindex_IncrementalStillPrunes(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	path := writeTestFile(t, server.projectRoot, "lib/gone.ex", `defmodule Gone do
+  def bye, do: :poof
+end`)
+
+	server.backgroundReindex()
+	server.backgroundWork.Wait()
+
+	if results, _ := server.store.LookupFunction("Gone", "bye"); len(results) == 0 {
+		t.Fatal("should be indexed by the full build first")
+	}
+
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+
+	server.backgroundReindex()
+	server.backgroundWork.Wait()
+
+	if results, _ := server.store.LookupFunction("Gone", "bye"); len(results) != 0 {
+		t.Error("deleted file was not pruned by the incremental path")
+	}
+}
+
+func writeTestFile(t *testing.T, dir, relPath, content string) string {
+	t.Helper()
+	path := filepath.Join(dir, relPath)
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestServer_fullBuildRefusesNonEmptyIndex(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/existing.ex", `defmodule Existing do
+  def value, do: :ok
+end`)
+
+	if _, err := server.fullBuild(); err == nil {
+		t.Fatal("fullBuild succeeded on a non-empty index")
+	}
+	if results, _ := server.store.LookupFunction("Existing", "value"); len(results) == 0 {
+		t.Error("refusing the full build removed the existing index")
+	}
+}
+
+func TestServer_buildTextEdits_OpenReindexWaitsForFullBuild(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	path := writeTestFile(t, server.projectRoot, "lib/accounts.ex", `defmodule MyApp.Accounts do
+  def old_name, do: :ok
+end`)
+	server.docs.Set(string(uri.File(path)), `defmodule MyApp.Accounts do
+  def old_name, do: :ok
+end`)
+
+	server.indexWrites.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			server.indexWrites.Unlock()
+		}
+	}()
+
+	server.buildTextEdits([]renameSite{{filePath: path, line: 2}}, "old_name", "new_name")
+	done := make(chan struct{})
+	go func() {
+		server.backgroundWork.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Error("open-buffer rename wrote through the index while a full build held the write lock")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	server.indexWrites.Unlock()
+	locked = false
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("open-buffer rename did not finish after the full build released the write lock")
+	}
+
+	if results, _ := server.store.LookupFunction("MyApp.Accounts", "new_name"); len(results) == 0 {
+		t.Error("renamed open-buffer definition was not indexed")
 	}
 }

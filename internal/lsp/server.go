@@ -27,6 +27,7 @@ import (
 	"go.lsp.dev/uri"
 	"go.uber.org/zap"
 
+	"github.com/remoteoss/dexter/internal/indexer"
 	"github.com/remoteoss/dexter/internal/parser"
 	"github.com/remoteoss/dexter/internal/stdlib"
 	"github.com/remoteoss/dexter/internal/store"
@@ -100,8 +101,15 @@ type Server struct {
 	renameFileOpsSupported bool          // client applies rename resource operations in a WorkspaceEdit
 	snippetSupport         bool          // client supports snippet insert text in completions
 
-	reindexing          sync.Mutex // serializes concurrent backgroundReindex calls
-	notifiedOTPMismatch sync.Once  // prevents repeated OTP mismatch warnings
+	reindexing sync.Mutex // serializes concurrent backgroundReindex calls
+
+	// indexWrites is held for writing by a cold full build and for reading by
+	// every single-file write. The bulk path a full build uses is insert-only:
+	// it skips the DELETE the incremental path does, and allocates file ids
+	// from a counter seeded when the batch opens. A save landing in the middle
+	// of one would duplicate rows or collide on a primary key.
+	indexWrites         sync.RWMutex
+	notifiedOTPMismatch sync.Once // prevents repeated OTP mismatch warnings
 
 	backgroundWork sync.WaitGroup // tracks background reindex goroutines so the store isn't closed while they're running
 }
@@ -210,8 +218,53 @@ func (s *Server) warmUsingCache() {
 	s.debugf("warmUsingCache: %d __using__ modules in %s", len(usingModules), time.Since(start).Round(time.Millisecond))
 }
 
+// fullBuild rebuilds the whole index in-process, through the same pipeline
+// `dexter init` uses: parse on every core, then one bulk transaction with the
+// indexes dropped. It is only correct on an empty index, so backgroundReindex
+// is the only caller.
+//
+// InProcess suppresses the connection-wide pragmas. They cannot be applied
+// reliably or undone on a live pool — leaving WAL needs exclusive access, and
+// the per-connection ones land on whichever pooled connection happens to serve
+// them. They were also the smallest part of the win.
+func (s *Server) fullBuild() (indexer.Stats, error) {
+	s.indexWrites.Lock()
+	defer s.indexWrites.Unlock()
+	if !s.store.IsEmpty() {
+		return indexer.Stats{}, errors.New("full build requires an empty index")
+	}
+
+	return indexer.FullBuild(s.store, s.projectRoot, indexer.Options{
+		StdlibRoot: s.stdlibRoot,
+		InProcess:  true,
+		Warn: func(format string, args ...interface{}) {
+			log.Printf("Warning: "+format, args...)
+		},
+	})
+}
+
+// indexOneFile parses and indexes a single file, the incremental path.
+func (s *Server) indexOneFile(path string) {
+	s.indexWrites.RLock()
+	defer s.indexWrites.RUnlock()
+	s.indexOneFileLocked(path)
+}
+
+// indexOneFileLocked is indexOneFile for callers already holding indexWrites.
+// Go's RWMutex is not reentrant, so the two must stay separate.
+func (s *Server) indexOneFileLocked(path string) {
+	defs, refs, err := parser.ParseFile(path)
+	if err != nil {
+		log.Printf("Error parsing %s: %v", path, err)
+		return
+	}
+	if err := s.store.IndexFileWithRefs(path, defs, refs); err != nil {
+		log.Printf("Error indexing %s: %v", path, err)
+	}
+}
+
 // backgroundReindex runs in the background. If the index is empty it does a
-// full init, otherwise it does an incremental mtime-based update.
+// full build, otherwise it does an incremental mtime-based update.
 func (s *Server) backgroundReindex() {
 	s.backgroundWork.Add(1)
 	go func() {
@@ -224,6 +277,7 @@ func (s *Server) backgroundReindex() {
 		start := time.Now()
 		reindexed := 0
 		isEmpty := s.store.IsEmpty()
+		fullBuilt := false
 
 		if isEmpty {
 			log.Printf("No index found, building from scratch...")
@@ -234,6 +288,17 @@ func (s *Server) backgroundReindex() {
 				}); err != nil {
 					log.Printf("ShowMessage: %v", err)
 				}
+			}
+
+			stats, err := s.fullBuild()
+			if err != nil {
+				// The incremental walk below needs nothing to be true of the
+				// database, so it is the safe thing to fall back to. It is
+				// slower, not wrong.
+				log.Printf("Warning: full index build failed, falling back to incremental: %v", err)
+			} else {
+				fullBuilt = true
+				reindexed = stats.Files
 			}
 		}
 
@@ -269,23 +334,28 @@ func (s *Server) backgroundReindex() {
 			})
 		}
 
-		// Index stdlib first (definitions only).
-		if s.stdlibRoot != "" {
-			walkAndIndex(s.stdlibRoot, false)
-		}
-
-		walkAndIndex(s.projectRoot, true)
-
-		// Prune store entries for files no longer on disk
-		if storedPaths, err := s.store.ListFilePaths(); err == nil {
-			var toRemove []string
-			for _, storedPath := range storedPaths {
-				if _, ok := seen[storedPath]; !ok {
-					toRemove = append(toRemove, storedPath)
-				}
+		// A full build already indexed every file on disk, so there is nothing
+		// to walk and nothing stale to prune — and `seen` is empty, so pruning
+		// here would delete the index that was just built.
+		if !fullBuilt {
+			// Index stdlib first (definitions only).
+			if s.stdlibRoot != "" {
+				walkAndIndex(s.stdlibRoot, false)
 			}
-			if len(toRemove) > 0 {
-				_ = s.store.RemoveFiles(toRemove)
+
+			walkAndIndex(s.projectRoot, true)
+
+			// Prune store entries for files no longer on disk
+			if storedPaths, err := s.store.ListFilePaths(); err == nil {
+				var toRemove []string
+				for _, storedPath := range storedPaths {
+					if _, ok := seen[storedPath]; !ok {
+						toRemove = append(toRemove, storedPath)
+					}
+				}
+				if len(toRemove) > 0 {
+					_ = s.store.RemoveFiles(toRemove)
+				}
 			}
 		}
 
@@ -621,17 +691,7 @@ func (s *Server) DidSave(ctx context.Context, params *protocol.DidSaveTextDocume
 		return nil
 	}
 
-	go func() {
-		defs, refs, err := parser.ParseFile(path)
-		if err != nil {
-			log.Printf("Error parsing %s: %v", path, err)
-			return
-		}
-
-		if err := s.store.IndexFileWithRefs(path, defs, refs); err != nil {
-			log.Printf("Error indexing %s: %v", path, err)
-		}
-	}()
+	go s.indexOneFile(path)
 
 	return nil
 }
@@ -2814,19 +2874,11 @@ func (s *Server) DidChangeWatchedFiles(ctx context.Context, params *protocol.Did
 		}
 		switch change.Type {
 		case protocol.FileChangeTypeCreated, protocol.FileChangeTypeChanged:
-			go func(filePath string) {
-				defs, refs, err := parser.ParseFile(filePath)
-				if err != nil {
-					log.Printf("Error parsing %s: %v", filePath, err)
-					return
-				}
-
-				if err := s.store.IndexFileWithRefs(filePath, defs, refs); err != nil {
-					log.Printf("Error indexing %s: %v", filePath, err)
-				}
-			}(path)
+			go s.indexOneFile(path)
 		case protocol.FileChangeTypeDeleted:
 			go func(filePath string) {
+				s.indexWrites.RLock()
+				defer s.indexWrites.RUnlock()
 				if err := s.store.RemoveFile(filePath); err != nil {
 					log.Printf("Error removing %s from index: %v", filePath, err)
 				}
@@ -4995,11 +5047,12 @@ func overlapsClaimed(claimed []moduleEditResult, e moduleEditResult) bool {
 // when it receives the reply — so their new paths are indexed from the text
 // the edits produce.
 func (mr *moduleRename) reindex(fileCache map[string]moduleFileInfo, movedFiles, clientRenames map[string]string) {
+	removePaths := make([]string, 0, len(movedFiles)+len(clientRenames))
 	for oldPath := range movedFiles {
-		_ = mr.server.store.RemoveFile(oldPath)
+		removePaths = append(removePaths, oldPath)
 	}
 	for oldPath := range clientRenames {
-		_ = mr.server.store.RemoveFile(oldPath)
+		removePaths = append(removePaths, oldPath)
 	}
 
 	var reindexPaths []string
@@ -5007,10 +5060,6 @@ func (mr *moduleRename) reindex(fileCache map[string]moduleFileInfo, movedFiles,
 		reindexPaths = append(reindexPaths, newPath)
 	}
 
-	type textReindex struct {
-		path string
-		text string
-	}
 	var openReindexes []textReindex
 	for fp := range mr.sitesByFile {
 		if _, moved := movedFiles[fp]; moved {
@@ -5044,24 +5093,18 @@ func (mr *moduleRename) reindex(fileCache map[string]moduleFileInfo, movedFiles,
 		}
 	}
 
-	mr.server.backgroundWork.Add(1)
-	go func() {
-		defer mr.server.backgroundWork.Done()
-		mr.server.reindexPaths(reindexPaths)
-		for _, r := range openReindexes {
-			defs, refs, err := parser.ParseText(r.path, r.text)
-			if err != nil {
-				continue
-			}
-			_ = mr.server.store.IndexFileWithRefs(r.path, defs, refs)
-		}
-	}()
+	mr.server.reindexAfterRename(removePaths, reindexPaths, openReindexes)
 }
 
 type renameSite struct {
 	filePath       string
 	line           int
 	includeKeyword bool // true for import-only lines where keyword keys ARE function names
+}
+
+type textReindex struct {
+	path string
+	text string
 }
 
 // buildTextEdits creates a WorkspaceEdit replacing all whole-token occurrences
@@ -5131,10 +5174,6 @@ func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string) *
 	openChanges := make(map[protocol.DocumentURI][]protocol.TextEdit)
 	var wg sync.WaitGroup
 	var reindexPaths []string
-	type textReindex struct {
-		path string
-		text string
-	}
 	var openReindexes []textReindex
 
 	for fp, fileSites := range sitesByFile {
@@ -5186,36 +5225,41 @@ func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string) *
 	}
 	wg.Wait()
 
-	s.backgroundWork.Add(1)
-	go func() {
-		defer s.backgroundWork.Done()
-		s.reindexPaths(reindexPaths)
-		for _, r := range openReindexes {
-			defs, refs, err := parser.ParseText(r.path, r.text)
-			if err != nil {
-				continue
-			}
-			_ = s.store.IndexFileWithRefs(r.path, defs, refs)
-		}
-	}()
+	s.reindexAfterRename(nil, reindexPaths, openReindexes)
 
 	return &WorkspaceEdit{Changes: openChanges}
 }
 
-// reindexPaths re-parses and reindexes a specific set of files sequentially.
-// Used after rename to avoid a full project walk.
-func (s *Server) reindexPaths(paths []string) {
-	for _, fp := range paths {
-		defs, refs, err := parser.ParseFile(fp)
-		if err != nil {
-			continue
+// reindexAfterRename applies every store mutation from a rename under one read
+// lock. Besides keeping each write out of a cold build, holding the lock across
+// removals and inserts prevents a build from observing an empty intermediate
+// state and starting its insert-only transaction in the middle of the rename.
+func (s *Server) reindexAfterRename(removePaths, diskPaths []string, textPaths []textReindex) {
+	s.backgroundWork.Add(1)
+	go func() {
+		defer s.backgroundWork.Done()
+
+		s.indexWrites.RLock()
+		defer s.indexWrites.RUnlock()
+
+		for _, path := range removePaths {
+			_ = s.store.RemoveFile(path)
+		}
+		for _, path := range diskPaths {
+			s.indexOneFileLocked(path)
+		}
+		for _, entry := range textPaths {
+			defs, refs, err := parser.ParseText(entry.path, entry.text)
+			if err != nil {
+				continue
+			}
+			_ = s.store.IndexFileWithRefs(entry.path, defs, refs)
 		}
 
-		_ = s.store.IndexFileWithRefs(fp, defs, refs)
-	}
-	if len(paths) > 0 {
-		log.Printf("Rename: reindexed %d files", len(paths)) // intentionally always logged — useful for user feedback
-	}
+		if len(diskPaths)+len(textPaths) > 0 {
+			log.Printf("Rename: reindexed %d files", len(diskPaths)+len(textPaths)) // intentionally always logged — useful for user feedback
+		}
+	}()
 }
 
 // isDepsFile returns true if filePath lives under the deps/ directory of some

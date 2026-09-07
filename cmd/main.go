@@ -6,11 +6,9 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"runtime"
-	"sync"
-	"sync/atomic"
 	"time"
 
+	"github.com/remoteoss/dexter/internal/indexer"
 	dexter_lsp "github.com/remoteoss/dexter/internal/lsp"
 	"github.com/remoteoss/dexter/internal/parser"
 	"github.com/remoteoss/dexter/internal/stdlib"
@@ -149,54 +147,6 @@ func findProjectRoot(path string) string {
 	return store.FindProjectRoot(path, "mix.exs")
 }
 
-type fileEntry struct {
-	path      string
-	mtimeNano int64
-}
-
-// statFilesParallel stats paths across all cores and returns the entries whose
-// stat succeeded, in the order they were given. Nothing depends on that order —
-// rows are keyed by path — but the walk order is the cheapest one to keep.
-func statFilesParallel(paths []string) []fileEntry {
-	if len(paths) == 0 {
-		return nil
-	}
-	workers := runtime.NumCPU()
-	if workers > len(paths) {
-		workers = len(paths)
-	}
-	out := make([]fileEntry, len(paths))
-	ok := make([]bool, len(paths))
-	var wg sync.WaitGroup
-	var next atomic.Int64
-	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				i := int(next.Add(1)) - 1
-				if i >= len(paths) {
-					return
-				}
-				info, err := os.Stat(paths[i])
-				if err != nil {
-					continue
-				}
-				out[i] = fileEntry{path: paths[i], mtimeNano: info.ModTime().UnixNano()}
-				ok[i] = true
-			}
-		}()
-	}
-	wg.Wait()
-	entries := out[:0]
-	for i := range out {
-		if ok[i] {
-			entries = append(entries, out[i])
-		}
-	}
-	return entries
-}
-
 func cmdInit(projectRoot string, force bool, profile bool) {
 	dbPath := store.DBPath(projectRoot)
 	if _, err := os.Stat(dbPath); err == nil {
@@ -220,163 +170,32 @@ func cmdInit(projectRoot string, force bool, profile bool) {
 		}
 	}()
 
-	if err := s.SetBulkPragmas(); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: bulk pragma setup: %v\n", err)
-	}
-
-	prof := &profiler{enabled: profile}
-	start := time.Now()
-
-	// Phase 1: collect file paths and mtimes. Both halves run on all cores:
-	// the traversal fans out per directory, and DirEntry.Info() costs one lstat
-	// per file — ~70k syscalls on a large monorepo, which dominated this phase.
-	filePaths := parser.CollectElixirFilesParallel(projectRoot)
-	var stdlibPaths []string
 	var stdlibRoot string
 	if root, ok := stdlib.Resolve(s, "", projectRoot); ok {
 		stdlibRoot = root
-		stdlibPaths = parser.CollectElixirFilesParallel(stdlibRoot)
-	}
-	files := statFilesParallel(filePaths)
-	stdlibFiles := statFilesParallel(stdlibPaths)
-	prof.log("  walk: %s (%s files)\n", prof.since(start).Round(time.Millisecond), formatInt(len(files)+len(stdlibFiles)))
-
-	// Parse stdlib files in parallel (definitions only — refs are not indexed for stdlib).
-	type stdlibResult struct {
-		path      string
-		mtimeNano int64
-		defs      []parser.Definition
-	}
-	stdlibCh := make(chan stdlibResult, len(stdlibFiles))
-	var stdlibWg sync.WaitGroup
-	stdlibWorkers := runtime.NumCPU()
-	stdlibFileCh := make(chan fileEntry, stdlibWorkers)
-	for i := 0; i < stdlibWorkers; i++ {
-		stdlibWg.Add(1)
-		go func() {
-			defer stdlibWg.Done()
-			for f := range stdlibFileCh {
-				defs, _, err := parser.ParseFile(f.path)
-				if err != nil {
-					continue
-				}
-				stdlibCh <- stdlibResult{f.path, f.mtimeNano, defs}
-			}
-		}()
-	}
-	go func() {
-		for _, f := range stdlibFiles {
-			stdlibFileCh <- f
-		}
-		close(stdlibFileCh)
-		stdlibWg.Wait()
-		close(stdlibCh)
-	}()
-	var stdlibResults []stdlibResult
-	for r := range stdlibCh {
-		stdlibResults = append(stdlibResults, r)
-	}
-	prof.log("  stdlib parse: %s files\n", formatInt(len(stdlibFiles)))
-
-	// Phase 2: parse user files in parallel
-	type parseResult struct {
-		path      string
-		mtimeNano int64
-		defs      []parser.Definition
-		refs      []parser.Reference
 	}
 
-	workers := runtime.NumCPU()
-	fileCh := make(chan fileEntry, workers)
-	resultCh := make(chan parseResult, 1024)
-
-	var parseNanos atomic.Int64
-	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for f := range fileCh {
-				t0 := prof.now()
-				defs, refs, err := parser.ParseFile(f.path)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Warning: %s: %v\n", f.path, err)
-					continue
-				}
-				parseNanos.Add(int64(prof.since(t0)))
-				resultCh <- parseResult{path: f.path, mtimeNano: f.mtimeNano, defs: defs, refs: refs}
-			}
-		}()
-	}
-
-	go func() {
-		for _, f := range files {
-			fileCh <- f
-		}
-		close(fileCh)
-		wg.Wait()
-		close(resultCh)
-	}()
-
-	// Phase 3: bulk insert to SQLite (single writer, single transaction, no indexes)
-	pipelineStart := prof.now()
-	if err := s.DropIndexes(); err != nil {
-		fatal(err)
-	}
-	batch, err := s.BeginBulkInsert()
+	stats, err := indexer.FullBuild(s, projectRoot, indexer.Options{
+		StdlibRoot: stdlibRoot,
+		Warn: func(format string, args ...interface{}) {
+			fmt.Fprintf(os.Stderr, "Warning: "+format+"\n", args...)
+		},
+	})
 	if err != nil {
 		fatal(err)
 	}
 
-	// Insert pre-parsed stdlib definitions (no refs)
-	for _, sr := range stdlibResults {
-		if err := batch.IndexFileWithMtimeAndRefs(sr.path, sr.mtimeNano, sr.defs, nil); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: %s: %v\n", sr.path, err)
-		}
+	if profile {
+		fmt.Fprintf(os.Stderr, "  walk: %s (%s files)\n", stats.Walk.Round(time.Millisecond), formatInt(stats.Files))
+		fmt.Fprintf(os.Stderr, "  parse+write: parse %s across %d workers, write %s\n",
+			stats.Parse.Round(time.Millisecond), stats.Workers, stats.Write.Round(time.Millisecond))
+		fmt.Fprintf(os.Stderr, "  commit: %s\n", stats.Commit.Round(time.Millisecond))
+		fmt.Fprintf(os.Stderr, "  create indices: %s\n", stats.CreateIndexes.Round(time.Millisecond))
 	}
 
-	// Insert user file results as they stream in (store filters stdlib refs)
-	count := len(stdlibResults)
-	defCount := 0
-	for _, sr := range stdlibResults {
-		defCount += len(sr.defs)
-	}
-	refCount := 0
-	var writeNanos int64
-	for res := range resultCh {
-		t0 := prof.now()
-		if err := batch.IndexFileWithMtimeAndRefs(res.path, res.mtimeNano, res.defs, res.refs); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: %s: %v\n", res.path, err)
-			continue
-		}
-		writeNanos += int64(prof.since(t0))
-		count++
-		defCount += len(res.defs)
-		refCount += len(res.refs)
-	}
-	prof.log("  parse+write: %s (parse: %s across %d workers, write: %s)\n",
-		prof.since(pipelineStart).Round(time.Millisecond),
-		time.Duration(parseNanos.Load()).Round(time.Millisecond),
-		workers,
-		time.Duration(writeNanos).Round(time.Millisecond))
-
-	commitStart := prof.now()
-	if err := batch.Commit(); err != nil {
-		fatal(err)
-	}
-	prof.log("  commit: %s\n", prof.since(commitStart).Round(time.Millisecond))
-
-	indexStart := prof.now()
-	if err := s.CreateIndexes(); err != nil {
-		fatal(err)
-	}
-	prof.log("  create indices: %s\n", prof.since(indexStart).Round(time.Millisecond))
-
-	if err := s.SetIndexVersion(version.IndexVersion); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to store index version: %v\n", err)
-	}
-
-	fmt.Fprintf(os.Stderr, "Indexed %s files (%s definitions, %s references) in %s\n", formatInt(count), formatInt(defCount), formatInt(refCount), time.Since(start).Round(time.Millisecond))
+	fmt.Fprintf(os.Stderr, "Indexed %s files (%s definitions, %s references) in %s\n",
+		formatInt(stats.Files), formatInt(stats.Definitions), formatInt(stats.References),
+		stats.Total.Round(time.Millisecond))
 }
 
 func cmdReindex(target string) {
@@ -549,7 +368,10 @@ func cmdLSP(projectRoot string) {
 		cmdInit(projectRoot, true, false)
 	}
 
-	if stored := s.GetIndexVersion(); stored != version.IndexVersion {
+	// A fresh store has version 0 but no stale data to discard. Let the live
+	// server build that empty index in the background through indexer.FullBuild;
+	// only a populated index from an older format needs the synchronous reset.
+	if stored := s.GetIndexVersion(); stored != version.IndexVersion && !s.IsEmpty() {
 		log.SetOutput(os.Stderr)
 		log.Printf("Index version mismatch (stored: %d, current: %d), rebuilding index...", stored, version.IndexVersion)
 		if err := s.Close(); err != nil {
@@ -594,28 +416,4 @@ func formatInt(n int) string {
 func fatal(err error) {
 	fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 	os.Exit(1)
-}
-
-type profiler struct {
-	enabled bool
-}
-
-func (p *profiler) now() time.Time {
-	if !p.enabled {
-		return time.Time{}
-	}
-	return time.Now()
-}
-
-func (p *profiler) since(start time.Time) time.Duration {
-	if !p.enabled {
-		return 0
-	}
-	return time.Since(start)
-}
-
-func (p *profiler) log(format string, args ...interface{}) {
-	if p.enabled {
-		fmt.Fprintf(os.Stderr, format, args...)
-	}
 }

@@ -449,10 +449,14 @@ func (c *Client) Close() {
 	_ = c.stdin.Close()
 
 	done := make(chan struct{})
-	go func() { _, _ = c.cmd.Process.Wait(); close(done) }()
+	// Cmd.Wait also waits for os/exec's stderr copy goroutine. Process.Wait
+	// only reaps the child, so callers could observe or reuse their stderr
+	// writer while os/exec was still writing to it.
+	go func() { _ = c.cmd.Wait(); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		_ = c.cmd.Process.Kill()
+		<-done
 	}
 }

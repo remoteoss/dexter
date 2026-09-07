@@ -5,6 +5,7 @@ Dexter is a fast Elixir LSP server. It indexes module and function definitions f
 ## Module structure
 
 - `cmd/main.go` — CLI entrypoint: `init`, `reindex`, `lookup`, `lsp` subcommands
+- `internal/indexer/` — the cold build: walk and stat on all cores, parse on all cores, then one bulk transaction with the indexes dropped. `dexter init` and the LSP server (when it finds an empty index) both call `FullBuild`. `Options.InProcess` marks the server, which shares the database with live readers and so cannot use the connection-wide bulk pragmas.
 - `internal/parser/` — Elixir parser backed by a hand-rolled tokenizer (`tokenizer.go`). The tokenizer produces a flat token stream (handling heredocs, sigils, strings, comments as opaque tokens) and `parser_tokenized.go` walks it to extract defmodule, def, defp, defmacro, defdelegate, defguard, defprotocol, defimpl, @type, @callback, alias, import, use, and Module.function references. Handles module nesting, alias resolution for defdelegate targets, and multi-line expressions natively via bracket depth tracking.
 - `internal/store/` — SQLite layer. Tables: `files` (path + mtime), `definitions` (module, function, kind, line, file_path, delegate_to, delegate_as), `refs` (module, function, line, file_path, kind).
 - `internal/lsp/` — LSP server. `server.go` handles all LSP methods. `elixir.go` contains pure functions for cursor expression extraction, alias/import/use extraction (tokenizer-based), and use-chain parsing. `rename.go` has rename helpers. `hover.go` has hover formatting. `documents.go` is an in-memory open-buffer store.
@@ -113,7 +114,8 @@ The largest remaining win is interning `file_path`: every ref row stores a ~122-
 
 - **Tokenizer instead of tree-sitter for indexing** — a hand-rolled tokenizer + walker replaced the original regex-based parser for both file indexing and runtime `__using__` parsing. The tokenizer handles heredocs, sigils, multi-line expressions, and comments as opaque tokens, eliminating fragile line-joining heuristics. Tree-sitter is only used for scope-aware variable operations in files already opened by the editor.
 - **SQLite for storage** — single file, fast reads, incremental updates via mtime tracking.
-- **Parallel indexing** — `init` uses all CPU cores for parsing, single writer for SQLite.
+- **Parallel indexing** — the cold build uses all CPU cores for parsing, single writer for SQLite. Both callers share `indexer.FullBuild`; the server used to have a second, serial implementation that parsed one file at a time and committed a transaction per file, which measured ~4x slower on a 10k-file corpus.
+- **Two write paths** — `indexer.FullBuild` is insert-only and allocates file ids from a counter, so it is only correct on an empty index and only with no other writer active. The server holds `indexWrites` for writing across a full build; every single-file write (save, watched file, rename) holds it for reading. Everything else — incremental sweeps included — goes through the per-file path, which deletes a file's rows before reinserting them.
 - **Delegate following** — `defdelegate` targets are resolved at index time (including alias resolution and `as:` renames). `LookupFollowDelegate` follows chains recursively (up to 5 hops) so `A → B → C` resolves to `C`.
 - **Git HEAD polling** — watches `.git/HEAD` mtime every 2 seconds to detect branch switches and trigger reindex.
 - **Full document sync** — `TextDocumentSyncKindFull`; Elixir files are small enough that incremental sync adds complexity without benefit.
