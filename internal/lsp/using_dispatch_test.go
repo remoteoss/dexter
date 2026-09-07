@@ -266,6 +266,31 @@ end`
 	}
 }
 
+func TestDispatch_ReferencesThroughDispatchedImportNestedCall(t *testing.T) {
+	server, cleanup := setupDispatchServer(t)
+	defer cleanup()
+
+	callerSrc := `defmodule MyApp.PageController do
+  use MyAppWeb, :controller
+
+  def index(conn) do
+    render(meta: assign_defaults(conn))
+  end
+end`
+	indexFile(t, server.store, server.projectRoot, "lib/nested_page_controller.ex", callerSrc)
+
+	helpersURI := "file://" + filepath.Join(server.projectRoot, "lib/controller_helpers.ex")
+	server.docs.Set(helpersURI, controllerHelpersSrc)
+
+	locs := referencesAt(t, server, helpersURI, 1, 6)
+	for _, l := range locs {
+		if filepath.Base(string(l.URI)) == "nested_page_controller.ex" {
+			return
+		}
+	}
+	t.Fatalf("expected the nested call site in nested_page_controller.ex, got %d locations", len(locs))
+}
+
 func TestDispatch_CompletionUsesSelectedBody(t *testing.T) {
 	server, cleanup := setupDispatchServer(t)
 	defer cleanup()

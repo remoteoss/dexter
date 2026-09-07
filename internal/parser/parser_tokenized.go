@@ -650,7 +650,13 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 			cm := currentModule()
 			if cm != "" && len(injectors) > 0 {
 				isStatementStart := i == 0 || tokens[i-1].Kind == TokEOL || tokens[i-1].Kind == TokComment
-				if isStatementStart {
+				// A parenthesized bare call can be nested inside another call,
+				// collection, or keyword value. It is still a candidate for a
+				// function imported by use/import, just like a statement-level call.
+				// Qualified and anonymous-function calls have a TokDot before the
+				// opening paren and therefore do not match this fast check.
+				isParenthesizedCall := i+1 < n && tokens[i+1].Kind == TokOpenParen
+				if isStatementStart || isParenthesizedCall {
 					name := tokenText(tok)
 					if !elixirKeyword[name] {
 						emit := false
