@@ -2307,6 +2307,23 @@ func TestExtractUsesWithOpts(t *testing.T) {
 			t.Errorf("repo: want MyRepo, got %q", calls[0].Opts["repo"])
 		}
 	})
+
+	for _, tt := range []struct {
+		name string
+		use  string
+		want string
+	}{
+		{name: "bare dispatch atom", use: ":controller", want: "controller"},
+		{name: "quoted dispatch atom", use: `:"controller"`, want: "controller"},
+		{name: "tuple dispatch atom", use: "{:controller, []}", want: "controller"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			calls := ExtractUsesWithOpts("defmodule Foo do\n  use MyAppWeb, "+tt.use+"\nend", nil)
+			if len(calls) != 1 || calls[0].dispatchAtom() != tt.want {
+				t.Fatalf("dispatch atom: want %q, got %#v", tt.want, calls)
+			}
+		})
+	}
 }
 
 func TestFindBufferFunctions(t *testing.T) {

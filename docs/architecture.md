@@ -51,6 +51,27 @@ The `__using__` cache (`usingCacheEntry`) stores the parsed result of each modul
 - `using opts do` — ExUnit.CaseTemplate form (only when `use ExUnit.CaseTemplate` is present)
 - Function delegation — when the body calls a local helper like `using_block(opts)`, `parseHelperQuoteBlock` finds the function definition and parses its `quote do` body
 
+### Atom dispatch (`use MyAppWeb, :controller`)
+
+The Phoenix entrypoint form dispatches on an atom rather than injecting anything itself:
+
+```elixir
+defmacro __using__(which) when is_atom(which), do: apply(__MODULE__, which, [])
+def controller do
+  quote do ... end
+end
+```
+
+`usingDispatchParam` recognises this only when `apply/3` targets `__MODULE__` **and** dispatches on that clause's own parameter — a literal function name or another module is not atom dispatch. Runtime parsing is scoped to the indexed module when a file defines multiple modules. When dispatch matches, `parseDispatchBodies` parses each `def name do quote do ... end end` in that module into its own `usingBody`, stored in `usingCacheEntry.dispatch` keyed by function name. Nothing is merged across targets.
+
+Selection happens at lookup time from the literal atom at the `use` site (`UseCall.Which`, or `UseCall.WhichKey` for the `use Mod, live_view: opts` form). `entry.bodyFor(which)` returns the matching body, or nil when the atom names no target — injecting nothing rather than guessing. A `use` that passes no literal atom resolves through the ordinary body, so the feature is purely additive. Completion, injected-alias merging, callback lookup, definitions, and references all select the same body.
+
+Transitive uses retain their complete `UseCall`, including the dispatch atom and keyword options. Visited keys include both module and dispatch target, which permits legitimate same-module chains such as `:api_controller` using `:controller` while still breaking real cycles. Local quoted helpers invoked with `unquote(helper())` are followed recursively.
+
+The token walker cannot evaluate conditionals, so a `use` nested in a compile-time branch (`on_ee do use X end`) is included unconditionally. This over-includes candidate names; it never removes one.
+
+`entry.bodies()` returns the ordinary body plus every dispatch target. `findModulesWhoseUsingImports` uses it, because the references slow path asks which modules *could* inject a name rather than which one a given `use` site selects.
+
 `lookupInUsingEntry(moduleName, fn, consumerOpts, visited)` is the recursive lookup. `lookupThroughUse` calls it with full consumer opts from `ExtractUsesWithOpts`. `ParseKeywordModuleOpts` parses `key: Module` pairs from use call opts strings, with alias resolution.
 
 ## References — injector scan
