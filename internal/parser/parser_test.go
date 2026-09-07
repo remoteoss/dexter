@@ -2,8 +2,11 @@ package parser
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -2740,5 +2743,76 @@ end
 	}
 	if !found {
 		t.Error("dedupe dropped the String.t reference entirely")
+	}
+}
+
+// TestCollectElixirFilesParallelMatchesWalk asserts that the parallel collector
+// finds exactly the same files as the sequential walk, including the directory
+// exclusions, so swapping it into the indexer cannot change what gets indexed.
+func TestCollectElixirFilesParallelMatchesWalk(t *testing.T) {
+	root := t.TempDir()
+
+	files := []string{
+		"lib/my_app.ex",
+		"lib/my_app/accounts.ex",
+		"lib/my_app/accounts/user.ex",
+		"lib/nested/deep/deeper/worker.ex",
+		"test/my_app_test.exs",
+		"config/config.exs",
+		"mix.exs",
+		// Excluded directories, at several depths.
+		"_build/dev/lib/my_app/ebin/skipped.ex",
+		".git/hooks/skipped.exs",
+		"node_modules/pkg/skipped.ex",
+		"lib/vendor/node_modules/nested_skipped.ex",
+		// Non-Elixir files.
+		"lib/README.md",
+		"lib/my_app/assets/app.js",
+	}
+	for _, f := range files {
+		path := filepath.Join(root, f)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("defmodule X do\nend\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var sequential []string
+	if err := WalkElixirFiles(root, func(path string, d fs.DirEntry) error {
+		sequential = append(sequential, path)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	parallel := CollectElixirFilesParallel(root)
+
+	sort.Strings(sequential)
+	sort.Strings(parallel)
+
+	if !reflect.DeepEqual(sequential, parallel) {
+		t.Errorf("parallel collector disagrees with WalkElixirFiles\n sequential (%d): %v\n parallel   (%d): %v",
+			len(sequential), sequential, len(parallel), parallel)
+	}
+
+	if len(parallel) != 7 {
+		t.Errorf("expected 7 Elixir files outside excluded dirs, got %d: %v", len(parallel), parallel)
+	}
+	for _, got := range parallel {
+		if strings.Contains(got, "_build") || strings.Contains(got, ".git") || strings.Contains(got, "node_modules") {
+			t.Errorf("excluded directory was walked: %s", got)
+		}
+	}
+}
+
+// TestCollectElixirFilesParallelEmptyAndMissing covers the degenerate roots.
+func TestCollectElixirFilesParallelEmptyAndMissing(t *testing.T) {
+	if got := CollectElixirFilesParallel(filepath.Join(t.TempDir(), "does-not-exist")); len(got) != 0 {
+		t.Errorf("missing root should yield no files, got %v", got)
+	}
+	if got := CollectElixirFilesParallel(t.TempDir()); len(got) != 0 {
+		t.Errorf("empty root should yield no files, got %v", got)
 	}
 }

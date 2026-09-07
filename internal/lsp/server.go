@@ -14,10 +14,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.lsp.dev/jsonrpc2"
@@ -156,6 +158,58 @@ func Serve(in io.Reader, out io.Writer, s *store.Store, projectRoot string) erro
 	return conn.Err()
 }
 
+// warmUsingCache parses every module's defmacro __using__ body ahead of the
+// first request that needs one.
+//
+// findModulesWhoseUsingImports, on the References slow path, has to consult
+// every __using__ module in the codebase. Those bodies are cached, but nothing
+// fills the cache, so the first such request pays for all of them at once: on a
+// 70k-file monorepo that is 563 file reads and parses, about 440ms, in front of
+// a user waiting on a reference lookup. Every later request costs 1-2ms.
+//
+// The work is the same either way; this only moves it off the request path. It
+// runs at the end of the background reindex, where the index is known to exist
+// and no request is waiting, and it is bounded to NumCPU readers so that a
+// speculative warm-up cannot storm the filesystem while the editor is starting.
+//
+// Nothing here is required for correctness. Entries are validated against file
+// mtime when they are read, so a warmed entry that goes stale is simply
+// re-parsed, and a file that cannot be read is skipped exactly as it would be
+// on the request path.
+func (s *Server) warmUsingCache() {
+	usingModules, err := s.store.LookupUsingModules()
+	if err != nil || len(usingModules) == 0 {
+		return
+	}
+
+	start := time.Now()
+	workers := runtime.NumCPU()
+	if workers > len(usingModules) {
+		workers = len(usingModules)
+	}
+
+	var (
+		next atomic.Int64
+		wg   sync.WaitGroup
+	)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				i := int(next.Add(1)) - 1
+				if i >= len(usingModules) {
+					return
+				}
+				s.cachedUsingWithPath(usingModules[i].Module, usingModules[i].FilePath)
+			}
+		}()
+	}
+	wg.Wait()
+
+	s.debugf("warmUsingCache: %d __using__ modules in %s", len(usingModules), time.Since(start).Round(time.Millisecond))
+}
+
 // backgroundReindex runs in the background. If the index is empty it does a
 // full init, otherwise it does an incremental mtime-based update.
 func (s *Server) backgroundReindex() {
@@ -241,6 +295,10 @@ func (s *Server) backgroundReindex() {
 		if err := s.store.Checkpoint(); err != nil {
 			log.Printf("Warning: WAL checkpoint after reindex: %v", err)
 		}
+
+		// The index is in place now, so fill the __using__ cache before a user
+		// asks for it. See warmUsingCache.
+		s.warmUsingCache()
 
 		elapsed := time.Since(start).Round(time.Millisecond)
 		log.Printf("Background reindex: %d files updated (%s)", reindexed, elapsed)

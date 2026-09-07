@@ -227,26 +227,15 @@ func cmdInit(projectRoot string, force bool, profile bool) {
 	prof := &profiler{enabled: profile}
 	start := time.Now()
 
-	// Phase 1: collect file paths and mtimes
-	// The walk itself is a single-threaded directory traversal, but DirEntry.Info()
-	// costs one lstat per file — ~70k serialized syscalls on a large monorepo, which
-	// dominated this phase. Collect the paths first, then stat them in parallel.
-	var filePaths []string
-	err = parser.WalkElixirFiles(projectRoot, func(path string, d fs.DirEntry) error {
-		filePaths = append(filePaths, path)
-		return nil
-	})
-	if err != nil {
-		fatal(err)
-	}
+	// Phase 1: collect file paths and mtimes. Both halves run on all cores:
+	// the traversal fans out per directory, and DirEntry.Info() costs one lstat
+	// per file — ~70k syscalls on a large monorepo, which dominated this phase.
+	filePaths := parser.CollectElixirFilesParallel(projectRoot)
 	var stdlibPaths []string
 	var stdlibRoot string
 	if root, ok := stdlib.Resolve(s, "", projectRoot); ok {
 		stdlibRoot = root
-		_ = parser.WalkElixirFiles(stdlibRoot, func(path string, d fs.DirEntry) error {
-			stdlibPaths = append(stdlibPaths, path)
-			return nil
-		})
+		stdlibPaths = parser.CollectElixirFilesParallel(stdlibRoot)
 	}
 	files := statFilesParallel(filePaths)
 	stdlibFiles := statFilesParallel(stdlibPaths)

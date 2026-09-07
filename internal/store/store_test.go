@@ -1358,7 +1358,7 @@ func TestBulkInsertMatchesRowAtATime(t *testing.T) {
 	read := func(s *Store, path string) (int, []ReferenceResult) {
 		t.Helper()
 		var defs int
-		if err := s.db.QueryRow("SELECT COUNT(*) FROM definitions WHERE file_path = ?", path).Scan(&defs); err != nil {
+		if err := s.db.QueryRow("SELECT COUNT(*) FROM definitions WHERE file_id = (SELECT id FROM files WHERE path = ?)", path).Scan(&defs); err != nil {
 			t.Fatal(err)
 		}
 		refs, err := s.LookupReferences("SharedLib.Worker", "call7")
@@ -1480,5 +1480,153 @@ func TestLookupByPrefixRange(t *testing.T) {
 	}
 	if seen["MyApp.Billing"] {
 		t.Error("LookupReferencesByPrefix matched an unrelated module")
+	}
+}
+
+// TestReferencesUsesCoveringIndex pins the plan for the References hot path.
+// idx_refs_module_function spans (module, function, file_id, line, kind) so the
+// query is answered from the index alone. Before that, every hit cost a random
+// read into the refs table — thousands of them for a widely-called function.
+// If the index or the query drifts apart, this fails.
+func TestReferencesUsesCoveringIndex(t *testing.T) {
+	s, _ := setupTestStore(t)
+
+	rows, err := s.db.Query(
+		"EXPLAIN QUERY PLAN SELECT f.path, r.line, r.kind FROM refs r JOIN files f ON f.id = r.file_id WHERE r.module = ? AND r.function = ?",
+		"MyApp.Accounts", "get_user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var plan strings.Builder
+	for rows.Next() {
+		var id, parent, notUsed int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notUsed, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan.WriteString(detail)
+		plan.WriteString("\n")
+	}
+	got := plan.String()
+
+	if !strings.Contains(got, "COVERING INDEX idx_refs_module_function") {
+		t.Errorf("references query no longer reads from a covering index:\n%s", got)
+	}
+	if strings.Contains(got, "SCAN refs") {
+		t.Errorf("references query scans the refs table:\n%s", got)
+	}
+	if strings.Contains(got, "TEMP B-TREE") {
+		t.Errorf("references query sorts in SQLite; ordering belongs in Go:\n%s", got)
+	}
+}
+
+// TestReindexKeepsFileID guards the id that definitions and refs point at. The
+// files row is upserted rather than replaced: INSERT OR REPLACE would delete the
+// old row and allocate a new id, silently detaching every row for that file.
+func TestReindexKeepsFileID(t *testing.T) {
+	s, dir := setupTestStore(t)
+	path := writeElixirFile(t, dir, "accounts.ex", `defmodule MyApp.Accounts do
+  def get_user(id), do: SharedLib.Worker.run(id)
+end
+`)
+
+	defs, refs, err := parser.ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IndexFileWithRefs(path, defs, refs); err != nil {
+		t.Fatal(err)
+	}
+
+	fileID := func() int64 {
+		t.Helper()
+		var id int64
+		if err := s.db.QueryRow("SELECT id FROM files WHERE path = ?", path).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	orphans := func() int {
+		t.Helper()
+		var n int
+		if err := s.db.QueryRow(
+			"SELECT (SELECT COUNT(*) FROM definitions WHERE file_id NOT IN (SELECT id FROM files)) + (SELECT COUNT(*) FROM refs WHERE file_id NOT IN (SELECT id FROM files))",
+		).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	first := fileID()
+
+	// Reindex the same path, as a save would.
+	if err := s.IndexFileWithRefs(path, defs, refs); err != nil {
+		t.Fatal(err)
+	}
+	if second := fileID(); second != first {
+		t.Errorf("file id changed across reindex: %d -> %d", first, second)
+	}
+	if n := orphans(); n != 0 {
+		t.Errorf("reindex orphaned %d rows", n)
+	}
+
+	// The definitions must still resolve back to the path.
+	results, err := s.LookupFunction("MyApp.Accounts", "get_user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].FilePath != path {
+		t.Errorf("lookup after reindex = %+v, want one result at %s", results, path)
+	}
+
+	// The same through the Batch path, which upserts through its own statement.
+	batch, err := s.BeginBatch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.IndexFileWithMtimeAndRefs(path, 42, defs, refs); err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if third := fileID(); third != first {
+		t.Errorf("file id changed across batch reindex: %d -> %d", first, third)
+	}
+	if n := orphans(); n != 0 {
+		t.Errorf("batch reindex orphaned %d rows", n)
+	}
+}
+
+// TestRemoveFileClearsRows checks that deleting a file takes its definitions and
+// refs with it. refs carries no foreign key (the parent-key check was costing
+// the cold index millions of lookups), so the delete must be explicit.
+func TestRemoveFileClearsRows(t *testing.T) {
+	s, dir := setupTestStore(t)
+	path := writeElixirFile(t, dir, "worker.ex", `defmodule SharedLib.Worker do
+  def run(id), do: MyApp.Accounts.get_user(id)
+end
+`)
+	defs, refs, err := parser.ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IndexFileWithRefs(path, defs, refs); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RemoveFile(path); err != nil {
+		t.Fatal(err)
+	}
+
+	var remaining int
+	if err := s.db.QueryRow(
+		"SELECT (SELECT COUNT(*) FROM definitions) + (SELECT COUNT(*) FROM refs) + (SELECT COUNT(*) FROM files)",
+	).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 {
+		t.Errorf("removing the only file left %d rows behind", remaining)
 	}
 }

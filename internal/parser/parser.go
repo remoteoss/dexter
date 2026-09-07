@@ -4,7 +4,9 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 )
 
 // IsElixirKeyword returns true if the name is an Elixir language keyword
@@ -151,8 +153,7 @@ func WalkElixirFiles(root string, fn func(path string, d fs.DirEntry) error) err
 			return nil
 		}
 		if d.IsDir() {
-			base := filepath.Base(path)
-			if base == "_build" || base == ".git" || base == "node_modules" {
+			if skipDir(filepath.Base(path)) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -162,4 +163,91 @@ func WalkElixirFiles(root string, fn func(path string, d fs.DirEntry) error) err
 		}
 		return fn(path, d)
 	})
+}
+
+// skipDir reports whether a directory name is excluded from indexing.
+func skipDir(name string) bool {
+	return name == "_build" || name == ".git" || name == "node_modules"
+}
+
+// readDirUnsorted lists a directory without sorting the entries. os.ReadDir and
+// filepath.WalkDir both sort every directory they read; the indexer keys rows by
+// path and does not care about order, so the sort is pure cost.
+func readDirUnsorted(dir string) ([]fs.DirEntry, error) {
+	f, err := os.Open(dir)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := f.ReadDir(-1)
+	_ = f.Close()
+	return entries, err
+}
+
+// CollectElixirFilesParallel returns the paths of every .ex/.exs file below root,
+// skipping the same directories as WalkElixirFiles. It fans the traversal out
+// across all cores: on a large monorepo the single-threaded walk is a real share
+// of a cold index, and each directory read is an independent syscall.
+//
+// The returned order is unspecified. Callers key rows by path, so traversal
+// order does not affect any query result.
+func CollectElixirFilesParallel(root string) []string {
+	workers := runtime.NumCPU()
+	sem := make(chan struct{}, workers)
+
+	var (
+		mu    sync.Mutex
+		files []string
+		wg    sync.WaitGroup
+	)
+
+	var walk func(dir string)
+	walk = func(dir string) {
+		defer wg.Done()
+
+		entries, err := readDirUnsorted(dir)
+		if err != nil {
+			return
+		}
+
+		var local []string
+		for _, e := range entries {
+			name := e.Name()
+			path := filepath.Join(dir, name)
+
+			// IsDir() is false for a symlink to a directory, so symlinked trees
+			// are not descended into — the same behaviour as filepath.WalkDir.
+			if e.IsDir() {
+				if skipDir(name) {
+					continue
+				}
+				wg.Add(1)
+				select {
+				case sem <- struct{}{}:
+					go func(d string) {
+						defer func() { <-sem }()
+						walk(d)
+					}(path)
+				default:
+					// Pool is saturated; recurse inline rather than queue
+					// unbounded goroutines.
+					walk(path)
+				}
+				continue
+			}
+			if IsElixirFile(path) {
+				local = append(local, path)
+			}
+		}
+
+		if len(local) > 0 {
+			mu.Lock()
+			files = append(files, local...)
+			mu.Unlock()
+		}
+	}
+
+	wg.Add(1)
+	walk(root)
+	wg.Wait()
+	return files
 }
