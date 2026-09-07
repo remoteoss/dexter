@@ -33,7 +33,9 @@ go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.4
 ## When to bump IndexVersion
 
 Bump `IndexVersion` (alongside `Version`) whenever a parser change or schema change would make existing indexes produce
-wrong results. The LSP server checks this on startup and triggers a forced rebuild on mismatch.
+wrong results. The LSP server checks this on startup and, on a mismatch, triggers a forced rebuild of a **populated**
+index. An empty index is left to the background full build, which stamps the current version itself — so a bump is not a
+way to force anything to happen on a store that has no rows.
 
 ## What to check when making changes
 

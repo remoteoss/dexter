@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -171,10 +172,18 @@ func (s *Store) Checkpoint() error {
 // rollback journal in RAM so no -wal file is written during the bulk load, a
 // large cache keeps pages in RAM during index creation, and temp_store=MEMORY
 // keeps sort temporaries off disk.
+//
+// journal_mode goes first because it is the only one of the four that can fail:
+// leaving WAL needs exclusive access, so any other open connection makes it
+// return "database is locked". Applying it first means a locked database changes
+// nothing at all. With synchronous first, that failure used to leave fsync
+// disabled on the connection for the rest of the process — harmless in a CLI
+// that exits, not harmless in a server. The LSP does not call this on its live
+// pool at all; see indexer.Options.InProcess.
 func (s *Store) SetBulkPragmas() error {
 	for _, pragma := range []string{
-		"PRAGMA synchronous = OFF",
 		"PRAGMA journal_mode = MEMORY",
+		"PRAGMA synchronous = OFF",
 		"PRAGMA cache_size = -2000000",
 		"PRAGMA temp_store = MEMORY",
 	} {
@@ -185,10 +194,44 @@ func (s *Store) SetBulkPragmas() error {
 	return nil
 }
 
+// dropPreFileIDSchema removes the pre-file_id tables so migrate can recreate
+// them. Definitions and refs used to carry the full absolute file_path on every
+// row: 122 characters repeated across 3.9M refs on a large monorepo, plus a
+// second copy inside idx_refs_file_path, which together were over half the
+// database. Both tables now carry an integer file_id into files(id).
+//
+// CREATE TABLE IF NOT EXISTS would silently keep the old shape, so the old
+// tables are dropped outright. The index is a derived cache and IndexVersion is
+// bumped alongside this change, so the server rebuilds from source on the next
+// start.
+func dropPreFileIDSchema(db *sql.DB) error {
+	var sqlText sql.NullString
+	err := db.QueryRow("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'refs'").Scan(&sqlText)
+	if err == sql.ErrNoRows {
+		return nil // fresh database
+	}
+	if err != nil {
+		return err
+	}
+	if !sqlText.Valid || strings.Contains(sqlText.String, "file_id") {
+		return nil // already migrated
+	}
+	_, err = db.Exec(`
+		DROP TABLE IF EXISTS refs;
+		DROP TABLE IF EXISTS definitions;
+		DROP TABLE IF EXISTS files;
+	`)
+	return err
+}
+
 func migrate(db *sql.DB) error {
+	if err := dropPreFileIDSchema(db); err != nil {
+		return err
+	}
 	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS files (
-			path TEXT PRIMARY KEY,
+			id INTEGER PRIMARY KEY,
+			path TEXT NOT NULL UNIQUE,
 			mtime INTEGER NOT NULL
 		);
 
@@ -198,20 +241,24 @@ func migrate(db *sql.DB) error {
 			arity INTEGER NOT NULL DEFAULT 0,
 			kind TEXT NOT NULL,
 			line INTEGER NOT NULL,
-			file_path TEXT NOT NULL,
+			file_id INTEGER NOT NULL,
 			delegate_to TEXT NOT NULL DEFAULT '',
 			delegate_as TEXT NOT NULL DEFAULT '',
 			params TEXT NOT NULL DEFAULT '',
-			FOREIGN KEY (file_path) REFERENCES files(path) ON DELETE CASCADE
+			FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
 		);
 
 		CREATE TABLE IF NOT EXISTS refs (
 			module TEXT NOT NULL,
 			function TEXT NOT NULL DEFAULT '',
 			line INTEGER NOT NULL,
-			file_path TEXT NOT NULL,
-			kind TEXT NOT NULL DEFAULT 'call',
-			FOREIGN KEY (file_path) REFERENCES files(path) ON DELETE CASCADE
+			file_id INTEGER NOT NULL,
+			kind TEXT NOT NULL DEFAULT 'call'
+			-- No FOREIGN KEY here on purpose. With _foreign_keys=ON every insert
+			-- costs a parent-key lookup, and refs is the table the cold index
+			-- spends most of its writer time on (3.9M rows on a large monorepo).
+			-- Every path that removes a file deletes its refs explicitly first,
+			-- so the cascade was never the thing keeping them consistent.
 		);
 
 		CREATE TABLE IF NOT EXISTS metadata (
@@ -222,8 +269,21 @@ func migrate(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
+	// idx_refs_function_kind was retired: no query leads with `function`, so
+	// SQLite never chose it (the two queries that filter on function/kind both
+	// lead with file_path and use idx_refs_file_path). On a 3.9M-row index it
+	// cost 80 MB and a share of every index rebuild. Drop it from databases
+	// that still carry it; this changes no query plan.
+	if _, err := db.Exec(`DROP INDEX IF EXISTS idx_refs_function_kind`); err != nil {
+		return err
+	}
 	return createIndexes(db)
 }
+
+// fileIDSubquery resolves a path argument to files.id inside a WHERE clause, so
+// call sites keep passing paths and only the SQL changes. files.path is UNIQUE,
+// so this is one index probe.
+const fileIDSubquery = "(SELECT id FROM files WHERE path = ?)"
 
 type dbExecer interface {
 	Exec(query string, args ...interface{}) (sql.Result, error)
@@ -232,11 +292,16 @@ type dbExecer interface {
 func createIndexes(db dbExecer) error {
 	_, err := db.Exec(`
 		CREATE INDEX IF NOT EXISTS idx_definitions_module_function ON definitions(module, function);
-		CREATE INDEX IF NOT EXISTS idx_definitions_file_path_line ON definitions(file_path, line);
-		CREATE INDEX IF NOT EXISTS idx_refs_module_function ON refs(module, function);
-		CREATE INDEX IF NOT EXISTS idx_refs_file_path ON refs(file_path);
-		CREATE INDEX IF NOT EXISTS idx_refs_function_kind ON refs(function, kind);
+		CREATE INDEX IF NOT EXISTS idx_definitions_file_id_line ON definitions(file_id, line);
+		CREATE INDEX IF NOT EXISTS idx_refs_module_function ON refs(module, function, file_id, line, kind);
+		CREATE INDEX IF NOT EXISTS idx_refs_file_id ON refs(file_id);
 		CREATE INDEX IF NOT EXISTS idx_definitions_delegate_to ON definitions(delegate_to);
+		-- LookupUsingModules runs on the References slow path. Without this it
+		-- scans every definition in the index (481k entries on a large monorepo)
+		-- to find a few hundred rows, because idx_definitions_module_function
+		-- leads with module and cannot be seeked by function alone. The partial
+		-- index holds only the __using__ rows, so the scan becomes a small range.
+		CREATE INDEX IF NOT EXISTS idx_definitions_using ON definitions(module, file_id) WHERE function = '__using__';
 	`)
 	return err
 }
@@ -247,16 +312,40 @@ func (s *Store) DropIndexes() error {
 		DROP INDEX IF EXISTS idx_definitions_module_function;
 		DROP INDEX IF EXISTS idx_definitions_file_path;
 		DROP INDEX IF EXISTS idx_definitions_file_path_line;
+		DROP INDEX IF EXISTS idx_definitions_file_id_line;
 		DROP INDEX IF EXISTS idx_refs_module_function;
 		DROP INDEX IF EXISTS idx_refs_file_path;
+		DROP INDEX IF EXISTS idx_refs_file_id;
 		DROP INDEX IF EXISTS idx_refs_function_kind;
 		DROP INDEX IF EXISTS idx_definitions_delegate_to;
+		DROP INDEX IF EXISTS idx_definitions_using;
 	`)
 	return err
 }
 
 func (s *Store) CreateIndexes() error {
 	return createIndexes(s.db)
+}
+
+// IndexNames returns the names of dexter's own indexes, as the database
+// currently has them. The bulk load drops them before writing and recreates
+// them after, so tests use this to check that they came back.
+func (s *Store) IndexNames() ([]string, error) {
+	rows, err := s.db.Query("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%' ORDER BY name")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	return names, rows.Err()
 }
 
 // GetIndexVersion returns the index version stored in the database, or 0 if
@@ -297,10 +386,16 @@ func (s *Store) SetStdlibRoot(root string) error {
 	return err
 }
 
+// IsEmpty reports whether the index holds no files. It answers false when the
+// query itself fails, because every caller uses this to decide whether a
+// destructive or insert-only path is safe: a database too broken to count is
+// the one case where those paths must not run. migrate() only issues CREATE
+// ... IF NOT EXISTS, so it succeeds on a store whose `files` pages are corrupt
+// and this is the first place that notices.
 func (s *Store) IsEmpty() bool {
 	var count int
-	_ = s.db.QueryRow("SELECT COUNT(*) FROM files").Scan(&count)
-	return count == 0
+	err := s.db.QueryRow("SELECT COUNT(*) FROM files").Scan(&count)
+	return err == nil && count == 0
 }
 
 func (s *Store) GetFileMtime(path string) (int64, bool) {
@@ -328,37 +423,39 @@ func (s *Store) IndexFileWithRefs(path string, defs []parser.Definition, refs []
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if _, err := tx.Exec("DELETE FROM definitions WHERE file_path = ?", path); err != nil {
-		return err
-	}
-	if _, err := tx.Exec("DELETE FROM refs WHERE file_path = ?", path); err != nil {
-		return err
-	}
-	if _, err := tx.Exec("INSERT OR REPLACE INTO files (path, mtime) VALUES (?, ?)", path, info.ModTime().UnixNano()); err != nil {
+	fileID, err := upsertFileID(tx, path, info.ModTime().UnixNano())
+	if err != nil {
 		return err
 	}
 
-	defStmt, err := tx.Prepare("INSERT INTO definitions (module, function, arity, kind, line, file_path, delegate_to, delegate_as, params) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+	if _, err := tx.Exec("DELETE FROM definitions WHERE file_id = ?", fileID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM refs WHERE file_id = ?", fileID); err != nil {
+		return err
+	}
+
+	defStmt, err := tx.Prepare("INSERT INTO definitions (module, function, arity, kind, line, file_id, delegate_to, delegate_as, params) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
 	if err != nil {
 		return err
 	}
 	defer func() { _ = defStmt.Close() }()
 
 	for _, d := range defs {
-		if _, err := defStmt.Exec(d.Module, d.Function, d.Arity, d.Kind, d.Line, d.FilePath, d.DelegateTo, d.DelegateAs, d.Params); err != nil {
+		if _, err := defStmt.Exec(d.Module, d.Function, d.Arity, d.Kind, d.Line, fileID, d.DelegateTo, d.DelegateAs, d.Params); err != nil {
 			return err
 		}
 	}
 
 	if len(refs) > 0 {
-		refStmt, err := tx.Prepare("INSERT INTO refs (module, function, line, file_path, kind) VALUES (?, ?, ?, ?, ?)")
+		refStmt, err := tx.Prepare("INSERT INTO refs (module, function, line, file_id, kind) VALUES (?, ?, ?, ?, ?)")
 		if err != nil {
 			return err
 		}
 		defer func() { _ = refStmt.Close() }()
 
 		for _, r := range refs {
-			if _, err := refStmt.Exec(r.Module, r.Function, r.Line, r.FilePath, r.Kind); err != nil {
+			if _, err := refStmt.Exec(r.Module, r.Function, r.Line, fileID, r.Kind); err != nil {
 				return err
 			}
 		}
@@ -366,6 +463,36 @@ func (s *Store) IndexFileWithRefs(path string, defs []parser.Definition, refs []
 
 	return tx.Commit()
 }
+
+// txExecQuerier is the subset of *sql.Tx that upsertFileID needs.
+type txExecQuerier interface {
+	QueryRow(query string, args ...interface{}) *sql.Row
+}
+
+// upsertFileID returns the files.id for path, inserting the row or refreshing
+// its mtime as needed. The UPSERT keeps the existing id, which matters because
+// definitions and refs point at it: INSERT OR REPLACE would delete the old row
+// and hand out a new id, orphaning (or cascading away) every row for the file.
+func upsertFileID(tx txExecQuerier, path string, mtimeNano int64) (int64, error) {
+	var id int64
+	err := tx.QueryRow(
+		"INSERT INTO files (path, mtime) VALUES (?, ?) ON CONFLICT(path) DO UPDATE SET mtime = excluded.mtime RETURNING id",
+		path, mtimeNano,
+	).Scan(&id)
+	return id, err
+}
+
+// Row counts for the multi-row INSERT statements used by the bulk path. Each
+// chunk stays under 900 bound parameters, which is below even the legacy
+// SQLITE_MAX_VARIABLE_NUMBER of 999, so the batch size never depends on how
+// the driver's SQLite was compiled.
+const (
+	defColumns   = 9
+	refColumns   = 5
+	maxBindVars  = 900
+	defChunkRows = maxBindVars / defColumns // 100
+	refChunkRows = maxBindVars / refColumns // 180
+)
 
 // Batch wraps multiple IndexFile operations in a single SQLite transaction
 // with shared prepared statements.
@@ -377,6 +504,41 @@ type Batch struct {
 	delDefStmt *sql.Stmt // nil in insert-only mode
 	delRefStmt *sql.Stmt // nil in insert-only mode
 	insertOnly bool
+
+	// Multi-row INSERT buffers, used in insert-only mode only. A cold index
+	// writes ~4.4M rows through one connection, and the writer is the
+	// bottleneck of the whole indexing pipeline; batching turns ~4.4M cgo
+	// crossings into a few tens of thousands. Incremental reindexing keeps the
+	// row-at-a-time path, where a file's DELETE must stay ordered ahead of its
+	// INSERTs and the row count is far too small to matter.
+	defChunkStmt *sql.Stmt
+	refChunkStmt *sql.Stmt
+	defArgs      []interface{}
+	refArgs      []interface{}
+
+	// Bulk-path file id allocation. Insert-only mode assigns ids in Go from a
+	// counter and writes files rows with an explicit id, so a cold index never
+	// pays a round trip per file to learn what id it just wrote.
+	nextFileID int64
+}
+
+// multiRowInsert builds "INSERT INTO <table> (<cols>) VALUES (?,..),(?,..)" for
+// exactly rows tuples of n placeholders each.
+func multiRowInsert(table, columns string, n, rows int) string {
+	var b strings.Builder
+	b.WriteString("INSERT INTO ")
+	b.WriteString(table)
+	b.WriteString(" (")
+	b.WriteString(columns)
+	b.WriteString(") VALUES ")
+	tuple := "(?" + strings.Repeat(",?", n-1) + ")"
+	for i := 0; i < rows; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(tuple)
+	}
+	return b.String()
 }
 
 func (s *Store) BeginBatch() (*Batch, error) {
@@ -396,20 +558,24 @@ func (s *Store) beginBatch(insertOnly bool) (*Batch, error) {
 		return nil, err
 	}
 
-	defStmt, err := tx.Prepare("INSERT INTO definitions (module, function, arity, kind, line, file_path, delegate_to, delegate_as, params) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+	defStmt, err := tx.Prepare("INSERT INTO definitions (module, function, arity, kind, line, file_id, delegate_to, delegate_as, params) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
 	if err != nil {
 		_ = tx.Rollback()
 		return nil, err
 	}
 
-	refStmt, err := tx.Prepare("INSERT INTO refs (module, function, line, file_path, kind) VALUES (?, ?, ?, ?, ?)")
+	refStmt, err := tx.Prepare("INSERT INTO refs (module, function, line, file_id, kind) VALUES (?, ?, ?, ?, ?)")
 	if err != nil {
 		_ = defStmt.Close()
 		_ = tx.Rollback()
 		return nil, err
 	}
 
-	fileStmt, err := tx.Prepare("INSERT OR REPLACE INTO files (path, mtime) VALUES (?, ?)")
+	fileSQL := "INSERT INTO files (path, mtime) VALUES (?, ?) ON CONFLICT(path) DO UPDATE SET mtime = excluded.mtime RETURNING id"
+	if insertOnly {
+		fileSQL = "INSERT INTO files (id, path, mtime) VALUES (?, ?, ?)"
+	}
+	fileStmt, err := tx.Prepare(fileSQL)
 	if err != nil {
 		_ = defStmt.Close()
 		_ = refStmt.Close()
@@ -426,14 +592,41 @@ func (s *Store) beginBatch(insertOnly bool) (*Batch, error) {
 	}
 
 	if !insertOnly {
-		b.delDefStmt, err = tx.Prepare("DELETE FROM definitions WHERE file_path = ?")
+		b.delDefStmt, err = tx.Prepare("DELETE FROM definitions WHERE file_id = ?")
 		if err != nil {
 			b.closeStmts()
 			_ = tx.Rollback()
 			return nil, err
 		}
-		b.delRefStmt, err = tx.Prepare("DELETE FROM refs WHERE file_path = ?")
+		b.delRefStmt, err = tx.Prepare("DELETE FROM refs WHERE file_id = ?")
 		if err != nil {
+			b.closeStmts()
+			_ = tx.Rollback()
+			return nil, err
+		}
+	} else {
+		b.defChunkStmt, err = tx.Prepare(multiRowInsert(
+			"definitions",
+			"module, function, arity, kind, line, file_id, delegate_to, delegate_as, params",
+			defColumns, defChunkRows))
+		if err != nil {
+			b.closeStmts()
+			_ = tx.Rollback()
+			return nil, err
+		}
+		b.refChunkStmt, err = tx.Prepare(multiRowInsert(
+			"refs", "module, function, line, file_id, kind", refColumns, refChunkRows))
+		if err != nil {
+			b.closeStmts()
+			_ = tx.Rollback()
+			return nil, err
+		}
+		b.defArgs = make([]interface{}, 0, defColumns*defChunkRows)
+		b.refArgs = make([]interface{}, 0, refColumns*refChunkRows)
+
+		// Bulk mode is used on a freshly created database, but seed from the
+		// table anyway so a non-empty one cannot collide on the primary key.
+		if err := tx.QueryRow("SELECT COALESCE(MAX(id), 0) FROM files").Scan(&b.nextFileID); err != nil {
 			b.closeStmts()
 			_ = tx.Rollback()
 			return nil, err
@@ -460,27 +653,55 @@ func (b *Batch) IndexFileWithMtimeAndRefs(path string, mtimeNano int64, defs []p
 }
 
 func (b *Batch) indexFile(path string, mtimeNano int64, defs []parser.Definition, refs []parser.Reference) error {
-	if !b.insertOnly {
-		if _, err := b.delDefStmt.Exec(path); err != nil {
-			return err
-		}
-		if _, err := b.delRefStmt.Exec(path); err != nil {
-			return err
-		}
-	}
-
-	if _, err := b.fileStmt.Exec(path, mtimeNano); err != nil {
+	fileID, err := b.fileID(path, mtimeNano)
+	if err != nil {
 		return err
 	}
 
+	if !b.insertOnly {
+		if _, err := b.delDefStmt.Exec(fileID); err != nil {
+			return err
+		}
+		if _, err := b.delRefStmt.Exec(fileID); err != nil {
+			return err
+		}
+	}
+
+	if b.insertOnly {
+		// Reset the buffer before checking the error: the chunk boundary is an
+		// exact-multiple test, so a buffer left full would never match again and
+		// the rest of the batch would silently fall back to flushPending.
+		for _, d := range defs {
+			b.defArgs = append(b.defArgs, d.Module, d.Function, d.Arity, d.Kind, d.Line, fileID, d.DelegateTo, d.DelegateAs, d.Params)
+			if len(b.defArgs) == defColumns*defChunkRows {
+				_, err := b.defChunkStmt.Exec(b.defArgs...)
+				b.defArgs = b.defArgs[:0]
+				if err != nil {
+					return err
+				}
+			}
+		}
+		for _, r := range refs {
+			b.refArgs = append(b.refArgs, r.Module, r.Function, r.Line, fileID, r.Kind)
+			if len(b.refArgs) == refColumns*refChunkRows {
+				_, err := b.refChunkStmt.Exec(b.refArgs...)
+				b.refArgs = b.refArgs[:0]
+				if err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+
 	for _, d := range defs {
-		if _, err := b.defStmt.Exec(d.Module, d.Function, d.Arity, d.Kind, d.Line, d.FilePath, d.DelegateTo, d.DelegateAs, d.Params); err != nil {
+		if _, err := b.defStmt.Exec(d.Module, d.Function, d.Arity, d.Kind, d.Line, fileID, d.DelegateTo, d.DelegateAs, d.Params); err != nil {
 			return err
 		}
 	}
 
 	for _, r := range refs {
-		if _, err := b.refStmt.Exec(r.Module, r.Function, r.Line, r.FilePath, r.Kind); err != nil {
+		if _, err := b.refStmt.Exec(r.Module, r.Function, r.Line, fileID, r.Kind); err != nil {
 			return err
 		}
 	}
@@ -488,7 +709,50 @@ func (b *Batch) indexFile(path string, mtimeNano int64, defs []parser.Definition
 	return nil
 }
 
+// fileID writes the files row for path and returns its id.
+//
+// The bulk path allocates ids from a counter and inserts them explicitly: a
+// cold index writes ~70k files, and asking SQLite to hand back each id would
+// add a round trip per file to the one thread that is already the bottleneck.
+// The incremental path upserts, so an existing file keeps the id that its
+// definitions and refs already point at.
+func (b *Batch) fileID(path string, mtimeNano int64) (int64, error) {
+	if b.insertOnly {
+		b.nextFileID++
+		if _, err := b.fileStmt.Exec(b.nextFileID, path, mtimeNano); err != nil {
+			return 0, err
+		}
+		return b.nextFileID, nil
+	}
+	var id int64
+	err := b.fileStmt.QueryRow(path, mtimeNano).Scan(&id)
+	return id, err
+}
+
+// flushPending writes any rows left over from a partly filled chunk, one row at
+// a time through the single-row statements.
+func (b *Batch) flushPending() error {
+	for i := 0; i < len(b.defArgs); i += defColumns {
+		if _, err := b.defStmt.Exec(b.defArgs[i : i+defColumns]...); err != nil {
+			return err
+		}
+	}
+	b.defArgs = b.defArgs[:0]
+	for i := 0; i < len(b.refArgs); i += refColumns {
+		if _, err := b.refStmt.Exec(b.refArgs[i : i+refColumns]...); err != nil {
+			return err
+		}
+	}
+	b.refArgs = b.refArgs[:0]
+	return nil
+}
+
 func (b *Batch) Commit() error {
+	if err := b.flushPending(); err != nil {
+		b.closeStmts()
+		_ = b.tx.Rollback()
+		return err
+	}
 	b.closeStmts()
 	return b.tx.Commit()
 }
@@ -502,6 +766,12 @@ func (b *Batch) closeStmts() {
 	_ = b.defStmt.Close()
 	_ = b.refStmt.Close()
 	_ = b.fileStmt.Close()
+	if b.defChunkStmt != nil {
+		_ = b.defChunkStmt.Close()
+	}
+	if b.refChunkStmt != nil {
+		_ = b.refChunkStmt.Close()
+	}
 	if b.delDefStmt != nil {
 		_ = b.delDefStmt.Close()
 	}
@@ -543,10 +813,10 @@ func (s *Store) RemoveFiles(paths []string) error {
 	defer func() { _ = tx.Rollback() }()
 
 	for _, path := range paths {
-		if _, err = tx.Exec("DELETE FROM definitions WHERE file_path = ?", path); err != nil {
+		if _, err = tx.Exec("DELETE FROM definitions WHERE file_id = "+fileIDSubquery, path); err != nil {
 			return err
 		}
-		if _, err = tx.Exec("DELETE FROM refs WHERE file_path = ?", path); err != nil {
+		if _, err = tx.Exec("DELETE FROM refs WHERE file_id = "+fileIDSubquery, path); err != nil {
 			return err
 		}
 		if _, err = tx.Exec("DELETE FROM files WHERE path = ?", path); err != nil {
@@ -654,7 +924,7 @@ func (s *Store) SearchSubmoduleSegments(parentModule string, segmentPrefix strin
 }
 
 func (s *Store) ListModuleFunctions(module string, publicOnly bool) ([]CompletionResult, error) {
-	query := "SELECT module, function, arity, kind, file_path, line, params FROM definitions WHERE module = ? AND function != '' AND kind NOT IN ('callback', 'macrocallback')"
+	query := "SELECT d.module, d.function, d.arity, d.kind, f.path, d.line, d.params FROM definitions d JOIN files f ON f.id = d.file_id WHERE d.module = ? AND d.function != '' AND d.kind NOT IN ('callback', 'macrocallback')"
 	if publicOnly {
 		query += " AND kind IN ('def', 'defmacro', 'defguard', 'defdelegate', 'type', 'opaque')"
 	}
@@ -681,7 +951,7 @@ func (s *Store) ListModuleFunctions(module string, publicOnly bool) ([]Completio
 // the given behaviour module (these are excluded from ListModuleFunctions).
 func (s *Store) ListModuleCallbacks(module string) ([]CompletionResult, error) {
 	rows, err := s.db.Query(
-		"SELECT module, function, arity, kind, file_path, line, params FROM definitions WHERE module = ? AND kind IN ('callback', 'macrocallback') GROUP BY function, arity ORDER BY function, arity LIMIT 100",
+		"SELECT d.module, d.function, d.arity, d.kind, f.path, d.line, d.params FROM definitions d JOIN files f ON f.id = d.file_id WHERE d.module = ? AND d.kind IN ('callback', 'macrocallback') GROUP BY d.function, d.arity ORDER BY d.function, d.arity LIMIT 100",
 		module,
 	)
 	if err != nil {
@@ -737,7 +1007,7 @@ type LookupResult struct {
 
 func (s *Store) LookupModule(module string) ([]LookupResult, error) {
 	return s.queryLookup(
-		"SELECT file_path, line, kind, arity, delegate_to, delegate_as FROM definitions WHERE module = ? AND function = '' AND kind IN ('module', 'defprotocol', 'defimpl')",
+		"SELECT f.path, d.line, d.kind, d.arity, d.delegate_to, d.delegate_as FROM definitions d JOIN files f ON f.id = d.file_id WHERE d.module = ? AND d.function = '' AND d.kind IN ('module', 'defprotocol', 'defimpl')",
 		module,
 	)
 }
@@ -745,7 +1015,7 @@ func (s *Store) LookupModule(module string) ([]LookupResult, error) {
 // LookupModulesInFile returns all module names defined in the given file, in line order.
 func (s *Store) LookupModulesInFile(filePath string) ([]string, error) {
 	rows, err := s.db.Query(
-		"SELECT module FROM definitions WHERE file_path = ? AND function = '' AND kind IN ('module', 'defprotocol') ORDER BY line",
+		"SELECT module FROM definitions WHERE file_id = "+fileIDSubquery+" AND function = '' AND kind IN ('module', 'defprotocol') ORDER BY line",
 		filePath,
 	)
 	if err != nil {
@@ -784,7 +1054,7 @@ func (s *Store) LookupFunctionInFile(filePath, function string, nearLine int) (s
 	var module string
 	err := s.db.QueryRow(
 		"SELECT d.module FROM definitions d "+
-			"WHERE d.file_path = ? AND d.function = ? AND d.kind NOT IN ('module', 'defprotocol', 'defimpl', 'callback', 'macrocallback') "+
+			"WHERE d.file_id = "+fileIDSubquery+" AND d.function = ? AND d.kind NOT IN ('module', 'defprotocol', 'defimpl', 'callback', 'macrocallback') "+
 			"LIMIT 1",
 		filePath, function,
 	).Scan(&module)
@@ -796,7 +1066,7 @@ func (s *Store) LookupFunctionInFile(filePath, function string, nearLine int) (s
 
 func (s *Store) LookupFunction(module, function string) ([]LookupResult, error) {
 	return s.queryLookup(
-		"SELECT file_path, line, kind, arity, delegate_to, delegate_as FROM definitions WHERE module = ? AND function = ? AND kind NOT IN ('module', 'defprotocol', 'defimpl', 'callback', 'macrocallback') ORDER BY CASE WHEN kind IN ('type', 'opaque') THEN 1 ELSE 0 END, line",
+		"SELECT f.path, d.line, d.kind, d.arity, d.delegate_to, d.delegate_as FROM definitions d JOIN files f ON f.id = d.file_id WHERE d.module = ? AND d.function = ? AND d.kind NOT IN ('module', 'defprotocol', 'defimpl', 'callback', 'macrocallback') ORDER BY CASE WHEN d.kind IN ('type', 'opaque') THEN 1 ELSE 0 END, d.line",
 		module, function,
 	)
 }
@@ -812,7 +1082,7 @@ type CallbackResult struct {
 // LookupCallbackDef returns @callback and @macrocallback definitions for a given behaviour module and function name.
 func (s *Store) LookupCallbackDef(behaviourModule, function string) ([]CallbackResult, error) {
 	rows, err := s.db.Query(
-		"SELECT file_path, line, kind, arity FROM definitions WHERE module = ? AND function = ? AND kind IN ('callback', 'macrocallback') ORDER BY line",
+		"SELECT f.path, d.line, d.kind, d.arity FROM definitions d JOIN files f ON f.id = d.file_id WHERE d.module = ? AND d.function = ? AND d.kind IN ('callback', 'macrocallback') ORDER BY d.line",
 		behaviourModule, function,
 	)
 	if err != nil {
@@ -842,12 +1112,12 @@ func (s *Store) LookupCallbackDefGlobal(function string, arity int) ([]CallbackR
 	)
 	if arity >= 0 {
 		rows, err = s.db.Query(
-			"SELECT file_path, line, kind, arity FROM definitions WHERE function = ? AND arity = ? AND kind IN ('callback', 'macrocallback') ORDER BY module, line",
+			"SELECT f.path, d.line, d.kind, d.arity FROM definitions d JOIN files f ON f.id = d.file_id WHERE d.function = ? AND d.arity = ? AND d.kind IN ('callback', 'macrocallback') ORDER BY d.module, d.line",
 			function, arity,
 		)
 	} else {
 		rows, err = s.db.Query(
-			"SELECT file_path, line, kind, arity FROM definitions WHERE function = ? AND kind IN ('callback', 'macrocallback') ORDER BY module, line",
+			"SELECT f.path, d.line, d.kind, d.arity FROM definitions d JOIN files f ON f.id = d.file_id WHERE d.function = ? AND d.kind IN ('callback', 'macrocallback') ORDER BY d.module, d.line",
 			function,
 		)
 	}
@@ -872,10 +1142,10 @@ func (s *Store) LookupCallbackDefGlobal(function string, arity int) ([]CallbackR
 // modules that define at least one @callback (since `use` commonly injects @behaviour).
 func (s *Store) LookupBehavioursForFile(filePath string) ([]string, error) {
 	rows, err := s.db.Query(`
-		SELECT module FROM refs WHERE file_path = ? AND kind = 'behaviour'
+		SELECT module FROM refs WHERE file_id = (SELECT id FROM files WHERE path = ?) AND kind = 'behaviour'
 		UNION
 		SELECT r.module FROM refs r
-		WHERE r.file_path = ? AND r.kind = 'use'
+		WHERE r.file_id = (SELECT id FROM files WHERE path = ?) AND r.kind = 'use'
 			AND EXISTS (SELECT 1 FROM definitions d WHERE d.module = r.module AND d.kind IN ('callback', 'macrocallback'))
 		ORDER BY 1`,
 		filePath, filePath,
@@ -907,12 +1177,13 @@ type BehaviourImplementorResult struct {
 // avoiding a cross-product when a file defines multiple modules.
 func (s *Store) LookupBehaviourImplementors(behaviourModule string) ([]BehaviourImplementorResult, error) {
 	rows, err := s.db.Query(`
-		SELECT DISTINCT d.module, r.file_path
+		SELECT DISTINCT d.module, f.path
 		FROM refs r
-		JOIN definitions d ON d.file_path = r.file_path AND d.function = '' AND d.kind IN ('module', 'defprotocol')
+		JOIN files f ON f.id = r.file_id
+		JOIN definitions d ON d.file_id = r.file_id AND d.function = '' AND d.kind IN ('module', 'defprotocol')
 			AND d.line = (
 				SELECT MAX(d2.line) FROM definitions d2
-				WHERE d2.file_path = r.file_path AND d2.function = '' AND d2.kind IN ('module', 'defprotocol') AND d2.line <= r.line
+				WHERE d2.file_id = r.file_id AND d2.function = '' AND d2.kind IN ('module', 'defprotocol') AND d2.line <= r.line
 			)
 		WHERE r.module = ? AND r.kind IN ('behaviour', 'use')
 		ORDER BY d.module`,
@@ -948,16 +1219,16 @@ func (s *Store) LookupFunctionInModules(modules []string, function string, arity
 	}
 	args = append(args, function)
 
-	query := "SELECT file_path, line, kind, arity, delegate_to, delegate_as FROM definitions WHERE module IN (" +
+	query := "SELECT f.path, d.line, d.kind, d.arity, d.delegate_to, d.delegate_as FROM definitions d JOIN files f ON f.id = d.file_id WHERE d.module IN (" +
 		strings.Join(placeholders, ",") +
-		") AND function = ? AND kind NOT IN ('module', 'defprotocol', 'defimpl', 'callback', 'macrocallback')"
+		") AND d.function = ? AND d.kind NOT IN ('module', 'defprotocol', 'defimpl', 'callback', 'macrocallback')"
 
 	if arity >= 0 {
-		query += " AND arity = ?"
+		query += " AND d.arity = ?"
 		args = append(args, arity)
 	}
 
-	query += " ORDER BY line"
+	query += " ORDER BY d.line"
 	return s.queryLookup(query, args...)
 }
 
@@ -986,13 +1257,18 @@ type ReferenceResult struct {
 }
 
 func (s *Store) LookupReferences(module, function string) ([]ReferenceResult, error) {
-	query := "SELECT file_path, line, kind FROM refs WHERE module = ?"
-	args := []interface{}{module}
-	query += " AND function = ?"
-	args = append(args, function)
-	query += " ORDER BY file_path, line"
-
-	rows, err := s.db.Query(query, args...)
+	// idx_refs_module_function covers (module, function, file_id, line, kind),
+	// so this reads the index alone — no row lookup into the refs table, which
+	// used to cost one random read per hit (7,749 of them for a hot function on
+	// a large monorepo). The join to files resolves ids to paths against a
+	// table small enough to stay in page cache.
+	//
+	// Ordering happens in Go: sorting by f.path in SQL would force a temp
+	// B-tree, while the result sets here are small enough that a sort costs
+	// microseconds.
+	rows, err := s.db.Query(
+		"SELECT f.path, r.line, r.kind FROM refs r JOIN files f ON f.id = r.file_id WHERE r.module = ? AND r.function = ?",
+		module, function)
 	if err != nil {
 		return nil, err
 	}
@@ -1006,7 +1282,16 @@ func (s *Store) LookupReferences(module, function string) ([]ReferenceResult, er
 		}
 		results = append(results, r)
 	}
-	return results, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].FilePath != results[j].FilePath {
+			return results[i].FilePath < results[j].FilePath
+		}
+		return results[i].Line < results[j].Line
+	})
+	return results, nil
 }
 
 // ModuleReferenceResult is like ReferenceResult but also carries the module
@@ -1021,9 +1306,15 @@ type ModuleReferenceResult struct {
 // LookupReferencesByPrefix returns all refs whose module equals prefix or starts
 // with prefix + ".". Used for bulk module renames to avoid N+1 queries.
 func (s *Store) LookupReferencesByPrefix(prefix string) ([]ModuleReferenceResult, error) {
+	// A range beats LIKE here: LIKE is case-insensitive by default, so SQLite
+	// cannot convert `module LIKE 'Prefix.%'` into an index range and falls back
+	// to a full scan of refs (3.9M rows on a large monorepo). '/' is '.'+1, so
+	// [prefix+"." , prefix+"/") is exactly the set of names under the prefix,
+	// and idx_refs_module_function serves it. Elixir module names are
+	// case-sensitive, so the stricter comparison is also the correct one.
 	rows, err := s.db.Query(
-		"SELECT module, file_path, line, kind FROM refs WHERE module = ? OR module LIKE ? ORDER BY file_path, line",
-		prefix, prefix+".%",
+		"SELECT r.module, f.path, r.line, r.kind FROM refs r JOIN files f ON f.id = r.file_id WHERE r.module = ? OR (r.module >= ? AND r.module < ?) ORDER BY f.path, r.line",
+		prefix, prefix+".", prefix+"/",
 	)
 	if err != nil {
 		return nil, err
@@ -1045,9 +1336,10 @@ func (s *Store) LookupReferencesByPrefix(prefix string) ([]ModuleReferenceResult
 // or starts with prefix + ".". The Module field is populated on each result.
 // Used for bulk module renames to replace N per-module LookupModule calls with one.
 func (s *Store) LookupModulesByPrefix(prefix string) ([]LookupResult, error) {
+	// Range rather than LIKE, for the same reason as LookupReferencesByPrefix.
 	rows, err := s.db.Query(
-		"SELECT module, file_path, line, kind, arity, delegate_to, delegate_as FROM definitions WHERE function = '' AND (module = ? OR module LIKE ?) AND kind IN ('module', 'defprotocol', 'defimpl') ORDER BY module",
-		prefix, prefix+".%",
+		"SELECT d.module, f.path, d.line, d.kind, d.arity, d.delegate_to, d.delegate_as FROM definitions d JOIN files f ON f.id = d.file_id WHERE d.function = '' AND (d.module = ? OR (d.module >= ? AND d.module < ?)) AND d.kind IN ('module', 'defprotocol', 'defimpl') ORDER BY d.module",
+		prefix, prefix+".", prefix+"/",
 	)
 	if err != nil {
 		return nil, err
@@ -1079,11 +1371,11 @@ type DelegateEntry struct {
 // equals target) and the as: case (delegate_as equals target function name).
 func (s *Store) LookupDelegatesTo(targetModule, targetFunction string) ([]DelegateEntry, error) {
 	rows, err := s.db.Query(
-		`SELECT module, function, delegate_as, file_path, line FROM definitions
-		 WHERE kind = 'defdelegate' AND delegate_to = ? AND delegate_as = '' AND function = ?
+		`SELECT d.module, d.function, d.delegate_as, f.path, d.line FROM definitions d JOIN files f ON f.id = d.file_id
+		 WHERE d.kind = 'defdelegate' AND d.delegate_to = ? AND d.delegate_as = '' AND d.function = ?
 		 UNION ALL
-		 SELECT module, function, delegate_as, file_path, line FROM definitions
-		 WHERE kind = 'defdelegate' AND delegate_to = ? AND delegate_as = ?`,
+		 SELECT d.module, d.function, d.delegate_as, f.path, d.line FROM definitions d JOIN files f ON f.id = d.file_id
+		 WHERE d.kind = 'defdelegate' AND d.delegate_to = ? AND d.delegate_as = ?`,
 		targetModule, targetFunction, targetModule, targetFunction,
 	)
 	if err != nil {
@@ -1113,7 +1405,7 @@ func (s *Store) SearchSymbols(query string, excludePathPrefix ...string) ([]Comp
 	pathFilter := ""
 	var extraArgs []interface{}
 	if len(excludePathPrefix) > 0 && excludePathPrefix[0] != "" {
-		pathFilter = " AND file_path NOT LIKE ?"
+		pathFilter = " AND f.path NOT LIKE ?"
 		extraArgs = append(extraArgs, excludePathPrefix[0]+"%")
 	}
 
@@ -1130,8 +1422,8 @@ func (s *Store) SearchSymbols(query string, excludePathPrefix ...string) ([]Comp
 		args := append([]interface{}{modulePart, suffixPart, suffixPart}, extraArgs...)
 		args = append(args, query, query)
 		rows, err = s.db.Query(
-			"SELECT module, function, arity, kind, file_path, line FROM definitions WHERE module LIKE ? AND (function LIKE ? OR module LIKE ?)"+pathFilter+
-				" ORDER BY CASE WHEN module = ? THEN 0 WHEN INSTR(module || '.' || function, ?) > 0 THEN 1 ELSE 2 END, module, function LIMIT 50",
+			"SELECT d.module, d.function, d.arity, d.kind, f.path, d.line FROM definitions d JOIN files f ON f.id = d.file_id WHERE d.module LIKE ? AND (d.function LIKE ? OR d.module LIKE ?)"+pathFilter+
+				" ORDER BY CASE WHEN d.module = ? THEN 0 WHEN INSTR(d.module || '.' || d.function, ?) > 0 THEN 1 ELSE 2 END, d.module, d.function LIMIT 50",
 			args...,
 		)
 	} else {
@@ -1139,8 +1431,8 @@ func (s *Store) SearchSymbols(query string, excludePathPrefix ...string) ([]Comp
 		args := append([]interface{}{pattern, pattern}, extraArgs...)
 		args = append(args, query, query, query)
 		rows, err = s.db.Query(
-			"SELECT module, function, arity, kind, file_path, line FROM definitions WHERE (module LIKE ? OR function LIKE ?)"+pathFilter+
-				" ORDER BY CASE WHEN module = ? THEN 0 WHEN INSTR(module, ?) > 0 OR INSTR(function, ?) > 0 THEN 1 ELSE 2 END, module, function LIMIT 50",
+			"SELECT d.module, d.function, d.arity, d.kind, f.path, d.line FROM definitions d JOIN files f ON f.id = d.file_id WHERE (d.module LIKE ? OR d.function LIKE ?)"+pathFilter+
+				" ORDER BY CASE WHEN d.module = ? THEN 0 WHEN INSTR(d.module, ?) > 0 OR INSTR(d.function, ?) > 0 THEN 1 ELSE 2 END, d.module, d.function LIMIT 50",
 			args...,
 		)
 	}
@@ -1193,7 +1485,7 @@ type UsingModule struct {
 // LookupUsingModules returns all modules that define a defmacro __using__
 // function, along with their file paths. The result set is typically small.
 func (s *Store) LookupUsingModules() ([]UsingModule, error) {
-	rows, err := s.db.Query("SELECT DISTINCT module, file_path FROM definitions WHERE function = '__using__'")
+	rows, err := s.db.Query("SELECT DISTINCT d.module, f.path FROM definitions d JOIN files f ON f.id = d.file_id WHERE d.function = '__using__'")
 	if err != nil {
 		return nil, err
 	}
@@ -1215,7 +1507,7 @@ func (s *Store) LookupUsingModules() ([]UsingModule, error) {
 func (s *Store) LookupEnclosingModule(filePath string, lineNum int) string {
 	var module string
 	err := s.db.QueryRow(
-		"SELECT module FROM definitions WHERE file_path = ? AND function = '' AND kind IN ('module', 'defprotocol') AND line <= ? ORDER BY line DESC LIMIT 1",
+		"SELECT module FROM definitions WHERE file_id = "+fileIDSubquery+" AND function = '' AND kind IN ('module', 'defprotocol') AND line <= ? ORDER BY line DESC LIMIT 1",
 		filePath, lineNum,
 	).Scan(&module)
 	if err != nil {
@@ -1228,7 +1520,7 @@ func (s *Store) LookupEnclosingModule(filePath string, lineNum int) string {
 // given line in a file (the nearest def/defp/defmacro at or before lineNum).
 func (s *Store) LookupEnclosingFunction(filePath string, lineNum int) (module, function string, arity int, line int, found bool) {
 	err := s.db.QueryRow(
-		"SELECT module, function, arity, line FROM definitions WHERE file_path = ? AND function != '' AND line <= ? ORDER BY line DESC LIMIT 1",
+		"SELECT module, function, arity, line FROM definitions WHERE file_id = "+fileIDSubquery+" AND function != '' AND line <= ? ORDER BY line DESC LIMIT 1",
 		filePath, lineNum,
 	).Scan(&module, &function, &arity, &line)
 	if err != nil {
@@ -1248,7 +1540,7 @@ type OutgoingRef struct {
 // endLine (inclusive, 1-based). Used for outgoing call hierarchy.
 func (s *Store) LookupRefsInRange(filePath string, startLine, endLine int) ([]OutgoingRef, error) {
 	rows, err := s.db.Query(
-		"SELECT module, function, line FROM refs WHERE file_path = ? AND line >= ? AND line <= ? AND kind = 'call' AND function != ''",
+		"SELECT module, function, line FROM refs WHERE file_id = "+fileIDSubquery+" AND line >= ? AND line <= ? AND kind = 'call' AND function != ''",
 		filePath, startLine, endLine,
 	)
 	if err != nil {
@@ -1272,7 +1564,7 @@ func (s *Store) LookupRefsInRange(filePath string, startLine, endLine int) ([]Ou
 func (s *Store) NextFunctionLine(filePath string, startLine int) int {
 	var line int
 	err := s.db.QueryRow(
-		"SELECT line FROM definitions WHERE file_path = ? AND function != '' AND line > ? ORDER BY line LIMIT 1",
+		"SELECT line FROM definitions WHERE file_id = "+fileIDSubquery+" AND function != '' AND line > ? ORDER BY line LIMIT 1",
 		filePath, startLine,
 	).Scan(&line)
 	if err != nil {

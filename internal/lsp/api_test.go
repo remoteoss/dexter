@@ -156,8 +156,8 @@ end
 	if fc.applied == nil {
 		t.Fatal("no workspace/applyEdit request reached the client")
 	}
-	if len(fc.applied.Changes) != 1 {
-		t.Errorf("ApplyEdit carried %d files, want 1", len(fc.applied.Changes))
+	if len(fc.applied.Changes) != 2 {
+		t.Errorf("ApplyEdit carried %d files, want both open and closed files", len(fc.applied.Changes))
 	}
 	data, err := os.ReadFile(openPath)
 	if err != nil {
@@ -175,10 +175,12 @@ func TestRenameFunction_ReportsRejectedApplyEdit(t *testing.T) {
 	defer cleanup()
 	server.conn = &fakeConn{reject: true}
 
-	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", `defmodule MyApp.Accounts do
+	definitionSrc := `defmodule MyApp.Accounts do
   def fetch_user(id), do: id
 end
-`)
+	`
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", definitionSrc)
+	definitionPath := filepath.Join(server.projectRoot, "lib/accounts.ex")
 	openSrc := `defmodule MyApp.Caller do
   def go(id), do: MyApp.Accounts.fetch_user(id)
 end
@@ -189,6 +191,13 @@ end
 
 	if _, err := server.RenameFunction("MyApp.Accounts", "fetch_user", "get_user"); err == nil {
 		t.Fatal("rename reported success despite the editor rejecting the edit")
+	}
+	data, err := os.ReadFile(definitionPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != definitionSrc {
+		t.Errorf("rejected rename changed a closed file:\n%s", data)
 	}
 }
 
@@ -254,6 +263,34 @@ end
 	}
 	if summary.FilesMoved[oldPath] != newPath {
 		t.Errorf("summary reports moves %v, want %s → %s", summary.FilesMoved, oldPath, newPath)
+	}
+}
+
+func TestRenameModule_RejectedApplyEditLeavesDiskUntouched(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+	server.conn = &fakeConn{reject: true}
+
+	src := `defmodule MyApp.Accounts do
+  def list_users, do: []
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", src)
+	oldPath := filepath.Join(server.projectRoot, "lib/accounts.ex")
+	newPath := filepath.Join(server.projectRoot, "lib/auth.ex")
+
+	if _, err := server.RenameModule("MyApp.Accounts", "MyApp.Auth"); err == nil {
+		t.Fatal("rename reported success despite the editor rejecting the edit")
+	}
+	data, err := os.ReadFile(oldPath)
+	if err != nil {
+		t.Fatalf("source file was moved or removed: %v", err)
+	}
+	if string(data) != src {
+		t.Errorf("rejected rename changed the source file:\n%s", data)
+	}
+	if _, err := os.Stat(newPath); !os.IsNotExist(err) {
+		t.Errorf("rejected rename created destination %s", newPath)
 	}
 }
 

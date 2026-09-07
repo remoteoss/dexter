@@ -21,9 +21,9 @@ import (
 // operations) into one reindex pass.
 const debounceWindow = 300 * time.Millisecond
 
-// Watcher keeps the index in sync with filesystem changes. Editors drive
-// index updates through LSP events, but a headless MCP server gets none, so
-// it watches the project tree directly (fsnotify).
+// Watcher keeps MCP queries in sync with filesystem changes. It runs in both
+// headless and attached mode because agent edits need not pass through the
+// editor's LSP file-change notifications.
 type Watcher struct {
 	fsw    *fsnotify.Watcher
 	server *lsp.Server

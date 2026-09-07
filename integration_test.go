@@ -737,4 +737,25 @@ func TestIntegration_LSPWithMCPListen(t *testing.T) {
 	if !strings.Contains(out, "lib/my_app/repo.ex") {
 		t.Errorf("attached-mode definition output missing location:\n%s", out)
 	}
+
+	// Agent edits do not necessarily produce editor LSP notifications. Attached
+	// MCP mode must still observe them through its filesystem watcher.
+	createdPath := filepath.Join(root, "lib", "my_app", "created_by_agent.ex")
+	if err := os.WriteFile(createdPath, []byte("defmodule MyApp.CreatedByAgent do\n  def run, do: :ok\nend\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		res, err = session.CallTool(ctx, &sdkmcp.CallToolParams{Name: "dexter_definition", Arguments: map[string]any{"module": "MyApp.CreatedByAgent"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(mcpToolText(t, res), "lib/my_app/created_by_agent.ex") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("attached MCP watcher did not index an agent-created file")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }

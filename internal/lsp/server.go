@@ -14,16 +14,19 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.lsp.dev/jsonrpc2"
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
 
+	"github.com/remoteoss/dexter/internal/indexer"
 	"github.com/remoteoss/dexter/internal/parser"
 	"github.com/remoteoss/dexter/internal/stdlib"
 	"github.com/remoteoss/dexter/internal/store"
@@ -97,10 +100,19 @@ type Server struct {
 	renameFileOpsSupported bool          // client applies rename resource operations in a WorkspaceEdit
 	snippetSupport         bool          // client supports snippet insert text in completions
 
-	reindexing          sync.Mutex // serializes concurrent backgroundReindex calls
-	notifiedOTPMismatch sync.Once  // prevents repeated OTP mismatch warnings
+	reindexing sync.Mutex // serializes concurrent backgroundReindex calls
+
+	// indexWrites is held for writing by a cold full build and for reading by
+	// every single-file write. The bulk path a full build uses is insert-only:
+	// it skips the DELETE the incremental path does, and allocates file ids
+	// from a counter seeded when the batch opens. A save landing in the middle
+	// of one would duplicate rows or collide on a primary key.
+	indexWrites         sync.RWMutex
+	indexUnavailable    bool      // guarded by indexWrites; set only after index recreation exhausts its retries
+	notifiedOTPMismatch sync.Once // prevents repeated OTP mismatch warnings
 
 	backgroundWork sync.WaitGroup // tracks background reindex goroutines so the store isn't closed while they're running
+	ready          chan struct{}  // closed once Serve has installed the LSP connection
 }
 
 func (s *Server) debugf(format string, args ...interface{}) {
@@ -127,6 +139,7 @@ func NewServer(s *store.Store, projectRoot string) *Server {
 		erlangRuntimeCache: make(map[string]*erlangRuntimeCache),
 		usingCache:         make(map[string]*usingCacheEntry),
 		depsCache:          make(map[string]bool),
+		ready:              make(chan struct{}),
 	}
 }
 
@@ -137,8 +150,180 @@ type stdinoutCloser struct {
 
 func (s stdinoutCloser) Close() error { return nil }
 
+// warmUsingCache parses every module's defmacro __using__ body ahead of the
+// first request that needs one.
+//
+// findModulesWhoseUsingImports, on the References slow path, has to consult
+// every __using__ module in the codebase. Those bodies are cached, but nothing
+// fills the cache, so the first such request pays for all of them at once: on a
+// 70k-file monorepo that is 563 file reads and parses, about 440ms, in front of
+// a user waiting on a reference lookup. Every later request costs 1-2ms.
+//
+// The work is the same either way; this only moves it off the request path. It
+// runs at the end of the background reindex, where the index is known to exist
+// and no request is waiting, and it is bounded to NumCPU readers so that a
+// speculative warm-up cannot storm the filesystem while the editor is starting.
+//
+// Nothing here is required for correctness. Entries are validated against file
+// mtime when they are read, so a warmed entry that goes stale is simply
+// re-parsed, and a file that cannot be read is skipped exactly as it would be
+// on the request path.
+func (s *Server) warmUsingCache() {
+	usingModules, err := s.store.LookupUsingModules()
+	if err != nil || len(usingModules) == 0 {
+		return
+	}
+
+	start := time.Now()
+	workers := runtime.NumCPU()
+	if workers > len(usingModules) {
+		workers = len(usingModules)
+	}
+
+	var (
+		next atomic.Int64
+		wg   sync.WaitGroup
+	)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				i := int(next.Add(1)) - 1
+				if i >= len(usingModules) {
+					return
+				}
+				s.cachedUsingWithPath(usingModules[i].Module, usingModules[i].FilePath)
+			}
+		}()
+	}
+	wg.Wait()
+
+	s.debugf("warmUsingCache: %d __using__ modules in %s", len(usingModules), time.Since(start).Round(time.Millisecond))
+}
+
+// pruneMissingFiles removes stored files that the sweep did not see on disk.
+//
+// It holds indexWrites for writing, so no single-file write can land between
+// the decision and the delete, and it re-checks each candidate against the
+// filesystem first. The re-check is what makes the prune safe rather than
+// merely unlikely to be wrong: seen is one traversal's answer, and a file
+// created and saved after that traversal passed its directory is absent from
+// seen but present on disk and in the index.
+//
+// It is also the backstop for the two walkers ever disagreeing about the file
+// set again. A walk that yields nothing then deletes nothing, because every
+// stored path still stats — while a project whose last file was genuinely
+// removed is still pruned, which is why the check is per candidate rather than
+// a test on seen being empty.
+func (s *Server) pruneMissingFiles(seen map[string]struct{}) {
+	s.indexWrites.Lock()
+	defer s.indexWrites.Unlock()
+	if s.indexUnavailable {
+		return
+	}
+
+	storedPaths, err := s.store.ListFilePaths()
+	if err != nil {
+		return
+	}
+
+	var toRemove []string
+	for _, storedPath := range storedPaths {
+		if _, ok := seen[storedPath]; ok {
+			continue
+		}
+		if _, err := os.Lstat(storedPath); err == nil || !errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		toRemove = append(toRemove, storedPath)
+	}
+	if len(toRemove) > 0 {
+		_ = s.store.RemoveFiles(toRemove)
+	}
+}
+
+// showError reports a problem the user has to act on. The caller logs as well,
+// so a client without window/showMessage support still leaves a trace.
+func (s *Server) showError(message string) {
+	if s.client == nil {
+		return
+	}
+	if err := s.client.ShowMessage(context.Background(), &protocol.ShowMessageParams{
+		Type:    protocol.MessageTypeError,
+		Message: message,
+	}); err != nil {
+		log.Printf("ShowMessage: %v", err)
+	}
+}
+
+// fullBuild rebuilds the whole index in-process, through the same pipeline
+// `dexter init` uses: parse on every core, then one bulk transaction with the
+// indexes dropped. It is only correct on an empty index, so backgroundReindex
+// is the only caller.
+//
+// The emptiness test is made here, under the same lock that holds for the whole
+// build, and reported through the ran return value. A caller cannot sample it
+// beforehand and act on the sample: a save or a watched-file event arriving in
+// between takes indexWrites for reading unopposed and writes a row, and the
+// build must then be skipped rather than attempted. ran is false with a nil
+// error for exactly that case, which is not a failure — the incremental path
+// handles what is already there.
+//
+// The whole build is one WAL transaction, so the -wal file grows to roughly the
+// size of the index before backgroundReindex's checkpoint reclaims it;
+// wal_autocheckpoint cannot touch frames belonging to an open transaction. On a
+// very large repository that is a few hundred MiB of transient disk.
+//
+// InProcess suppresses the connection-wide pragmas. They cannot be applied
+// reliably or undone on a live pool — leaving WAL needs exclusive access, and
+// the per-connection ones land on whichever pooled connection happens to serve
+// them. They were also the smallest part of the win.
+func (s *Server) fullBuild() (stats indexer.Stats, ran bool, err error) {
+	s.indexWrites.Lock()
+	defer s.indexWrites.Unlock()
+	if !s.store.IsEmpty() {
+		return indexer.Stats{}, false, nil
+	}
+
+	stats, err = indexer.FullBuild(s.store, s.projectRoot, indexer.Options{
+		StdlibRoot: s.stdlibRoot,
+		InProcess:  true,
+		Warn: func(format string, args ...interface{}) {
+			log.Printf("Warning: "+format, args...)
+		},
+	})
+	if errors.Is(err, indexer.ErrUnindexed) {
+		s.indexUnavailable = true
+	}
+	return stats, true, err
+}
+
+// indexOneFile parses and indexes a single file, the incremental path.
+func (s *Server) indexOneFile(path string) {
+	s.indexWrites.RLock()
+	defer s.indexWrites.RUnlock()
+	if s.indexUnavailable {
+		return
+	}
+	s.indexOneFileLocked(path)
+}
+
+// indexOneFileLocked is indexOneFile for callers already holding indexWrites.
+// Go's RWMutex is not reentrant, so the two must stay separate.
+func (s *Server) indexOneFileLocked(path string) {
+	defs, refs, err := parser.ParseFile(path)
+	if err != nil {
+		log.Printf("Error parsing %s: %v", path, err)
+		return
+	}
+	if err := s.store.IndexFileWithRefs(path, defs, refs); err != nil {
+		log.Printf("Error indexing %s: %v", path, err)
+	}
+}
+
 // backgroundReindex runs in the background. If the index is empty it does a
-// full init, otherwise it does an incremental mtime-based update.
+// full build, otherwise it does an incremental mtime-based update.
 func (s *Server) backgroundReindex() {
 	s.backgroundWork.Add(1)
 	go func() {
@@ -152,7 +337,7 @@ func (s *Server) backgroundReindex() {
 }
 
 // ReindexWorkspace runs the same full-or-incremental reindex as
-// backgroundReindex, but blocking, and reports how many files were updated.
+// backgroundReindex, but blocks until it completes.
 func (s *Server) ReindexWorkspace() (int, time.Duration) {
 	s.reindexing.Lock()
 	defer s.reindexing.Unlock()
@@ -162,9 +347,10 @@ func (s *Server) ReindexWorkspace() (int, time.Duration) {
 func (s *Server) reindexWorkspace() (int, time.Duration) {
 	start := time.Now()
 	reindexed := 0
-	isEmpty := s.store.IsEmpty()
+	coldStart := s.store.IsEmpty()
+	fullBuilt := false
 
-	if isEmpty {
+	if coldStart {
 		log.Printf("No index found, building from scratch...")
 		if s.client != nil {
 			if err := s.client.ShowMessage(context.Background(), &protocol.ShowMessageParams{
@@ -174,7 +360,46 @@ func (s *Server) reindexWorkspace() (int, time.Duration) {
 				log.Printf("ShowMessage: %v", err)
 			}
 		}
+
+		stats, ran, err := s.fullBuild()
+		switch {
+		case errors.Is(err, indexer.ErrUnindexed):
+			// The SQL indexes did not come back after the bulk load committed
+			// or rolled back, so every query is a full table scan. Falling back
+			// to the incremental walk would be far worse than doing nothing:
+			// each per-file write issues a DELETE by file_id against definitions
+			// and refs tables, once per file on disk. FullBuild leaves the
+			// index version unset, so the next editor start rebuilds from
+			// scratch through cmdInit — in a process with no live readers,
+			// where deleting the database is safe.
+			log.Printf("Error: SQL indexes could not be restored after the bulk build: %v", err)
+			s.showError("Dexter: the index could not be completed. Run `dexter init --force` in your project root and restart your editor. If it happens again, please report it.")
+			// Collapse any committed data in the WAL rather than leaving it at
+			// its high-water mark for the rest of the process.
+			if err := s.store.Checkpoint(); err != nil {
+				log.Printf("Warning: WAL checkpoint: %v", err)
+			}
+			return reindexed, time.Since(start).Round(time.Millisecond)
+		case err != nil:
+			// The incremental walk below needs nothing to be true of the
+			// database, so it is the safe thing to fall back to. It is
+			// slower, not wrong.
+			log.Printf("Warning: full index build failed, falling back to incremental: %v", err)
+		case !ran:
+			// Something wrote to the index between the check above and the
+			// build's lock. Nothing was built, and the incremental path
+			// below covers whatever is there.
+			log.Printf("Index was no longer empty at build time, using incremental reindex")
+		default:
+			fullBuilt = true
+			reindexed = stats.Files
+		}
 	}
+
+	// Re-read rather than reusing coldStart. A full build, a failed build
+	// and a concurrent write all change the answer, and reading a stale
+	// true here would skip the mtime short-circuit for every file.
+	isEmpty := s.store.IsEmpty()
 
 	seen := make(map[string]struct{})
 	walkAndIndex := func(root string, indexRefs bool) {
@@ -208,24 +433,28 @@ func (s *Server) reindexWorkspace() (int, time.Duration) {
 		})
 	}
 
-	// Index stdlib first (definitions only).
-	if s.stdlibRoot != "" {
-		walkAndIndex(s.stdlibRoot, false)
-	}
-
-	walkAndIndex(s.projectRoot, true)
-
-	// Prune store entries for files no longer on disk
-	if storedPaths, err := s.store.ListFilePaths(); err == nil {
-		var toRemove []string
-		for _, storedPath := range storedPaths {
-			if _, ok := seen[storedPath]; !ok {
-				toRemove = append(toRemove, storedPath)
-			}
+	// A full build already indexed every file on disk from the traversal
+	// this walk would repeat, so skipping it saves a second traversal and a
+	// stored-mtime query per file. The prune lives in the same branch and
+	// so cannot run without the walk that fills `seen`.
+	if !fullBuilt {
+		// The walk writes, so it takes indexWrites for reading, the same as
+		// every other single-file write. That is what keeps it from
+		// overlapping a cold build.
+		s.indexWrites.RLock()
+		if s.indexUnavailable {
+			s.indexWrites.RUnlock()
+			return reindexed, time.Since(start).Round(time.Millisecond)
 		}
-		if len(toRemove) > 0 {
-			_ = s.store.RemoveFiles(toRemove)
+		// Index stdlib first (definitions only).
+		if s.stdlibRoot != "" {
+			walkAndIndex(s.stdlibRoot, false)
 		}
+
+		walkAndIndex(s.projectRoot, true)
+		s.indexWrites.RUnlock()
+
+		s.pruneMissingFiles(seen)
 	}
 
 	// Collapse the WAL back to disk now that the (potentially large) reindex
@@ -235,10 +464,14 @@ func (s *Server) reindexWorkspace() (int, time.Duration) {
 		log.Printf("Warning: WAL checkpoint after reindex: %v", err)
 	}
 
+	// The index is in place now, so fill the __using__ cache before a user
+	// asks for it. See warmUsingCache.
+	s.warmUsingCache()
+
 	elapsed := time.Since(start).Round(time.Millisecond)
 	log.Printf("Background reindex: %d files updated (%s)", reindexed, elapsed)
 
-	if isEmpty && s.client != nil {
+	if coldStart && s.client != nil {
 		if err := s.client.ShowMessage(context.Background(), &protocol.ShowMessageParams{
 			Type:    protocol.MessageTypeInfo,
 			Message: fmt.Sprintf("Dexter: index built (%d files in %s)", reindexed, elapsed),
@@ -273,7 +506,7 @@ func (s *Server) WatchGitHead() {
 			if currentMtime != lastMtime {
 				lastMtime = currentMtime
 				log.Printf("Git HEAD changed, reindexing...")
-				s.backgroundReindex()
+				s.ReindexWorkspace()
 			}
 		}
 	}()
@@ -556,17 +789,7 @@ func (s *Server) DidSave(ctx context.Context, params *protocol.DidSaveTextDocume
 		return nil
 	}
 
-	go func() {
-		defs, refs, err := parser.ParseFile(path)
-		if err != nil {
-			log.Printf("Error parsing %s: %v", path, err)
-			return
-		}
-
-		if err := s.store.IndexFileWithRefs(path, defs, refs); err != nil {
-			log.Printf("Error indexing %s: %v", path, err)
-		}
-	}()
+	go s.indexOneFile(path)
 
 	return nil
 }
@@ -1876,7 +2099,7 @@ func (s *Server) lookupThroughUseOf(fullModule, functionName string) []store.Loo
 	if err != nil || len(modResults) == 0 {
 		return nil
 	}
-	fileText, _, ok := s.ReadFileText(modResults[0].FilePath)
+	fileText, _, ok := s.readFileText(modResults[0].FilePath)
 	if !ok {
 		return nil
 	}
@@ -2749,19 +2972,14 @@ func (s *Server) DidChangeWatchedFiles(ctx context.Context, params *protocol.Did
 		}
 		switch change.Type {
 		case protocol.FileChangeTypeCreated, protocol.FileChangeTypeChanged:
-			go func(filePath string) {
-				defs, refs, err := parser.ParseFile(filePath)
-				if err != nil {
-					log.Printf("Error parsing %s: %v", filePath, err)
-					return
-				}
-
-				if err := s.store.IndexFileWithRefs(filePath, defs, refs); err != nil {
-					log.Printf("Error indexing %s: %v", filePath, err)
-				}
-			}(path)
+			go s.indexOneFile(path)
 		case protocol.FileChangeTypeDeleted:
 			go func(filePath string) {
+				s.indexWrites.RLock()
+				defer s.indexWrites.RUnlock()
+				if s.indexUnavailable {
+					return
+				}
 				if err := s.store.RemoveFile(filePath); err != nil {
 					log.Printf("Error removing %s from index: %v", filePath, err)
 				}
@@ -4195,7 +4413,7 @@ func (s *Server) RenameEdit(ctx context.Context, params *protocol.RenameParams) 
 				if existing, err := s.store.LookupFunction(fullModule, params.NewName); err == nil && len(existing) > 0 {
 					return nil, fmt.Errorf("function %s.%s already exists", fullModule, params.NewName)
 				}
-				edit, _, err := s.renameFunctionEdits(fullModule, functionName, params.NewName)
+				edit, _, err := s.renameFunctionEdits(fullModule, functionName, params.NewName, false)
 				return edit, err
 			}
 		} else if moduleRef != "" {
@@ -4210,7 +4428,7 @@ func (s *Server) RenameEdit(ctx context.Context, params *protocol.RenameParams) 
 				if !isValidModuleName(newModule) {
 					return nil, fmt.Errorf("invalid module name %q: must be CamelCase segments separated by dots", params.NewName)
 				}
-				edit, _, _, err := s.renameModuleEdits(fullModule, newModule)
+				edit, _, _, err := s.renameModuleEdits(fullModule, newModule, false)
 				return edit, err
 			}
 		}
@@ -4220,9 +4438,8 @@ func (s *Server) RenameEdit(ctx context.Context, params *protocol.RenameParams) 
 }
 
 // renameFunctionEdits builds a WorkspaceEdit renaming all occurrences of
-// module.functionName to newName across the codebase. The second return lists
-// every file it edited.
-func (s *Server) renameFunctionEdits(module, functionName, newName string) (*WorkspaceEdit, []string, error) {
+// module.functionName to newName across the codebase.
+func (s *Server) renameFunctionEdits(module, functionName, newName string, deliverAll bool) (*WorkspaceEdit, []string, error) {
 	// Collect all (filePath, lineNumber) pairs — definitions + references
 	type siteKey struct {
 		filePath string
@@ -4293,7 +4510,7 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*Wor
 	specPrefix := "@spec " + functionName
 	callbackPrefix := "@callback " + functionName
 	for filePath := range defFilePaths {
-		fileText, _, ok := s.ReadFileText(filePath)
+		fileText, _, ok := s.readFileText(filePath)
 		if !ok {
 			continue
 		}
@@ -4327,7 +4544,7 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*Wor
 		if r.Kind != "import" {
 			continue
 		}
-		lineText, ok := s.FileLine(r.FilePath, r.Line)
+		lineText, ok := s.getFileLine(r.FilePath, r.Line)
 		if !ok {
 			continue
 		}
@@ -4337,7 +4554,7 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*Wor
 		}
 	}
 	for filePath := range importFilePaths {
-		fileText, _, ok := s.ReadFileText(filePath)
+		fileText, _, ok := s.readFileText(filePath)
 		if !ok {
 			continue
 		}
@@ -4346,8 +4563,7 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*Wor
 		}
 	}
 
-	edit := s.buildTextEdits(sites, functionName, newName)
-
+	edit := s.buildTextEdits(sites, functionName, newName, deliverAll)
 	changedFiles := make(map[string]bool, len(sites))
 	for _, site := range sites {
 		changedFiles[site.filePath] = true
@@ -4365,7 +4581,7 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*Wor
 				if s.isDepsFile(del.FilePath) {
 					continue
 				}
-				fileText, open, ok := s.ReadFileText(del.FilePath)
+				fileText, open, ok := s.readFileText(del.FilePath)
 				if !ok {
 					continue
 				}
@@ -4389,10 +4605,10 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*Wor
 				if !changed {
 					continue
 				}
-
 				changedFiles[del.FilePath] = true
+
 				fileURI := protocol.DocumentURI(uri.File(del.FilePath))
-				if open {
+				if open || deliverAll {
 					if edit.Changes == nil {
 						edit.Changes = make(map[protocol.DocumentURI][]protocol.TextEdit)
 					}
@@ -4416,8 +4632,8 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*Wor
 	}
 
 	files := make([]string, 0, len(changedFiles))
-	for fp := range changedFiles {
-		files = append(files, fp)
+	for filePath := range changedFiles {
+		files = append(files, filePath)
 	}
 	sort.Strings(files)
 	return edit, files, nil
@@ -4431,10 +4647,7 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*Wor
 // WorkspaceEdit, keeping the response small and avoiding editor freezes.
 // Files following the naming convention are also renamed/moved: closed ones
 // by the server, open ones by the client through rename operations.
-//
-// The extra returns list the files it moved (old path to new path, whoever
-// performs the move) and the files it edited.
-func (s *Server) renameModuleEdits(oldModule, newModule string) (*WorkspaceEdit, map[string]string, []string, error) {
+func (s *Server) renameModuleEdits(oldModule, newModule string, deliverAll bool) (*WorkspaceEdit, map[string]string, []string, error) {
 	mr := s.buildModuleRename(oldModule, newModule)
 
 	// Check for collisions: verify that none of the target module names
@@ -4448,22 +4661,21 @@ func (s *Server) renameModuleEdits(oldModule, newModule string) (*WorkspaceEdit,
 
 	fileCache := mr.readFiles()
 
-	movedFiles, clientRenames := mr.moveConventionalFiles(fileCache)
-	openChanges := mr.applyEdits(fileCache, movedFiles)
-	mr.reindex(fileCache, movedFiles, clientRenames)
-
+	movedFiles, clientRenames := mr.moveConventionalFiles(fileCache, deliverAll)
+	openChanges := mr.applyEdits(fileCache, movedFiles, deliverAll)
+	if !deliverAll {
+		mr.reindex(fileCache, movedFiles, clientRenames)
+	}
 	moved := make(map[string]string, len(movedFiles)+len(clientRenames))
 	for from, to := range movedFiles {
 		moved[from] = to
 	}
-	// Client renames have not happened yet, but they are part of this rename
-	// and the caller is told what the rename moves, not what it moved itself.
 	for from, to := range clientRenames {
 		moved[from] = to
 	}
 	files := make([]string, 0, len(mr.sitesByFile))
-	for fp := range mr.sitesByFile {
-		files = append(files, fp)
+	for filePath := range mr.sitesByFile {
+		files = append(files, filePath)
 	}
 	sort.Strings(files)
 
@@ -4656,7 +4868,7 @@ func (mr *moduleRename) readFiles() map[string]moduleFileInfo {
 	resultsCh := make(chan fileResult, len(mr.sitesByFile))
 	for fp := range mr.sitesByFile {
 		go func() {
-			text, open, ok := mr.server.ReadFileText(fp)
+			text, open, ok := mr.server.readFileText(fp)
 			if ok {
 				resultsCh <- fileResult{fp, strings.Split(text, "\n"), open}
 			} else {
@@ -4831,7 +5043,7 @@ func (mr *moduleRename) conventionalNewPath(r store.LookupResult) (string, bool)
 // Returns the files moved on disk, the moves left to the client, the open
 // files moved on disk anyway (fallback clients, which need showDocument and a
 // deferred delete), and the path to show for the trigger file.
-func (mr *moduleRename) moveConventionalFiles(fileCache map[string]moduleFileInfo) (movedFiles, clientRenames map[string]string) {
+func (mr *moduleRename) moveConventionalFiles(fileCache map[string]moduleFileInfo, deliverAll bool) (movedFiles, clientRenames map[string]string) {
 	movedFiles = make(map[string]string)
 	clientRenames = make(map[string]string)
 	for _, r := range mr.allModuleDefs {
@@ -4844,6 +5056,10 @@ func (mr *moduleRename) moveConventionalFiles(fileCache map[string]moduleFileInf
 		}
 		fi, hasContent := fileCache[r.FilePath]
 		if !hasContent {
+			continue
+		}
+		if deliverAll {
+			clientRenames[r.FilePath] = newPath
 			continue
 		}
 
@@ -4888,7 +5104,7 @@ func (mr *moduleRename) moveConventionalFiles(fileCache map[string]moduleFileInf
 
 // applyEdits applies text edits to all non-moved files: open buffers get
 // TextEdits in the WorkspaceEdit, closed files are written directly to disk.
-func (mr *moduleRename) applyEdits(fileCache map[string]moduleFileInfo, movedFiles map[string]string) map[protocol.DocumentURI][]protocol.TextEdit {
+func (mr *moduleRename) applyEdits(fileCache map[string]moduleFileInfo, movedFiles map[string]string, deliverAll bool) map[protocol.DocumentURI][]protocol.TextEdit {
 	openChanges := make(map[protocol.DocumentURI][]protocol.TextEdit)
 	var wg sync.WaitGroup
 
@@ -4900,7 +5116,7 @@ func (mr *moduleRename) applyEdits(fileCache map[string]moduleFileInfo, movedFil
 		if !ok {
 			continue
 		}
-		if fi.open {
+		if fi.open || deliverAll {
 			fileURI := protocol.DocumentURI(uri.File(fp))
 			// Each site is matched against the original line, so two sites can
 			// resolve to the same span — `alias Old.{A, B}` is one reference
@@ -4962,11 +5178,12 @@ func overlapsClaimed(claimed []moduleEditResult, e moduleEditResult) bool {
 // when it receives the reply — so their new paths are indexed from the text
 // the edits produce.
 func (mr *moduleRename) reindex(fileCache map[string]moduleFileInfo, movedFiles, clientRenames map[string]string) {
+	removePaths := make([]string, 0, len(movedFiles)+len(clientRenames))
 	for oldPath := range movedFiles {
-		_ = mr.server.store.RemoveFile(oldPath)
+		removePaths = append(removePaths, oldPath)
 	}
 	for oldPath := range clientRenames {
-		_ = mr.server.store.RemoveFile(oldPath)
+		removePaths = append(removePaths, oldPath)
 	}
 
 	var reindexPaths []string
@@ -4974,10 +5191,6 @@ func (mr *moduleRename) reindex(fileCache map[string]moduleFileInfo, movedFiles,
 		reindexPaths = append(reindexPaths, newPath)
 	}
 
-	type textReindex struct {
-		path string
-		text string
-	}
 	var openReindexes []textReindex
 	for fp := range mr.sitesByFile {
 		if _, moved := movedFiles[fp]; moved {
@@ -5011,18 +5224,7 @@ func (mr *moduleRename) reindex(fileCache map[string]moduleFileInfo, movedFiles,
 		}
 	}
 
-	mr.server.backgroundWork.Add(1)
-	go func() {
-		defer mr.server.backgroundWork.Done()
-		mr.server.reindexPaths(reindexPaths)
-		for _, r := range openReindexes {
-			defs, refs, err := parser.ParseText(r.path, r.text)
-			if err != nil {
-				continue
-			}
-			_ = mr.server.store.IndexFileWithRefs(r.path, defs, refs)
-		}
-	}()
+	mr.server.reindexAfterRename(removePaths, reindexPaths, openReindexes)
 }
 
 type renameSite struct {
@@ -5031,10 +5233,15 @@ type renameSite struct {
 	includeKeyword bool // true for import-only lines where keyword keys ARE function names
 }
 
+type textReindex struct {
+	path string
+	text string
+}
+
 // buildTextEdits creates a WorkspaceEdit replacing all whole-token occurrences
 // of oldToken with newToken. Open buffers are returned in the WorkspaceEdit;
 // closed files are written directly to disk in parallel goroutines.
-func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string) *WorkspaceEdit {
+func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string, deliverAll bool) *WorkspaceEdit {
 	// Group sites by file
 	sitesByFile := make(map[string][]renameSite, len(sites))
 	for _, site := range sites {
@@ -5050,7 +5257,7 @@ func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string) *
 	resultsCh := make(chan fileResult, len(sitesByFile))
 	for fp := range sitesByFile {
 		go func() {
-			text, open, ok := s.ReadFileText(fp)
+			text, open, ok := s.readFileText(fp)
 			if ok {
 				resultsCh <- fileResult{fp, strings.Split(text, "\n"), open}
 			} else {
@@ -5098,10 +5305,6 @@ func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string) *
 	openChanges := make(map[protocol.DocumentURI][]protocol.TextEdit)
 	var wg sync.WaitGroup
 	var reindexPaths []string
-	type textReindex struct {
-		path string
-		text string
-	}
 	var openReindexes []textReindex
 
 	for fp, fileSites := range sitesByFile {
@@ -5113,7 +5316,7 @@ func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string) *
 		// Compute edits once for both TextEdits and reindexing
 		updatedLines := applyTokenEdits(fi.lines, fileSites)
 
-		if fi.open {
+		if fi.open || deliverAll {
 			// Open buffer: build TextEdits for the editor AND capture updated
 			// text for reindexing (computed once, used for both purposes).
 			fileURI := protocol.DocumentURI(uri.File(fp))
@@ -5138,7 +5341,9 @@ func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string) *
 					})
 				}
 			}
-			openReindexes = append(openReindexes, textReindex{fp, strings.Join(updatedLines, "\n")})
+			if !deliverAll {
+				openReindexes = append(openReindexes, textReindex{fp, strings.Join(updatedLines, "\n")})
+			}
 		} else {
 			// Closed file: write to disk in parallel
 			wg.Add(1)
@@ -5153,36 +5358,46 @@ func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string) *
 	}
 	wg.Wait()
 
-	s.backgroundWork.Add(1)
-	go func() {
-		defer s.backgroundWork.Done()
-		s.reindexPaths(reindexPaths)
-		for _, r := range openReindexes {
-			defs, refs, err := parser.ParseText(r.path, r.text)
-			if err != nil {
-				continue
-			}
-			_ = s.store.IndexFileWithRefs(r.path, defs, refs)
-		}
-	}()
+	if !deliverAll {
+		s.reindexAfterRename(nil, reindexPaths, openReindexes)
+	}
 
 	return &WorkspaceEdit{Changes: openChanges}
 }
 
-// reindexPaths re-parses and reindexes a specific set of files sequentially.
-// Used after rename to avoid a full project walk.
-func (s *Server) reindexPaths(paths []string) {
-	for _, fp := range paths {
-		defs, refs, err := parser.ParseFile(fp)
-		if err != nil {
-			continue
+// reindexAfterRename applies every store mutation from a rename under one read
+// lock. Besides keeping each write out of a cold build, holding the lock across
+// removals and inserts prevents a build from observing an empty intermediate
+// state and starting its insert-only transaction in the middle of the rename.
+func (s *Server) reindexAfterRename(removePaths, diskPaths []string, textPaths []textReindex) {
+	s.backgroundWork.Add(1)
+	go func() {
+		defer s.backgroundWork.Done()
+
+		s.indexWrites.RLock()
+		defer s.indexWrites.RUnlock()
+		if s.indexUnavailable {
+			return
 		}
 
-		_ = s.store.IndexFileWithRefs(fp, defs, refs)
-	}
-	if len(paths) > 0 {
-		log.Printf("Rename: reindexed %d files", len(paths)) // intentionally always logged — useful for user feedback
-	}
+		for _, path := range removePaths {
+			_ = s.store.RemoveFile(path)
+		}
+		for _, path := range diskPaths {
+			s.indexOneFileLocked(path)
+		}
+		for _, entry := range textPaths {
+			defs, refs, err := parser.ParseText(entry.path, entry.text)
+			if err != nil {
+				continue
+			}
+			_ = s.store.IndexFileWithRefs(entry.path, defs, refs)
+		}
+
+		if len(diskPaths)+len(textPaths) > 0 {
+			log.Printf("Rename: reindexed %d files", len(diskPaths)+len(textPaths)) // intentionally always logged — useful for user feedback
+		}
+	}()
 }
 
 // isDepsFile returns true if filePath lives under the deps/ directory of some
@@ -5229,11 +5444,11 @@ func isDepsFileUncached(filePath string) bool {
 	}
 }
 
-// ReadFileText returns the contents of filePath, preferring the in-memory
+// readFileText returns the contents of filePath, preferring the in-memory
 // document store for editor-owned (didOpen) buffers. The second return
 // indicates whether the file is currently open in the editor — transient
 // entries loaded from disk via GetOrLoad are NOT reported as open.
-func (s *Server) ReadFileText(filePath string) (text string, open bool, ok bool) {
+func (s *Server) readFileText(filePath string) (text string, open bool, ok bool) {
 	uri := string(uri.File(filePath))
 	if t, found := s.docs.GetIfOpen(uri); found {
 		return t, true, true
@@ -5244,12 +5459,17 @@ func (s *Server) ReadFileText(filePath string) (text string, open bool, ok bool)
 	return "", false, false
 }
 
-// FileLine returns the text of line lineNum (1-based) from the file at
+// ReadFileText returns a file's current text, preferring an editor-owned buffer.
+func (s *Server) ReadFileText(filePath string) (text string, open bool, ok bool) {
+	return s.readFileText(filePath)
+}
+
+// getFileLine returns the text of line lineNum (1-based) from the file at
 // filePath, preferring the in-memory document store for editor-owned
 // buffers. Transient entries loaded via GetOrLoad fall through to the
 // disk path. For closed files, only reads up to the target line instead
 // of the whole file.
-func (s *Server) FileLine(filePath string, lineNum int) (string, bool) {
+func (s *Server) getFileLine(filePath string, lineNum int) (string, bool) {
 	// Editor-owned buffer: extract the single line from memory
 	uri := string(uri.File(filePath))
 	if text, ok := s.docs.GetIfOpen(uri); ok {
@@ -5276,6 +5496,11 @@ func (s *Server) FileLine(filePath string, lineNum int) (string, bool) {
 	return "", false
 }
 
+// FileLine returns one 1-based line, preferring an editor-owned buffer.
+func (s *Server) FileLine(filePath string, lineNum int) (string, bool) {
+	return s.getFileLine(filePath, lineNum)
+}
+
 // findBareCallRefs scans definition files for bare intra-module calls to
 // functionName (not indexed in the store) and returns them as ReferenceResults.
 func (s *Server) findBareCallRefs(module, functionName string) []store.ReferenceResult {
@@ -5289,7 +5514,7 @@ func (s *Server) findBareCallRefs(module, functionName string) []store.Reference
 	}
 	var refs []store.ReferenceResult
 	for filePath := range defFilePaths {
-		fileText, _, ok := s.ReadFileText(filePath)
+		fileText, _, ok := s.readFileText(filePath)
 		if !ok {
 			continue
 		}
@@ -5381,7 +5606,7 @@ func (s *Server) SignatureHelp(ctx context.Context, params *protocol.SignatureHe
 	}
 
 	// Read the definition file, preferring the in-memory doc store
-	fileText, _, ok2 := s.ReadFileText(result.FilePath)
+	fileText, _, ok2 := s.readFileText(result.FilePath)
 	if !ok2 {
 		return nil, nil
 	}
@@ -5586,7 +5811,7 @@ func (s *Server) PrepareCallHierarchy(ctx context.Context, params *protocol.Call
 
 	r := defResults[0]
 	nameCol := 0
-	if defLine, ok := s.FileLine(r.FilePath, r.Line); ok {
+	if defLine, ok := s.getFileLine(r.FilePath, r.Line); ok {
 		if col := findTokenColumn(defLine, functionName); col >= 0 {
 			nameCol = col
 		}
@@ -5668,7 +5893,7 @@ func (s *Server) IncomingCalls(ctx context.Context, params *protocol.CallHierarc
 		}
 
 		nameCol := 0
-		if defLine, ok := s.FileLine(r.FilePath, callerLine); ok {
+		if defLine, ok := s.getFileLine(r.FilePath, callerLine); ok {
 			if col := findTokenColumn(defLine, callerFunc); col >= 0 {
 				nameCol = col
 			}
@@ -5731,16 +5956,22 @@ func (s *Server) OutgoingCalls(ctx context.Context, params *protocol.CallHierarc
 	}
 	type targetInfo struct {
 		callRanges []protocol.Range
+		lines      map[int]struct{}
 	}
 	targets := make(map[callTarget]*targetInfo)
 	var targetOrder []callTarget
 	for _, ref := range outRefs {
 		key := callTarget{ref.Module, ref.Function}
 		if _, ok := targets[key]; !ok {
-			targets[key] = &targetInfo{}
+			targets[key] = &targetInfo{lines: make(map[int]struct{})}
 			targetOrder = append(targetOrder, key)
 		}
-		targets[key].callRanges = append(targets[key].callRanges, lineRange(ref.Line-1))
+		info := targets[key]
+		if _, duplicateLine := info.lines[ref.Line]; duplicateLine {
+			continue
+		}
+		info.lines[ref.Line] = struct{}{}
+		info.callRanges = append(info.callRanges, lineRange(ref.Line-1))
 	}
 
 	var calls []protocol.CallHierarchyOutgoingCall
@@ -5758,7 +5989,7 @@ func (s *Server) OutgoingCalls(ctx context.Context, params *protocol.CallHierarc
 		}
 
 		nameCol := 0
-		if defLine, ok := s.FileLine(td.FilePath, td.Line); ok {
+		if defLine, ok := s.getFileLine(td.FilePath, td.Line); ok {
 			if col := findTokenColumn(defLine, key.function); col >= 0 {
 				nameCol = col
 			}

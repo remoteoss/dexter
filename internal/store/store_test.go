@@ -3,6 +3,7 @@ package store
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -1314,6 +1315,396 @@ func TestFindProjectRoot(t *testing.T) {
 	})
 }
 
+// makeFile creates a real file so IndexFile's os.Stat succeeds, and returns its path.
+func makeFile(t *testing.T, dir, name string) string {
+	t.Helper()
+	p := filepath.Join(dir, name)
+	if err := os.WriteFile(p, []byte("# generated\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// genRows builds enough definitions and references to cross the multi-row
+// INSERT chunk boundaries (defChunkRows=100, refChunkRows=180) and leave a
+// partial chunk behind, so both the chunked path and flushPending are exercised.
+func genRows(path string, defCount, refCount int) ([]parser.Definition, []parser.Reference) {
+	defs := make([]parser.Definition, 0, defCount)
+	for i := 0; i < defCount; i++ {
+		defs = append(defs, parser.Definition{
+			Module: "MyApp.Gen", Function: "fn" + strconv.Itoa(i), Arity: i % 4,
+			Kind: "def", Line: i + 1, FilePath: path,
+		})
+	}
+	refs := make([]parser.Reference, 0, refCount)
+	for i := 0; i < refCount; i++ {
+		refs = append(refs, parser.Reference{
+			Module: "SharedLib.Worker", Function: "call" + strconv.Itoa(i),
+			Line: i + 1, FilePath: path, Kind: "call",
+		})
+	}
+	return defs, refs
+}
+
+// TestBulkInsertMatchesRowAtATime pins the multi-row INSERT path in
+// BeginBulkInsert to the row-at-a-time path in BeginBatch. The bulk path
+// buffers rows and flushes them in chunks, so a boundary or flush bug would
+// silently drop or duplicate rows.
+func TestBulkInsertMatchesRowAtATime(t *testing.T) {
+	// 250 defs = 2 full chunks of 100 + 50 pending; 425 refs = 2 full chunks of
+	// 180 + 65 pending. Both remainders exercise flushPending.
+	const defCount, refCount = 250, 425
+
+	read := func(s *Store, path string) (int, []ReferenceResult) {
+		t.Helper()
+		var defs int
+		if err := s.db.QueryRow("SELECT COUNT(*) FROM definitions WHERE file_id = (SELECT id FROM files WHERE path = ?)", path).Scan(&defs); err != nil {
+			t.Fatal(err)
+		}
+		refs, err := s.LookupReferences("SharedLib.Worker", "call7")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return defs, refs
+	}
+
+	bulkStore, bulkDir := setupTestStore(t)
+	bulkPath := makeFile(t, bulkDir, "gen.ex")
+	bd, br := genRows(bulkPath, defCount, refCount)
+	batch, err := bulkStore.BeginBulkInsert()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.IndexFileWithMtimeAndRefs(bulkPath, 1, bd, br); err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	rowStore, rowDir := setupTestStore(t)
+	rowPath := makeFile(t, rowDir, "gen.ex")
+	rd, rr := genRows(rowPath, defCount, refCount)
+	rowBatch, err := rowStore.BeginBatch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rowBatch.IndexFileWithMtimeAndRefs(rowPath, 1, rd, rr); err != nil {
+		t.Fatal(err)
+	}
+	if err := rowBatch.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	bulkDefs, bulkRefs := read(bulkStore, bulkPath)
+	rowDefs, rowRefs := read(rowStore, rowPath)
+
+	if bulkDefs != defCount {
+		t.Errorf("bulk definitions = %d, want %d", bulkDefs, defCount)
+	}
+	if bulkDefs != rowDefs {
+		t.Errorf("definition count: bulk %d, row-at-a-time %d", bulkDefs, rowDefs)
+	}
+	if len(bulkRefs) != 1 {
+		t.Errorf("bulk refs for call7 = %d, want 1", len(bulkRefs))
+	}
+	if len(bulkRefs) != len(rowRefs) {
+		t.Errorf("ref count: bulk %d, row-at-a-time %d", len(bulkRefs), len(rowRefs))
+	}
+
+	var total int
+	if err := bulkStore.db.QueryRow("SELECT COUNT(*) FROM refs").Scan(&total); err != nil {
+		t.Fatal(err)
+	}
+	if total != refCount {
+		t.Errorf("bulk refs total = %d, want %d", total, refCount)
+	}
+}
+
+// TestLookupByPrefixRange covers the range predicate that replaced `LIKE
+// 'Prefix.%'`. The range must include the prefix itself and everything under
+// it, and must exclude a module that merely starts with the same letters.
+func TestLookupByPrefixRange(t *testing.T) {
+	s, dir := setupTestStore(t)
+	path := makeFile(t, dir, "mods.ex")
+
+	defs := []parser.Definition{
+		{Module: "MyApp.Accounts", Kind: "module", Line: 1, FilePath: path},
+		{Module: "MyApp.Accounts.User", Kind: "module", Line: 2, FilePath: path},
+		{Module: "MyApp.AccountsExtra", Kind: "module", Line: 3, FilePath: path},
+		{Module: "MyApp.Billing", Kind: "module", Line: 4, FilePath: path},
+	}
+	refs := []parser.Reference{
+		{Module: "MyApp.Accounts", Line: 10, FilePath: path, Kind: "alias"},
+		{Module: "MyApp.Accounts.User", Line: 11, FilePath: path, Kind: "alias"},
+		{Module: "MyApp.AccountsExtra", Line: 12, FilePath: path, Kind: "alias"},
+		{Module: "MyApp.Billing", Line: 13, FilePath: path, Kind: "alias"},
+	}
+	batch, err := s.BeginBatch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.IndexFileWithMtimeAndRefs(path, 1, defs, refs); err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	gotMods, err := s.LookupModulesByPrefix("MyApp.Accounts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var modNames []string
+	for _, m := range gotMods {
+		modNames = append(modNames, m.Module)
+	}
+	wantMods := "MyApp.Accounts,MyApp.Accounts.User"
+	if strings.Join(modNames, ",") != wantMods {
+		t.Errorf("LookupModulesByPrefix = %v, want %s", modNames, wantMods)
+	}
+
+	gotRefs, err := s.LookupReferencesByPrefix("MyApp.Accounts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, r := range gotRefs {
+		seen[r.Module] = true
+	}
+	if !seen["MyApp.Accounts"] || !seen["MyApp.Accounts.User"] {
+		t.Errorf("LookupReferencesByPrefix missing prefix members: %v", seen)
+	}
+	if seen["MyApp.AccountsExtra"] {
+		t.Error("LookupReferencesByPrefix matched MyApp.AccountsExtra, which is not under the prefix")
+	}
+	if seen["MyApp.Billing"] {
+		t.Error("LookupReferencesByPrefix matched an unrelated module")
+	}
+}
+
+// TestReferencesUsesCoveringIndex pins the plan for the References hot path.
+// idx_refs_module_function spans (module, function, file_id, line, kind) so the
+// query is answered from the index alone. Before that, every hit cost a random
+// read into the refs table — thousands of them for a widely-called function.
+// If the index or the query drifts apart, this fails.
+func TestReferencesUsesCoveringIndex(t *testing.T) {
+	s, _ := setupTestStore(t)
+
+	rows, err := s.db.Query(
+		"EXPLAIN QUERY PLAN SELECT f.path, r.line, r.kind FROM refs r JOIN files f ON f.id = r.file_id WHERE r.module = ? AND r.function = ?",
+		"MyApp.Accounts", "get_user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var plan strings.Builder
+	for rows.Next() {
+		var id, parent, notUsed int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notUsed, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan.WriteString(detail)
+		plan.WriteString("\n")
+	}
+	got := plan.String()
+
+	if !strings.Contains(got, "COVERING INDEX idx_refs_module_function") {
+		t.Errorf("references query no longer reads from a covering index:\n%s", got)
+	}
+	if strings.Contains(got, "SCAN refs") {
+		t.Errorf("references query scans the refs table:\n%s", got)
+	}
+	if strings.Contains(got, "TEMP B-TREE") {
+		t.Errorf("references query sorts in SQLite; ordering belongs in Go:\n%s", got)
+	}
+}
+
+// TestReindexKeepsFileID guards the id that definitions and refs point at. The
+// files row is upserted rather than replaced: INSERT OR REPLACE would delete the
+// old row and allocate a new id, silently detaching every row for that file.
+func TestReindexKeepsFileID(t *testing.T) {
+	s, dir := setupTestStore(t)
+	path := writeElixirFile(t, dir, "accounts.ex", `defmodule MyApp.Accounts do
+  def get_user(id), do: SharedLib.Worker.run(id)
+end
+`)
+
+	defs, refs, err := parser.ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IndexFileWithRefs(path, defs, refs); err != nil {
+		t.Fatal(err)
+	}
+
+	fileID := func() int64 {
+		t.Helper()
+		var id int64
+		if err := s.db.QueryRow("SELECT id FROM files WHERE path = ?", path).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	orphans := func() int {
+		t.Helper()
+		var n int
+		if err := s.db.QueryRow(
+			"SELECT (SELECT COUNT(*) FROM definitions WHERE file_id NOT IN (SELECT id FROM files)) + (SELECT COUNT(*) FROM refs WHERE file_id NOT IN (SELECT id FROM files))",
+		).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	first := fileID()
+
+	// Reindex the same path, as a save would.
+	if err := s.IndexFileWithRefs(path, defs, refs); err != nil {
+		t.Fatal(err)
+	}
+	if second := fileID(); second != first {
+		t.Errorf("file id changed across reindex: %d -> %d", first, second)
+	}
+	if n := orphans(); n != 0 {
+		t.Errorf("reindex orphaned %d rows", n)
+	}
+
+	// The definitions must still resolve back to the path.
+	results, err := s.LookupFunction("MyApp.Accounts", "get_user")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].FilePath != path {
+		t.Errorf("lookup after reindex = %+v, want one result at %s", results, path)
+	}
+
+	// The same through the Batch path, which upserts through its own statement.
+	batch, err := s.BeginBatch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.IndexFileWithMtimeAndRefs(path, 42, defs, refs); err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if third := fileID(); third != first {
+		t.Errorf("file id changed across batch reindex: %d -> %d", first, third)
+	}
+	if n := orphans(); n != 0 {
+		t.Errorf("batch reindex orphaned %d rows", n)
+	}
+}
+
+// TestRemoveFileClearsRows checks that deleting a file takes its definitions and
+// refs with it. refs carries no foreign key (the parent-key check was costing
+// the cold index millions of lookups), so the delete must be explicit.
+func TestRemoveFileClearsRows(t *testing.T) {
+	s, dir := setupTestStore(t)
+	path := writeElixirFile(t, dir, "worker.ex", `defmodule SharedLib.Worker do
+  def run(id), do: MyApp.Accounts.get_user(id)
+end
+`)
+	defs, refs, err := parser.ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IndexFileWithRefs(path, defs, refs); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RemoveFile(path); err != nil {
+		t.Fatal(err)
+	}
+
+	var remaining int
+	if err := s.db.QueryRow(
+		"SELECT (SELECT COUNT(*) FROM definitions) + (SELECT COUNT(*) FROM refs) + (SELECT COUNT(*) FROM files)",
+	).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 {
+		t.Errorf("removing the only file left %d rows behind", remaining)
+	}
+}
+
+// Leaving WAL needs exclusive access, so journal_mode fails whenever another
+// connection has the database open. It is applied first so that failure leaves
+// the connection exactly as it was — the ordering used to be the other way
+// round, and a locked database was left with fsync disabled for the rest of the
+// process.
+func TestSetBulkPragmas_LockedDatabaseChangesNothing(t *testing.T) {
+	dir := t.TempDir()
+
+	s1, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s1.Close() }()
+
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s2.Close() }()
+
+	synchronous := func(s *Store) int {
+		t.Helper()
+		var v int
+		if err := s.db.QueryRow("PRAGMA synchronous").Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+
+	before := synchronous(s1)
+
+	// Hold a read transaction open on the second connection, the way an LSP
+	// handler serving a query would.
+	tx, err := s2.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := tx.QueryRow("SELECT COUNT(*) FROM files").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := s1.SetBulkPragmas(); err == nil {
+		t.Fatal("SetBulkPragmas should fail while another connection holds the database")
+	}
+
+	if got := synchronous(s1); got != before {
+		t.Errorf("synchronous = %d after a failed SetBulkPragmas, want %d unchanged", got, before)
+	}
+}
+
+func TestSetBulkPragmas_AppliesWhenExclusive(t *testing.T) {
+	dir := t.TempDir()
+
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+
+	if err := s.SetBulkPragmas(); err != nil {
+		t.Fatalf("SetBulkPragmas on an exclusive database: %v", err)
+	}
+
+	var mode string
+	if err := s.db.QueryRow("PRAGMA journal_mode").Scan(&mode); err != nil {
+		t.Fatal(err)
+	}
+	if mode != "memory" {
+		t.Errorf("journal_mode = %q, want memory", mode)
+	}
+}
+
 func TestListModuleCallbacks(t *testing.T) {
 	s, dir := setupTestStore(t)
 	defer func() { _ = s.Close() }()
@@ -1322,13 +1713,9 @@ func TestListModuleCallbacks(t *testing.T) {
   @callback deliver(map()) :: :ok | {:error, term()}
   @callback name() :: String.t()
   @macrocallback render(term()) :: Macro.t()
-
-  def dispatch(msg) do
-    :ok
-  end
+  def dispatch(msg), do: msg
 end
 `)
-
 	defs, _, err := parser.ParseFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -1342,20 +1729,14 @@ end
 		t.Fatal(err)
 	}
 	if len(results) != 3 {
-		t.Fatalf("expected 3 callbacks, got %d: %+v", len(results), results)
+		t.Fatalf("callbacks = %d, want 3: %+v", len(results), results)
 	}
-	kinds := map[string]string{}
-	for _, r := range results {
-		kinds[r.Function] = r.Kind
-		if r.Function == "dispatch" {
-			t.Error("regular function included in callbacks")
-		}
+	kinds := make(map[string]string, len(results))
+	for _, result := range results {
+		kinds[result.Function] = result.Kind
 	}
-	if kinds["deliver"] != "callback" {
-		t.Errorf("deliver kind = %q, want callback", kinds["deliver"])
-	}
-	if kinds["render"] != "macrocallback" {
-		t.Errorf("render kind = %q, want macrocallback", kinds["render"])
+	if kinds["deliver"] != "callback" || kinds["render"] != "macrocallback" {
+		t.Errorf("callback kinds = %v", kinds)
 	}
 }
 
@@ -1363,18 +1744,16 @@ func TestStats(t *testing.T) {
 	s, dir := setupTestStore(t)
 	defer func() { _ = s.Close() }()
 
-	st, err := s.Stats()
+	stats, err := s.Stats()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Files != 0 || st.Definitions != 0 || st.References != 0 {
-		t.Errorf("empty store stats = %+v, want zeros", st)
+	if stats.Files != 0 || stats.Definitions != 0 || stats.References != 0 {
+		t.Errorf("empty store stats = %+v, want zeros", stats)
 	}
 
-	path := writeElixirFile(t, dir, "lib/worker.ex", `defmodule MyApp.Worker do
-  def run do
-    MyApp.Accounts.fetch_user(1)
-  end
+	path := writeElixirFile(t, dir, "lib/worker.ex", `defmodule SharedLib.Worker do
+  def run, do: MyApp.Accounts.fetch_user(1)
 end
 `)
 	defs, refs, err := parser.ParseFile(path)
@@ -1384,18 +1763,11 @@ end
 	if err := s.IndexFileWithRefs(path, defs, refs); err != nil {
 		t.Fatal(err)
 	}
-
-	st, err = s.Stats()
+	stats, err = s.Stats()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Files != 1 {
-		t.Errorf("Files = %d, want 1", st.Files)
-	}
-	if st.Definitions < 2 { // module + run
-		t.Errorf("Definitions = %d, want >= 2", st.Definitions)
-	}
-	if st.References < 1 {
-		t.Errorf("References = %d, want >= 1", st.References)
+	if stats.Files != 1 || stats.Definitions < 2 || stats.References < 1 {
+		t.Errorf("populated store stats = %+v", stats)
 	}
 }

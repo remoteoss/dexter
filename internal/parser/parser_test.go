@@ -2,8 +2,11 @@ package parser
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -2696,5 +2699,150 @@ end
 	}
 	if !found {
 		t.Errorf("expected bare macro call ref for setup with comment before do")
+	}
+}
+
+// TestParseEmitsNoDuplicateRefs pins that a file never yields two identical ref
+// rows. Refs are line-granular, so N identical calls on one line — most often a
+// @spec repeating the same type, as in `String.t()` seven times — used to write
+// N identical rows. They are invisible to every query (nothing counts refs, and
+// the References handler dedupes by file+line) but they cost time in the
+// single-threaded SQLite writer, which is the indexing bottleneck.
+func TestParseEmitsNoDuplicateRefs(t *testing.T) {
+	src := `defmodule MyApp.Reports do
+  alias SharedLib.Details
+
+  @spec build(String.t(), String.t(), String.t(), String.t()) :: Details.t()
+  def build(a, b, c, d) do
+    {a, b, c, d}
+  end
+end
+`
+	_, refs, err := ParseText("lib/my_app/reports.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	seen := make(map[Reference]int)
+	for _, r := range refs {
+		seen[r]++
+	}
+	for r, n := range seen {
+		if n > 1 {
+			t.Errorf("duplicate ref emitted %d times: %+v", n, r)
+		}
+	}
+
+	// Dedupe must keep the distinct rows: the @spec still records that this file
+	// references String.t/0 on that line.
+	var found bool
+	for _, r := range refs {
+		if r.Module == "String" && r.Function == "t" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("dedupe dropped the String.t reference entirely")
+	}
+}
+
+// TestCollectElixirFilesParallelMatchesWalk asserts that the parallel collector
+// finds exactly the same files as the sequential walk, including the directory
+// exclusions, so swapping it into the indexer cannot change what gets indexed.
+func TestCollectElixirFilesParallelMatchesWalk(t *testing.T) {
+	root := t.TempDir()
+
+	files := []string{
+		"lib/my_app.ex",
+		"lib/my_app/accounts.ex",
+		"lib/my_app/accounts/user.ex",
+		"lib/nested/deep/deeper/worker.ex",
+		"test/my_app_test.exs",
+		"config/config.exs",
+		"mix.exs",
+		// Excluded directories, at several depths.
+		"_build/dev/lib/my_app/ebin/skipped.ex",
+		".git/hooks/skipped.exs",
+		"node_modules/pkg/skipped.ex",
+		"lib/vendor/node_modules/nested_skipped.ex",
+		// Non-Elixir files.
+		"lib/README.md",
+		"lib/my_app/assets/app.js",
+	}
+	for _, f := range files {
+		path := filepath.Join(root, f)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("defmodule X do\nend\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var sequential []string
+	if err := WalkElixirFiles(root, func(path string, d fs.DirEntry) error {
+		sequential = append(sequential, path)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	parallel := CollectElixirFilesParallel(root)
+
+	sort.Strings(sequential)
+	sort.Strings(parallel)
+
+	if !reflect.DeepEqual(sequential, parallel) {
+		t.Errorf("parallel collector disagrees with WalkElixirFiles\n sequential (%d): %v\n parallel   (%d): %v",
+			len(sequential), sequential, len(parallel), parallel)
+	}
+
+	if len(parallel) != 7 {
+		t.Errorf("expected 7 Elixir files outside excluded dirs, got %d: %v", len(parallel), parallel)
+	}
+	for _, got := range parallel {
+		if strings.Contains(got, "_build") || strings.Contains(got, ".git") || strings.Contains(got, "node_modules") {
+			t.Errorf("excluded directory was walked: %s", got)
+		}
+	}
+}
+
+// TestCollectElixirFilesParallelEmptyAndMissing covers the degenerate roots.
+func TestCollectElixirFilesParallelEmptyAndMissing(t *testing.T) {
+	if got := CollectElixirFilesParallel(filepath.Join(t.TempDir(), "does-not-exist")); len(got) != 0 {
+		t.Errorf("missing root should yield no files, got %v", got)
+	}
+	if got := CollectElixirFilesParallel(t.TempDir()); len(got) != 0 {
+		t.Errorf("empty root should yield no files, got %v", got)
+	}
+}
+
+// TestWalkAndCollectAgreeOnSymlinkedRoot pins the invariant that the cold build
+// and the incremental sweep describe the same file set. The sweep prunes every
+// stored path its walk does not yield, so a walker that disagrees with the
+// collector on a symlinked root deletes the whole index.
+func TestWalkAndCollectAgreeOnSymlinkedRoot(t *testing.T) {
+	base := t.TempDir()
+	real := filepath.Join(base, "real")
+	if err := os.MkdirAll(filepath.Join(real, "lib"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"a.ex", filepath.Join("lib", "b.ex")} {
+		if err := os.WriteFile(filepath.Join(real, p), []byte("defmodule A do\nend\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	for _, root := range []string{real, link} {
+		collected := len(CollectElixirFilesParallel(root))
+		walked := 0
+		_ = WalkElixirFiles(root, func(string, os.DirEntry) error { walked++; return nil })
+		if collected != 2 || walked != 2 {
+			t.Errorf("root %s: Collect=%d Walk=%d, want 2 and 2", root, collected, walked)
+		}
 	}
 }

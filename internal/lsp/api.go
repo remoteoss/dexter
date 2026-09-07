@@ -11,8 +11,10 @@ import (
 
 	"go.lsp.dev/jsonrpc2"
 	"go.lsp.dev/protocol"
+	"go.lsp.dev/uri"
 	"go.uber.org/zap"
 
+	"github.com/remoteoss/dexter/internal/parser"
 	"github.com/remoteoss/dexter/internal/store"
 )
 
@@ -29,6 +31,7 @@ func Serve(server *Server, in io.Reader, out io.Writer) error {
 	conn := jsonrpc2.NewConn(stream)
 	server.client = protocol.ClientDispatcher(conn, logger)
 	server.conn = conn
+	close(server.ready)
 
 	handler := server.renameHandler(protocol.ServerHandler(server, nil))
 	ctx := context.Background()
@@ -36,6 +39,12 @@ func Serve(server *Server, in io.Reader, out io.Writer) error {
 	conn.Go(ctx, handler)
 	<-conn.Done()
 	return conn.Err()
+}
+
+// Ready is closed after Serve has installed the live LSP connection. Attached
+// services must wait for it before accepting requests that can apply edits.
+func (s *Server) Ready() <-chan struct{} {
+	return s.ready
 }
 
 // SetStdlibRoot records the Elixir stdlib directory so lookups can classify
@@ -123,6 +132,11 @@ func (s *Server) CollectReferences(module, function string) []store.ReferenceRes
 func (s *Server) WithReindexLock(fn func()) {
 	s.reindexing.Lock()
 	defer s.reindexing.Unlock()
+	s.indexWrites.RLock()
+	defer s.indexWrites.RUnlock()
+	if s.indexUnavailable {
+		return
+	}
 	fn()
 }
 
@@ -151,7 +165,7 @@ func (s *Server) RenameFunction(module, functionName, newName string) (RenameSum
 		return RenameSummary{}, fmt.Errorf("function %s.%s already exists", module, newName)
 	}
 
-	edit, files, err := s.renameFunctionEdits(module, functionName, newName)
+	edit, files, err := s.renameFunctionEdits(module, functionName, newName, true)
 	if err != nil {
 		return RenameSummary{}, err
 	}
@@ -177,7 +191,7 @@ func (s *Server) RenameModule(oldModule, newModule string) (RenameSummary, error
 		return RenameSummary{}, fmt.Errorf("module %s not found in the index", oldModule)
 	}
 
-	edit, moved, files, err := s.renameModuleEdits(oldModule, newModule)
+	edit, moved, files, err := s.renameModuleEdits(oldModule, newModule, true)
 	if err != nil {
 		return RenameSummary{}, err
 	}
@@ -201,6 +215,10 @@ func (s *Server) deliverEdits(edit *WorkspaceEdit) error {
 		return nil
 	}
 	if s.conn != nil {
+		prepared, err := s.prepareDeliveredEdit(edit)
+		if err != nil {
+			return err
+		}
 		applied, err := s.applyEdit(context.Background(), "dexter rename", edit)
 		if err != nil {
 			return err
@@ -208,6 +226,7 @@ func (s *Server) deliverEdits(edit *WorkspaceEdit) error {
 		if !applied {
 			return fmt.Errorf("editor did not apply the rename edits for open files")
 		}
+		s.recordDeliveredEdit(prepared)
 		return nil
 	}
 
@@ -253,6 +272,69 @@ func (s *Server) deliverEdits(edit *WorkspaceEdit) error {
 	return nil
 }
 
+type deliveredFile struct {
+	oldPath string
+	newPath string
+	text    string
+	open    bool
+}
+
+// prepareDeliveredEdit snapshots the source text without mutating disk or the
+// document store. That keeps an editor-rejected workspace edit fully atomic.
+func (s *Server) prepareDeliveredEdit(edit *WorkspaceEdit) ([]deliveredFile, error) {
+	edits := edit.textEditsByPath()
+	renames := edit.fileRenames()
+	paths := make(map[string]struct{}, len(edits)+len(renames))
+	for path := range edits {
+		paths[path] = struct{}{}
+	}
+	for path := range renames {
+		paths[path] = struct{}{}
+	}
+
+	prepared := make([]deliveredFile, 0, len(paths))
+	for path := range paths {
+		text, open, ok := s.ReadFileText(path)
+		if !ok {
+			return nil, fmt.Errorf("reading %s to prepare rename edits", path)
+		}
+		if fileEdits := edits[path]; len(fileEdits) > 0 {
+			text = applyTextEdits(text, fileEdits)
+		}
+		newPath := path
+		if renamed, ok := renames[path]; ok {
+			newPath = renamed
+		}
+		prepared = append(prepared, deliveredFile{oldPath: path, newPath: newPath, text: text, open: open})
+	}
+	return prepared, nil
+}
+
+// recordDeliveredEdit makes MCP reads and index queries reflect an accepted
+// editor edit immediately, without waiting for subsequent didChange events.
+func (s *Server) recordDeliveredEdit(files []deliveredFile) {
+	s.indexWrites.RLock()
+	defer s.indexWrites.RUnlock()
+	if s.indexUnavailable {
+		return
+	}
+	for _, file := range files {
+		if file.oldPath != file.newPath {
+			_ = s.store.RemoveFile(file.oldPath)
+		}
+		defs, refs, err := parser.ParseText(file.newPath, file.text)
+		if err == nil {
+			_ = s.store.IndexFileWithRefs(file.newPath, defs, refs)
+		}
+		if file.open {
+			if file.oldPath != file.newPath {
+				s.docs.Close(string(uri.File(file.oldPath)))
+			}
+			s.docs.Set(string(uri.File(file.newPath)), file.text)
+		}
+	}
+}
+
 // applyTextEdits applies non-overlapping TextEdits to text. Positions use the
 // same line/byte-column convention the rename machinery produces them in.
 func applyTextEdits(text string, edits []protocol.TextEdit) string {
@@ -278,4 +360,10 @@ func applyTextEdits(text string, edits []protocol.TextEdit) string {
 		lines = append(lines[:start.Line], append(replacement, lines[end.Line+1:]...)...)
 	}
 	return strings.Join(lines, "\n")
+}
+
+func (s *Server) reindexPaths(paths []string) {
+	for _, path := range paths {
+		s.indexOneFile(path)
+	}
 }
