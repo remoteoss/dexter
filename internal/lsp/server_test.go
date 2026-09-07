@@ -6159,9 +6159,10 @@ end`)
 	}
 }
 
-// The prune step deletes every stored path the walk did not see. A full build
-// does not populate `seen`, so running the prune after one would delete the
-// index that was just written.
+// A full build must leave its own output alone. The walk that fills `seen` and
+// the prune that consumes it are both inside the `!fullBuilt` branch, so this
+// pins the outcome rather than the mechanism: whatever the branch does, a cold
+// start ends with the index it just built.
 func TestServer_backgroundReindex_FullBuildDoesNotPrune(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
@@ -6226,7 +6227,11 @@ func writeTestFile(t *testing.T, dir, relPath, content string) string {
 	return path
 }
 
-func TestServer_fullBuildRefusesNonEmptyIndex(t *testing.T) {
+// A non-empty index is not an error, it is a race the caller has to hear about:
+// a save or a watched-file event can write a row between backgroundReindex's
+// check and this lock. fullBuild reports it as ran=false so the caller falls
+// through to the incremental path instead of logging a failure.
+func TestServer_fullBuildSkipsNonEmptyIndex(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
 
@@ -6234,11 +6239,93 @@ func TestServer_fullBuildRefusesNonEmptyIndex(t *testing.T) {
   def value, do: :ok
 end`)
 
-	if _, err := server.fullBuild(); err == nil {
-		t.Fatal("fullBuild succeeded on a non-empty index")
+	_, ran, err := server.fullBuild()
+	if err != nil {
+		t.Fatalf("fullBuild on a non-empty index should not error: %v", err)
+	}
+	if ran {
+		t.Fatal("fullBuild ran on a non-empty index")
 	}
 	if results, _ := server.store.LookupFunction("Existing", "value"); len(results) == 0 {
-		t.Error("refusing the full build removed the existing index")
+		t.Error("skipping the full build removed the existing index")
+	}
+}
+
+// The prune deletes rows for files that are gone, and `seen` is one traversal's
+// answer to what is on disk. A file created and saved after that traversal
+// passed its directory is missing from `seen` and present on disk, so the prune
+// re-checks the filesystem before deleting. Without that check the sweep
+// deletes rows a concurrent save has just written — and, if the walkers ever
+// disagree about the file set again, the entire index. The seen set here names
+// neither file, standing in for a walk that missed both.
+func TestServer_pruneMissingFiles_KeepsFilesOnDisk(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	onDisk := writeTestFile(t, server.projectRoot, "lib/concurrent.ex", `defmodule Concurrent do
+  def saved, do: :ok
+end`)
+	indexFile(t, server.store, server.projectRoot, "lib/concurrent.ex", `defmodule Concurrent do
+  def saved, do: :ok
+end`)
+	deleted := writeTestFile(t, server.projectRoot, "lib/removed.ex", `defmodule Removed do
+  def gone, do: :ok
+end`)
+	indexFile(t, server.store, server.projectRoot, "lib/removed.ex", `defmodule Removed do
+  def gone, do: :ok
+end`)
+	if err := os.Remove(deleted); err != nil {
+		t.Fatal(err)
+	}
+
+	server.pruneMissingFiles(map[string]struct{}{})
+
+	if results, _ := server.store.LookupFunction("Concurrent", "saved"); len(results) == 0 {
+		t.Errorf("pruned %s, which exists on disk", onDisk)
+	}
+	if results, _ := server.store.LookupFunction("Removed", "gone"); len(results) != 0 {
+		t.Error("did not prune a file that is gone from disk")
+	}
+}
+
+func TestServer_pruneMissingFiles_KeepsFilesOnStatError(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root, an inaccessible directory is still searchable")
+	}
+
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	path := filepath.Join(server.projectRoot, "private", "kept.ex")
+	indexFile(t, server.store, server.projectRoot, "private/kept.ex", `defmodule Kept do
+	def present, do: :ok
+end`)
+	privateDir := filepath.Dir(path)
+	if err := os.Chmod(privateDir, 0o000); err != nil {
+		t.Skipf("cannot make directory inaccessible: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(privateDir, 0o755) })
+
+	server.pruneMissingFiles(map[string]struct{}{})
+	if results, _ := server.store.LookupFunction("Kept", "present"); len(results) == 0 {
+		t.Error("pruned a file after Lstat failed for a reason other than non-existence")
+	}
+}
+
+func TestServer_IndexUnavailableRejectsIncrementalWrite(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	path := writeTestFile(t, server.projectRoot, "lib/rejected.ex", `defmodule Rejected do
+  def value, do: :ok
+end`)
+	server.indexWrites.Lock()
+	server.indexUnavailable = true
+	server.indexWrites.Unlock()
+	server.indexOneFile(path)
+
+	if results, _ := server.store.LookupFunction("Rejected", "value"); len(results) != 0 {
+		t.Error("incremental write proceeded after index recreation failed")
 	}
 }
 

@@ -109,6 +109,7 @@ type Server struct {
 	// from a counter seeded when the batch opens. A save landing in the middle
 	// of one would duplicate rows or collide on a primary key.
 	indexWrites         sync.RWMutex
+	indexUnavailable    bool      // guarded by indexWrites; set only after index recreation exhausts its retries
 	notifiedOTPMismatch sync.Once // prevents repeated OTP mismatch warnings
 
 	backgroundWork sync.WaitGroup // tracks background reindex goroutines so the store isn't closed while they're running
@@ -218,35 +219,110 @@ func (s *Server) warmUsingCache() {
 	s.debugf("warmUsingCache: %d __using__ modules in %s", len(usingModules), time.Since(start).Round(time.Millisecond))
 }
 
+// pruneMissingFiles removes stored files that the sweep did not see on disk.
+//
+// It holds indexWrites for writing, so no single-file write can land between
+// the decision and the delete, and it re-checks each candidate against the
+// filesystem first. The re-check is what makes the prune safe rather than
+// merely unlikely to be wrong: seen is one traversal's answer, and a file
+// created and saved after that traversal passed its directory is absent from
+// seen but present on disk and in the index.
+//
+// It is also the backstop for the two walkers ever disagreeing about the file
+// set again. A walk that yields nothing then deletes nothing, because every
+// stored path still stats — while a project whose last file was genuinely
+// removed is still pruned, which is why the check is per candidate rather than
+// a test on seen being empty.
+func (s *Server) pruneMissingFiles(seen map[string]struct{}) {
+	s.indexWrites.Lock()
+	defer s.indexWrites.Unlock()
+	if s.indexUnavailable {
+		return
+	}
+
+	storedPaths, err := s.store.ListFilePaths()
+	if err != nil {
+		return
+	}
+
+	var toRemove []string
+	for _, storedPath := range storedPaths {
+		if _, ok := seen[storedPath]; ok {
+			continue
+		}
+		if _, err := os.Lstat(storedPath); err == nil || !errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		toRemove = append(toRemove, storedPath)
+	}
+	if len(toRemove) > 0 {
+		_ = s.store.RemoveFiles(toRemove)
+	}
+}
+
+// showError reports a problem the user has to act on. The caller logs as well,
+// so a client without window/showMessage support still leaves a trace.
+func (s *Server) showError(message string) {
+	if s.client == nil {
+		return
+	}
+	if err := s.client.ShowMessage(context.Background(), &protocol.ShowMessageParams{
+		Type:    protocol.MessageTypeError,
+		Message: message,
+	}); err != nil {
+		log.Printf("ShowMessage: %v", err)
+	}
+}
+
 // fullBuild rebuilds the whole index in-process, through the same pipeline
 // `dexter init` uses: parse on every core, then one bulk transaction with the
 // indexes dropped. It is only correct on an empty index, so backgroundReindex
 // is the only caller.
 //
+// The emptiness test is made here, under the same lock that holds for the whole
+// build, and reported through the ran return value. A caller cannot sample it
+// beforehand and act on the sample: a save or a watched-file event arriving in
+// between takes indexWrites for reading unopposed and writes a row, and the
+// build must then be skipped rather than attempted. ran is false with a nil
+// error for exactly that case, which is not a failure — the incremental path
+// handles what is already there.
+//
+// The whole build is one WAL transaction, so the -wal file grows to roughly the
+// size of the index before backgroundReindex's checkpoint reclaims it;
+// wal_autocheckpoint cannot touch frames belonging to an open transaction. On a
+// very large repository that is a few hundred MiB of transient disk.
+//
 // InProcess suppresses the connection-wide pragmas. They cannot be applied
 // reliably or undone on a live pool — leaving WAL needs exclusive access, and
 // the per-connection ones land on whichever pooled connection happens to serve
 // them. They were also the smallest part of the win.
-func (s *Server) fullBuild() (indexer.Stats, error) {
+func (s *Server) fullBuild() (stats indexer.Stats, ran bool, err error) {
 	s.indexWrites.Lock()
 	defer s.indexWrites.Unlock()
 	if !s.store.IsEmpty() {
-		return indexer.Stats{}, errors.New("full build requires an empty index")
+		return indexer.Stats{}, false, nil
 	}
 
-	return indexer.FullBuild(s.store, s.projectRoot, indexer.Options{
+	stats, err = indexer.FullBuild(s.store, s.projectRoot, indexer.Options{
 		StdlibRoot: s.stdlibRoot,
 		InProcess:  true,
 		Warn: func(format string, args ...interface{}) {
 			log.Printf("Warning: "+format, args...)
 		},
 	})
+	if errors.Is(err, indexer.ErrUnindexed) {
+		s.indexUnavailable = true
+	}
+	return stats, true, err
 }
 
 // indexOneFile parses and indexes a single file, the incremental path.
 func (s *Server) indexOneFile(path string) {
 	s.indexWrites.RLock()
 	defer s.indexWrites.RUnlock()
+	if s.indexUnavailable {
+		return
+	}
 	s.indexOneFileLocked(path)
 }
 
@@ -276,10 +352,10 @@ func (s *Server) backgroundReindex() {
 
 		start := time.Now()
 		reindexed := 0
-		isEmpty := s.store.IsEmpty()
+		coldStart := s.store.IsEmpty()
 		fullBuilt := false
 
-		if isEmpty {
+		if coldStart {
 			log.Printf("No index found, building from scratch...")
 			if s.client != nil {
 				if err := s.client.ShowMessage(context.Background(), &protocol.ShowMessageParams{
@@ -290,17 +366,45 @@ func (s *Server) backgroundReindex() {
 				}
 			}
 
-			stats, err := s.fullBuild()
-			if err != nil {
+			stats, ran, err := s.fullBuild()
+			switch {
+			case errors.Is(err, indexer.ErrUnindexed):
+				// The SQL indexes did not come back after the bulk load committed
+				// or rolled back, so every query is a full table scan. Falling back
+				// to the incremental walk would be far worse than doing nothing:
+				// each per-file write issues a DELETE by file_id against definitions
+				// and refs tables, once per file on disk. FullBuild leaves the
+				// index version unset, so the next editor start rebuilds from
+				// scratch through cmdInit — in a process with no live readers,
+				// where deleting the database is safe.
+				log.Printf("Error: SQL indexes could not be restored after the bulk build: %v", err)
+				s.showError("Dexter: the index could not be completed. Run `dexter init --force` in your project root and restart your editor. If it happens again, please report it.")
+				// Collapse any committed data in the WAL rather than leaving it at
+				// its high-water mark for the rest of the process.
+				if err := s.store.Checkpoint(); err != nil {
+					log.Printf("Warning: WAL checkpoint: %v", err)
+				}
+				return
+			case err != nil:
 				// The incremental walk below needs nothing to be true of the
 				// database, so it is the safe thing to fall back to. It is
 				// slower, not wrong.
 				log.Printf("Warning: full index build failed, falling back to incremental: %v", err)
-			} else {
+			case !ran:
+				// Something wrote to the index between the check above and the
+				// build's lock. Nothing was built, and the incremental path
+				// below covers whatever is there.
+				log.Printf("Index was no longer empty at build time, using incremental reindex")
+			default:
 				fullBuilt = true
 				reindexed = stats.Files
 			}
 		}
+
+		// Re-read rather than reusing coldStart. A full build, a failed build
+		// and a concurrent write all change the answer, and reading a stale
+		// true here would skip the mtime short-circuit for every file.
+		isEmpty := s.store.IsEmpty()
 
 		seen := make(map[string]struct{})
 		walkAndIndex := func(root string, indexRefs bool) {
@@ -334,29 +438,28 @@ func (s *Server) backgroundReindex() {
 			})
 		}
 
-		// A full build already indexed every file on disk, so there is nothing
-		// to walk and nothing stale to prune — and `seen` is empty, so pruning
-		// here would delete the index that was just built.
+		// A full build already indexed every file on disk from the traversal
+		// this walk would repeat, so skipping it saves a second traversal and a
+		// stored-mtime query per file. The prune lives in the same branch and
+		// so cannot run without the walk that fills `seen`.
 		if !fullBuilt {
+			// The walk writes, so it takes indexWrites for reading, the same as
+			// every other single-file write. That is what keeps it from
+			// overlapping a cold build.
+			s.indexWrites.RLock()
+			if s.indexUnavailable {
+				s.indexWrites.RUnlock()
+				return
+			}
 			// Index stdlib first (definitions only).
 			if s.stdlibRoot != "" {
 				walkAndIndex(s.stdlibRoot, false)
 			}
 
 			walkAndIndex(s.projectRoot, true)
+			s.indexWrites.RUnlock()
 
-			// Prune store entries for files no longer on disk
-			if storedPaths, err := s.store.ListFilePaths(); err == nil {
-				var toRemove []string
-				for _, storedPath := range storedPaths {
-					if _, ok := seen[storedPath]; !ok {
-						toRemove = append(toRemove, storedPath)
-					}
-				}
-				if len(toRemove) > 0 {
-					_ = s.store.RemoveFiles(toRemove)
-				}
-			}
+			s.pruneMissingFiles(seen)
 		}
 
 		// Collapse the WAL back to disk now that the (potentially large) reindex
@@ -373,7 +476,7 @@ func (s *Server) backgroundReindex() {
 		elapsed := time.Since(start).Round(time.Millisecond)
 		log.Printf("Background reindex: %d files updated (%s)", reindexed, elapsed)
 
-		if isEmpty && s.client != nil {
+		if coldStart && s.client != nil {
 			if err := s.client.ShowMessage(context.Background(), &protocol.ShowMessageParams{
 				Type:    protocol.MessageTypeInfo,
 				Message: fmt.Sprintf("Dexter: index built (%d files in %s)", reindexed, elapsed),
@@ -2879,6 +2982,9 @@ func (s *Server) DidChangeWatchedFiles(ctx context.Context, params *protocol.Did
 			go func(filePath string) {
 				s.indexWrites.RLock()
 				defer s.indexWrites.RUnlock()
+				if s.indexUnavailable {
+					return
+				}
 				if err := s.store.RemoveFile(filePath); err != nil {
 					log.Printf("Error removing %s from index: %v", filePath, err)
 				}
@@ -5241,6 +5347,9 @@ func (s *Server) reindexAfterRename(removePaths, diskPaths []string, textPaths [
 
 		s.indexWrites.RLock()
 		defer s.indexWrites.RUnlock()
+		if s.indexUnavailable {
+			return
+		}
 
 		for _, path := range removePaths {
 			_ = s.store.RemoveFile(path)

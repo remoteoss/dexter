@@ -10,6 +10,7 @@
 package indexer
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -21,6 +22,11 @@ import (
 	"github.com/remoteoss/dexter/internal/store"
 	"github.com/remoteoss/dexter/internal/version"
 )
+
+// ErrUnindexed reports that the SQL indexes could not be recreated after they
+// were dropped for a bulk load. The data may have committed or the load may
+// have rolled back, but either way every query is now a full table scan.
+var ErrUnindexed = errors.New("SQL indexes could not be created after bulk build")
 
 // Options configures a full build.
 type Options struct {
@@ -35,14 +41,34 @@ type Options struct {
 	InProcess bool
 
 	// Warn reports a recoverable per-file failure. Optional.
+	//
+	// It is called from every parse worker, so it must be safe for concurrent
+	// use. FullBuild serialises its own calls through serialWarn, so a callback
+	// that only forwards to log.Printf needs nothing extra; one that counts or
+	// accumulates should still not assume single-threaded access from any other
+	// caller.
 	Warn func(format string, args ...interface{})
 }
 
-func (o Options) warn(format string, args ...interface{}) {
-	if o.Warn != nil {
+// serialWarn returns a callback that forwards to Warn under a mutex. Options is
+// passed by value, so the lock cannot live on the struct — a copy would carry a
+// copy of the mutex and guard nothing.
+func (o Options) serialWarn() func(string, ...interface{}) {
+	if o.Warn == nil {
+		return func(string, ...interface{}) {}
+	}
+	var mu sync.Mutex
+	return func(format string, args ...interface{}) {
+		mu.Lock()
+		defer mu.Unlock()
 		o.Warn(format, args...)
 	}
 }
+
+const (
+	createIndexAttempts   = 3
+	createIndexRetryDelay = 250 * time.Millisecond
+)
 
 // Stats reports what a full build did, and how long each phase took. The
 // durations are always collected; `dexter init --profile` prints them.
@@ -121,11 +147,13 @@ func FullBuild(s *store.Store, projectRoot string, opts Options) (Stats, error) 
 	var stats Stats
 	start := time.Now()
 
+	warn := opts.serialWarn()
+
 	if !opts.InProcess {
 		// Safe only because this caller owns the database outright and the
 		// process exits after the build.
 		if err := s.SetBulkPragmas(); err != nil {
-			opts.warn("bulk pragma setup: %v", err)
+			warn("bulk pragma setup: %v", err)
 		}
 	}
 
@@ -135,7 +163,7 @@ func FullBuild(s *store.Store, projectRoot string, opts Options) (Stats, error) 
 	filePaths := parser.CollectElixirFilesParallel(projectRoot)
 	var stdlibPaths []string
 	if opts.StdlibRoot != "" {
-		stdlibPaths = parser.CollectElixirFilesParallel(opts.StdlibRoot)
+		stdlibPaths = dedupeAgainst(parser.CollectElixirFilesParallel(opts.StdlibRoot), filePaths)
 	}
 	files := statFilesParallel(filePaths)
 	stdlibFiles := statFilesParallel(stdlibPaths)
@@ -161,7 +189,7 @@ func FullBuild(s *store.Store, projectRoot string, opts Options) (Stats, error) 
 				t0 := time.Now()
 				defs, refs, err := parser.ParseFile(f.path)
 				if err != nil {
-					opts.warn("%s: %v", f.path, err)
+					warn("%s: %v", f.path, err)
 					continue
 				}
 				parseNanos.Add(int64(time.Since(t0)))
@@ -187,7 +215,7 @@ func FullBuild(s *store.Store, projectRoot string, opts Options) (Stats, error) 
 	// caller's WaitGroup is waiting on.
 	if err := s.DropIndexes(); err != nil {
 		drain(resultCh)
-		return stats, fmt.Errorf("drop indexes: %w", err)
+		return stats, restoreIndexes(s, fmt.Errorf("drop indexes: %w", err))
 	}
 
 	batch, err := s.BeginBulkInsert()
@@ -196,10 +224,17 @@ func FullBuild(s *store.Store, projectRoot string, opts Options) (Stats, error) 
 		return stats, restoreIndexes(s, fmt.Errorf("begin bulk insert: %w", err))
 	}
 
+	// A write failure inside the bulk transaction is not recoverable, so it ends
+	// the build rather than being warned about. The files row is written before
+	// the definitions and refs (see store.Batch.indexFile), and insert-only mode
+	// buffers rows across files, so continuing past one would commit a file with
+	// a current mtime and no symbols — invisible to the mtime sweep forever —
+	// and could also drop buffered rows belonging to files already counted here.
+	// Returning instead leaves SetIndexVersion unreached, so the next start
+	// rebuilds.
 	for _, sr := range stdlibResults {
 		if err := batch.IndexFileWithMtimeAndRefs(sr.path, sr.mtimeNano, sr.defs, nil); err != nil {
-			opts.warn("%s: %v", sr.path, err)
-			continue
+			return stats, abortBuild(s, batch, resultCh, fmt.Errorf("%s: %w", sr.path, err))
 		}
 		stats.Files++
 		stats.Definitions += len(sr.defs)
@@ -211,8 +246,7 @@ func FullBuild(s *store.Store, projectRoot string, opts Options) (Stats, error) 
 		err := batch.IndexFileWithMtimeAndRefs(res.path, res.mtimeNano, res.defs, res.refs)
 		writeNanos += time.Since(writeStart)
 		if err != nil {
-			opts.warn("%s: %v", res.path, err)
-			continue
+			return stats, abortBuild(s, batch, resultCh, fmt.Errorf("%s: %w", res.path, err))
 		}
 		stats.Files++
 		stats.Definitions += len(res.defs)
@@ -228,15 +262,15 @@ func FullBuild(s *store.Store, projectRoot string, opts Options) (Stats, error) 
 	stats.Commit = time.Since(commitStart)
 
 	indexStart := time.Now()
-	if err := s.CreateIndexes(); err != nil {
-		return stats, fmt.Errorf("create indexes: %w", err)
+	if err := createIndexesWithRetry(s); err != nil {
+		return stats, fmt.Errorf("%w: %v", ErrUnindexed, err)
 	}
 	stats.CreateIndexes = time.Since(indexStart)
 
 	// Last, so that a build interrupted before this point leaves a version the
 	// next start rejects, and rebuilds.
 	if err := s.SetIndexVersion(version.IndexVersion); err != nil {
-		opts.warn("failed to store index version: %v", err)
+		warn("failed to store index version: %v", err)
 	}
 
 	stats.Total = time.Since(start)
@@ -294,17 +328,71 @@ func parseStdlib(stdlibFiles []fileEntry) []stdlibResult {
 	return results
 }
 
+// createIndexesWithRetry recreates the indexes, retrying a few times. The
+// statements are CREATE ... IF NOT EXISTS, so a retry is free and idempotent,
+// and the likeliest failure here is SQLITE_BUSY against another pooled
+// connection, which clears on its own.
+func createIndexesWithRetry(s *store.Store) error {
+	var err error
+	for attempt := 0; attempt < createIndexAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * createIndexRetryDelay)
+		}
+		if err = s.CreateIndexes(); err == nil {
+			return nil
+		}
+	}
+	return err
+}
+
+// dedupeAgainst returns the entries of paths that do not appear in exclude.
+//
+// The stdlib root can resolve inside the project root — an explicit
+// initializationOptions.stdlibPath, DEXTER_ELIXIR_LIB_ROOT, or a vendored
+// elixir checkout under deps/, none of which stdlib.Resolve checks — and the
+// project walk descends into deps/. The insert-only batch cannot upsert, so an
+// overlapping path would fail on files.path UNIQUE and end the build. Matching
+// exact paths rather than testing directory containment also covers the cases
+// a prefix test misses, such as two roots aliased through a symlink.
+func dedupeAgainst(paths, exclude []string) []string {
+	if len(paths) == 0 || len(exclude) == 0 {
+		return paths
+	}
+	seen := make(map[string]struct{}, len(exclude))
+	for _, p := range exclude {
+		seen[p] = struct{}{}
+	}
+	out := paths[:0:0]
+	for _, p := range paths {
+		if _, dup := seen[p]; dup {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
 func drain(ch <-chan parseResult) {
 	for range ch { //nolint:revive // draining so the parse workers can exit
 	}
 }
 
-// restoreIndexes puts the indexes back after a failed bulk load, so that a
-// database left behind by a failure is slow rather than unusable. The original
-// error is what the caller sees; a failure to restore is appended to it.
+// abortBuild ends a build that has already opened its bulk transaction. The
+// order matters: drain first, because the parse workers keep producing and the
+// caller's WaitGroup is waiting on them; then roll the transaction back, or its
+// write lock outlives the build and the pooled connection never comes back —
+// restoreIndexes runs its DDL on a different connection and would block on it.
+func abortBuild(s *store.Store, batch *store.Batch, resultCh <-chan parseResult, cause error) error {
+	drain(resultCh)
+	if err := batch.Rollback(); err != nil {
+		cause = fmt.Errorf("%w (and rolling back failed: %v)", cause, err)
+	}
+	return restoreIndexes(s, cause)
+}
+
 func restoreIndexes(s *store.Store, cause error) error {
-	if err := s.CreateIndexes(); err != nil {
-		return fmt.Errorf("%w (and restoring indexes failed: %v)", cause, err)
+	if err := createIndexesWithRetry(s); err != nil {
+		return errors.Join(cause, fmt.Errorf("%w: %v", ErrUnindexed, err))
 	}
 	return cause
 }

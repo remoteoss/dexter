@@ -147,22 +147,57 @@ func IsElixirFile(path string) bool {
 
 // WalkElixirFiles walks root, skipping _build/.git/node_modules directories,
 // and calls fn for each .ex/.exs file found.
+//
+// A root that is itself a symlink to a directory is followed; symlinks below it
+// are not. This has to match CollectElixirFilesParallel exactly, because the
+// two describe the same set of files to different phases of the same index: the
+// cold build enumerates with Collect, and the incremental sweep prunes every
+// stored path this walk does not yield. filepath.WalkDir alone stats the root
+// with Lstat, so it treats a symlinked root as a non-directory and yields
+// nothing — which on a symlinked project or stdlib root made the sweep prune
+// the entire index the cold build had just written. Walking the root's children
+// rather than the root keeps the caller's path prefix, which the editor's URIs
+// depend on, instead of the resolved one filepath.EvalSymlinks would give.
 func WalkElixirFiles(root string, fn func(path string, d fs.DirEntry) error) error {
-	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if d.IsDir() {
-			if skipDir(filepath.Base(path)) {
-				return filepath.SkipDir
+	walk := func(target string) error {
+		return filepath.WalkDir(target, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return nil
 			}
-			return nil
+			if d.IsDir() {
+				if skipDir(filepath.Base(path)) {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if !IsElixirFile(path) {
+				return nil
+			}
+			return fn(path, d)
+		})
+	}
+
+	info, err := os.Stat(root)
+	if err != nil {
+		return nil
+	}
+	if !info.IsDir() {
+		return walk(root)
+	}
+
+	entries, err := readDirUnsorted(root)
+	if err != nil {
+		return nil
+	}
+	for _, e := range entries {
+		if e.IsDir() && skipDir(e.Name()) {
+			continue
 		}
-		if !IsElixirFile(path) {
-			return nil
+		if err := walk(filepath.Join(root, e.Name())); err != nil {
+			return err
 		}
-		return fn(path, d)
-	})
+	}
+	return nil
 }
 
 // skipDir reports whether a directory name is excluded from indexing.

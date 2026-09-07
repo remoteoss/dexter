@@ -386,10 +386,16 @@ func (s *Store) SetStdlibRoot(root string) error {
 	return err
 }
 
+// IsEmpty reports whether the index holds no files. It answers false when the
+// query itself fails, because every caller uses this to decide whether a
+// destructive or insert-only path is safe: a database too broken to count is
+// the one case where those paths must not run. migrate() only issues CREATE
+// ... IF NOT EXISTS, so it succeeds on a store whose `files` pages are corrupt
+// and this is the first place that notices.
 func (s *Store) IsEmpty() bool {
 	var count int
-	_ = s.db.QueryRow("SELECT COUNT(*) FROM files").Scan(&count)
-	return count == 0
+	err := s.db.QueryRow("SELECT COUNT(*) FROM files").Scan(&count)
+	return err == nil && count == 0
 }
 
 func (s *Store) GetFileMtime(path string) (int64, bool) {

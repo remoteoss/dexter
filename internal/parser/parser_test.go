@@ -2816,3 +2816,33 @@ func TestCollectElixirFilesParallelEmptyAndMissing(t *testing.T) {
 		t.Errorf("empty root should yield no files, got %v", got)
 	}
 }
+
+// TestWalkAndCollectAgreeOnSymlinkedRoot pins the invariant that the cold build
+// and the incremental sweep describe the same file set. The sweep prunes every
+// stored path its walk does not yield, so a walker that disagrees with the
+// collector on a symlinked root deletes the whole index.
+func TestWalkAndCollectAgreeOnSymlinkedRoot(t *testing.T) {
+	base := t.TempDir()
+	real := filepath.Join(base, "real")
+	if err := os.MkdirAll(filepath.Join(real, "lib"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"a.ex", filepath.Join("lib", "b.ex")} {
+		if err := os.WriteFile(filepath.Join(real, p), []byte("defmodule A do\nend\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	for _, root := range []string{real, link} {
+		collected := len(CollectElixirFilesParallel(root))
+		walked := 0
+		_ = WalkElixirFiles(root, func(string, os.DirEntry) error { walked++; return nil })
+		if collected != 2 || walked != 2 {
+			t.Errorf("root %s: Collect=%d Walk=%d, want 2 and 2", root, collected, walked)
+		}
+	}
+}
