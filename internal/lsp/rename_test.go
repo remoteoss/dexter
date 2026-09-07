@@ -1628,11 +1628,19 @@ end
 	})
 
 	// Re-index with original content for test 2, and close the def file so it
-	// takes the closed-file path (moved on disk by the server). Wait for the
-	// first rename's asynchronous index bookkeeping before restoring it.
+	// takes the closed-file path (moved on disk by the server).
+	//
+	// Wait for test 1's background reindex first: a client-applied rename
+	// queues a removal of the old path from the index (the client owns the
+	// move, so the server drops what it no longer describes). That removal
+	// runs on a goroutine, and if it lands after the re-index below it
+	// deletes the definition test 2 needs, leaving the rename with nothing
+	// to move.
 	server.backgroundWork.Wait()
 	server.docs.Close("file://" + oldPath)
 	indexFile(t, server.store, server.projectRoot, "lib/docusign.ex", defContent)
+	// Test 1 rewrote the closed caller on disk; put it back too.
+	indexFile(t, server.store, server.projectRoot, "lib/web.ex", callerContent)
 
 	// Test 2: rename from a caller file via alias (def file is closed)
 	t.Run("from caller via alias", func(t *testing.T) {
