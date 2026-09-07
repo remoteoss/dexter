@@ -73,8 +73,13 @@ jobs:
           cd internal/lsp/testdata/monorepo/apps/app_with_styler && mix deps.get && mix deps.compile && cd -
           cd internal/lsp/testdata/monorepo/apps/app_with_ecto_migration && mix deps.get && mix deps.compile && cd -
           cd internal/lsp/testdata/monorepo/apps/app_basic && mix deps.get && cd -
+      # Every formatter test needs mix on PATH and skips itself without it, so
+      # this job is the only place they run — the test/test-race jobs have no
+      # Elixir. Match the whole family rather than naming tests one by one: a
+      # hand-maintained list silently stops covering each new test that is
+      # added outside it.
       - name: Run integration tests
-        run: go test ./internal/lsp/ -run 'TestFormatterServer_(WithStyler|BasicProject|BadIndentation|CacheInvalidation|DifferentProjects|MigrationDSL)' -v -timeout 120s
+        run: go test ./internal/lsp/ -run 'TestFormatter|TestDidSave_Formatter' -v -timeout 600s
 
   lint:
     runs-on: ubuntu-latest
