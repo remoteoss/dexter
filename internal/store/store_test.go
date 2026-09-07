@@ -3,6 +3,7 @@ package store
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -1312,4 +1313,172 @@ func TestFindProjectRoot(t *testing.T) {
 			t.Errorf("got %q, want %q", got, root)
 		}
 	})
+}
+
+// makeFile creates a real file so IndexFile's os.Stat succeeds, and returns its path.
+func makeFile(t *testing.T, dir, name string) string {
+	t.Helper()
+	p := filepath.Join(dir, name)
+	if err := os.WriteFile(p, []byte("# generated\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// genRows builds enough definitions and references to cross the multi-row
+// INSERT chunk boundaries (defChunkRows=100, refChunkRows=180) and leave a
+// partial chunk behind, so both the chunked path and flushPending are exercised.
+func genRows(path string, defCount, refCount int) ([]parser.Definition, []parser.Reference) {
+	defs := make([]parser.Definition, 0, defCount)
+	for i := 0; i < defCount; i++ {
+		defs = append(defs, parser.Definition{
+			Module: "MyApp.Gen", Function: "fn" + strconv.Itoa(i), Arity: i % 4,
+			Kind: "def", Line: i + 1, FilePath: path,
+		})
+	}
+	refs := make([]parser.Reference, 0, refCount)
+	for i := 0; i < refCount; i++ {
+		refs = append(refs, parser.Reference{
+			Module: "SharedLib.Worker", Function: "call" + strconv.Itoa(i),
+			Line: i + 1, FilePath: path, Kind: "call",
+		})
+	}
+	return defs, refs
+}
+
+// TestBulkInsertMatchesRowAtATime pins the multi-row INSERT path in
+// BeginBulkInsert to the row-at-a-time path in BeginBatch. The bulk path
+// buffers rows and flushes them in chunks, so a boundary or flush bug would
+// silently drop or duplicate rows.
+func TestBulkInsertMatchesRowAtATime(t *testing.T) {
+	// 250 defs = 2 full chunks of 100 + 50 pending; 425 refs = 2 full chunks of
+	// 180 + 65 pending. Both remainders exercise flushPending.
+	const defCount, refCount = 250, 425
+
+	read := func(s *Store, path string) (int, []ReferenceResult) {
+		t.Helper()
+		var defs int
+		if err := s.db.QueryRow("SELECT COUNT(*) FROM definitions WHERE file_path = ?", path).Scan(&defs); err != nil {
+			t.Fatal(err)
+		}
+		refs, err := s.LookupReferences("SharedLib.Worker", "call7")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return defs, refs
+	}
+
+	bulkStore, bulkDir := setupTestStore(t)
+	bulkPath := makeFile(t, bulkDir, "gen.ex")
+	bd, br := genRows(bulkPath, defCount, refCount)
+	batch, err := bulkStore.BeginBulkInsert()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.IndexFileWithMtimeAndRefs(bulkPath, 1, bd, br); err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	rowStore, rowDir := setupTestStore(t)
+	rowPath := makeFile(t, rowDir, "gen.ex")
+	rd, rr := genRows(rowPath, defCount, refCount)
+	rowBatch, err := rowStore.BeginBatch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rowBatch.IndexFileWithMtimeAndRefs(rowPath, 1, rd, rr); err != nil {
+		t.Fatal(err)
+	}
+	if err := rowBatch.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	bulkDefs, bulkRefs := read(bulkStore, bulkPath)
+	rowDefs, rowRefs := read(rowStore, rowPath)
+
+	if bulkDefs != defCount {
+		t.Errorf("bulk definitions = %d, want %d", bulkDefs, defCount)
+	}
+	if bulkDefs != rowDefs {
+		t.Errorf("definition count: bulk %d, row-at-a-time %d", bulkDefs, rowDefs)
+	}
+	if len(bulkRefs) != 1 {
+		t.Errorf("bulk refs for call7 = %d, want 1", len(bulkRefs))
+	}
+	if len(bulkRefs) != len(rowRefs) {
+		t.Errorf("ref count: bulk %d, row-at-a-time %d", len(bulkRefs), len(rowRefs))
+	}
+
+	var total int
+	if err := bulkStore.db.QueryRow("SELECT COUNT(*) FROM refs").Scan(&total); err != nil {
+		t.Fatal(err)
+	}
+	if total != refCount {
+		t.Errorf("bulk refs total = %d, want %d", total, refCount)
+	}
+}
+
+// TestLookupByPrefixRange covers the range predicate that replaced `LIKE
+// 'Prefix.%'`. The range must include the prefix itself and everything under
+// it, and must exclude a module that merely starts with the same letters.
+func TestLookupByPrefixRange(t *testing.T) {
+	s, dir := setupTestStore(t)
+	path := makeFile(t, dir, "mods.ex")
+
+	defs := []parser.Definition{
+		{Module: "MyApp.Accounts", Kind: "module", Line: 1, FilePath: path},
+		{Module: "MyApp.Accounts.User", Kind: "module", Line: 2, FilePath: path},
+		{Module: "MyApp.AccountsExtra", Kind: "module", Line: 3, FilePath: path},
+		{Module: "MyApp.Billing", Kind: "module", Line: 4, FilePath: path},
+	}
+	refs := []parser.Reference{
+		{Module: "MyApp.Accounts", Line: 10, FilePath: path, Kind: "alias"},
+		{Module: "MyApp.Accounts.User", Line: 11, FilePath: path, Kind: "alias"},
+		{Module: "MyApp.AccountsExtra", Line: 12, FilePath: path, Kind: "alias"},
+		{Module: "MyApp.Billing", Line: 13, FilePath: path, Kind: "alias"},
+	}
+	batch, err := s.BeginBatch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.IndexFileWithMtimeAndRefs(path, 1, defs, refs); err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	gotMods, err := s.LookupModulesByPrefix("MyApp.Accounts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var modNames []string
+	for _, m := range gotMods {
+		modNames = append(modNames, m.Module)
+	}
+	wantMods := "MyApp.Accounts,MyApp.Accounts.User"
+	if strings.Join(modNames, ",") != wantMods {
+		t.Errorf("LookupModulesByPrefix = %v, want %s", modNames, wantMods)
+	}
+
+	gotRefs, err := s.LookupReferencesByPrefix("MyApp.Accounts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, r := range gotRefs {
+		seen[r.Module] = true
+	}
+	if !seen["MyApp.Accounts"] || !seen["MyApp.Accounts.User"] {
+		t.Errorf("LookupReferencesByPrefix missing prefix members: %v", seen)
+	}
+	if seen["MyApp.AccountsExtra"] {
+		t.Error("LookupReferencesByPrefix matched MyApp.AccountsExtra, which is not under the prefix")
+	}
+	if seen["MyApp.Billing"] {
+		t.Error("LookupReferencesByPrefix matched an unrelated module")
+	}
 }

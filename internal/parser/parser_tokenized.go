@@ -730,7 +730,32 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 		}
 	}
 
-	return defs, refs, nil
+	return defs, dedupeRefs(refs), nil
+}
+
+// dedupeRefs removes exact duplicate rows from refs, preserving first-occurrence
+// order. The same call site can be emitted more than once — a piped call is
+// reachable both from the TokPipe case and from the pipe scan inside
+// extractRefsForLine — and injector fan-out can repeat a row when a module is
+// reached through two paths. Identical rows are indistinguishable to every
+// query (no query counts refs; the References handler dedupes by file+line
+// anyway), so dropping them cannot change a result. It is worth doing here
+// because this runs in the parallel parse workers, while the rows it removes
+// would otherwise cost time in the single-threaded SQLite writer.
+func dedupeRefs(refs []Reference) []Reference {
+	if len(refs) < 2 {
+		return refs
+	}
+	seen := make(map[Reference]struct{}, len(refs))
+	out := refs[:0]
+	for _, r := range refs {
+		if _, dup := seen[r]; dup {
+			continue
+		}
+		seen[r] = struct{}{}
+		out = append(out, r)
+	}
+	return out
 }
 
 func boolToInt(b bool) int {

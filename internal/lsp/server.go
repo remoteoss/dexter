@@ -5706,16 +5706,22 @@ func (s *Server) OutgoingCalls(ctx context.Context, params *protocol.CallHierarc
 	}
 	type targetInfo struct {
 		callRanges []protocol.Range
+		lines      map[int]struct{}
 	}
 	targets := make(map[callTarget]*targetInfo)
 	var targetOrder []callTarget
 	for _, ref := range outRefs {
 		key := callTarget{ref.Module, ref.Function}
 		if _, ok := targets[key]; !ok {
-			targets[key] = &targetInfo{}
+			targets[key] = &targetInfo{lines: make(map[int]struct{})}
 			targetOrder = append(targetOrder, key)
 		}
-		targets[key].callRanges = append(targets[key].callRanges, lineRange(ref.Line-1))
+		info := targets[key]
+		if _, duplicateLine := info.lines[ref.Line]; duplicateLine {
+			continue
+		}
+		info.lines[ref.Line] = struct{}{}
+		info.callRanges = append(info.callRanges, lineRange(ref.Line-1))
 	}
 
 	var calls []protocol.CallHierarchyOutgoingCall

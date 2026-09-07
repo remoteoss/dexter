@@ -96,6 +96,19 @@ A module rename also moves files whose names follow the module naming convention
 
 `alias Old.{A, B}` (and the `require`/`import` forms) names the module once, as the prefix, while the index records one reference per member — so a member's full name never appears on the line. `findGroupedAliasEdits` handles both directions: renaming the prefix rewrites the prefix, renaming a member rewrites that member inside the braces. Since every member on the line resolves to the same prefix edit, `applyEdits` drops TextEdits that overlap one already emitted for that line; the on-disk path rewrites the line as it goes and never sees the second match.
 
+## Indexing throughput
+
+The cold index is bound by the single SQLite writer, not by parsing. On a 70k-file monorepo the parse workers burn ~14s of CPU across 15 cores (~1s of wall time) while the writer needs ~4s, so the pipeline runs at the speed of one core. Anything that removes bytes or statements from the writer is worth CPU spent in the parse workers, which have ~15x headroom.
+
+Consequences that are easy to undo by accident:
+
+- **Refs are deduplicated in the parser** (`dedupeRefs`), not in the store. Refs are line-granular, so `@spec f(String.t(), String.t())` produces identical rows; ~60k of them on a large monorepo. Identical rows cannot change a result — no query counts refs, and the References handler dedupes by file+line — so the parse workers drop them before they reach the writer.
+- **The bulk path batches inserts** into multi-row `INSERT`s (`multiRowInsert`, 900 bound parameters per statement, which is under even the legacy `SQLITE_MAX_VARIABLE_NUMBER` of 999). Incremental reindex keeps the row-at-a-time path, where a file's `DELETE` must stay ordered ahead of its `INSERT`s.
+- **Prefix queries use a range, never `LIKE`.** `LIKE` is case-insensitive by default, so SQLite cannot turn `module LIKE 'Prefix.%'` into an index range and scans all refs. `module >= 'Prefix.' AND module < 'Prefix/'` ('/' is '.'+1) uses `idx_refs_module_function` and turns that scan into a range search: on a 3.9M-row index, 11-14x faster with a warm page cache and ~190x faster cold.
+- **`idx_refs_function_kind` was retired.** No query leads with `function`; the two that filter on function/kind both lead with `file_path`. It cost 80 MB and a share of every index rebuild. Check `EXPLAIN QUERY PLAN` before adding an index here — index build time is ~40% of a cold index.
+
+The largest remaining win is interning `file_path`: every ref row stores a ~122-character absolute path, but there are only ~69k distinct paths, so the column and `idx_refs_file_path` together account for well over half the database.
+
 ## Key design decisions
 
 - **Tokenizer instead of tree-sitter for indexing** — a hand-rolled tokenizer + walker replaced the original regex-based parser for both file indexing and runtime `__using__` parsing. The tokenizer handles heredocs, sigils, multi-line expressions, and comments as opaque tokens, eliminating fragile line-joining heuristics. Tree-sitter is only used for scope-aware variable operations in files already opened by the editor.

@@ -2698,3 +2698,47 @@ end
 		t.Errorf("expected bare macro call ref for setup with comment before do")
 	}
 }
+
+// TestParseEmitsNoDuplicateRefs pins that a file never yields two identical ref
+// rows. Refs are line-granular, so N identical calls on one line — most often a
+// @spec repeating the same type, as in `String.t()` seven times — used to write
+// N identical rows. They are invisible to every query (nothing counts refs, and
+// the References handler dedupes by file+line) but they cost time in the
+// single-threaded SQLite writer, which is the indexing bottleneck.
+func TestParseEmitsNoDuplicateRefs(t *testing.T) {
+	src := `defmodule MyApp.Reports do
+  alias SharedLib.Details
+
+  @spec build(String.t(), String.t(), String.t(), String.t()) :: Details.t()
+  def build(a, b, c, d) do
+    {a, b, c, d}
+  end
+end
+`
+	_, refs, err := ParseText("lib/my_app/reports.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	seen := make(map[Reference]int)
+	for _, r := range refs {
+		seen[r]++
+	}
+	for r, n := range seen {
+		if n > 1 {
+			t.Errorf("duplicate ref emitted %d times: %+v", n, r)
+		}
+	}
+
+	// Dedupe must keep the distinct rows: the @spec still records that this file
+	// references String.t/0 on that line.
+	var found bool
+	for _, r := range refs {
+		if r.Module == "String" && r.Function == "t" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("dedupe dropped the String.t reference entirely")
+	}
+}
