@@ -3,7 +3,6 @@ package mcp
 import (
 	"context"
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 
@@ -21,12 +20,14 @@ func (h *Handler) fileOutlineHandler(ctx context.Context, req *mcp.CallToolReque
 		return nil, nil, fmt.Errorf("file must not be empty")
 	}
 	path := h.resolvePath(args.File)
-	if _, err := os.Stat(path); err != nil {
+	text, _, ok := h.lsp.ReadFileText(path)
+	if !ok {
 		return textResult(fmt.Sprintf("File not found: %s", h.relPath(path))), nil, nil
 	}
 
-	// Parse fresh from disk so the outline is correct even when the index is stale.
-	defs, _, err := parser.ParseFile(path)
+	// Parse fresh source so the outline is correct when either the index is
+	// stale or an attached editor has unsaved changes.
+	defs, _, err := parser.ParseText(path, text)
 	if err != nil {
 		return nil, nil, fmt.Errorf("parsing %s: %w", h.relPath(path), err)
 	}

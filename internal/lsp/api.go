@@ -31,7 +31,6 @@ func Serve(server *Server, in io.Reader, out io.Writer) error {
 	conn := jsonrpc2.NewConn(stream)
 	server.client = protocol.ClientDispatcher(conn, logger)
 	server.conn = conn
-	close(server.ready)
 
 	handler := server.renameHandler(protocol.ServerHandler(server, nil))
 	ctx := context.Background()
@@ -41,8 +40,9 @@ func Serve(server *Server, in io.Reader, out io.Writer) error {
 	return conn.Err()
 }
 
-// Ready is closed after Serve has installed the live LSP connection. Attached
-// services must wait for it before accepting requests that can apply edits.
+// Ready is closed after the LSP initialize request has been handled. Attached
+// services must wait for it before accepting requests so client capabilities,
+// stdlib discovery, and the live connection are all available.
 func (s *Server) Ready() <-chan struct{} {
 	return s.ready
 }

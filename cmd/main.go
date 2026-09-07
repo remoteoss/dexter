@@ -406,7 +406,14 @@ func cmdLSP(projectRoot string, mcpListen string) {
 	go func() {
 		serveErrCh <- dexter_lsp.Serve(server, os.Stdin, os.Stdout)
 	}()
-	<-server.Ready()
+	select {
+	case <-server.Ready():
+	case err := <-serveErrCh:
+		if err == nil {
+			err = fmt.Errorf("LSP connection closed before initialization")
+		}
+		fatal(err)
+	}
 
 	watcher, err := dexter_mcp.WatchFiles(server, s, projectRoot)
 	if err != nil {

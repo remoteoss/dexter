@@ -22,6 +22,7 @@ import (
 type testEnv struct {
 	t       *testing.T
 	store   *store.Store
+	lsp     *lsp.Server
 	root    string
 	session *mcp.ClientSession
 }
@@ -56,7 +57,7 @@ func setupTestEnv(t *testing.T) *testEnv {
 	}
 	t.Cleanup(func() { _ = session.Close() })
 
-	return &testEnv{t: t, store: s, root: root, session: session}
+	return &testEnv{t: t, store: s, lsp: server, root: root, session: session}
 }
 
 // indexFile writes an Elixir source file under the project root and indexes it.

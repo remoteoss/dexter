@@ -1,11 +1,15 @@
 package mcp
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"go.lsp.dev/protocol"
+	"go.lsp.dev/uri"
 )
 
 const accountsSource = `defmodule MyApp.Accounts do
@@ -219,6 +223,27 @@ end
 	)
 }
 
+func TestFileOutlineTool_UsesOpenBuffer(t *testing.T) {
+	e := setupProject(t)
+	path := filepath.Join(e.root, "lib/my_app/accounts.ex")
+	buffer := `defmodule MyApp.Accounts do
+  def unsaved_function, do: :ok
+end
+`
+	if err := e.lsp.DidOpen(context.Background(), &protocol.DidOpenTextDocumentParams{
+		TextDocument: protocol.TextDocumentItem{
+			URI:  protocol.DocumentURI(uri.File(path)),
+			Text: buffer,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	out := e.callTool("dexter_file_outline", map[string]any{"file": "lib/my_app/accounts.ex"})
+	wantContains(t, out, "def unsaved_function/0")
+	wantNotContains(t, out, "def fetch_user/1")
+}
+
 func TestImplementationsTool_Behaviour(t *testing.T) {
 	e := setupProject(t)
 	e.indexFile("lib/my_app/notifier.ex", `defmodule MyApp.Notifier do
@@ -270,6 +295,14 @@ end
 		"lib/my_app/size_impls.ex:1",
 		"lib/my_app/size_impls.ex:5",
 	)
+
+	out = e.callTool("dexter_implementations", map[string]any{"module": "MyApp.Size", "function": "size"})
+	wantContains(t, out,
+		"Implementations of protocol function MyApp.Size.size",
+		"lib/my_app/size_impls.ex:2",
+		"lib/my_app/size_impls.ex:6",
+	)
+	wantNotContains(t, out, "lib/my_app/size_impls.ex:1", "lib/my_app/size_impls.ex:5")
 }
 
 func TestCallHierarchyTool(t *testing.T) {

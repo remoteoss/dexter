@@ -56,6 +56,25 @@ func TestApplyTextEdits(t *testing.T) {
 	}
 }
 
+func TestReadyWaitsForInitialize(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	select {
+	case <-server.Ready():
+		t.Fatal("server reported ready before LSP initialization")
+	default:
+	}
+	if _, err := server.Initialize(context.Background(), &protocol.InitializeParams{}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-server.Ready():
+	default:
+		t.Fatal("server did not report ready after LSP initialization")
+	}
+}
+
 // Without a live client, a rename requested through the exported API must
 // land on disk even for files marked open (the defensive fallback path).
 func TestRenameFunction_WritesOpenBuffers(t *testing.T) {
@@ -210,6 +229,7 @@ func TestRenameModule_ForwardsFileMoveToClient(t *testing.T) {
 	defer cleanup()
 	fc := &fakeConn{}
 	server.conn = fc
+	server.renameFileOpsSupported = true
 
 	src := `defmodule MyApp.Accounts do
   def list_users, do: []
@@ -263,6 +283,42 @@ end
 	}
 	if summary.FilesMoved[oldPath] != newPath {
 		t.Errorf("summary reports moves %v, want %s → %s", summary.FilesMoved, oldPath, newPath)
+	}
+}
+
+func TestRenameModule_LeavesConventionalFileInPlaceWithoutClientMoveSupport(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+	fc := &fakeConn{}
+	server.conn = fc
+	server.renameFileOpsSupported = false
+
+	src := `defmodule MyApp.Accounts do
+  def list_users, do: []
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", src)
+	oldPath := filepath.Join(server.projectRoot, "lib/accounts.ex")
+	newPath := filepath.Join(server.projectRoot, "lib/auth.ex")
+
+	summary, err := server.RenameModule("MyApp.Accounts", "MyApp.Auth")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, change := range fc.applied.DocumentChanges {
+		if _, ok := change.(RenameFile); ok {
+			t.Fatal("applyEdit included a rename operation the client does not support")
+		}
+	}
+	if _, err := os.Stat(oldPath); err != nil {
+		t.Errorf("source file should remain at its old path: %v", err)
+	}
+	if _, err := os.Stat(newPath); !os.IsNotExist(err) {
+		t.Errorf("destination should not be created, stat error = %v", err)
+	}
+	if len(summary.FilesMoved) != 0 {
+		t.Errorf("summary reported unsupported moves: %v", summary.FilesMoved)
 	}
 }
 

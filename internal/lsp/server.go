@@ -112,7 +112,8 @@ type Server struct {
 	notifiedOTPMismatch sync.Once // prevents repeated OTP mismatch warnings
 
 	backgroundWork sync.WaitGroup // tracks background reindex goroutines so the store isn't closed while they're running
-	ready          chan struct{}  // closed once Serve has installed the LSP connection
+	ready          chan struct{}  // closed once the LSP initialize request has completed
+	readyOnce      sync.Once
 }
 
 func (s *Server) debugf(format string, args ...interface{}) {
@@ -686,6 +687,7 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 		},
 	}
 	s.debugf("Initialize: capabilities: %+v", result.Capabilities)
+	s.readyOnce.Do(func() { close(s.ready) })
 	return result, nil
 }
 
@@ -5059,7 +5061,12 @@ func (mr *moduleRename) moveConventionalFiles(fileCache map[string]moduleFileInf
 			continue
 		}
 		if deliverAll {
-			clientRenames[r.FilePath] = newPath
+			// Headless callers encode moves in the edit and deliverEdits applies
+			// them on disk. Attached callers can forward them only when the live
+			// editor supports rename resource operations.
+			if mr.server.conn == nil || mr.server.renameFileOpsSupported {
+				clientRenames[r.FilePath] = newPath
+			}
 			continue
 		}
 

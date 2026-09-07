@@ -10,7 +10,7 @@ import (
 
 type ImplementationsParams struct {
 	Module   string `json:"module" jsonschema:"behaviour or protocol module, fully qualified"`
-	Function string `json:"function,omitempty" jsonschema:"callback name; when set, locate its definition in each implementor"`
+	Function string `json:"function,omitempty" jsonschema:"callback or protocol function name; when set, locate its definition in each implementor"`
 }
 
 func (h *Handler) implementationsHandler(ctx context.Context, req *mcp.CallToolRequest, args ImplementationsParams) (*mcp.CallToolResult, any, error) {
@@ -39,6 +39,49 @@ func (h *Handler) implementationsHandler(ctx context.Context, req *mcp.CallToolR
 	if isProtocol {
 		var b strings.Builder
 		fmt.Fprintf(&b, "%s is a protocol (defprotocol at %s:%d).\n", module, h.relPath(modResults[decls[0]].FilePath), modResults[decls[0]].Line)
+		if function := strings.TrimSpace(args.Function); function != "" {
+			defs, err := h.store.LookupFunction(module, function)
+			if err != nil {
+				return nil, nil, fmt.Errorf("looking up protocol function: %w", err)
+			}
+
+			// Functions in defprotocol and defimpl blocks share the protocol's
+			// module name in the index. Attribute each definition to the nearest
+			// preceding declaration in its file so a declaration and one or more
+			// implementations can safely coexist in the same file.
+			scopeKind := func(filePath string, line int) string {
+				kind, scopeLine := "", -1
+				for _, r := range modResults {
+					if r.FilePath == filePath && r.Line <= line && r.Line > scopeLine {
+						kind, scopeLine = r.Kind, r.Line
+					}
+				}
+				return kind
+			}
+			arities := make(map[int]bool)
+			for _, d := range defs {
+				if scopeKind(d.FilePath, d.Line) == "defprotocol" {
+					arities[d.Arity] = true
+				}
+			}
+			if len(arities) == 0 {
+				return textResult(fmt.Sprintf("%s does not define a protocol function named %s. List its functions with dexter_module_api.", module, function)), nil, nil
+			}
+
+			fmt.Fprintf(&b, "\nImplementations of protocol function %s.%s:\n", module, function)
+			found := 0
+			for _, d := range defs {
+				if !arities[d.Arity] || scopeKind(d.FilePath, d.Line) != "defimpl" {
+					continue
+				}
+				fmt.Fprintf(&b, "  %s - %s:%d\n", symbolName(module, function, d.Arity), h.relPath(d.FilePath), d.Line)
+				found++
+			}
+			if found == 0 {
+				fmt.Fprintf(&b, "  (no indexed defimpl defines %s)\n", function)
+			}
+			return textResult(b.String()), nil, nil
+		}
 		if len(impls) == 0 {
 			fmt.Fprintf(&b, "No defimpl implementations found in the index.\n")
 			return textResult(b.String()), nil, nil
