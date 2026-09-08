@@ -464,7 +464,7 @@ Register it with your MCP client. For Claude Code:
 claude mcp add dexter -- dexter mcp
 ```
 
-Any client that speaks MCP over stdio works the same way: point it at `dexter mcp`. The server indexes the project on first use and keeps the index fresh by watching the project tree (fsnotify) and detecting git branch switches; a `dexter_reindex` tool forces an immediate update if a lookup ever seems stale. Attached LSP+MCP mode also watches the tree, so edits made directly by an agent are indexed even when they bypass editor notifications.
+Any client that speaks MCP over stdio works the same way: point it at `dexter mcp`. The server obtains its workspace from the client through MCP roots and resolves it the way the LSP does (an existing `.dexter` index first, then the `.git` repository root), so it binds the project the client is working in rather than the directory it was launched from; clients that provide no roots get the launch directory, and an explicit path argument (`dexter mcp <path>`) overrides negotiation entirely. In `--listen` mode each resolved root gets its own workspace, so sessions from different projects can share one server. The server indexes a workspace on first use and keeps the index fresh by watching the project tree (fsnotify) and detecting git branch switches; a `dexter_reindex` tool forces an immediate update if a lookup ever seems stale. Attached LSP+MCP mode also watches the tree, so edits made directly by an agent are indexed even when they bypass editor notifications.
 
 Useful variants:
 

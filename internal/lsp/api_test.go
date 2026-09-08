@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"go.lsp.dev/jsonrpc2"
 	"go.lsp.dev/protocol"
@@ -380,5 +381,33 @@ end
 	}
 	if summary.FilesMoved[oldPath] != newPath {
 		t.Errorf("summary reports moves %v, want %s → %s", summary.FilesMoved, oldPath, newPath)
+	}
+}
+
+// StopGitHeadWatch must end the watch goroutine so a HEAD change after it can
+// no longer trigger a reindex against a store the caller is about to close.
+func TestStopGitHeadWatch(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	headPath := filepath.Join(server.projectRoot, ".git", "HEAD")
+	if err := os.MkdirAll(filepath.Dir(headPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(headPath, []byte("ref: refs/heads/main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	server.WatchGitHead()
+	done := make(chan struct{})
+	go func() {
+		server.StopGitHeadWatch()
+		server.StopGitHeadWatch() // idempotent
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("StopGitHeadWatch did not return")
 	}
 }

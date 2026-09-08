@@ -114,6 +114,10 @@ type Server struct {
 	backgroundWork sync.WaitGroup // tracks background reindex goroutines so the store isn't closed while they're running
 	ready          chan struct{}  // closed once the LSP initialize request has completed
 	readyOnce      sync.Once
+
+	gitHeadStop     chan struct{} // closed by StopGitHeadWatch to end the WatchGitHead goroutine
+	gitHeadStopOnce sync.Once
+	gitHeadWG       sync.WaitGroup
 }
 
 func (s *Server) debugf(format string, args ...interface{}) {
@@ -141,6 +145,7 @@ func NewServer(s *store.Store, projectRoot string) *Server {
 		usingCache:         make(map[string]*usingCacheEntry),
 		depsCache:          make(map[string]bool),
 		ready:              make(chan struct{}),
+		gitHeadStop:        make(chan struct{}),
 	}
 }
 
@@ -485,7 +490,9 @@ func (s *Server) reindexWorkspace() (int, time.Duration) {
 
 // WatchGitHead polls .git/HEAD mtime and triggers reindex on branch switches.
 func (s *Server) WatchGitHead() {
+	s.gitHeadWG.Add(1)
 	go func() {
+		defer s.gitHeadWG.Done()
 		headPath := filepath.Join(s.projectRoot, ".git", "HEAD")
 		var lastMtime int64
 
@@ -498,7 +505,12 @@ func (s *Server) WatchGitHead() {
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
 
-		for range ticker.C {
+		for {
+			select {
+			case <-s.gitHeadStop:
+				return
+			case <-ticker.C:
+			}
 			info, err := os.Stat(headPath)
 			if err != nil {
 				continue

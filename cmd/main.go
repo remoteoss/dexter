@@ -135,7 +135,7 @@ func main() {
 			if err != nil {
 				return err
 			}
-			cmdMCP(projectRoot, mcpListen)
+			cmdMCP(projectRoot, mcpListen, len(args) > 0)
 			return nil
 		},
 	}
@@ -490,43 +490,53 @@ func openStoreForServer(projectRoot string) *store.Store {
 }
 
 // cmdMCP starts the headless MCP server. Logs go to stderr; stdout belongs to
-// the MCP stdio transport.
-func cmdMCP(projectRoot string, listen string) {
+// the MCP stdio transport. With an explicit path the workspace is fixed and
+// indexed before serving; without one, each session's workspace root is
+// negotiated through MCP roots, with projectRoot (the launch directory) as
+// the fallback for clients that provide none.
+func cmdMCP(projectRoot string, listen string, explicitRoot bool) {
 	projectRoot = findProjectRoot(projectRoot)
-
 	log.SetOutput(os.Stderr)
-	s := openStoreForServer(projectRoot)
-	defer func() {
-		if err := s.Close(); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to close store: %v\n", err)
-		}
-	}()
 
-	server := dexter_lsp.NewServer(s, projectRoot)
-	if root, ok := stdlib.Resolve(s, "", projectRoot); ok {
-		server.SetStdlibRoot(root)
-	}
-
-	// Serve only once the index reflects the current tree: an empty index is
-	// built from scratch, an existing one gets a fast incremental update.
-	server.ReindexWorkspace()
-	server.WatchGitHead()
-
-	// Headless servers get no editor events, so watch the tree directly.
-	watcher, err := dexter_mcp.WatchFiles(server, s, projectRoot)
-	if err != nil {
-		log.Printf("Warning: file watching unavailable (%v); the index updates on branch switches and via dexter_reindex", err)
-	} else {
+	var h *dexter_mcp.Handler
+	if explicitRoot {
+		s := openStoreForServer(projectRoot)
 		defer func() {
-			if err := watcher.Close(); err != nil {
-				log.Printf("Warning: closing file watcher: %v", err)
+			if err := s.Close(); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to close store: %v\n", err)
 			}
 		}()
+
+		server := dexter_lsp.NewServer(s, projectRoot)
+		if root, ok := stdlib.Resolve(s, "", projectRoot); ok {
+			server.SetStdlibRoot(root)
+		}
+
+		// Serve only once the index reflects the current tree: an empty index
+		// is built from scratch, an existing one gets a fast incremental
+		// update.
+		server.ReindexWorkspace()
+		server.WatchGitHead()
+
+		// Headless servers get no editor events, so watch the tree directly.
+		watcher, err := dexter_mcp.WatchFiles(server, s, projectRoot)
+		if err != nil {
+			log.Printf("Warning: file watching unavailable (%v); the index updates on branch switches and via dexter_reindex", err)
+		} else {
+			defer func() {
+				if err := watcher.Close(); err != nil {
+					log.Printf("Warning: closing file watcher: %v", err)
+				}
+			}()
+		}
+
+		h = dexter_mcp.NewHandler(dexter_mcp.Config{LSP: server, Store: s, ProjectRoot: projectRoot})
+		log.Printf("Dexter MCP v%s starting (root: %s)", version.Version, projectRoot)
+	} else {
+		h = dexter_mcp.NewHandler(dexter_mcp.Config{ProjectRoot: projectRoot, NegotiateRoots: true})
+		defer h.Close()
+		log.Printf("Dexter MCP v%s starting (workspace roots negotiated per session; fallback root: %s)", version.Version, projectRoot)
 	}
-
-	h := dexter_mcp.NewHandler(dexter_mcp.Config{LSP: server, Store: s, ProjectRoot: projectRoot})
-
-	log.Printf("Dexter MCP v%s starting (root: %s)", version.Version, projectRoot)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

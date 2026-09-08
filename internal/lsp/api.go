@@ -125,6 +125,15 @@ func (s *Server) CollectReferences(module, function string) []store.ReferenceRes
 	return out
 }
 
+// StopGitHeadWatch ends the WatchGitHead goroutine and waits for it, joining
+// any reindex it is mid-way through, so the store can be closed safely. The
+// MCP server calls it when tearing down a workspace; an LSP session never
+// does, its git-head watch runs for the life of the process.
+func (s *Server) StopGitHeadWatch() {
+	s.gitHeadStopOnce.Do(func() { close(s.gitHeadStop) })
+	s.gitHeadWG.Wait()
+}
+
 // WithReindexLock runs fn while holding the reindex lock, serializing it with
 // ReindexWorkspace and the background reindexes. The MCP file watcher wraps
 // its index writes in it so they cannot interleave with a concurrent
