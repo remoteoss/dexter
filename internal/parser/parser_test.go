@@ -2005,10 +2005,11 @@ end
 		t.Fatal(err)
 	}
 
-	// Module refs in the callback type annotation should be extracted as call refs.
+	// Module refs in the callback type annotation should still be extracted.
+	// They are recorded under the "typespec" kind: they name types, not calls.
 	refModules := map[string]bool{}
 	for _, r := range refs {
-		if r.Kind == "call" {
+		if r.Kind == "typespec" {
 			refModules[r.Module+"."+r.Function] = true
 		}
 	}
@@ -2844,5 +2845,86 @@ func TestWalkAndCollectAgreeOnSymlinkedRoot(t *testing.T) {
 		if collected != 2 || walked != 2 {
 			t.Errorf("root %s: Collect=%d Walk=%d, want 2 and 2", root, collected, walked)
 		}
+	}
+}
+
+// TestParse_AliasOverExistingAlias covers alias chaining on alias lines:
+// `alias SharedLib.Accounts` then `alias Accounts.Users` must record the
+// canonical SharedLib.Accounts.Users, not the literal "Accounts.Users".
+func TestParse_AliasOverExistingAlias(t *testing.T) {
+	src := `defmodule MyApp.Web do
+  alias SharedLib.Accounts
+  alias Accounts.Users
+  alias Accounts.Sessions, as: S
+  alias Accounts.{Tokens, Roles}
+
+  def bar do
+    Users.list()
+    S.current()
+    Tokens.mint()
+    Roles.all()
+  end
+end`
+	_, refs, err := ParseText("lib/web.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := make(map[string]bool)
+	for _, r := range refs {
+		seen[r.Module] = true
+	}
+	for _, want := range []string{
+		"SharedLib.Accounts.Users",
+		"SharedLib.Accounts.Sessions",
+		"SharedLib.Accounts.Tokens",
+		"SharedLib.Accounts.Roles",
+	} {
+		if !seen[want] {
+			t.Errorf("expected a reference to %s; got %v", want, seen)
+		}
+	}
+	if seen["Accounts.Users"] || seen["Accounts.Sessions"] {
+		t.Errorf("unresolved chained alias leaked into refs: %v", seen)
+	}
+}
+
+// TestParse_TypespecRefsGetOwnKind covers module references that appear inside
+// a typespec. `@spec put_meta(SharedLib.Schema.schema(), meta)` names the type
+// SharedLib.Schema.schema, not the macro of the same name, so it must not be
+// recorded as a call.
+func TestParse_TypespecRefsGetOwnKind(t *testing.T) {
+	src := `defmodule MyApp.Ecto do
+  @type meta :: map()
+
+  @spec put_meta(SharedLib.Schema.schema(), meta) :: SharedLib.Schema.schema()
+        when meta: [source: SharedLib.Schema.source()]
+  def put_meta(struct, opts), do: {struct, opts}
+
+  @callback build(SharedLib.Schema.schema()) :: :ok
+
+  @type wrapper :: SharedLib.Schema.schema()
+
+  def go, do: SharedLib.Schema.schema("users")
+end`
+	_, refs, err := ParseText("lib/ecto.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	kindByLine := make(map[int]string)
+	for _, r := range refs {
+		if r.Module == "SharedLib.Schema" {
+			kindByLine[r.Line] = r.Kind
+		}
+	}
+
+	for _, line := range []int{4, 5, 8, 10} {
+		if kindByLine[line] != "typespec" {
+			t.Errorf("line %d: got kind %q, want typespec", line, kindByLine[line])
+		}
+	}
+	// The real call on line 12 stays a call.
+	if kindByLine[12] != "call" {
+		t.Errorf("line 12: got kind %q, want call", kindByLine[12])
 	}
 }

@@ -914,9 +914,14 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 			return nil, nil
 		}
 
-		// Current module — return buffer location directly (works before indexing)
+		// Current module — return buffer location directly (works before indexing).
+		// In a typespec the bare name is the type, everywhere else the function.
 		if fullModule == currentModule {
-			if line, found := tf.FindFunctionDefinition(functionName); found {
+			find := tf.FindFunctionDefinition
+			if tf.InTypespec(lineNum) {
+				find = tf.FindTypeDefinition
+			}
+			if line, found := find(functionName); found {
 				return []protocol.Location{{
 					URI:   params.TextDocument.URI,
 					Range: lineRange(line - 1),
@@ -934,20 +939,26 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		}
 		if err == nil && len(results) > 0 {
 			s.debugf("Definition: found %d result(s) in store for %s.%s", len(results), fullModule, functionName)
-			return storeResultsToLocations(filterOutTypes(results)), nil
+			hits := byKindForContext(tf, lineNum, results)
+			// An imported call (e.g. `field` from `use Ecto.Schema`) reaches
+			// only the public definitions of the module it came from.
+			if fullModule != extractEnclosingModuleFromTokens(tf.source, tf.tokens, lineNum) {
+				hits = filterOutPrivate(hits)
+			}
+			return storeResultsToLocations(hits), nil
 		}
 
 		// fullModule may not directly define the function — try its use chain
 		// (e.g. `import MyApp.Factory` where MyApp.Factory uses ExMachina).
 		if results := s.lookupThroughUseOf(fullModule, functionName); len(results) > 0 {
 			s.debugf("Definition: found %d result(s) via use chain of %s for %s", len(results), fullModule, functionName)
-			return storeResultsToLocations(filterOutTypes(results)), nil
+			return storeResultsToLocations(byKindForContext(tf, lineNum, results)), nil
 		}
 
 		// Fallback for use-chain inline defs (not stored as module definitions)
 		if results := s.lookupThroughUse(text, functionName, aliases); len(results) > 0 {
 			s.debugf("Definition: found %d result(s) via current file use chain for %s", len(results), functionName)
-			return storeResultsToLocations(filterOutTypes(results)), nil
+			return storeResultsToLocations(byKindForContext(tf, lineNum, results)), nil
 		}
 
 		s.debugf("Definition: no result found for bare function %q in module %q", functionName, fullModule)
@@ -969,7 +980,12 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		}
 		if err == nil && len(results) > 0 {
 			s.debugf("Definition: found %d result(s) in store for %s.%s", len(results), fullModule, functionName)
-			return storeResultsToLocations(filterOutTypes(results)), nil
+			hits := byKindForContext(tf, lineNum, results)
+			// A remote call reaches only the public definitions of the target.
+			if fullModule != extractEnclosingModuleFromTokens(tf.source, tf.tokens, lineNum) {
+				hits = filterOutPrivate(hits)
+			}
+			return storeResultsToLocations(hits), nil
 		}
 		// Not directly defined — the function may have been injected by a
 		// `use` macro in fullModule's source (e.g. Oban.Worker injects `new`).
@@ -1010,6 +1026,58 @@ func storeResultsToLocations(results []store.LookupResult) []protocol.Location {
 }
 
 var typeKinds = map[string]bool{"type": true, "typep": true, "opaque": true}
+
+// privateKinds are definitions that only the defining module can call.
+var privateKinds = map[string]bool{"defp": true, "defmacrop": true, "defguardp": true}
+
+// filterOutPrivate drops private definitions from a lookup whose call site is
+// outside the defining module. A module can export a public def and keep a
+// private helper of the same name — Ecto.Schema does exactly this with
+// `defmacro field/3` and `defp field/4` — and only the public one is reachable
+// from a remote or imported call.
+//
+// If every result is private the results are returned unchanged: the call does
+// not compile in Elixir, but a jump to the private helper is a better answer
+// than none. Callers must apply this only when the call site's enclosing module
+// differs from the module that was looked up.
+func filterOutPrivate(results []store.LookupResult) []store.LookupResult {
+	var public []store.LookupResult
+	for _, r := range results {
+		if !privateKinds[r.Kind] {
+			public = append(public, r)
+		}
+	}
+	if len(public) > 0 {
+		return public
+	}
+	return results
+}
+
+// byKindForContext picks the definitions that match how the name is written:
+// types inside a typespec, everything else outside one.
+func byKindForContext(tf *TokenizedFile, lineNum int, results []store.LookupResult) []store.LookupResult {
+	if tf.InTypespec(lineNum) {
+		return filterToTypes(results)
+	}
+	return filterOutTypes(results)
+}
+
+// filterToTypes is the mirror of filterOutTypes, for a name written inside a
+// typespec: there `Mod.schema()` names the type, so the type definitions are
+// the answer and a function of the same name is not. Results are returned
+// unchanged when the module declares no such type.
+func filterToTypes(results []store.LookupResult) []store.LookupResult {
+	var types []store.LookupResult
+	for _, r := range results {
+		if typeKinds[r.Kind] {
+			types = append(types, r)
+		}
+	}
+	if len(types) > 0 {
+		return types
+	}
+	return results
+}
 
 func filterOutTypes(results []store.LookupResult) []store.LookupResult {
 	var nonTypes []store.LookupResult
@@ -3938,9 +4006,14 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 		fullModule := s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, tf, lineNum, functionName, aliases)
 
 		if fullModule != "" {
-			// Current module — hover from the buffer directly
+			// Current module — hover from the buffer directly. In a typespec the
+			// bare name is the type, everywhere else the function.
 			if fullModule == currentModule {
-				if line, found := tf.FindFunctionDefinition(functionName); found {
+				find := tf.FindFunctionDefinition
+				if tf.InTypespec(lineNum) {
+					find = tf.FindTypeDefinition
+				}
+				if line, found := find(functionName); found {
 					return s.hoverFromBuffer(tf, text, line-1)
 				}
 			}
@@ -3954,7 +4027,8 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 				results, err = s.store.LookupFunction(fullModule, functionName)
 			}
 			if err == nil && len(results) > 0 {
-				return s.hoverFromFile(functionName, results[0])
+				hits := byKindForContext(tf, lineNum, results)
+				return s.hoverFromFile(functionName, hits[0])
 			}
 		}
 
@@ -3983,7 +4057,8 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 			results, err = s.store.LookupFunction(fullModule, functionName)
 		}
 		if err == nil && len(results) > 0 {
-			return s.hoverFromFile(functionName, results[0])
+			hits := byKindForContext(tf, lineNum, results)
+			return s.hoverFromFile(functionName, hits[0])
 		}
 	}
 
@@ -4277,6 +4352,10 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 	s.debugf("References: expr=%q module=%q function=%q", expr, moduleRef, functionName)
 
 	var fullModule string
+	// Same-file occurrences of a name written in a typespec — see the note
+	// below. They carry the bare type uses (`@type t :: schema | embedded`)
+	// that the call-shaped scan cannot see.
+	var typespecOccurrences []protocol.Location
 
 	if moduleRef == "" {
 		if functionName == "" {
@@ -4289,6 +4368,15 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 		// function with the same name, so variable references take priority.
 		// Bare identifiers that aren't defined as variables fall through to
 		// function reference lookup.
+		//
+		// A name in a typespec is the exception: `@type schema` and a later
+		// `@type t :: schema | embedded` look like a variable and its use, and
+		// answering with those two lines alone would hide the real references
+		// to the type. There the occurrences are merged with the type's
+		// references instead of replacing them — they are the only way to find
+		// a bare type use in the same file, and they are the whole answer for
+		// a type parameter (the `t` in `@type wrapper(t) :: t`), which has no
+		// definition to look up.
 		if tree, src, release, ok := s.docs.GetTree(docURI); ok {
 			defer release()
 			if occs := treesitter.FindVariableOccurrencesWithTree(tree.RootNode(), src, uint(lineNum), uint(col)); len(occs) > 0 {
@@ -4302,8 +4390,11 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 						},
 					})
 				}
-				s.debugf("References: returning %d variable occurrences", len(locations))
-				return locations, nil
+				if !tf.InTypespec(lineNum) {
+					s.debugf("References: returning %d variable occurrences", len(locations))
+					return locations, nil
+				}
+				typespecOccurrences = locations
 			}
 		}
 
@@ -4312,6 +4403,10 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 		s.debugf("References: resolved bare %q -> %q", functionName, fullModule)
 		if fullModule == "" {
 			s.debugf("References: could not resolve bare function %q", functionName)
+			if typespecOccurrences != nil {
+				s.debugf("References: returning %d typespec occurrences", len(typespecOccurrences))
+				return typespecOccurrences, nil
+			}
 			return nil, nil
 		}
 	} else {
@@ -4423,6 +4518,26 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 		}
 	}
 
+	// A name written in a typespec refers to a type, and the same name written
+	// anywhere else refers to a function, even where a module declares both —
+	// `Ecto.Schema` has `@type schema` and `defmacro schema/2`. Keep whichever
+	// kind the cursor is asking about. Module-level lookups (no function name)
+	// are left alone: alias/import/use sites are references to the module
+	// whatever line they sit on.
+	if functionName != "" {
+		wantTypespec := tf.InTypespec(lineNum)
+		kept := refResults[:0]
+		for _, r := range refResults {
+			if (r.Kind == "typespec") == wantTypespec {
+				kept = append(kept, r)
+			}
+		}
+		if s.debug {
+			s.debugf("References: typespec filter (want=%v): %d of %d kept", wantTypespec, len(kept), len(refResults))
+		}
+		refResults = kept
+	}
+
 	// Deduplicate by file+line (multiple injector modules may attribute the same call)
 	type refKey struct {
 		filePath string
@@ -4432,6 +4547,20 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 
 	// Filter out stdlib paths
 	var locations []protocol.Location
+
+	// Bare uses of a type in the file being edited, which no indexed ref and
+	// no call-shaped scan can report.
+	if typespecOccurrences != nil {
+		docPath := uriToPath(protocol.DocumentURI(docURI))
+		for _, l := range typespecOccurrences {
+			line := int(l.Range.Start.Line)
+			if line == lineNum && !params.Context.IncludeDeclaration {
+				continue
+			}
+			seen[refKey{docPath, line + 1}] = struct{}{}
+			locations = append(locations, l)
+		}
+	}
 	for _, r := range refResults {
 		if s.stdlibRoot != "" && strings.HasPrefix(r.FilePath, s.stdlibRoot) {
 			continue
@@ -5639,16 +5768,30 @@ func (s *Server) findBareCallRefs(module, functionName string) []store.Reference
 		if !ok {
 			continue
 		}
-		for _, lineNum := range FindBareFunctionCalls(fileText, functionName) {
+		hits := FindBareFunctionCalls(fileText, functionName)
+		if len(hits) == 0 {
+			continue
+		}
+		// A bare name inside a typespec names the type, not the function, so
+		// it is recorded under its own kind — the same split the indexed refs
+		// use. Tokenizing costs a pass over the file, so it happens only when
+		// the cheap text scan has already found something.
+		tf := NewTokenizedFile(fileText)
+		for _, lineNum := range hits {
+			kind := "call"
+			if tf.InTypespec(lineNum - 1) {
+				kind = "typespec"
+			}
 			refs = append(refs, store.ReferenceResult{
 				FilePath: filePath,
 				Line:     lineNum,
-				Kind:     "call",
+				Kind:     kind,
 			})
 		}
 	}
 	return refs
 }
+
 func (s *Server) SignatureHelp(ctx context.Context, params *protocol.SignatureHelpParams) (*protocol.SignatureHelp, error) {
 	docURI := string(params.TextDocument.URI)
 	text, ok := s.docs.GetOrLoad(docURI)

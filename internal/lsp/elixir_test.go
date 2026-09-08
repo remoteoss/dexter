@@ -1909,6 +1909,47 @@ end`
 		}
 	})
 
+	t.Run("require with as:", func(t *testing.T) {
+		// Regression: `require Mod, as: Name` inside a __using__ quote block
+		// injects the alias into every module that uses it, exactly like
+		// `alias Mod, as: Name` does.
+		text := `defmodule MyApp.Schema do
+  defmacro __using__(_opts) do
+    quote do
+      require MyApp.Accounts.Macros, as: Macros
+    end
+  end
+end`
+		_, _, _, _, aliases := parseUsingBody(text)
+		if aliases == nil {
+			t.Fatal("expected aliases, got nil")
+		}
+		if aliases["Macros"] != "MyApp.Accounts.Macros" {
+			t.Errorf("Macros: got %q, want MyApp.Accounts.Macros", aliases["Macros"])
+		}
+	})
+
+	t.Run("require with as: in delegated using_block", func(t *testing.T) {
+		// Same, but through the CaseTemplate `using_block` helper path.
+		text := `defmodule MyApp.ConnCase do
+  use ExUnit.CaseTemplate
+
+  def using_block(_opts) do
+    quote do
+      require MyApp.Accounts.Macros, as: Macros
+    end
+  end
+
+  using opts do
+    using_block(opts)
+  end
+end`
+		_, _, _, _, aliases := parseUsingBody(text)
+		if aliases["Macros"] != "MyApp.Accounts.Macros" {
+			t.Errorf("Macros: got %q, want MyApp.Accounts.Macros", aliases["Macros"])
+		}
+	})
+
 	t.Run("multi alias", func(t *testing.T) {
 		text := `defmodule MyApp.Schema do
   defmacro __using__(_opts) do
@@ -3464,5 +3505,77 @@ func TestDepthTrackingConsistency(t *testing.T) {
 					w.Depth(), w.BlockDepth())
 			}
 		})
+	}
+}
+
+func TestExtractAliasesInScope_RequireAsOverExistingAlias(t *testing.T) {
+	// Regression: `require Query, as: Something` where Query is itself an
+	// alias must resolve Something to the canonical module, not to "Query".
+	text := `defmodule MyApp.Slides.Slide02 do
+  alias SharedLib.Query
+  require Query, as: Something
+
+  def active_users do
+    Something.from(user in "users")
+  end
+end`
+	aliases := ExtractAliasesInScope(text, 5)
+	if aliases["Something"] != "SharedLib.Query" {
+		t.Errorf("expected Something -> SharedLib.Query, got %q", aliases["Something"])
+	}
+}
+
+func TestExtractAliasesInScope_AliasOverExistingAlias(t *testing.T) {
+	// The same chain rule applies to `alias`: the module name on an alias
+	// line is itself resolved against the aliases already in scope.
+	text := `defmodule MyApp.Web do
+  alias SharedLib.Accounts
+  alias Accounts.Users, as: U
+  alias Accounts.Sessions
+
+  def bar, do: U.list()
+end`
+	aliases := ExtractAliasesInScope(text, 5)
+	if aliases["U"] != "SharedLib.Accounts.Users" {
+		t.Errorf("expected U -> SharedLib.Accounts.Users, got %q", aliases["U"])
+	}
+	if aliases["Sessions"] != "SharedLib.Accounts.Sessions" {
+		t.Errorf("expected Sessions -> SharedLib.Accounts.Sessions, got %q", aliases["Sessions"])
+	}
+}
+
+func TestExtractAliasesInScope_MultiAliasOverExistingAlias(t *testing.T) {
+	text := `defmodule MyApp.Web do
+  alias SharedLib.Accounts
+  alias Accounts.{Users, Sessions}
+
+  def bar, do: Users.list()
+end`
+	aliases := ExtractAliasesInScope(text, 4)
+	if aliases["Users"] != "SharedLib.Accounts.Users" {
+		t.Errorf("expected Users -> SharedLib.Accounts.Users, got %q", aliases["Users"])
+	}
+	if aliases["Sessions"] != "SharedLib.Accounts.Sessions" {
+		t.Errorf("expected Sessions -> SharedLib.Accounts.Sessions, got %q", aliases["Sessions"])
+	}
+}
+
+func TestExtractAliasesInScope_AliasChainDoesNotLeakAcrossNestedModule(t *testing.T) {
+	// Aliases of a nested module must not resolve chains in the parent scope
+	// after the nested module ends.
+	text := `defmodule MyApp.Outer do
+  alias SharedLib.Accounts
+
+  defmodule Inner do
+    alias SharedLib.Billing, as: Accounts
+  end
+
+  alias Accounts.Users, as: U
+
+  def bar, do: U.list()
+end`
+	aliases := ExtractAliasesInScope(text, 9)
+	if aliases["U"] != "SharedLib.Accounts.Users" {
+		t.Errorf("expected U -> SharedLib.Accounts.Users, got %q", aliases["U"])
 	}
 }

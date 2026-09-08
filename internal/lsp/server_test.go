@@ -6373,3 +6373,505 @@ end`)
 		t.Error("renamed open-buffer definition was not indexed")
 	}
 }
+
+// TestDefinition_ImportedCallSkipsPrivateNamesake mirrors Ecto.Schema, which
+// exports `defmacro field/3` and also keeps a private `defp field/4` helper.
+// A call injected by `use` reaches only the public macro, so go-to-definition
+// must not offer the private helper as a second target.
+func TestDefinition_ImportedCallSkipsPrivateNamesake(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	schemaSrc := `defmodule SharedLib.Schema do
+  defmacro __using__(_opts) do
+    quote do
+      import SharedLib.Schema, only: [field: 2, field: 3]
+    end
+  end
+
+  defmacro field(name, type, opts \\ []) do
+    quote do: {unquote(name), unquote(type), unquote(opts)}
+  end
+
+  defp field(mod, name, type, opts) do
+    {mod, name, type, opts}
+  end
+end
+`
+	callerSrc := `defmodule MyApp.User do
+  use SharedLib.Schema
+
+  schema "users" do
+    field :email, :string
+  end
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/schema.ex", schemaSrc)
+	indexFile(t, server.store, server.projectRoot, "lib/user.ex", callerSrc)
+	callerPath := filepath.Join(server.projectRoot, "lib", "user.ex")
+	callerURI := "file://" + callerPath
+	server.docs.Set(callerURI, callerSrc)
+
+	locs := definitionAt(t, server, callerURI, 4, 4)
+	if len(locs) != 1 {
+		t.Fatalf("expected exactly the public macro, got %d locations: %+v", len(locs), locs)
+	}
+	// line 7 (0-based) is `defmacro field(...)`; line 11 is `defp field(...)`
+	if locs[0].Range.Start.Line != 7 {
+		t.Errorf("expected the public defmacro on line 7, got line %d", locs[0].Range.Start.Line)
+	}
+}
+
+// TestDefinition_QualifiedCallSkipsPrivateNamesake covers the same rule for an
+// explicit remote call.
+func TestDefinition_QualifiedCallSkipsPrivateNamesake(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	schemaSrc := `defmodule SharedLib.Schema do
+  def build(name), do: name
+
+  defp build(mod, name), do: {mod, name}
+end
+`
+	callerSrc := `defmodule MyApp.User do
+  def go do
+    SharedLib.Schema.build(:email)
+  end
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/schema.ex", schemaSrc)
+	indexFile(t, server.store, server.projectRoot, "lib/user.ex", callerSrc)
+	callerPath := filepath.Join(server.projectRoot, "lib", "user.ex")
+	callerURI := "file://" + callerPath
+	server.docs.Set(callerURI, callerSrc)
+
+	locs := definitionAt(t, server, callerURI, 2, 21)
+	if len(locs) != 1 {
+		t.Fatalf("expected exactly the public def, got %d locations: %+v", len(locs), locs)
+	}
+	if locs[0].Range.Start.Line != 1 {
+		t.Errorf("expected the public def on line 1, got line %d", locs[0].Range.Start.Line)
+	}
+}
+
+// TestDefinition_SameModulePrivateStillResolves guards the fix: a bare call to
+// a module's own private helper must still jump to it.
+func TestDefinition_SameModulePrivateStillResolves(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	src := `defmodule MyApp.Worker do
+  def run do
+    normalize(:a)
+  end
+
+  defp normalize(value), do: value
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/worker.ex", src)
+	path := filepath.Join(server.projectRoot, "lib", "worker.ex")
+	uri := "file://" + path
+	server.docs.Set(uri, src)
+
+	locs := definitionAt(t, server, uri, 2, 4)
+	if len(locs) == 0 {
+		t.Fatal("expected the private helper to resolve from inside its own module")
+	}
+	if locs[0].Range.Start.Line != 5 {
+		t.Errorf("expected defp on line 5, got line %d", locs[0].Range.Start.Line)
+	}
+}
+
+// TestDefinition_PrivateOnlyRemoteStillResolves guards the fallback: when a
+// module has no public namesake, the private definition is still offered
+// rather than nothing.
+func TestDefinition_PrivateOnlyRemoteStillResolves(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	libSrc := `defmodule SharedLib.Secret do
+  defp hidden(value), do: value
+end
+`
+	callerSrc := `defmodule MyApp.User do
+  def go, do: SharedLib.Secret.hidden(:a)
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/secret.ex", libSrc)
+	indexFile(t, server.store, server.projectRoot, "lib/user.ex", callerSrc)
+	callerPath := filepath.Join(server.projectRoot, "lib", "user.ex")
+	callerURI := "file://" + callerPath
+	server.docs.Set(callerURI, callerSrc)
+
+	locs := definitionAt(t, server, callerURI, 1, 33)
+	if len(locs) == 0 {
+		t.Error("expected the private definition as a last-resort target")
+	}
+}
+
+// TestDefinition_InjectedPrivateHelperStillResolves guards the private filter:
+// a `defp` inside a `__using__` quote block becomes a private function of the
+// module that uses it, so a bare call must still find it.
+func TestDefinition_InjectedPrivateHelperStillResolves(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	libSrc := `defmodule SharedLib.Helpers do
+  defmacro __using__(_opts) do
+    quote do
+      defp normalize_value(value), do: value
+    end
+  end
+end
+`
+	callerSrc := `defmodule MyApp.Worker do
+  use SharedLib.Helpers
+
+  def run do
+    normalize_value(:a)
+  end
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/helpers.ex", libSrc)
+	indexFile(t, server.store, server.projectRoot, "lib/worker.ex", callerSrc)
+	callerPath := filepath.Join(server.projectRoot, "lib", "worker.ex")
+	callerURI := "file://" + callerPath
+	server.docs.Set(callerURI, callerSrc)
+
+	locs := definitionAt(t, server, callerURI, 4, 4)
+	if len(locs) == 0 {
+		t.Error("expected the injected private helper to still resolve")
+	}
+}
+
+// TestDefinition_PrivateInSecondModuleOfFile guards the enclosing-module check:
+// the filter must use the module enclosing the cursor, not the first module in
+// the file.
+func TestDefinition_PrivateInSecondModuleOfFile(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	src := `defmodule MyApp.First do
+  def normalize(value), do: value
+end
+
+defmodule MyApp.Second do
+  def run do
+    normalize(:a)
+  end
+
+  defp normalize(value), do: {:ok, value}
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/two.ex", src)
+	path := filepath.Join(server.projectRoot, "lib", "two.ex")
+	uri := "file://" + path
+	server.docs.Set(uri, src)
+
+	locs := definitionAt(t, server, uri, 6, 4)
+	if len(locs) == 0 {
+		t.Fatal("expected the private helper of the enclosing module to resolve")
+	}
+	if locs[0].Range.Start.Line != 9 {
+		t.Errorf("expected MyApp.Second's defp on line 9, got line %d", locs[0].Range.Start.Line)
+	}
+}
+
+// TestDefinition_BareCallPrefersFunctionOverType mirrors Ecto.Schema, which
+// declares `@type schema` above `defmacro schema/2` and `defp schema/4`. A bare
+// call names the function, so go-to-definition must not land on the type just
+// because it appears first in the file.
+func TestDefinition_BareCallPrefersFunctionOverType(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	src := `defmodule MyApp.Schema do
+  @type schema :: %{optional(atom) => any}
+
+  defmacro schema(source, do: block) do
+    schema(source, true, block)
+  end
+
+  defp schema(source, meta?, block), do: {source, meta?, block}
+end
+`
+	path := filepath.Join(server.projectRoot, "lib", "schema.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/schema.ex", src)
+	fileURI := "file://" + path
+	server.docs.Set(fileURI, src)
+
+	// line 4 is `    schema(source, true, block)` — col 4 is on the call
+	locs := definitionAt(t, server, fileURI, 4, 4)
+	if len(locs) == 0 {
+		t.Fatal("expected go-to-definition for the bare call schema/3")
+	}
+	if locs[0].Range.Start.Line == 1 {
+		t.Error("jumped to `@type schema` instead of the function definition")
+	}
+	if locs[0].Range.Start.Line != 3 && locs[0].Range.Start.Line != 7 {
+		t.Errorf("expected a function definition (line 3 or 7), got line %d", locs[0].Range.Start.Line)
+	}
+}
+
+// TestDefinition_BareTypeInSpecPrefersType is the other half of the rule: in a
+// typespec the same bare name refers to the type, even when a function of that
+// name also exists.
+func TestDefinition_BareTypeInSpecPrefersType(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	src := `defmodule MyApp.Order do
+  @type status :: :pending | :complete
+
+  @spec status(status()) :: status()
+  def status(value), do: value
+end
+`
+	path := filepath.Join(server.projectRoot, "lib", "order.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/order.ex", src)
+	fileURI := "file://" + path
+	server.docs.Set(fileURI, src)
+
+	// line 3 is the @spec; col 15 is on the `status()` argument type
+	locs := definitionAt(t, server, fileURI, 3, 15)
+	if len(locs) == 0 {
+		t.Fatal("expected go-to-definition for the bare type reference status()")
+	}
+	if locs[0].Range.Start.Line != 1 {
+		t.Errorf("expected @type status on line 1, got line %d", locs[0].Range.Start.Line)
+	}
+}
+
+// TestReferences_TypespecRefsSeparatedFromCalls covers a module that declares
+// both `@type schema` and `defmacro schema/2`, as Ecto.Schema does. A
+// `Mod.schema()` written in an `@spec` names the type, so it must not appear
+// among the references to the macro — and the references to the type must be
+// exactly those typespec sites.
+func TestReferences_TypespecRefsSeparatedFromCalls(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	libSrc := `defmodule SharedLib.Schema do
+  @type schema :: %{optional(atom) => any}
+
+  defmacro schema(source, do: block), do: {source, block}
+end
+`
+	callerSrc := `defmodule MyApp.Ecto do
+  @spec put_meta(SharedLib.Schema.schema(), map()) :: SharedLib.Schema.schema()
+  def put_meta(struct, opts), do: {struct, opts}
+
+  def go do
+    SharedLib.Schema.schema("users", do: nil)
+  end
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/schema.ex", libSrc)
+	indexFile(t, server.store, server.projectRoot, "lib/ecto.ex", callerSrc)
+	libPath := filepath.Join(server.projectRoot, "lib", "schema.ex")
+	callerPath := filepath.Join(server.projectRoot, "lib", "ecto.ex")
+	libURI := "file://" + libPath
+	server.docs.Set(libURI, libSrc)
+	server.docs.Set("file://"+callerPath, callerSrc)
+
+	callerLines := func(locs []protocol.Location) map[uint32]bool {
+		lines := make(map[uint32]bool)
+		for _, l := range locs {
+			if strings.Contains(string(l.URI), "ecto.ex") {
+				lines[l.Range.Start.Line] = true
+			}
+		}
+		return lines
+	}
+
+	// Cursor on `schema` in `defmacro schema(...)` — the macro.
+	macroRefs := callerLines(referencesAt(t, server, libURI, 3, 11))
+	if macroRefs[1] {
+		t.Error("the @spec type reference on line 1 must not be a reference to the macro")
+	}
+	if !macroRefs[5] {
+		t.Errorf("expected the real call on line 5 among the macro references, got %v", macroRefs)
+	}
+
+	// Cursor on `schema` in `@type schema :: ...` — the type.
+	typeRefs := callerLines(referencesAt(t, server, libURI, 1, 8))
+	if !typeRefs[1] {
+		t.Errorf("expected the @spec type reference on line 1, got %v", typeRefs)
+	}
+	if typeRefs[5] {
+		t.Error("the call on line 5 must not be a reference to the type")
+	}
+}
+
+// TestReferences_TypeNameNotShadowedByVariableScan covers a type whose name is
+// repeated in another typespec in the same file, as `Ecto.Schema` does with
+// `@type schema` and `@type t :: schema | embedded_schema`. The tree-sitter
+// variable scan claims those occurrences, which used to hide the real
+// cross-file references to the type.
+func TestReferences_TypeNameNotShadowedByVariableScan(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	libSrc := `defmodule SharedLib.Schema do
+  @type schema :: %{optional(atom) => any}
+  @type embedded :: %{optional(atom) => any}
+  @type t :: schema | embedded
+
+  defmacro schema(source, do: block), do: {source, block}
+end
+`
+	callerSrc := `defmodule MyApp.Ecto do
+  @spec put_meta(SharedLib.Schema.schema(), map()) :: SharedLib.Schema.schema()
+  def put_meta(struct, opts), do: {struct, opts}
+
+  def go, do: SharedLib.Schema.schema("users", do: nil)
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/schema.ex", libSrc)
+	indexFile(t, server.store, server.projectRoot, "lib/ecto.ex", callerSrc)
+	libURI := "file://" + filepath.Join(server.projectRoot, "lib", "schema.ex")
+	server.docs.Set(libURI, libSrc)
+	server.docs.Set("file://"+filepath.Join(server.projectRoot, "lib", "ecto.ex"), callerSrc)
+
+	// Cursor on `schema` in `@type schema :: ...`
+	locs := referencesAt(t, server, libURI, 1, 8)
+	foundSpec := false
+	for _, l := range locs {
+		if strings.Contains(string(l.URI), "ecto.ex") {
+			if l.Range.Start.Line == 1 {
+				foundSpec = true
+			}
+			if l.Range.Start.Line == 4 {
+				t.Error("the call on line 4 must not be a reference to the type")
+			}
+		}
+	}
+	if !foundSpec {
+		t.Errorf("expected the @spec type reference in ecto.ex, got %+v", locs)
+	}
+}
+
+// TestReferences_TypeParameterStillUsesVariableScan guards the change above: a
+// type parameter such as the `t` in `@type wrapper(t) :: t | nil` has no
+// definition to look up, so the variable occurrences remain the right answer.
+func TestReferences_TypeParameterStillUsesVariableScan(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	src := `defmodule MyApp.Types do
+  @type wrapper(t) :: t | nil
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/types.ex", src)
+	uri := "file://" + filepath.Join(server.projectRoot, "lib", "types.ex")
+	server.docs.Set(uri, src)
+
+	// Cursor on the `t` parameter in `@type wrapper(t)`
+	locs := referencesAt(t, server, uri, 1, 16)
+	if len(locs) == 0 {
+		t.Error("expected the type parameter occurrences from the variable scan")
+	}
+}
+
+// TestReferences_SameModuleTypeAndCall covers the bare names the file scan
+// finds inside a module: a type used in another typespec belongs to the type's
+// references, and a real call belongs to the function's. (An `@spec` head is
+// deliberately not a reference — FindBareFunctionCalls skips those lines.)
+func TestReferences_SameModuleTypeAndCall(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	src := `defmodule SharedLib.Schema do
+  @type schema :: %{optional(atom) => any}
+  @type embedded :: %{optional(atom) => any}
+  @type t :: schema | embedded
+
+  @spec schema(binary(), keyword()) :: schema()
+  def schema(source, opts), do: {source, opts}
+
+  def build(source), do: schema(source, [])
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/schema.ex", src)
+	uri := "file://" + filepath.Join(server.projectRoot, "lib", "schema.ex")
+	server.docs.Set(uri, src)
+
+	lineSet := func(locs []protocol.Location) map[uint32]bool {
+		out := make(map[uint32]bool)
+		for _, l := range locs {
+			out[l.Range.Start.Line] = true
+		}
+		return out
+	}
+
+	// Cursor on `schema` in `@type schema :: ...` — the type.
+	typeRefs := lineSet(referencesAt(t, server, uri, 1, 8))
+	if !typeRefs[3] {
+		t.Errorf("expected `@type t :: schema | embedded` on line 3 among the type references, got %v", typeRefs)
+	}
+
+	if typeRefs[8] {
+		t.Error("the call on line 8 must not be a reference to the type")
+	}
+
+	// Cursor on `schema` in `def schema(...)` — the function.
+	funcRefs := lineSet(referencesAt(t, server, uri, 6, 6))
+	if !funcRefs[8] {
+		t.Errorf("expected the call on line 8 among the function references, got %v", funcRefs)
+	}
+	if funcRefs[3] {
+		t.Error("`@type t :: schema | embedded` must not be a reference to the function")
+	}
+}
+
+// TestDefinition_QualifiedTypeInSpec covers a qualified name written in a
+// typespec: `@spec put_meta(SharedLib.Schema.schema(), ...)` names the type, so
+// definition and hover must describe `@type schema`, not the macro of the same
+// name. Outside the spec the same expression is the macro.
+func TestDefinition_QualifiedTypeInSpec(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	libSrc := `defmodule SharedLib.Schema do
+  @type schema :: %{optional(atom) => any}
+
+  defmacro schema(source, do: block), do: {source, block}
+end
+`
+	callerSrc := `defmodule MyApp.Ecto do
+  @spec put_meta(SharedLib.Schema.schema(), map()) :: map()
+  def put_meta(struct, opts), do: {struct, opts}
+
+  def go, do: SharedLib.Schema.schema("users", do: nil)
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/schema.ex", libSrc)
+	indexFile(t, server.store, server.projectRoot, "lib/ecto.ex", callerSrc)
+	callerURI := "file://" + filepath.Join(server.projectRoot, "lib", "ecto.ex")
+	server.docs.Set(callerURI, callerSrc)
+	server.docs.Set("file://"+filepath.Join(server.projectRoot, "lib", "schema.ex"), libSrc)
+
+	// line 1, col 35 is on `schema` in `SharedLib.Schema.schema()` in the @spec
+	specLocs := definitionAt(t, server, callerURI, 1, 35)
+	if len(specLocs) == 0 {
+		t.Fatal("expected go-to-definition for the type in the spec")
+	}
+	if specLocs[0].Range.Start.Line != 1 {
+		t.Errorf("expected `@type schema` on line 1, got line %d", specLocs[0].Range.Start.Line)
+	}
+
+	// line 4, col 31 is on `schema` in the real call
+	callLocs := definitionAt(t, server, callerURI, 4, 31)
+	if len(callLocs) == 0 {
+		t.Fatal("expected go-to-definition for the call")
+	}
+	if callLocs[0].Range.Start.Line != 3 {
+		t.Errorf("expected the macro on line 3, got line %d", callLocs[0].Range.Start.Line)
+	}
+
+	specHover := hoverAt(t, server, callerURI, 1, 35)
+	if specHover == nil || !strings.Contains(specHover.Contents.Value, "@type schema") {
+		t.Errorf("expected the type declaration on hover in a spec, got %+v", specHover)
+	}
+}

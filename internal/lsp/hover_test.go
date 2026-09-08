@@ -1248,3 +1248,48 @@ end`)
 	hover := hoverAt(t, server, uri, 1, 3)
 	_ = hover
 }
+
+// TestHover_BareNamePrefersFunctionOutsideTypespec covers a module that
+// declares a type and a function under one name, as Ecto.Schema does. Hover on
+// a call describes the function; hover inside a typespec describes the type.
+func TestHover_BareNamePrefersFunctionOutsideTypespec(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	src := `defmodule MyApp.Schema do
+  @type schema :: %{optional(atom) => any}
+
+  @doc "The public macro."
+  defmacro schema(source, do: block) do
+    schema(source, true, block)
+  end
+
+  @spec build(schema()) :: schema()
+  def build(value), do: value
+
+  defp schema(source, meta?, block), do: {source, meta?, block}
+end
+`
+	path := filepath.Join(server.projectRoot, "lib", "schema.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/schema.ex", src)
+	uri := "file://" + path
+	server.docs.Set(uri, src)
+
+	// line 5 is the bare call `schema(source, true, block)`
+	call := hoverAt(t, server, uri, 5, 4)
+	if call == nil {
+		t.Fatal("expected hover on the bare call")
+	}
+	if !strings.Contains(call.Contents.Value, "defmacro schema") {
+		t.Errorf("expected the macro signature on a call, got:\n%s", call.Contents.Value)
+	}
+
+	// line 8 is `@spec build(schema()) :: schema()` — col 14 is on the type
+	spec := hoverAt(t, server, uri, 8, 14)
+	if spec == nil {
+		t.Fatal("expected hover on the type reference in the spec")
+	}
+	if !strings.Contains(spec.Contents.Value, "@type schema") {
+		t.Errorf("expected the type declaration in a spec, got:\n%s", spec.Contents.Value)
+	}
+}
