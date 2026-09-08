@@ -47,13 +47,15 @@ type optBinding struct {
 // body, keyed by module name. Storing filePath avoids a LookupModule query on
 // cache hits; mtime invalidates the entry when the source file changes.
 type usingCacheEntry struct {
-	mtime       int64
-	filePath    string
-	imports     []string               // modules imported in __using__, source order
-	inlineDefs  map[string][]inlineDef // function name → inline defs in quote do block
-	transUses   []string               // modules used inside __using__ body (double-use chains)
-	optBindings []optBinding           // dynamic imports/uses resolved from opts
-	aliases     map[string]string      // alias short name → full module injected by __using__
+	mtime    int64
+	filePath string
+	usingBody
+
+	// dispatch holds one body per target of an atom-dispatch __using__, keyed by
+	// the atom the consumer passes (`use MyAppWeb, :controller` → "controller").
+	// Nil for ordinary __using__ macros. Selection happens at lookup time from
+	// the literal atom, so targets never merge.
+	dispatch map[string]*usingBody
 }
 
 type erlangBuildRootState struct {
@@ -1966,8 +1968,8 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 		aliases := tf.ExtractAliases()
 		s.mergeAliasesFromUseTokenized(tf, aliases)
 		visitedCompletion := make(map[string]bool)
-		for _, usedModule := range tf.ExtractUses() {
-			s.addCompletionsFromUsing(resolveModule(usedModule, aliases), funcPrefix, seen, &items, visitedCompletion, inPipe, s.snippetSupport)
+		for _, useCall := range tf.ExtractUsesWithOpts(aliases) {
+			s.addCompletionsFromUsingFor(useCall.Module, useCall.dispatchAtom(), useCall.Opts, funcPrefix, seen, &items, visitedCompletion, inPipe, s.snippetSupport)
 		}
 
 		// Variables in scope via tree-sitter
@@ -2049,7 +2051,7 @@ func (s *Server) cachedUsingWithPath(moduleName, knownPath string) *usingCacheEn
 			return entry
 		}
 		// File changed — re-parse using the cached path (no LookupModule needed)
-		if newEntry := s.parseUsingFile(entry.filePath); newEntry != nil {
+		if newEntry := s.parseUsingFile(entry.filePath, moduleName); newEntry != nil {
 			s.usingCacheMu.Lock()
 			s.usingCache[moduleName] = newEntry
 			s.usingCacheMu.Unlock()
@@ -2068,7 +2070,7 @@ func (s *Server) cachedUsingWithPath(moduleName, knownPath string) *usingCacheEn
 		filePath = modResults[0].FilePath
 	}
 	filePath = filepath.Clean(filePath)
-	newEntry := s.parseUsingFile(filePath)
+	newEntry := s.parseUsingFile(filePath, moduleName)
 	if newEntry == nil {
 		return nil
 	}
@@ -2078,7 +2080,7 @@ func (s *Server) cachedUsingWithPath(moduleName, knownPath string) *usingCacheEn
 	return newEntry
 }
 
-func (s *Server) parseUsingFile(filePath string) *usingCacheEntry {
+func (s *Server) parseUsingFile(filePath, moduleName string) *usingCacheEntry {
 	f, err := os.Open(filePath)
 	if err != nil {
 		return nil
@@ -2093,15 +2095,26 @@ func (s *Server) parseUsingFile(filePath string) *usingCacheEntry {
 	if err != nil {
 		return nil
 	}
-	imported, inlineDefs, transUses, optBindings, aliases := parseUsingBody(string(fileData))
+	text := string(fileData)
+	// The common one-module-per-file case avoids an extra tokenization.
+	if strings.Count(text, "defmodule") > 1 {
+		if scoped, ok := sourceForModule(text, moduleName); ok {
+			text = scoped
+		}
+	}
+	imported, inlineDefs, transUses, transCalls, optBindings, aliases := parseUsingBodyDetailed(text)
 	return &usingCacheEntry{
-		mtime:       info.ModTime().UnixNano(),
-		filePath:    filePath,
-		imports:     imported,
-		inlineDefs:  inlineDefs,
-		transUses:   transUses,
-		optBindings: optBindings,
-		aliases:     aliases,
+		mtime:    info.ModTime().UnixNano(),
+		filePath: filePath,
+		usingBody: usingBody{
+			imports:     imported,
+			inlineDefs:  inlineDefs,
+			transUses:   transUses,
+			transCalls:  transCalls,
+			optBindings: optBindings,
+			aliases:     aliases,
+		},
+		dispatch: parseDispatchBodies(text),
 	}
 }
 
@@ -2129,7 +2142,7 @@ func (s *Server) lookupThroughUse(text, functionName string, aliases map[string]
 	visited := make(map[string]bool)
 
 	for i := len(useCalls) - 1; i >= 0; i-- {
-		if result := s.lookupInUsingEntry(useCalls[i].Module, functionName, useCalls[i].Opts, visited); result != nil {
+		if result := s.lookupInUsingEntryFor(useCalls[i].Module, functionName, useCalls[i].dispatchAtom(), useCalls[i].Opts, visited); result != nil {
 			return result
 		}
 	}
@@ -2141,18 +2154,56 @@ func (s *Server) lookupThroughUse(text, functionName string, aliases map[string]
 // consumerOpts are the keyword args from the `use Module, key: Val` call and
 // are used to resolve dynamic imports like `import unquote(mod)`.
 func (s *Server) lookupInUsingEntry(moduleName, functionName string, consumerOpts map[string]string, visited map[string]bool) []store.LookupResult {
-	if visited[moduleName] {
+	return s.lookupInUsingEntryFor(moduleName, functionName, "", consumerOpts, visited)
+}
+
+// bodyFor picks the injected body for a `use` call. An ordinary __using__ has a
+// single body. An atom-dispatch entrypoint has one per target, selected by the
+// literal atom; an atom that names no target injects nothing, because guessing
+// a target would merge unrelated blocks.
+func (e *usingCacheEntry) bodyFor(which string) *usingBody {
+	if e.dispatch != nil && which != "" {
+		return e.dispatch[which]
+	}
+	return &e.usingBody
+}
+
+// bodies returns every body a module's __using__ can inject: the ordinary one
+// plus each atom-dispatch target. Used where the question is which modules
+// *could* inject a name, rather than which one a given `use` site selects.
+func (e *usingCacheEntry) bodies() []*usingBody {
+	out := make([]*usingBody, 0, 1+len(e.dispatch))
+	out = append(out, &e.usingBody)
+	for _, b := range e.dispatch {
+		out = append(out, b)
+	}
+	return out
+}
+
+func usingVisitKey(moduleName, which string) string {
+	return moduleName + "\x00" + which
+}
+
+// lookupInUsingEntryFor is lookupInUsingEntry with the dispatch atom from the
+// `use` site (empty for an ordinary `use Module`).
+func (s *Server) lookupInUsingEntryFor(moduleName, functionName, which string, consumerOpts map[string]string, visited map[string]bool) []store.LookupResult {
+	visitKey := usingVisitKey(moduleName, which)
+	if visited[visitKey] {
 		return nil
 	}
-	visited[moduleName] = true
+	visited[visitKey] = true
 
 	entry := s.cachedUsing(moduleName)
 	if entry == nil {
 		return nil
 	}
+	body := entry.bodyFor(which)
+	if body == nil {
+		return nil
+	}
 
 	// Inline defs take priority: directly injected by the quote do block
-	if defs, ok := entry.inlineDefs[functionName]; ok {
+	if defs, ok := body.inlineDefs[functionName]; ok {
 		var results []store.LookupResult
 		for _, d := range defs {
 			results = append(results, store.LookupResult{FilePath: entry.filePath, Line: d.line})
@@ -2161,13 +2212,13 @@ func (s *Server) lookupInUsingEntry(moduleName, functionName string, consumerOpt
 	}
 
 	// Static imports
-	for j := len(entry.imports) - 1; j >= 0; j-- {
+	for j := len(body.imports) - 1; j >= 0; j-- {
 		var results []store.LookupResult
 		var err error
 		if s.followDelegates {
-			results, err = s.store.LookupFollowDelegate(entry.imports[j], functionName)
+			results, err = s.store.LookupFollowDelegate(body.imports[j], functionName)
 		} else {
-			results, err = s.store.LookupFunction(entry.imports[j], functionName)
+			results, err = s.store.LookupFunction(body.imports[j], functionName)
 		}
 		if err != nil || len(results) == 0 {
 			continue
@@ -2176,7 +2227,7 @@ func (s *Server) lookupInUsingEntry(moduleName, functionName string, consumerOpt
 	}
 
 	// Dynamic imports/uses driven by opts (e.g. `import unquote(mod)`)
-	for _, b := range entry.optBindings {
+	for _, b := range body.optBindings {
 		mod := consumerOpts[b.optKey]
 		if mod == "" {
 			mod = b.defaultMod
@@ -2204,8 +2255,17 @@ func (s *Server) lookupInUsingEntry(moduleName, functionName string, consumerOpt
 	}
 
 	// Transitive uses: use Module inside the __using__ body (double-use chains)
-	for k := len(entry.transUses) - 1; k >= 0; k-- {
-		if result := s.lookupInUsingEntry(entry.transUses[k], functionName, nil, visited); result != nil {
+	for k := len(body.transCalls) - 1; k >= 0; k-- {
+		call := body.transCalls[k]
+		if result := s.lookupInUsingEntryFor(call.Module, functionName, call.dispatchAtom(), call.Opts, visited); result != nil {
+			return result
+		}
+	}
+	for k := len(body.transUses) - 1; k >= 0; k-- {
+		if body.hasTransCall(body.transUses[k]) {
+			continue
+		}
+		if result := s.lookupInUsingEntry(body.transUses[k], functionName, nil, visited); result != nil {
 			return result
 		}
 	}
@@ -2217,23 +2277,40 @@ func (s *Server) lookupInUsingEntry(moduleName, functionName string, consumerOpt
 // resolveModuleViaUseChainWithOpts is like resolveModuleViaUseChain but uses
 // consumer-provided opts to resolve dynamic imports (e.g. `import unquote(mod)`).
 func (s *Server) resolveModuleViaUseChainWithOpts(moduleName, functionName string, consumerOpts map[string]string, visited map[string]bool) string {
-	if visited[moduleName] {
+	return s.resolveModuleViaUseChainFor(moduleName, functionName, "", consumerOpts, visited)
+}
+
+// resolveModuleViaUseChainFor is resolveModuleViaUseChainWithOpts with the
+// dispatch atom from the `use` site (empty for an ordinary `use Module`).
+func (s *Server) resolveModuleViaUseChainFor(moduleName, functionName, which string, consumerOpts map[string]string, visited map[string]bool) string {
+	visitKey := usingVisitKey(moduleName, which)
+	if visited[visitKey] {
 		return ""
 	}
-	visited[moduleName] = true
+	visited[visitKey] = true
 
 	entry := s.cachedUsing(moduleName)
 	if entry == nil {
 		return ""
 	}
+	body := entry.bodyFor(which)
+	if body == nil {
+		return ""
+	}
 
-	for j := len(entry.imports) - 1; j >= 0; j-- {
-		if results, err := s.store.LookupFunction(entry.imports[j], functionName); err == nil && len(results) > 0 {
-			return entry.imports[j]
+	// Functions defined directly in the quote do block belong to the module
+	// that injected them, not to any imported module.
+	if _, ok := body.inlineDefs[functionName]; ok {
+		return moduleName
+	}
+
+	for j := len(body.imports) - 1; j >= 0; j-- {
+		if results, err := s.store.LookupFunction(body.imports[j], functionName); err == nil && len(results) > 0 {
+			return body.imports[j]
 		}
 	}
 
-	for _, b := range entry.optBindings {
+	for _, b := range body.optBindings {
 		mod := consumerOpts[b.optKey]
 		if mod == "" {
 			mod = b.defaultMod
@@ -2253,8 +2330,17 @@ func (s *Server) resolveModuleViaUseChainWithOpts(moduleName, functionName strin
 		}
 	}
 
-	for k := len(entry.transUses) - 1; k >= 0; k-- {
-		if mod := s.resolveModuleViaUseChainWithOpts(entry.transUses[k], functionName, nil, visited); mod != "" {
+	for k := len(body.transCalls) - 1; k >= 0; k-- {
+		call := body.transCalls[k]
+		if mod := s.resolveModuleViaUseChainFor(call.Module, functionName, call.dispatchAtom(), call.Opts, visited); mod != "" {
+			return mod
+		}
+	}
+	for k := len(body.transUses) - 1; k >= 0; k-- {
+		if body.hasTransCall(body.transUses[k]) {
+			continue
+		}
+		if mod := s.resolveModuleViaUseChainWithOpts(body.transUses[k], functionName, nil, visited); mod != "" {
 			return mod
 		}
 	}
@@ -2311,10 +2397,17 @@ func (s *Server) findModulesWhoseUsingImports(targetModule string) []string {
 	seen := make(map[string]bool)
 	var directInjectors []string
 	for _, c := range entries {
-		for _, imp := range c.entry.imports {
-			if imp == targetModule {
-				directInjectors = append(directInjectors, c.module)
-				seen[c.module] = true
+		for _, body := range c.entry.bodies() {
+			found := false
+			for _, imp := range body.imports {
+				if imp == targetModule {
+					directInjectors = append(directInjectors, c.module)
+					seen[c.module] = true
+					found = true
+					break
+				}
+			}
+			if found {
 				break
 			}
 		}
@@ -2337,11 +2430,18 @@ func (s *Server) findModulesWhoseUsingImports(targetModule string) []string {
 			if seen[c.module] {
 				continue
 			}
-			for _, tu := range c.entry.transUses {
-				if tu == current {
-					seen[c.module] = true
-					allInjectors = append(allInjectors, c.module)
-					queue = append(queue, c.module)
+			for _, body := range c.entry.bodies() {
+				found := false
+				for _, tu := range body.transUses {
+					if tu == current {
+						seen[c.module] = true
+						allInjectors = append(allInjectors, c.module)
+						queue = append(queue, c.module)
+						found = true
+						break
+					}
+				}
+				if found {
 					break
 				}
 			}
@@ -2353,18 +2453,23 @@ func (s *Server) findModulesWhoseUsingImports(targetModule string) []string {
 
 // addCompletionsFromUsing adds completion items injected by a module's __using__
 // body — inline defs, imported functions, and transitive uses — into items.
-func (s *Server) addCompletionsFromUsing(moduleName, funcPrefix string, seen map[string]bool, items *[]protocol.CompletionItem, visited map[string]bool, inPipe bool, useSnippets bool) {
-	if visited[moduleName] {
+func (s *Server) addCompletionsFromUsingFor(moduleName, which string, consumerOpts map[string]string, funcPrefix string, seen map[string]bool, items *[]protocol.CompletionItem, visited map[string]bool, inPipe bool, useSnippets bool) {
+	visitKey := usingVisitKey(moduleName, which)
+	if visited[visitKey] {
 		return
 	}
-	visited[moduleName] = true
+	visited[visitKey] = true
 
 	entry := s.cachedUsing(moduleName)
 	if entry == nil {
 		return
 	}
+	body := entry.bodyFor(which)
+	if body == nil {
+		return
+	}
 
-	for funcName, defs := range entry.inlineDefs {
+	for funcName, defs := range body.inlineDefs {
 		if !strings.HasPrefix(funcName, funcPrefix) {
 			continue
 		}
@@ -2390,10 +2495,10 @@ func (s *Server) addCompletionsFromUsing(moduleName, funcPrefix string, seen map
 		}
 	}
 
-	for _, mod := range entry.imports {
+	addModule := func(mod string) {
 		results, err := s.store.ListModuleFunctions(mod, true)
 		if err != nil {
-			continue
+			return
 		}
 		for _, r := range results {
 			key := funcKey(r.Function, r.Arity)
@@ -2416,9 +2521,33 @@ func (s *Server) addCompletionsFromUsing(moduleName, funcPrefix string, seen map
 			}
 		}
 	}
+	for _, mod := range body.imports {
+		addModule(mod)
+	}
 
-	for _, transModule := range entry.transUses {
-		s.addCompletionsFromUsing(transModule, funcPrefix, seen, items, visited, inPipe, useSnippets)
+	for _, binding := range body.optBindings {
+		mod := consumerOpts[binding.optKey]
+		if mod == "" {
+			mod = binding.defaultMod
+		}
+		if mod == "" {
+			continue
+		}
+		switch binding.kind {
+		case "import":
+			addModule(mod)
+		case "use":
+			s.addCompletionsFromUsingFor(mod, "", nil, funcPrefix, seen, items, visited, inPipe, useSnippets)
+		}
+	}
+
+	for _, call := range body.transCalls {
+		s.addCompletionsFromUsingFor(call.Module, call.dispatchAtom(), call.Opts, funcPrefix, seen, items, visited, inPipe, useSnippets)
+	}
+	for _, transModule := range body.transUses {
+		if !body.hasTransCall(transModule) {
+			s.addCompletionsFromUsingFor(transModule, "", nil, funcPrefix, seen, items, visited, inPipe, useSnippets)
+		}
 	}
 }
 
@@ -2447,7 +2576,7 @@ func (s *Server) resolveBareFunctionModule(filePath, text string, tf *TokenizedF
 	// Use chains — use opts-aware resolution so `import unquote(mod)` patterns
 	// resolve to the consumer-provided module rather than always using the default.
 	for _, uc := range tf.ExtractUsesWithOpts(aliases) {
-		if mod := s.resolveModuleViaUseChainWithOpts(uc.Module, functionName, uc.Opts, map[string]bool{}); mod != "" {
+		if mod := s.resolveModuleViaUseChainFor(uc.Module, functionName, uc.dispatchAtom(), uc.Opts, map[string]bool{}); mod != "" {
 			return mod
 		}
 	}
@@ -2497,30 +2626,52 @@ func (s *Server) mergeAliasesFromUseTokenized(tf *TokenizedFile, aliases map[str
 func (s *Server) mergeAliasesFromUseCalls(useCalls []UseCall, aliases map[string]string) {
 	visited := make(map[string]bool)
 	for _, uc := range useCalls {
-		s.mergeAliasesFromUsingEntry(uc.Module, aliases, visited)
+		s.mergeAliasesFromUsingEntryFor(uc.Module, uc.dispatchAtom(), uc.Opts, aliases, visited)
 	}
 }
 
-func (s *Server) mergeAliasesFromUsingEntry(moduleName string, aliases map[string]string, visited map[string]bool) {
-	if visited[moduleName] {
+func (s *Server) mergeAliasesFromUsingEntryFor(moduleName, which string, consumerOpts map[string]string, aliases map[string]string, visited map[string]bool) {
+	visitKey := usingVisitKey(moduleName, which)
+	if visited[visitKey] {
 		return
 	}
-	visited[moduleName] = true
+	visited[visitKey] = true
 
 	entry := s.cachedUsing(moduleName)
 	if entry == nil {
 		return
 	}
+	body := entry.bodyFor(which)
+	if body == nil {
+		return
+	}
 
-	for short, full := range entry.aliases {
+	for short, full := range body.aliases {
 		if _, exists := aliases[short]; !exists {
 			aliases[short] = full
 		}
 	}
+	for _, binding := range body.optBindings {
+		if binding.kind != "use" {
+			continue
+		}
+		mod := consumerOpts[binding.optKey]
+		if mod == "" {
+			mod = binding.defaultMod
+		}
+		if mod != "" {
+			s.mergeAliasesFromUsingEntryFor(mod, "", nil, aliases, visited)
+		}
+	}
 
 	// Follow transitive uses
-	for _, transModule := range entry.transUses {
-		s.mergeAliasesFromUsingEntry(transModule, aliases, visited)
+	for _, call := range body.transCalls {
+		s.mergeAliasesFromUsingEntryFor(call.Module, call.dispatchAtom(), call.Opts, aliases, visited)
+	}
+	for _, transModule := range body.transUses {
+		if !body.hasTransCall(transModule) {
+			s.mergeAliasesFromUsingEntryFor(transModule, "", nil, aliases, visited)
+		}
 	}
 }
 
@@ -2938,21 +3089,21 @@ func extractImplAnnotation(lines []string, lineNum int) string {
 // definitions matching functionName/arity. This resolves dynamic `use unquote(mod)`
 // patterns where the concrete module appears as a keyword opt in the chain.
 func (s *Server) findCallbacksViaUseChain(text, functionName string, arity int, aliases map[string]string) []store.CallbackResult {
-	uses := ExtractUses(text)
+	uses := ExtractUsesWithOpts(text, aliases)
 	visited := make(map[string]bool)
 	var results []store.CallbackResult
-	for _, moduleName := range uses {
-		moduleName = resolveModule(moduleName, aliases)
-		s.collectCallbacksInChain(moduleName, functionName, arity, visited, &results)
+	for _, call := range uses {
+		s.collectCallbacksInChainFor(call.Module, call.dispatchAtom(), functionName, arity, visited, &results)
 	}
 	return results
 }
 
-func (s *Server) collectCallbacksInChain(moduleName, functionName string, arity int, visited map[string]bool, results *[]store.CallbackResult) {
-	if visited[moduleName] {
+func (s *Server) collectCallbacksInChainFor(moduleName, which, functionName string, arity int, visited map[string]bool, results *[]store.CallbackResult) {
+	visitKey := usingVisitKey(moduleName, which)
+	if visited[visitKey] {
 		return
 	}
-	visited[moduleName] = true
+	visited[visitKey] = true
 
 	if callbacks, err := s.store.LookupCallbackDef(moduleName, functionName); err == nil {
 		for _, cb := range callbacks {
@@ -2966,8 +3117,17 @@ func (s *Server) collectCallbacksInChain(moduleName, functionName string, arity 
 	if entry == nil {
 		return
 	}
-	for _, transModule := range entry.transUses {
-		s.collectCallbacksInChain(transModule, functionName, arity, visited, results)
+	body := entry.bodyFor(which)
+	if body == nil {
+		return
+	}
+	for _, call := range body.transCalls {
+		s.collectCallbacksInChainFor(call.Module, call.dispatchAtom(), functionName, arity, visited, results)
+	}
+	for _, transModule := range body.transUses {
+		if !body.hasTransCall(transModule) {
+			s.collectCallbacksInChainFor(transModule, "", functionName, arity, visited, results)
+		}
 	}
 }
 
@@ -4190,7 +4350,7 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 		useCalls := tf.ExtractUsesWithOpts(aliases)
 		visited := make(map[string]bool)
 		for _, uc := range useCalls {
-			if s.lookupInUsingEntry(uc.Module, functionName, uc.Opts, visited) != nil {
+			if s.lookupInUsingEntryFor(uc.Module, functionName, uc.dispatchAtom(), uc.Opts, visited) != nil {
 				injectors = append(injectors, uc.Module)
 				s.debugf("References: opt-binding injector for %s: %s", functionName, uc.Module)
 			}
