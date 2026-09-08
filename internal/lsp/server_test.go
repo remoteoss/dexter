@@ -6875,3 +6875,144 @@ end
 		t.Errorf("expected the type declaration on hover in a spec, got %+v", specHover)
 	}
 }
+
+// A module whose short name reaches call sites only through an alias injected
+// by a __using__ block. The files holding those calls declare no alias, so the
+// index has them under the bare short name.
+const injectedAliasFixture = `defmodule MyApp.Repo do
+  defmacro __using__(_) do
+    quote do
+      alias MyApp.Repo
+    end
+  end
+end
+`
+
+func TestReferences_ModuleViaUseInjectedAlias(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/repo.ex", injectedAliasFixture)
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/accounts.ex", `defmodule MyApp.Accounts do
+  use MyApp.Repo
+
+  def list_users do
+    Repo.all(User)
+  end
+end
+`)
+	// Same short name, no `use` — a different module entirely.
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/unrelated.ex", `defmodule MyApp.Unrelated do
+  def count do
+    Repo.aggregate(:count)
+  end
+end
+`)
+
+	repoPath := filepath.Join(server.projectRoot, "lib/my_app/repo.ex")
+	accountsPath := filepath.Join(server.projectRoot, "lib/my_app/accounts.ex")
+	unrelatedPath := filepath.Join(server.projectRoot, "lib/my_app/unrelated.ex")
+	repoURI := "file://" + repoPath
+	server.docs.Set(repoURI, injectedAliasFixture)
+
+	// Cursor on `MyApp.Repo` in the defmodule line.
+	locs := referencesAt(t, server, repoURI, 0, 16)
+
+	// A module lookup answers with the sites that name the module — here the
+	// `use` line — not with every call made through the injected alias.
+	found := make(map[string]bool)
+	for _, l := range locs {
+		found[uriToPath(l.URI)] = true
+	}
+	if !found[accountsPath] {
+		t.Errorf("expected the `use MyApp.Repo` site in accounts.ex, got %v", locs)
+	}
+	if found[unrelatedPath] {
+		t.Error("a bare Repo. in a file that does not use MyApp.Repo is a different module and should NOT be reported")
+	}
+}
+
+func TestReferences_FunctionViaUseInjectedAlias(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	repoContent := `defmodule MyApp.Repo do
+  defmacro __using__(_) do
+    quote do
+      alias MyApp.Repo
+    end
+  end
+
+  def all(queryable), do: queryable
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/repo.ex", repoContent)
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/accounts.ex", `defmodule MyApp.Accounts do
+  use MyApp.Repo
+
+  def list_users do
+    Repo.all(User)
+  end
+end
+`)
+
+	repoPath := filepath.Join(server.projectRoot, "lib/my_app/repo.ex")
+	accountsPath := filepath.Join(server.projectRoot, "lib/my_app/accounts.ex")
+	repoURI := "file://" + repoPath
+	server.docs.Set(repoURI, repoContent)
+
+	// Cursor on `all` in `def all(queryable)`.
+	locs := referencesAt(t, server, repoURI, 7, 6)
+
+	found := false
+	for _, l := range locs {
+		if uriToPath(l.URI) == accountsPath {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected the Repo.all/1 call in accounts.ex, got %v", locs)
+	}
+}
+
+// The alias travels one more step: a module `use`s the injector inside its own
+// __using__, so its own users get the alias too.
+func TestRenameModuleUpdatesTransitivelyInjectedAliasCallSites(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/repo.ex", injectedAliasFixture)
+	indexFile(t, server.store, server.projectRoot, "lib/my_app_web.ex", `defmodule MyAppWeb do
+  defmacro __using__(_) do
+    quote do
+      use MyApp.Repo
+    end
+  end
+end
+`)
+	indexFile(t, server.store, server.projectRoot, "lib/my_app_web/user_controller.ex", `defmodule MyAppWeb.UserController do
+  use MyAppWeb
+
+  def index(conn, _params) do
+    render(conn, users: Repo.all(User))
+  end
+end
+`)
+
+	repoPath := filepath.Join(server.projectRoot, "lib/my_app/repo.ex")
+	controllerPath := filepath.Join(server.projectRoot, "lib/my_app_web/user_controller.ex")
+	repoURI := "file://" + repoPath
+	server.docs.Set(repoURI, injectedAliasFixture)
+
+	if edit := renameAt(t, server, repoURI, 0, 16, "Database"); edit == nil {
+		t.Fatal("expected non-nil edit")
+	}
+
+	got, err := os.ReadFile(controllerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "Database.all(User)") {
+		t.Errorf("expected the transitively injected call site to be renamed, got:\n%s", got)
+	}
+}

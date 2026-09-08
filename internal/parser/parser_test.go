@@ -2928,3 +2928,73 @@ end`
 		t.Errorf("line 12: got kind %q, want call", kindByLine[12])
 	}
 }
+
+// A predicate name inside a string interpolation ends in `?`, which also opens
+// a char literal in Elixir (`?a`). Reading `#{dry_run?}` the second way
+// swallows the closing brace, and everything after it in the file — every
+// definition and every reference — was lost.
+func TestParseText_InterpolatedPredicateNameKeepsRestOfFile(t *testing.T) {
+	src := `defmodule MyApp.Migration do
+  alias MyApp.Repo
+
+  def run(dry_run?) do
+    IO.puts("Backfilling (DRY RUN: #{dry_run?})...")
+    Repo.all(MyApp.Site)
+  end
+
+  defp insert!(changeset) do
+    Repo.insert!(changeset)
+  end
+end
+`
+	defs, refs, err := ParseText("/tmp/migration.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var haveInsert bool
+	for _, d := range defs {
+		if d.Function == "insert!" {
+			haveInsert = true
+		}
+	}
+	if !haveInsert {
+		t.Errorf("expected insert!/1 to be indexed after the interpolation, got %+v", defs)
+	}
+
+	lines := make(map[int]bool)
+	for _, r := range refs {
+		if r.Module == "MyApp.Repo" || r.Module == "Repo" {
+			lines[r.Line] = true
+		}
+	}
+	for _, want := range []int{6, 10} {
+		if !lines[want] {
+			t.Errorf("expected a Repo reference on line %d, got %+v", want, refs)
+		}
+	}
+}
+
+// The char literal itself still tokenizes: `?a` in operand position is a
+// number, not the tail of an identifier.
+func TestParseText_CharLiteralInInterpolation(t *testing.T) {
+	src := `defmodule MyApp.Chars do
+  def pad(s), do: String.pad_leading(s, 2, "#{[?0]}")
+
+  def run, do: Repo.all(MyApp.Site)
+end
+`
+	_, refs, err := ParseText("/tmp/chars.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, r := range refs {
+		if r.Function == "all" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected the call after a char literal in an interpolation, got %+v", refs)
+	}
+}

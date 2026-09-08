@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -2407,6 +2408,84 @@ func (s *Server) resolveModuleViaUseChainFor(moduleName, functionName, which str
 	return ""
 }
 
+// usingEntryRef pairs a module with its parsed __using__ entry.
+type usingEntryRef struct {
+	module string
+	entry  *usingCacheEntry
+}
+
+// loadUsingEntries returns the parsed __using__ entry of every module that
+// defines one. Entries are loaded concurrently: each needs an os.Stat for
+// mtime validation (and a file read on a cache miss), so the wall-clock cost
+// is dominated by I/O rather than parsing.
+func (s *Server) loadUsingEntries() []usingEntryRef {
+	usingModules, err := s.store.LookupUsingModules()
+	if err != nil {
+		return nil
+	}
+
+	entries := make([]usingEntryRef, len(usingModules))
+	var wg sync.WaitGroup
+	for i, um := range usingModules {
+		wg.Add(1)
+		go func(i int, mod, path string) {
+			defer wg.Done()
+			// The file path from the index skips the per-module LookupModule
+			// query on a cache miss.
+			entry := s.cachedUsingWithPath(mod, path)
+			if entry != nil {
+				entries[i] = usingEntryRef{mod, entry}
+			}
+		}(i, um.Module, um.FilePath)
+	}
+	wg.Wait()
+
+	n := 0
+	for _, c := range entries {
+		if c.entry != nil {
+			entries[n] = c
+			n++
+		}
+	}
+	return entries[:n]
+}
+
+// closeOverUsingChain walks the use chain upward from direct: if B.__using__
+// uses one of the direct modules, and A.__using__ uses B, both join the set.
+// seen must already hold the direct modules.
+func closeOverUsingChain(entries []usingEntryRef, direct []string, seen map[string]bool) []string {
+	all := append([]string{}, direct...)
+	queue := append([]string{}, direct...)
+
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+
+		for _, c := range entries {
+			if seen[c.module] {
+				continue
+			}
+			for _, body := range c.entry.bodies() {
+				found := false
+				for _, tu := range body.transUses {
+					if tu == current {
+						seen[c.module] = true
+						all = append(all, c.module)
+						queue = append(queue, c.module)
+						found = true
+						break
+					}
+				}
+				if found {
+					break
+				}
+			}
+		}
+	}
+
+	return all
+}
+
 // findModulesWhoseUsingImports returns modules whose __using__ chain
 // (directly or transitively via use) imports targetModule. Follows the chain
 // upward: if C.__using__ imports targetModule, and B.__using__ uses C, and
@@ -2416,41 +2495,7 @@ func (s *Server) resolveModuleViaUseChainFor(moduleName, functionName, which str
 // modules like String), this iterates over the small set of modules that
 // define __using__ and checks their cached import/transUse lists.
 func (s *Server) findModulesWhoseUsingImports(targetModule string) []string {
-	usingModules, err := s.store.LookupUsingModules()
-	if err != nil {
-		return nil
-	}
-
-	// Load and validate __using__ entries concurrently, using file paths
-	// from the index to skip per-module LookupModule queries on cache miss.
-	// Parallelism helps because each entry requires an os.Stat call for
-	// mtime validation (and possibly a file read on cache miss).
-	type cached struct {
-		module string
-		entry  *usingCacheEntry
-	}
-	entries := make([]cached, len(usingModules))
-	var wg sync.WaitGroup
-	for i, um := range usingModules {
-		wg.Add(1)
-		go func(i int, mod, path string) {
-			defer wg.Done()
-			entry := s.cachedUsingWithPath(mod, path)
-			if entry != nil {
-				entries[i] = cached{mod, entry}
-			}
-		}(i, um.Module, um.FilePath)
-	}
-	wg.Wait()
-	// Compact out nil entries.
-	n := 0
-	for _, c := range entries {
-		if c.entry != nil {
-			entries[n] = c
-			n++
-		}
-	}
-	entries = entries[:n]
+	entries := s.loadUsingEntries()
 
 	// Step 1: Find modules whose __using__ directly imports targetModule.
 	seen := make(map[string]bool)
@@ -2478,36 +2523,287 @@ func (s *Server) findModulesWhoseUsingImports(targetModule string) []string {
 
 	// Step 2: Walk upward — find modules whose __using__ transitively uses
 	// any of the direct injectors (via transUses in __using__ bodies).
-	allInjectors := append([]string{}, directInjectors...)
-	queue := append([]string{}, directInjectors...)
+	return closeOverUsingChain(entries, directInjectors, seen)
+}
+
+// injectedAlias is an alias that a __using__ block puts in the scope of every
+// module that uses it. The call sites written through it carry only shortName,
+// and the file holding them has no alias line of its own, so the index has
+// them under that bare name.
+type injectedAlias struct {
+	shortName string   // name written at the call site — the last segment, or an `as:` name
+	module    string   // module it resolves to: the target, or one under it
+	injectors []string // modules whose `use` brings the alias in, transitively closed
+}
+
+// findInjectedAliasesFor returns the aliases that some module's __using__
+// block binds to targetModule or a module under it.
+//
+// The alias line inside a __using__ body is itself an indexed reference to the
+// target, so the injectors come out of targetRefs — the references the caller
+// already looked up. That keeps this off the cost of loadUsingEntries, which
+// stats every __using__ in the project; only the handful of modules that both
+// define a __using__ and mention the target get their body loaded.
+func (s *Server) findInjectedAliasesFor(targetModule string, targetRefs []store.ModuleReferenceResult) []injectedAlias {
+	usingByFile := s.usingModulesByFile()
+	if len(usingByFile) == 0 {
+		return nil
+	}
+
+	type aliasKey struct{ shortName, module string }
+	direct := make(map[aliasKey][]string)
+	checked := make(map[string]bool)
+	for _, r := range targetRefs {
+		if r.Kind != "alias" && r.Kind != "require" && r.Kind != "import" {
+			continue
+		}
+		for _, mod := range usingByFile[r.FilePath] {
+			if checked[mod] {
+				continue
+			}
+			checked[mod] = true
+			entry := s.cachedUsingWithPath(mod, r.FilePath)
+			if entry == nil {
+				continue
+			}
+			for _, body := range entry.bodies() {
+				for shortName, full := range body.aliases {
+					if full == targetModule || strings.HasPrefix(full, targetModule+".") {
+						k := aliasKey{shortName, full}
+						direct[k] = append(direct[k], mod)
+					}
+				}
+			}
+		}
+	}
+	if len(direct) == 0 {
+		return nil
+	}
+
+	result := make([]injectedAlias, 0, len(direct))
+	for k, injectors := range direct {
+		result = append(result, injectedAlias{
+			shortName: k.shortName,
+			module:    k.module,
+			injectors: s.closeOverInjectors(injectors, usingByFile),
+		})
+	}
+	return result
+}
+
+// usingModulesByFile groups the modules that inject a body into their users by
+// the file that holds them. The __using__ definitions come from one small
+// indexed query, served by the partial index on them.
+func (s *Server) usingModulesByFile() map[string][]string {
+	usingModules, err := s.store.LookupUsingModules()
+	if err != nil {
+		return nil
+	}
+	byFile := make(map[string][]string, len(usingModules))
+	for _, um := range usingModules {
+		byFile[um.FilePath] = append(byFile[um.FilePath], um.Module)
+	}
+
+	// An ExUnit.CaseTemplate writes its injected body as `using do` rather
+	// than `defmacro __using__`, so it has no __using__ definition for the
+	// query above to find — and test files reach their aliases through one of
+	// these. Its `use ExUnit.CaseTemplate` line is indexed, which locates it
+	// just as cheaply.
+	caseTemplates, err := s.store.LookupReferences("ExUnit.CaseTemplate", "")
+	if err != nil {
+		return byFile
+	}
+	for _, r := range caseTemplates {
+		if r.Kind != "use" {
+			continue
+		}
+		mods, err := s.store.LookupModulesInFile(r.FilePath)
+		if err != nil {
+			continue
+		}
+		for _, m := range mods {
+			if !slices.Contains(byFile[r.FilePath], m) {
+				byFile[r.FilePath] = append(byFile[r.FilePath], m)
+			}
+		}
+	}
+	return byFile
+}
+
+// closeOverInjectors walks the use chain upward: a module whose own __using__
+// uses an injector passes the injected alias on to its own users. Candidates
+// come from the index — the `use` sites of each injector — so this costs one
+// indexed query per injector rather than a scan of every __using__ body.
+func (s *Server) closeOverInjectors(direct []string, usingByFile map[string][]string) []string {
+	seen := make(map[string]bool, len(direct))
+	all := make([]string, 0, len(direct))
+	queue := make([]string, 0, len(direct))
+	for _, m := range direct {
+		if !seen[m] {
+			seen[m] = true
+			all = append(all, m)
+			queue = append(queue, m)
+		}
+	}
 
 	for len(queue) > 0 {
 		current := queue[0]
 		queue = queue[1:]
 
-		for _, c := range entries {
-			if seen[c.module] {
+		refs, err := s.store.LookupReferences(current, "")
+		if err != nil {
+			continue
+		}
+		for _, r := range refs {
+			if r.Kind != "use" {
 				continue
 			}
-			for _, body := range c.entry.bodies() {
-				found := false
-				for _, tu := range body.transUses {
-					if tu == current {
-						seen[c.module] = true
-						allInjectors = append(allInjectors, c.module)
-						queue = append(queue, c.module)
-						found = true
+			for _, mod := range usingByFile[r.FilePath] {
+				if seen[mod] {
+					continue
+				}
+				// The `use` has to sit inside the __using__ body to pass the
+				// alias on. A module that uses the injector at its own top
+				// level just consumes the alias.
+				entry := s.cachedUsing(mod)
+				if entry == nil {
+					continue
+				}
+				passesOn := false
+				for _, body := range entry.bodies() {
+					for _, tu := range body.transUses {
+						if tu == current {
+							passesOn = true
+							break
+						}
+					}
+					if passesOn {
 						break
 					}
 				}
-				if found {
-					break
+				if !passesOn {
+					continue
 				}
+				seen[mod] = true
+				all = append(all, mod)
+				queue = append(queue, mod)
 			}
 		}
 	}
 
-	return allInjectors
+	return all
+}
+
+// injectedAliasRefs returns indexed references that name targetModule, or a
+// module under it, through an alias injected by a __using__ block. The files
+// holding them declare no alias of their own, so the index has them under the
+// bare short name and a lookup for the target's full name cannot see them.
+//
+// Only files that actually `use` an injector are kept: the same short name
+// written in a file with no such `use` is a different module.
+// A functionName narrows the result to calls of that function through the
+// injected alias (`Repo.all(...)` for MyApp.Repo.all); empty matches the
+// module itself and every module under it.
+func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs []store.ModuleReferenceResult) []store.ModuleReferenceResult {
+	aliases := s.findInjectedAliasesFor(targetModule, targetRefs)
+	if len(aliases) == 0 {
+		return nil
+	}
+
+	var out []store.ModuleReferenceResult
+	useSiteCache := make(map[string]map[string]bool)
+	for _, ia := range aliases {
+		// Files whose `use` brings this alias in.
+		consumers := make(map[string]bool)
+		for _, inj := range ia.injectors {
+			files, ok := useSiteCache[inj]
+			if !ok {
+				files = make(map[string]bool)
+				if refs, err := s.store.LookupReferences(inj, ""); err == nil {
+					for _, r := range refs {
+						if r.Kind == "use" {
+							files[r.FilePath] = true
+						}
+					}
+				}
+				useSiteCache[inj] = files
+			}
+			for fp := range files {
+				consumers[fp] = true
+			}
+		}
+		if len(consumers) == 0 {
+			continue
+		}
+
+		if functionName != "" {
+			refs, err := s.store.LookupReferences(ia.shortName, functionName)
+			if err != nil {
+				continue
+			}
+			for _, r := range refs {
+				if !consumers[r.FilePath] {
+					continue
+				}
+				out = append(out, store.ModuleReferenceResult{
+					Module:   ia.module,
+					FilePath: r.FilePath,
+					Line:     r.Line,
+					Kind:     r.Kind,
+				})
+			}
+			continue
+		}
+
+		// The short name stands in for ia.module, so `Repo.Migrations` under
+		// an injected `alias MyApp.Repo` names `MyApp.Repo.Migrations`.
+		refs, err := s.store.LookupReferencesByPrefix(ia.shortName)
+		if err != nil {
+			continue
+		}
+		for _, r := range refs {
+			if !consumers[r.FilePath] {
+				continue
+			}
+			r.Module = ia.module + r.Module[len(ia.shortName):]
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// injectedAliasReferences is injectedAliasRefs shaped for the References
+// handler. moduleRefs are the module-level references to fullModule, which
+// carry the alias line inside the injecting __using__ body.
+func (s *Server) injectedAliasReferences(fullModule, functionName string, moduleRefs []store.ReferenceResult) []store.ReferenceResult {
+	if len(moduleRefs) == 0 {
+		return nil
+	}
+	adapted := make([]store.ModuleReferenceResult, 0, len(moduleRefs))
+	for _, r := range moduleRefs {
+		adapted = append(adapted, store.ModuleReferenceResult{
+			Module:   fullModule,
+			FilePath: r.FilePath,
+			Line:     r.Line,
+			Kind:     r.Kind,
+		})
+	}
+	injected := s.injectedAliasRefs(fullModule, functionName, adapted)
+	if len(injected) == 0 {
+		return nil
+	}
+	out := make([]store.ReferenceResult, 0, len(injected))
+	for _, r := range injected {
+		// A module lookup answers with the alias/import/use sites that name
+		// the module, not with every call made through it — the same
+		// convention the direct lookup follows, which asks for refs with no
+		// function. A function lookup wants exactly the call sites.
+		if functionName == "" && r.Kind != "alias" && r.Kind != "import" && r.Kind != "use" && r.Kind != "require" {
+			continue
+		}
+		out = append(out, store.ReferenceResult{FilePath: r.FilePath, Line: r.Line, Kind: r.Kind})
+	}
+	return out
 }
 
 // addCompletionsFromUsing adds completion items injected by a module's __using__
@@ -4471,6 +4767,23 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 		s.debugf("References: direct lookup: %d results (%s)", len(refResults), time.Since(tStep).Round(time.Microsecond))
 	}
 
+	// Sites written through an alias that a __using__ block injects. The file
+	// holding them declares no alias of its own, so the index has them under
+	// the bare short name and the lookup above cannot see them. The injecting
+	// module is found from the module's own references, so this costs one
+	// small query when nothing in the project injects the module.
+	moduleKindRefs := refResults
+	if functionName != "" {
+		moduleKindRefs, err = s.store.LookupReferences(fullModule, "")
+		if err != nil {
+			moduleKindRefs = nil
+		}
+	}
+	if injected := s.injectedAliasReferences(fullModule, functionName, moduleKindRefs); len(injected) > 0 {
+		s.debugf("References: via injected alias: +%d results", len(injected))
+		refResults = append(refResults, injected...)
+	}
+
 	if injectorCh != nil {
 		ir := <-injectorCh
 		if s.debug {
@@ -5117,6 +5430,22 @@ func (mr *moduleRename) collectSites() {
 	refs, err := mr.server.store.LookupReferencesByPrefix(mr.oldModule)
 	if err == nil {
 		for _, r := range refs {
+			if _, ok := mr.moduleRenames[r.Module]; !ok {
+				newMod := mr.newModule + r.Module[len(mr.oldModule):]
+				mr.moduleRenames[r.Module] = newMod
+				mr.tokenReplacements[r.Module] = newMod
+			}
+			addSite(r.FilePath, r.Line, r.Module)
+		}
+
+		// Sites reached through an alias injected by a __using__ block. The
+		// file holding them has no alias line of its own, so the index has
+		// them under the bare short name and the query above cannot see them.
+		// They are added under the resolved name: findModuleEdits falls back
+		// to the short suffix, which is what the line actually spells. A site
+		// written through an `as:` name spells neither and needs no edit —
+		// the alias line inside the __using__ body carries the rename.
+		for _, r := range mr.server.injectedAliasRefs(mr.oldModule, "", refs) {
 			if _, ok := mr.moduleRenames[r.Module]; !ok {
 				newMod := mr.newModule + r.Module[len(mr.oldModule):]
 				mr.moduleRenames[r.Module] = newMod

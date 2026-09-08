@@ -3204,3 +3204,54 @@ end
 		t.Errorf("expected 'alias CoreLib.{Config, Job, Worker}', got:\n%s", got)
 	}
 }
+
+// A module renamed while its short name reaches call sites only through an
+// alias injected by its own `__using__` block. The call sites carry no alias
+// line of their own, so the index has them under the bare short name and the
+// rename used to leave them behind.
+func TestRenameModuleUpdatesUseInjectedAliasCallSites(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	repoContent := `defmodule MyApp.Repo do
+  defmacro __using__(_) do
+    quote do
+      alias MyApp.Repo
+    end
+  end
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/repo.ex", repoContent)
+
+	accountsContent := `defmodule MyApp.Accounts do
+  use MyApp.Repo
+
+  def list_users do
+    Repo.all(User)
+  end
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/accounts.ex", accountsContent)
+
+	repoPath := filepath.Join(server.projectRoot, "lib/my_app/repo.ex")
+	accountsPath := filepath.Join(server.projectRoot, "lib/my_app/accounts.ex")
+	repoURI := "file://" + repoPath
+	server.docs.Set(repoURI, repoContent)
+
+	if edit := renameAt(t, server, repoURI, 0, 16, "Database"); edit == nil {
+		t.Fatal("expected non-nil edit")
+	}
+
+	// accounts.ex is not open, so the server writes it rather than returning
+	// edits for the editor to apply.
+	got, err := os.ReadFile(accountsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "Database.all(User)") {
+		t.Errorf("expected the bare call site to become Database.all(User), got:\n%s", got)
+	}
+	if strings.Contains(string(got), "Repo.") {
+		t.Errorf("no Repo. call site should be left behind, got:\n%s", got)
+	}
+}

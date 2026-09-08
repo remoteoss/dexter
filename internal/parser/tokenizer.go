@@ -605,7 +605,7 @@ func scanInterpolation(source []byte, i, line int, lineStarts *[]int) (int, int)
 			innerDelim := c
 			i++
 			i, line = scanStringContent(source, i, line, innerDelim, lineStarts)
-		case c == '?' && i+1 < len(source):
+		case c == '?' && i+1 < len(source) && !endsIdentifier(source, i):
 			i++ // consume '?'
 			if source[i] == '\\' && i+1 < len(source) {
 				if source[i+1] == '\n' {
@@ -833,6 +833,21 @@ func isHexDigit(ch byte) bool {
 // isIdentContinue returns true for ASCII characters valid after the first character of a lowercase identifier.
 func isIdentContinue(ch byte) bool {
 	return isLetter(ch) || isDigit(ch) || ch == '_' || ch == '?' || ch == '!' || ch == '@'
+}
+
+// endsIdentifier reports whether the '?' at i closes a predicate name
+// (`dry_run?`) rather than opening a char literal (`?a`). Elixir spells both
+// with the same byte, and the difference decides where the token ends: read
+// the '?' of `#{dry_run?}` as a char literal and it swallows the closing
+// brace, so the interpolation never ends and the rest of the file is scanned
+// as string content. A char literal only appears in operand position, which
+// is never straight after a name.
+func endsIdentifier(source []byte, i int) bool {
+	if i == 0 {
+		return false
+	}
+	prev := source[i-1]
+	return isLetter(prev) || isDigit(prev) || prev == '_'
 }
 
 // isIdentContinueMod returns true for ASCII characters valid in module name identifiers (no ? or !).
