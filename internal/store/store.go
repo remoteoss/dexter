@@ -1454,6 +1454,61 @@ func (s *Store) LookupUsingModules() ([]UsingModule, error) {
 	return modules, rows.Err()
 }
 
+const lookupCaseTemplateModulesQuery = `
+	WITH sites AS (
+		SELECT r.file_id,
+			(
+			SELECT d2.module
+			FROM definitions d2
+			WHERE d2.file_id = r.file_id
+				AND d2.function = ''
+				AND d2.kind IN ('module', 'defprotocol')
+				AND d2.line <= r.line
+			ORDER BY d2.line DESC
+			LIMIT 1
+			) AS nearest
+		FROM refs r
+		WHERE r.module = 'ExUnit.CaseTemplate'
+			AND r.function = ''
+			AND r.kind = 'use'
+	)
+	SELECT DISTINCT d.module, f.path
+	FROM sites s
+	JOIN files f ON f.id = s.file_id
+	JOIN definitions d ON d.file_id = s.file_id
+		AND d.function = ''
+		AND d.kind IN ('module', 'defprotocol')
+		AND (
+			d.module = s.nearest
+			OR s.nearest >= d.module || '.' AND s.nearest < d.module || '/'
+		)
+	WHERE s.nearest IS NOT NULL
+	ORDER BY d.module`
+
+// LookupCaseTemplateModules returns candidate modules enclosing each
+// `use ExUnit.CaseTemplate` site. The nearest preceding module and any of its
+// defined ancestors are included: after a nested module closes, line-only
+// index data cannot tell whether a later use belongs to it or to its parent,
+// and the scoped using parser cheaply rejects the wrong candidate. Unrelated
+// sibling modules are excluded. One indexed query avoids the previous N+1.
+func (s *Store) LookupCaseTemplateModules() ([]UsingModule, error) {
+	rows, err := s.db.Query(lookupCaseTemplateModulesQuery)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var modules []UsingModule
+	for rows.Next() {
+		var m UsingModule
+		if err := rows.Scan(&m.Module, &m.FilePath); err != nil {
+			return nil, err
+		}
+		modules = append(modules, m)
+	}
+	return modules, rows.Err()
+}
+
 // LookupEnclosingModule returns the module name for the nearest defmodule at or before
 // lineNum in the given file. Returns "" if none is found.
 func (s *Store) LookupEnclosingModule(filePath string, lineNum int) string {

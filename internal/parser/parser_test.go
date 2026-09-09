@@ -2975,6 +2975,50 @@ end
 	}
 }
 
+// Predicate identifiers may end in a non-ASCII letter. The interpolation
+// scanner must look at the preceding rune, not merely the preceding byte, or
+// it mistakes the trailing question mark for a character literal and consumes
+// the closing brace.
+func TestParseText_InterpolatedUnicodePredicateNameKeepsRestOfFile(t *testing.T) {
+	src := `defmodule MyApp.Validator do
+  alias MyApp.Repo
+
+  def run(validó?) do
+    IO.puts("valid: #{validó?}")
+    Repo.all(MyApp.Record)
+  end
+
+  def after_interpolation, do: Repo.count(MyApp.Record)
+end
+`
+	defs, refs, err := ParseText("/tmp/validator.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var haveAfter bool
+	for _, d := range defs {
+		if d.Function == "after_interpolation" {
+			haveAfter = true
+		}
+	}
+	if !haveAfter {
+		t.Errorf("expected the definition after the interpolation, got %+v", defs)
+	}
+
+	lines := make(map[int]bool)
+	for _, r := range refs {
+		if r.Module == "MyApp.Repo" {
+			lines[r.Line] = true
+		}
+	}
+	for _, want := range []int{6, 9} {
+		if !lines[want] {
+			t.Errorf("expected a Repo reference on line %d, got %+v", want, refs)
+		}
+	}
+}
+
 // The char literal itself still tokenizes: `?a` in operand position is a
 // number, not the tail of an identifier.
 func TestParseText_CharLiteralInInterpolation(t *testing.T) {

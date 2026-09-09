@@ -1491,6 +1491,8 @@ func extractUsesFromTokens(source []byte, tokens []parser.Token) []string {
 type UseCall struct {
 	Module string            // the module being used (alias-resolved)
 	Opts   map[string]string // keyword args: opt_key → module name (alias-resolved)
+	line   int               // 1-based source line; zero for synthesized transitive calls
+	local  bool              // nested in an inline do: expression; cannot affect later lines
 
 	// Which is the literal atom passed as the second argument, e.g. "controller"
 	// for `use MyAppWeb, :controller`. WhichKey is the first keyword key, e.g.
@@ -1521,6 +1523,16 @@ func ExtractUsesWithOpts(text string, aliases map[string]string) []UseCall {
 func extractUsesWithOptsFromTokens(source []byte, tokens []parser.Token, aliases map[string]string) []UseCall {
 	n := len(tokens)
 	var calls []UseCall
+	isBlockKey := func(colon int) bool {
+		if colon <= 0 || tokens[colon].Kind != parser.TokColon {
+			return false
+		}
+		switch parser.TokenText(source, tokens[colon-1]) {
+		case "do", "else", "rescue", "catch", "after":
+			return true
+		}
+		return false
+	}
 
 	for i := 0; i < n; i++ {
 		if tokens[i].Kind != parser.TokUse {
@@ -1532,14 +1544,31 @@ func extractUsesWithOptsFromTokens(source []byte, tokens []parser.Token, aliases
 			continue
 		}
 		module := parser.ResolveModuleRef(modName, aliases, "")
+		local := false
+		prev := i - 1
+		for prev >= 0 && (tokens[prev].Kind == parser.TokComment || tokens[prev].Kind == parser.TokEOL) {
+			prev--
+		}
+		if isBlockKey(prev) {
+			local = true
+		}
+		for p := i - 1; p >= 0 && tokens[p].Line == tokens[i].Line; p-- {
+			if parser.TokenText(source, tokens[p]) == ";" {
+				break
+			}
+			if isBlockKey(p) {
+				local = true
+				break
+			}
+		}
 
 		nk := tokNextSig(tokens, n, k)
 		if nk < n && tokens[nk].Kind == parser.TokComma {
 			opts := tokCollectKeywordModuleOpts(source, tokens, n, nk+1, aliases)
 			which, whichKey := tokCollectDispatchAtom(source, tokens, n, nk+1)
-			calls = append(calls, UseCall{Module: module, Opts: opts, Which: which, WhichKey: whichKey})
+			calls = append(calls, UseCall{Module: module, Opts: opts, Which: which, WhichKey: whichKey, line: tokens[i].Line, local: local})
 		} else {
-			calls = append(calls, UseCall{Module: module})
+			calls = append(calls, UseCall{Module: module, line: tokens[i].Line, local: local})
 		}
 		i = k
 	}

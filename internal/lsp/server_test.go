@@ -6704,6 +6704,59 @@ end
 	}
 }
 
+func TestReferences_IncludeDeclarationKeepsTypeAndFunctionSeparate(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	src := `defmodule SharedLib.Schema do
+  @type schema :: map()
+  @type wrapper :: schema()
+
+  def schema(value), do: value
+  def call(value), do: schema(value)
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/schema.ex", src)
+	path := filepath.Join(server.projectRoot, "lib", "schema.ex")
+	fileURI := "file://" + path
+	server.docs.Set(fileURI, src)
+
+	references := func(line, col uint32) map[uint32]bool {
+		t.Helper()
+		locs, err := server.References(context.Background(), &protocol.ReferenceParams{
+			TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+				TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(fileURI)},
+				Position:     protocol.Position{Line: line, Character: col},
+			},
+			Context: protocol.ReferenceContext{IncludeDeclaration: true},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines := make(map[uint32]bool)
+		for _, loc := range locs {
+			lines[loc.Range.Start.Line] = true
+		}
+		return lines
+	}
+
+	typeRefs := references(1, 9)
+	if !typeRefs[1] || !typeRefs[2] {
+		t.Errorf("expected the type declaration and use, got %v", typeRefs)
+	}
+	if typeRefs[4] {
+		t.Error("function declaration must not be included with type references")
+	}
+
+	functionRefs := references(4, 7)
+	if !functionRefs[4] || !functionRefs[5] {
+		t.Errorf("expected the function declaration and call, got %v", functionRefs)
+	}
+	if functionRefs[1] {
+		t.Error("type declaration must not be included with function references")
+	}
+}
+
 // TestReferences_TypeNameNotShadowedByVariableScan covers a type whose name is
 // repeated in another typespec in the same file, as `Ecto.Schema` does with
 // `@type schema` and `@type t :: schema | embedded_schema`. The tree-sitter
@@ -6972,6 +7025,354 @@ end
 	}
 	if !found {
 		t.Errorf("expected the Repo.all/1 call in accounts.ex, got %v", locs)
+	}
+}
+
+func TestRenameModuleDoesNotTouchInjectedAliasOutsideUsingModule(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/repo.ex", injectedAliasFixture)
+	consumer := `defmodule MyApp.UsesRepo do
+  use MyApp.Repo
+  def all, do: Repo.all(User)
+end
+
+defmodule MyApp.Unrelated do
+  def all, do: Repo.all(User)
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/combined.ex", consumer)
+
+	repoPath := filepath.Join(server.projectRoot, "lib/my_app/repo.ex")
+	consumerPath := filepath.Join(server.projectRoot, "lib/my_app/combined.ex")
+	repoURI := "file://" + repoPath
+	server.docs.Set(repoURI, injectedAliasFixture)
+
+	if edit := renameAt(t, server, repoURI, 0, 16, "Database"); edit == nil {
+		t.Fatal("expected non-nil edit")
+	}
+
+	got, err := os.ReadFile(consumerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(got)
+	if !strings.Contains(text, "Database.all(User)") {
+		t.Errorf("expected the using module's call to be renamed, got:\n%s", text)
+	}
+	if !strings.Contains(text, "def all, do: Repo.all(User)\nend\n") {
+		t.Errorf("the sibling module's unrelated Repo call was renamed:\n%s", text)
+	}
+}
+
+func TestRenameChildModuleViaUseInjectedParentAlias(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/repo.ex", injectedAliasFixture)
+	child := `defmodule MyApp.Repo.Migrations do
+  def run, do: :ok
+end
+`
+	consumer := `defmodule MyApp.Release do
+  use MyApp.Repo
+  def migrate, do: Repo.Migrations.run()
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/repo/migrations.ex", child)
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/release.ex", consumer)
+
+	childPath := filepath.Join(server.projectRoot, "lib/my_app/repo/migrations.ex")
+	consumerPath := filepath.Join(server.projectRoot, "lib/my_app/release.ex")
+	childURI := "file://" + childPath
+	server.docs.Set(childURI, child)
+
+	if edit := renameAt(t, server, childURI, 0, 23, "Changes"); edit == nil {
+		t.Fatal("expected non-nil edit")
+	}
+
+	got, err := os.ReadFile(consumerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "Repo.Changes.run()") {
+		t.Errorf("expected the child name behind the injected parent alias to be renamed, got:\n%s", got)
+	}
+}
+
+func TestRenameInjectedAliasRespectsUseDispatchTarget(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/repo.ex", `defmodule MyApp.Repo do
+end
+`)
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/entry.ex", `defmodule MyApp.Entry do
+  defmacro __using__(which) when is_atom(which), do: apply(__MODULE__, which, [])
+
+  def repo do
+    quote do
+      alias MyApp.Repo
+    end
+  end
+
+  def plain do
+    quote do
+      :ok
+    end
+  end
+end
+`)
+	selected := `defmodule MyApp.Selected do
+  use MyApp.Entry, :repo
+  def all, do: Repo.all(User)
+end
+`
+	unselected := `defmodule MyApp.Unselected do
+  use MyApp.Entry, :plain
+  def all, do: Repo.all(User)
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/selected.ex", selected)
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/unselected.ex", unselected)
+
+	repoPath := filepath.Join(server.projectRoot, "lib/my_app/repo.ex")
+	selectedPath := filepath.Join(server.projectRoot, "lib/my_app/selected.ex")
+	unselectedPath := filepath.Join(server.projectRoot, "lib/my_app/unselected.ex")
+	repoURI := "file://" + repoPath
+	server.docs.Set(repoURI, `defmodule MyApp.Repo do
+end
+`)
+
+	if edit := renameAt(t, server, repoURI, 0, 16, "Database"); edit == nil {
+		t.Fatal("expected non-nil edit")
+	}
+
+	selectedGot, err := os.ReadFile(selectedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(selectedGot), "Database.all(User)") {
+		t.Errorf("selected dispatch target was not renamed:\n%s", selectedGot)
+	}
+
+	unselectedGot, err := os.ReadFile(unselectedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(unselectedGot), "Repo.all(User)") {
+		t.Errorf("unselected dispatch target was incorrectly renamed:\n%s", unselectedGot)
+	}
+}
+
+func TestRenameInjectedAliasRespectsLexicalBlockAndOrder(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/repo.ex", injectedAliasFixture)
+	consumer := `defmodule MyApp.Conditional do
+  def before_use, do: Repo.all(:before)
+
+  if true do
+    use MyApp.Repo
+    def inside_block, do: Repo.all(:inside)
+  end
+
+  def after_block, do: Repo.all(:after)
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/conditional.ex", consumer)
+
+	repoPath := filepath.Join(server.projectRoot, "lib/my_app/repo.ex")
+	consumerPath := filepath.Join(server.projectRoot, "lib/my_app/conditional.ex")
+	repoURI := "file://" + repoPath
+	server.docs.Set(repoURI, injectedAliasFixture)
+
+	if edit := renameAt(t, server, repoURI, 0, 16, "Database"); edit == nil {
+		t.Fatal("expected non-nil edit")
+	}
+
+	got, err := os.ReadFile(consumerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(got)
+	if !strings.Contains(text, "Database.all(:inside)") {
+		t.Errorf("call inside the use's lexical block was not renamed:\n%s", text)
+	}
+	for _, unchanged := range []string{"Repo.all(:before)", "Repo.all(:after)"} {
+		if !strings.Contains(text, unchanged) {
+			t.Errorf("call outside the use's lexical extent was renamed; missing %q:\n%s", unchanged, text)
+		}
+	}
+}
+
+func TestRenameInjectedAliasChecksEveryUseDispatchOnSameLine(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	repo := `defmodule MyApp.Repo do
+end
+`
+	entry := `defmodule MyApp.Entry do
+  defmacro __using__(which) when is_atom(which), do: apply(__MODULE__, which, [])
+
+  def plain do
+    quote do
+      :ok
+    end
+  end
+
+  def repo do
+    quote do
+      alias MyApp.Repo
+    end
+  end
+end
+`
+	consumer := `defmodule MyApp.Consumer do
+  use MyApp.Entry, :plain; use MyApp.Entry, :repo
+  def all, do: Repo.all(User)
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/repo.ex", repo)
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/entry.ex", entry)
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/consumer.ex", consumer)
+
+	repoPath := filepath.Join(server.projectRoot, "lib/my_app/repo.ex")
+	consumerPath := filepath.Join(server.projectRoot, "lib/my_app/consumer.ex")
+	repoURI := "file://" + repoPath
+	server.docs.Set(repoURI, repo)
+
+	if edit := renameAt(t, server, repoURI, 0, 16, "Database"); edit == nil {
+		t.Fatal("expected non-nil edit")
+	}
+	got, err := os.ReadFile(consumerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "Database.all(User)") {
+		t.Errorf("the second dispatch on the shared line injects the alias, got:\n%s", got)
+	}
+}
+
+func TestRenameInjectedAliasDoesNotEscapeInlineDoBlock(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/repo.ex", injectedAliasFixture)
+	consumer := `defmodule MyApp.InlineConditional do
+  if true, do: use MyApp.Repo
+  def all, do: Repo.all(User)
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/inline_conditional.ex", consumer)
+
+	repoPath := filepath.Join(server.projectRoot, "lib/my_app/repo.ex")
+	consumerPath := filepath.Join(server.projectRoot, "lib/my_app/inline_conditional.ex")
+	repoURI := "file://" + repoPath
+	server.docs.Set(repoURI, injectedAliasFixture)
+
+	if edit := renameAt(t, server, repoURI, 0, 16, "Database"); edit == nil {
+		t.Fatal("expected non-nil edit")
+	}
+	got, err := os.ReadFile(consumerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "Repo.all(User)") {
+		t.Errorf("alias from inline do block escaped into the module scope:\n%s", got)
+	}
+}
+
+func TestRenameInjectedAliasAfterInlineDoStatementStillApplies(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/repo.ex", injectedAliasFixture)
+	consumer := `defmodule MyApp.AfterInlineConditional do
+  if true, do: :ok; use MyApp.Repo
+  def all, do: Repo.all(User)
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/after_inline.ex", consumer)
+
+	repoPath := filepath.Join(server.projectRoot, "lib/my_app/repo.ex")
+	consumerPath := filepath.Join(server.projectRoot, "lib/my_app/after_inline.ex")
+	repoURI := "file://" + repoPath
+	server.docs.Set(repoURI, injectedAliasFixture)
+
+	if edit := renameAt(t, server, repoURI, 0, 16, "Database"); edit == nil {
+		t.Fatal("expected non-nil edit")
+	}
+	got, err := os.ReadFile(consumerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "Database.all(User)") {
+		t.Errorf("module-scoped use after the inline statement did not apply:\n%s", got)
+	}
+}
+
+func TestRenameInjectedAliasDoesNotEscapeInlineElseBlock(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/repo.ex", injectedAliasFixture)
+	consumer := `defmodule MyApp.InlineElse do
+  if false, do: :ok, else: use MyApp.Repo
+  def all, do: Repo.all(User)
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/inline_else.ex", consumer)
+
+	repoPath := filepath.Join(server.projectRoot, "lib/my_app/repo.ex")
+	consumerPath := filepath.Join(server.projectRoot, "lib/my_app/inline_else.ex")
+	repoURI := "file://" + repoPath
+	server.docs.Set(repoURI, injectedAliasFixture)
+
+	if edit := renameAt(t, server, repoURI, 0, 16, "Database"); edit == nil {
+		t.Fatal("expected non-nil edit")
+	}
+	got, err := os.ReadFile(consumerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "Repo.all(User)") {
+		t.Errorf("alias from inline else block escaped into the module scope:\n%s", got)
+	}
+}
+
+func TestRenameInjectedAliasDoesNotEscapeSplitInlineBlock(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/repo.ex", injectedAliasFixture)
+	consumer := `defmodule MyApp.SplitInline do
+  if true,
+    do:
+      use MyApp.Repo
+
+  def all, do: Repo.all(User)
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/split_inline.ex", consumer)
+
+	repoPath := filepath.Join(server.projectRoot, "lib/my_app/repo.ex")
+	consumerPath := filepath.Join(server.projectRoot, "lib/my_app/split_inline.ex")
+	repoURI := "file://" + repoPath
+	server.docs.Set(repoURI, injectedAliasFixture)
+
+	if edit := renameAt(t, server, repoURI, 0, 16, "Database"); edit == nil {
+		t.Fatal("expected non-nil edit")
+	}
+	got, err := os.ReadFile(consumerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "Repo.all(User)") {
+		t.Errorf("alias from split inline block escaped into module scope:\n%s", got)
 	}
 }
 

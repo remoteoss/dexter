@@ -847,7 +847,14 @@ func endsIdentifier(source []byte, i int) bool {
 		return false
 	}
 	prev := source[i-1]
-	return isLetter(prev) || isDigit(prev) || prev == '_'
+	if isLetter(prev) || isDigit(prev) || prev == '_' {
+		return true
+	}
+	if prev < utf8.RuneSelf {
+		return false
+	}
+	r, _ := utf8.DecodeLastRune(source[:i])
+	return r != utf8.RuneError && (unicode.IsLetter(r) || unicode.IsDigit(r))
 }
 
 // isIdentContinueMod returns true for ASCII characters valid in module name identifiers (no ? or !).

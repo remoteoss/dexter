@@ -15,7 +15,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -2536,6 +2535,20 @@ type injectedAlias struct {
 	injectors []string // modules whose `use` brings the alias in, transitively closed
 }
 
+// matchInjectedAlias maps an alias declaration to the spelling and canonical
+// module used for a target lookup. The alias may name the target, a descendant
+// of it, or an ancestor of it.
+func matchInjectedAlias(shortName, full, targetModule string) (written, resolved string, ok bool) {
+	switch {
+	case full == targetModule || strings.HasPrefix(full, targetModule+"."):
+		return shortName, full, true
+	case strings.HasPrefix(targetModule, full+"."):
+		return shortName + targetModule[len(full):], targetModule, true
+	default:
+		return "", "", false
+	}
+}
+
 // findInjectedAliasesFor returns the aliases that some module's __using__
 // block binds to targetModule or a module under it.
 //
@@ -2550,10 +2563,36 @@ func (s *Server) findInjectedAliasesFor(targetModule string, targetRefs []store.
 		return nil
 	}
 
+	// An injected alias may name a parent of the target: `alias MyApp.Repo`
+	// makes `MyApp.Repo.Migrations` appear in consumer files as
+	// `Repo.Migrations`. The target's own reference set cannot lead us to that
+	// alias line, so add the exact references of each proper parent. These are
+	// indexed point lookups, not prefix scans.
+	refs := append([]store.ModuleReferenceResult(nil), targetRefs...)
+	for parent := targetModule; ; {
+		dot := strings.LastIndexByte(parent, '.')
+		if dot < 0 {
+			break
+		}
+		parent = parent[:dot]
+		parentRefs, err := s.store.LookupReferences(parent, "")
+		if err != nil {
+			continue
+		}
+		for _, r := range parentRefs {
+			refs = append(refs, store.ModuleReferenceResult{
+				Module:   parent,
+				FilePath: r.FilePath,
+				Line:     r.Line,
+				Kind:     r.Kind,
+			})
+		}
+	}
+
 	type aliasKey struct{ shortName, module string }
 	direct := make(map[aliasKey][]string)
 	checked := make(map[string]bool)
-	for _, r := range targetRefs {
+	for _, r := range refs {
 		if r.Kind != "alias" && r.Kind != "require" && r.Kind != "import" {
 			continue
 		}
@@ -2568,10 +2607,12 @@ func (s *Server) findInjectedAliasesFor(targetModule string, targetRefs []store.
 			}
 			for _, body := range entry.bodies() {
 				for shortName, full := range body.aliases {
-					if full == targetModule || strings.HasPrefix(full, targetModule+".") {
-						k := aliasKey{shortName, full}
-						direct[k] = append(direct[k], mod)
+					written, resolved, ok := matchInjectedAlias(shortName, full, targetModule)
+					if !ok {
+						continue
 					}
+					k := aliasKey{written, resolved}
+					direct[k] = append(direct[k], mod)
 				}
 			}
 		}
@@ -2589,6 +2630,87 @@ func (s *Server) findInjectedAliasesFor(targetModule string, targetRefs []store.
 		})
 	}
 	return result
+}
+
+// usingInjectsAlias reports whether the body selected by a concrete use call
+// injects the requested alias, directly or through another use. Dispatch is
+// significant: aliases from `:controller` must not leak into `:channel`.
+func (s *Server) usingInjectsAlias(module, which, targetModule, written, resolved string, visited map[string]bool) bool {
+	visitKey := usingVisitKey(module, which)
+	if visited[visitKey] {
+		return false
+	}
+	visited[visitKey] = true
+
+	entry := s.cachedUsing(module)
+	if entry == nil {
+		return false
+	}
+	body := entry.bodyFor(which)
+	if body == nil {
+		return false
+	}
+	for shortName, full := range body.aliases {
+		gotWritten, gotResolved, ok := matchInjectedAlias(shortName, full, targetModule)
+		if ok && gotWritten == written && gotResolved == resolved {
+			return true
+		}
+	}
+	for i := len(body.transCalls) - 1; i >= 0; i-- {
+		call := body.transCalls[i]
+		if s.usingInjectsAlias(call.Module, call.dispatchAtom(), targetModule, written, resolved, visited) {
+			return true
+		}
+	}
+	for i := len(body.transUses) - 1; i >= 0; i-- {
+		if body.hasTransCall(body.transUses[i]) {
+			continue
+		}
+		if s.usingInjectsAlias(body.transUses[i], "", targetModule, written, resolved, visited) {
+			return true
+		}
+	}
+	return false
+}
+
+// lexicalScopeAt returns stable token positions for the block ancestry at a
+// 1-based line. A module-level directive is visible in later nested blocks,
+// while one inside an if/case/fn is not visible after that block ends.
+func lexicalScopeAt(tf *TokenizedFile, line int) []int {
+	w := parser.NewTokenWalker(tf.source, tf.tokens)
+	stack := make([]int, 0, 8)
+	for w.More() {
+		tok := w.Current()
+		if tok.Line > line {
+			break
+		}
+		switch tok.Kind {
+		case parser.TokDo, parser.TokFn:
+			// `do:` and `fn:` keyword keys do not open blocks.
+			next := parser.NextSigToken(tf.tokens, tf.n, w.Pos()+1)
+			if next >= tf.n || tf.tokens[next].Kind != parser.TokColon {
+				stack = append(stack, w.Pos())
+			}
+		case parser.TokEnd:
+			if len(stack) > 0 {
+				stack = stack[:len(stack)-1]
+			}
+		}
+		w.Advance()
+	}
+	return stack
+}
+
+func scopeContains(scope, parent []int) bool {
+	if len(scope) < len(parent) {
+		return false
+	}
+	for i := range parent {
+		if scope[i] != parent[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // usingModulesByFile groups the modules that inject a body into their users by
@@ -2609,22 +2731,20 @@ func (s *Server) usingModulesByFile() map[string][]string {
 	// query above to find — and test files reach their aliases through one of
 	// these. Its `use ExUnit.CaseTemplate` line is indexed, which locates it
 	// just as cheaply.
-	caseTemplates, err := s.store.LookupReferences("ExUnit.CaseTemplate", "")
+	caseTemplates, err := s.store.LookupCaseTemplateModules()
 	if err != nil {
 		return byFile
 	}
-	for _, r := range caseTemplates {
-		if r.Kind != "use" {
-			continue
-		}
-		mods, err := s.store.LookupModulesInFile(r.FilePath)
-		if err != nil {
-			continue
-		}
-		for _, m := range mods {
-			if !slices.Contains(byFile[r.FilePath], m) {
-				byFile[r.FilePath] = append(byFile[r.FilePath], m)
+	for _, ct := range caseTemplates {
+		alreadyPresent := false
+		for _, mod := range byFile[ct.FilePath] {
+			if mod == ct.Module {
+				alreadyPresent = true
+				break
 			}
+		}
+		if !alreadyPresent {
+			byFile[ct.FilePath] = append(byFile[ct.FilePath], ct.Module)
 		}
 	}
 	return byFile
@@ -2704,36 +2824,130 @@ func (s *Server) closeOverInjectors(direct []string, usingByFile map[string][]st
 // A functionName narrows the result to calls of that function through the
 // injected alias (`Repo.all(...)` for MyApp.Repo.all); empty matches the
 // module itself and every module under it.
-func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs []store.ModuleReferenceResult) []store.ModuleReferenceResult {
+func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs []store.ModuleReferenceResult, moduleSitesOnly bool) []store.ModuleReferenceResult {
 	aliases := s.findInjectedAliasesFor(targetModule, targetRefs)
 	if len(aliases) == 0 {
 		return nil
 	}
 
 	var out []store.ModuleReferenceResult
-	useSiteCache := make(map[string]map[string]bool)
+	type useSite struct {
+		filePath string
+		line     int
+	}
+	useSiteCache := make(map[string][]useSite)
+	tokenizedFiles := make(map[string]*TokenizedFile)
+	missingFiles := make(map[string]bool)
+	type scopeKey struct {
+		filePath string
+		line     int
+	}
+	scopeCache := make(map[scopeKey][]int)
+	tokenizedAt := func(filePath string) (*TokenizedFile, bool) {
+		tf, ok := tokenizedFiles[filePath]
+		if !ok {
+			if missingFiles[filePath] {
+				return nil, false
+			}
+			text, _, found := s.readFileText(filePath)
+			if !found {
+				missingFiles[filePath] = true
+				return nil, false
+			}
+			tf = NewTokenizedFile(text)
+			tokenizedFiles[filePath] = tf
+		}
+		return tf, true
+	}
+	moduleAt := func(filePath string, line int) (string, bool) {
+		tf, ok := tokenizedAt(filePath)
+		if !ok {
+			return "", false
+		}
+		return extractEnclosingModuleFromTokens(tf.source, tf.tokens, line-1), true
+	}
+	scopeAt := func(filePath string, line int) ([]int, bool) {
+		key := scopeKey{filePath, line}
+		if scope, ok := scopeCache[key]; ok {
+			return scope, true
+		}
+		tf, ok := tokenizedAt(filePath)
+		if !ok {
+			return nil, false
+		}
+		scope := lexicalScopeAt(tf, line)
+		scopeCache[key] = scope
+		return scope, true
+	}
+	useCallsAt := func(filePath string, line int) []UseCall {
+		tf, ok := tokenizedAt(filePath)
+		if !ok {
+			return nil
+		}
+		var calls []UseCall
+		for _, call := range tf.ExtractUsesWithOpts(nil) {
+			if call.line == line {
+				calls = append(calls, call)
+			}
+		}
+		return calls
+	}
 	for _, ia := range aliases {
-		// Files whose `use` brings this alias in.
-		consumers := make(map[string]bool)
+		// Exact lexical module scopes whose `use` brings this alias in. Keeping
+		// the line also prevents an earlier bare name in the same module from
+		// being mistaken for an alias that is introduced later.
+		consumers := make(map[string][]int)
 		for _, inj := range ia.injectors {
-			files, ok := useSiteCache[inj]
+			cacheKey := inj + "\x00" + ia.shortName + "\x00" + ia.module
+			sites, ok := useSiteCache[cacheKey]
 			if !ok {
-				files = make(map[string]bool)
 				if refs, err := s.store.LookupReferences(inj, ""); err == nil {
 					for _, r := range refs {
-						if r.Kind == "use" {
-							files[r.FilePath] = true
+						if r.Kind != "use" {
+							continue
+						}
+						for _, call := range useCallsAt(r.FilePath, r.Line) {
+							if call.local || !s.usingInjectsAlias(inj, call.dispatchAtom(), targetModule, ia.shortName, ia.module, make(map[string]bool)) {
+								continue
+							}
+							sites = append(sites, useSite{r.FilePath, r.Line})
+							break
 						}
 					}
 				}
-				useSiteCache[inj] = files
+				useSiteCache[cacheKey] = sites
 			}
-			for fp := range files {
-				consumers[fp] = true
+			for _, site := range sites {
+				consumers[site.filePath] = append(consumers[site.filePath], site.line)
 			}
 		}
 		if len(consumers) == 0 {
 			continue
+		}
+		isConsumer := func(filePath string, line int) bool {
+			useLines := consumers[filePath]
+			if len(useLines) == 0 {
+				return false
+			}
+			refModule, ok := moduleAt(filePath, line)
+			if !ok {
+				return false
+			}
+			refScope, ok := scopeAt(filePath, line)
+			if !ok {
+				return false
+			}
+			for _, useLine := range useLines {
+				if useLine > line {
+					continue
+				}
+				useModule, found := moduleAt(filePath, useLine)
+				useScope, scoped := scopeAt(filePath, useLine)
+				if found && scoped && useModule == refModule && scopeContains(refScope, useScope) {
+					return true
+				}
+			}
+			return false
 		}
 
 		if functionName != "" {
@@ -2742,7 +2956,7 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 				continue
 			}
 			for _, r := range refs {
-				if !consumers[r.FilePath] {
+				if !isConsumer(r.FilePath, r.Line) {
 					continue
 				}
 				out = append(out, store.ModuleReferenceResult{
@@ -2762,7 +2976,10 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 			continue
 		}
 		for _, r := range refs {
-			if !consumers[r.FilePath] {
+			if moduleSitesOnly && r.Kind != "alias" && r.Kind != "import" && r.Kind != "use" && r.Kind != "require" {
+				continue
+			}
+			if !isConsumer(r.FilePath, r.Line) {
 				continue
 			}
 			r.Module = ia.module + r.Module[len(ia.shortName):]
@@ -2788,7 +3005,7 @@ func (s *Server) injectedAliasReferences(fullModule, functionName string, module
 			Kind:     r.Kind,
 		})
 	}
-	injected := s.injectedAliasRefs(fullModule, functionName, adapted)
+	injected := s.injectedAliasRefs(fullModule, functionName, adapted, functionName == "")
 	if len(injected) == 0 {
 		return nil
 	}
@@ -4893,6 +5110,7 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 	if params.Context.IncludeDeclaration {
 		defResults, err := s.store.LookupFunction(fullModule, functionName)
 		if err == nil {
+			defResults = byKindForContext(tf, lineNum, defResults)
 			for _, r := range defResults {
 				if s.stdlibRoot != "" && strings.HasPrefix(r.FilePath, s.stdlibRoot) {
 					continue
@@ -5445,7 +5663,7 @@ func (mr *moduleRename) collectSites() {
 		// to the short suffix, which is what the line actually spells. A site
 		// written through an `as:` name spells neither and needs no edit —
 		// the alias line inside the __using__ body carries the rename.
-		for _, r := range mr.server.injectedAliasRefs(mr.oldModule, "", refs) {
+		for _, r := range mr.server.injectedAliasRefs(mr.oldModule, "", refs, false) {
 			if _, ok := mr.moduleRenames[r.Module]; !ok {
 				newMod := mr.newModule + r.Module[len(mr.oldModule):]
 				mr.moduleRenames[r.Module] = newMod

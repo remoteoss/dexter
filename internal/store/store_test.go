@@ -1483,6 +1483,98 @@ func TestLookupByPrefixRange(t *testing.T) {
 	}
 }
 
+func TestLookupCaseTemplateModulesReturnsOnlyEnclosingModule(t *testing.T) {
+	s, dir := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	path := writeElixirFile(t, dir, "test/support/templates.ex", `defmodule MyApp.DataCase do
+  use ExUnit.CaseTemplate
+end
+
+defmodule MyApp.Sibling do
+  def helper, do: :ok
+end
+`)
+	defs, refs, err := parser.ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IndexFileWithRefs(path, defs, refs); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.LookupCaseTemplateModules()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Module != "MyApp.DataCase" || got[0].FilePath != path {
+		t.Fatalf("LookupCaseTemplateModules() = %+v, want only MyApp.DataCase", got)
+	}
+}
+
+func TestLookupCaseTemplateModulesIncludesOuterAfterNestedModule(t *testing.T) {
+	s, dir := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	path := writeElixirFile(t, dir, "test/support/outer_case.ex", `defmodule MyApp.OuterCase do
+  defmodule Helper do
+    def value, do: :ok
+  end
+
+  use ExUnit.CaseTemplate
+end
+`)
+	defs, refs, err := parser.ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IndexFileWithRefs(path, defs, refs); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.LookupCaseTemplateModules()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, result := range got {
+		if result.Module == "MyApp.OuterCase" {
+			return
+		}
+	}
+	t.Fatalf("LookupCaseTemplateModules() = %+v, missing outer module after nested module", got)
+}
+
+func TestLookupCaseTemplateModulesUsesHotPathIndexes(t *testing.T) {
+	s, _ := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	rows, err := s.db.Query("EXPLAIN QUERY PLAN " + lookupCaseTemplateModulesQuery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var plan strings.Builder
+	for rows.Next() {
+		var id, parent, notUsed int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notUsed, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan.WriteString(detail)
+		plan.WriteByte('\n')
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	detail := plan.String()
+	for _, index := range []string{"idx_refs_module_function", "idx_definitions_file_id_line"} {
+		if !strings.Contains(detail, index) {
+			t.Errorf("query plan does not use %s:\n%s", index, detail)
+		}
+	}
+}
+
 // TestReferencesUsesCoveringIndex pins the plan for the References hot path.
 // idx_refs_module_function spans (module, function, file_id, line, kind) so the
 // query is answered from the index alone. Before that, every hit cost a random
