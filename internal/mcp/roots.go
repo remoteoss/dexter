@@ -22,7 +22,7 @@ func fileURIToPath(raw string) (string, error) {
 	if u.Host != "" && u.Host != "localhost" {
 		return "", fmt.Errorf("root URI %q names a remote host", raw)
 	}
-	path := filepath.FromSlash(u.Path)
+	path := filepath.Clean(filepath.FromSlash(u.Path))
 	if !filepath.IsAbs(path) {
 		return "", fmt.Errorf("root URI %q has no absolute path", raw)
 	}

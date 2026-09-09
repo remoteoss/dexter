@@ -517,6 +517,7 @@ func cmdMCP(projectRoot string, listen string, explicitRoot bool) {
 		// update.
 		server.ReindexWorkspace()
 		server.WatchGitHead()
+		defer server.StopGitHeadWatch()
 
 		// Headless servers get no editor events, so watch the tree directly.
 		watcher, err := dexter_mcp.WatchFiles(server, s, projectRoot)

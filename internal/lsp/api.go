@@ -363,6 +363,9 @@ func applyTextEdits(text string, edits []protocol.TextEdit) string {
 		if int(start.Line) >= len(lines) || int(end.Line) >= len(lines) {
 			continue
 		}
+		if int(start.Character) > len(lines[start.Line]) || int(end.Character) > len(lines[end.Line]) {
+			continue
+		}
 		prefix := lines[start.Line][:start.Character]
 		suffix := lines[end.Line][end.Character:]
 		replacement := strings.Split(prefix+e.NewText+suffix, "\n")

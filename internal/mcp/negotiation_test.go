@@ -96,6 +96,33 @@ func mustTool(t *testing.T, cs *mcp.ClientSession, name string, args map[string]
 	return out
 }
 
+func TestFileURIToPath(t *testing.T) {
+	cases := []struct {
+		uri  string
+		want string // "" means an error is expected
+	}{
+		{"file:///a/b", "/a/b"},
+		{"file:///a/b/", "/a/b"}, // trailing slash must not key a second workspace
+		{"file://localhost/a/b", "/a/b"},
+		{"file:///a/my%20project", "/a/my project"},
+		{"file://otherhost/a", ""},
+		{"file://a", ""}, // host form, no path
+		{"file:relative", ""},
+	}
+	for _, tc := range cases {
+		got, err := fileURIToPath(tc.uri)
+		if tc.want == "" {
+			if err == nil {
+				t.Errorf("fileURIToPath(%q) = %q, want error", tc.uri, got)
+			}
+			continue
+		}
+		if err != nil || got != tc.want {
+			t.Errorf("fileURIToPath(%q) = %q, %v; want %q", tc.uri, got, err, tc.want)
+		}
+	}
+}
+
 func hasIndex(root string) bool {
 	_, err := os.Stat(filepath.Join(root, ".dexter", "dexter.db"))
 	return err == nil

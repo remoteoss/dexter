@@ -40,6 +40,14 @@ func TestApplyTextEdits(t *testing.T) {
 			want: "get_user(get_user(1))\n",
 		},
 		{
+			name: "out-of-range column is skipped, not a panic",
+			text: "short\n",
+			edits: []protocol.TextEdit{
+				{Range: protocol.Range{Start: protocol.Position{Line: 0, Character: 40}, End: protocol.Position{Line: 0, Character: 50}}, NewText: "x"},
+			},
+			want: "short\n",
+		},
+		{
 			name: "multi-line span replacement",
 			text: "a\nold one\nold two\nb\n",
 			edits: []protocol.TextEdit{
