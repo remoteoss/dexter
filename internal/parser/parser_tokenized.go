@@ -104,12 +104,11 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 	// `@spec put_meta(Ecto.Schema.schema(), meta)` refers to the type
 	// Ecto.Schema.schema, not to the macro of that name. They are recorded
 	// under their own kind so a lookup for a function can leave them out and a
-	// lookup for a type can pick them out. The flag is set by @spec/@type/
-	// @callback and cleared by the next definition or attribute, so the
-	// continuation lines of a multi-line spec are covered too.
-	inTypespec := false
-	callKind := func() string {
-		if inTypespec {
+	// lookup for a type can pick them out. The token range uses the same
+	// statement-boundary scanner as open-document lookup.
+	typespecStart, typespecEnd := -1, -1
+	callKind := func(pos int) string {
+		if pos >= typespecStart && pos < typespecEnd {
 			return "typespec"
 		}
 		return "call"
@@ -200,7 +199,7 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 				if k < lineEnd && tokens[k].Kind == TokOpenBrace {
 					resolved := ResolveModuleRef(modName, aliases, cm)
 					if resolved != "" {
-						refs = append(refs, Reference{Module: resolved, Line: tok.Line, FilePath: path, Kind: callKind()})
+						refs = append(refs, Reference{Module: resolved, Line: tok.Line, FilePath: path, Kind: callKind(j)})
 					}
 					j = k
 					continue
@@ -225,7 +224,7 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 				if !elixirKeyword[funcName] {
 					resolved := ResolveModuleRef(modName, aliases, cm)
 					if resolved != "" {
-						refs = append(refs, Reference{Module: resolved, Function: funcName, Line: tok.Line, FilePath: path, Kind: callKind()})
+						refs = append(refs, Reference{Module: resolved, Function: funcName, Line: tok.Line, FilePath: path, Kind: callKind(j)})
 					}
 				}
 				j = k + 1
@@ -236,7 +235,7 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 			if modName != cm {
 				resolved := ResolveModuleRef(modName, aliases, cm)
 				if resolved != "" {
-					refs = append(refs, Reference{Module: resolved, Line: tok.Line, FilePath: path, Kind: callKind()})
+					refs = append(refs, Reference{Module: resolved, Line: tok.Line, FilePath: path, Kind: callKind(j)})
 				}
 			}
 			j = k - 1
@@ -283,7 +282,6 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 			continue
 
 		case TokEnd:
-			inTypespec = false
 			prevDepth := depth
 			TrackBlockDepth(tok.Kind, &depth)
 			if len(moduleStack) > 0 && moduleStack[len(moduleStack)-1].depth == prevDepth {
@@ -301,25 +299,21 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 			continue
 
 		case TokDefmodule:
-			inTypespec = false
 			i++
 			i = processModuleDef(i, "module")
 			continue
 
 		case TokDefprotocol:
-			inTypespec = false
 			i++
 			i = processModuleDef(i, "defprotocol")
 			continue
 
 		case TokDefimpl:
-			inTypespec = false
 			i++
 			i = processModuleDef(i, "defimpl")
 			continue
 
 		case TokDef, TokDefp, TokDefmacro, TokDefmacrop, TokDefguard, TokDefguardp, TokDefdelegate:
-			inTypespec = false
 			cm := currentModule()
 			if cm == "" {
 				i++
@@ -371,7 +365,6 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 			goto extractRefsForLine
 
 		case TokDefstruct:
-			inTypespec = false
 			cm := currentModule()
 			if cm != "" {
 				defs = append(defs, Definition{
@@ -386,7 +379,6 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 			goto extractRefsForLine
 
 		case TokDefexception:
-			inTypespec = false
 			cm := currentModule()
 			if cm != "" {
 				defs = append(defs, Definition{
@@ -401,7 +393,6 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 			goto extractRefsForLine
 
 		case TokAlias:
-			inTypespec = false
 			aliasLine := tok.Line
 			i++
 			j := nextSig(i)
@@ -449,7 +440,6 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 			continue
 
 		case TokImport:
-			inTypespec = false
 			importLine := tok.Line
 			i++
 			j := nextSig(i)
@@ -465,7 +455,6 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 			continue
 
 		case TokUse:
-			inTypespec = false
 			useLine := tok.Line
 			i++
 			j := nextSig(i)
@@ -481,7 +470,6 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 			continue
 
 		case TokRequire:
-			inTypespec = false
 			requireLine := tok.Line
 			i++
 			j := nextSig(i)
@@ -512,7 +500,8 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 			continue
 
 		case TokAttrType:
-			inTypespec = true
+			typespecStart = i
+			typespecEnd = ScanTypespecEnd(source, tokens, n, i)
 			cm := currentModule()
 			if cm != "" {
 				attrLine := tok.Line
@@ -550,7 +539,6 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 			goto extractRefsForLine
 
 		case TokAttrBehaviour:
-			inTypespec = false
 			cm := currentModule()
 			if cm != "" {
 				attrLine := tok.Line
@@ -570,7 +558,8 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 			goto extractRefsForLine
 
 		case TokAttrCallback:
-			inTypespec = true
+			typespecStart = i
+			typespecEnd = ScanTypespecEnd(source, tokens, n, i)
 			cm := currentModule()
 			if cm != "" {
 				attrLine := tok.Line
@@ -604,12 +593,12 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 			goto extractRefsForLine
 
 		case TokAttrSpec:
-			inTypespec = true
+			typespecStart = i
+			typespecEnd = ScanTypespecEnd(source, tokens, n, i)
 			i++
 			goto extractRefsForLine
 
 		case TokAttrDoc, TokAttr:
-			inTypespec = false
 			i++
 			goto extractRefsForLine
 
@@ -621,7 +610,7 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 					cm := currentModule()
 					resolved := ResolveModuleRef(modName, aliases, cm)
 					if resolved != "" {
-						refs = append(refs, Reference{Module: resolved, Line: tok.Line, FilePath: path, Kind: callKind()})
+						refs = append(refs, Reference{Module: resolved, Line: tok.Line, FilePath: path, Kind: callKind(i)})
 					}
 					i = k + 1
 					continue
@@ -652,7 +641,7 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 				if !elixirKeyword[funcName] {
 					resolved := ResolveModuleRef(modName, aliases, cm)
 					if resolved != "" {
-						refs = append(refs, Reference{Module: resolved, Function: funcName, Line: tok.Line, FilePath: path, Kind: callKind()})
+						refs = append(refs, Reference{Module: resolved, Function: funcName, Line: tok.Line, FilePath: path, Kind: callKind(i)})
 					}
 				}
 				i = k + 2
@@ -663,7 +652,7 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 			if modName != cm {
 				resolved := ResolveModuleRef(modName, aliases, cm)
 				if resolved != "" {
-					refs = append(refs, Reference{Module: resolved, Line: tok.Line, FilePath: path, Kind: callKind()})
+					refs = append(refs, Reference{Module: resolved, Line: tok.Line, FilePath: path, Kind: callKind(i)})
 				}
 			}
 			i = k
@@ -677,7 +666,7 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 					name := tokenText(tokens[j])
 					if !elixirKeyword[name] {
 						for mod := range injectors {
-							refs = append(refs, Reference{Module: mod, Function: name, Line: tokens[j].Line, FilePath: path, Kind: callKind()})
+							refs = append(refs, Reference{Module: mod, Function: name, Line: tokens[j].Line, FilePath: path, Kind: callKind(j)})
 						}
 					}
 				}
@@ -720,7 +709,7 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 						}
 						if emit {
 							for mod := range injectors {
-								refs = append(refs, Reference{Module: mod, Function: name, Line: tok.Line, FilePath: path, Kind: callKind()})
+								refs = append(refs, Reference{Module: mod, Function: name, Line: tok.Line, FilePath: path, Kind: callKind(i)})
 							}
 						}
 					}
@@ -760,7 +749,7 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 							name := tokenText(tokens[pj])
 							if !elixirKeyword[name] {
 								for mod := range injectors {
-									refs = append(refs, Reference{Module: mod, Function: name, Line: tokens[pj].Line, FilePath: path, Kind: callKind()})
+									refs = append(refs, Reference{Module: mod, Function: name, Line: tokens[pj].Line, FilePath: path, Kind: callKind(pj)})
 								}
 							}
 						}

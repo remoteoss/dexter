@@ -2929,6 +2929,30 @@ end`
 	}
 }
 
+func TestParse_TypespecEndsBeforeFollowingExpression(t *testing.T) {
+	src := `defmodule MyApp.Schema do
+  @spec field(SharedLib.Schema.schema()) :: :ok
+  SharedLib.Schema.schema("users")
+end`
+	_, refs, err := ParseText("lib/schema.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	kindByLine := make(map[int]string)
+	for _, r := range refs {
+		if r.Module == "SharedLib.Schema" {
+			kindByLine[r.Line] = r.Kind
+		}
+	}
+	if kindByLine[2] != "typespec" {
+		t.Errorf("typespec reference: got kind %q, want typespec", kindByLine[2])
+	}
+	if kindByLine[3] != "call" {
+		t.Errorf("following expression: got kind %q, want call", kindByLine[3])
+	}
+}
+
 // A predicate name inside a string interpolation ends in `?`, which also opens
 // a char literal in Elixir (`?a`). Reading `#{dry_run?}` the second way
 // swallows the closing brace, and everything after it in the file — every

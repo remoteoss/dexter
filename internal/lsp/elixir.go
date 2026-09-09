@@ -155,12 +155,9 @@ func (tf *TokenizedFile) findDefinition(functionName string, preferType bool) (i
 }
 
 // InTypespec reports whether the given 0-based line sits inside a @type,
-// @typep, @opaque, @spec, @callback or @macrocallback declaration. It looks at
-// the most recent definition-starting token at or before the line, so the
-// continuation lines of a multi-line typespec count too.
+// @typep, @opaque, @spec, @callback or @macrocallback declaration.
 func (tf *TokenizedFile) InTypespec(targetLine int) bool {
 	targetLine1 := targetLine + 1
-	inSpec := false
 	for i := 0; i < tf.n; i++ {
 		tok := tf.tokens[i]
 		if tok.Line > targetLine1 {
@@ -168,15 +165,14 @@ func (tf *TokenizedFile) InTypespec(targetLine int) bool {
 		}
 		switch tok.Kind {
 		case parser.TokAttrType, parser.TokAttrSpec, parser.TokAttrCallback:
-			inSpec = true
-		case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
-			parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate,
-			parser.TokDefmodule, parser.TokDefprotocol, parser.TokDefimpl,
-			parser.TokDefstruct, parser.TokDefexception, parser.TokAttr:
-			inSpec = false
+			end := parser.ScanTypespecEnd(tf.source, tf.tokens, tf.n, i)
+			if end >= tf.n || tf.tokens[end].Line >= targetLine1 {
+				return true
+			}
+			i = end
 		}
 	}
-	return inSpec
+	return false
 }
 
 // ExtractAliasesInScope parses alias declarations visible at the given 0-based line.
@@ -1489,10 +1485,12 @@ func extractUsesFromTokens(source []byte, tokens []parser.Token) []string {
 
 // UseCall holds a `use Module` declaration with its keyword opts.
 type UseCall struct {
-	Module string            // the module being used (alias-resolved)
-	Opts   map[string]string // keyword args: opt_key → module name (alias-resolved)
-	line   int               // 1-based source line; zero for synthesized transitive calls
-	local  bool              // nested in an inline do: expression; cannot affect later lines
+	Module     string            // the module being used (alias-resolved)
+	Opts       map[string]string // keyword args: opt_key → module name (alias-resolved)
+	line       int               // 1-based source line; zero for synthesized transitive calls
+	local      bool              // nested in an inline do: expression; cannot affect later lines
+	token      int               // TokUse position; zero for synthesized transitive calls
+	moduleExpr string            // source spelling, retained for scope-aware matching
 
 	// Which is the literal atom passed as the second argument, e.g. "controller"
 	// for `use MyAppWeb, :controller`. WhichKey is the first keyword key, e.g.
@@ -1566,9 +1564,9 @@ func extractUsesWithOptsFromTokens(source []byte, tokens []parser.Token, aliases
 		if nk < n && tokens[nk].Kind == parser.TokComma {
 			opts := tokCollectKeywordModuleOpts(source, tokens, n, nk+1, aliases)
 			which, whichKey := tokCollectDispatchAtom(source, tokens, n, nk+1)
-			calls = append(calls, UseCall{Module: module, Opts: opts, Which: which, WhichKey: whichKey, line: tokens[i].Line, local: local})
+			calls = append(calls, UseCall{Module: module, Opts: opts, Which: which, WhichKey: whichKey, line: tokens[i].Line, local: local, token: i, moduleExpr: modName})
 		} else {
-			calls = append(calls, UseCall{Module: module, line: tokens[i].Line, local: local})
+			calls = append(calls, UseCall{Module: module, line: tokens[i].Line, local: local, token: i, moduleExpr: modName})
 		}
 		i = k
 	}

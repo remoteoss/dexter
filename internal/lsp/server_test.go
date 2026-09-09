@@ -6643,6 +6643,32 @@ end
 	}
 }
 
+func TestDefinition_BareCallAfterSpecPrefersFunction(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	src := `defmodule MyApp.Order do
+  @type status :: :pending | :complete
+  def status(value), do: value
+
+  @spec normalize(status()) :: status()
+  status(:pending)
+end
+`
+	path := filepath.Join(server.projectRoot, "lib", "order.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/order.ex", src)
+	fileURI := "file://" + path
+	server.docs.Set(fileURI, src)
+
+	locs := definitionAt(t, server, fileURI, 5, 3)
+	if len(locs) == 0 {
+		t.Fatal("expected go-to-definition for the call after the spec")
+	}
+	if locs[0].Range.Start.Line != 2 {
+		t.Errorf("expected function status on line 2, got line %d", locs[0].Range.Start.Line)
+	}
+}
+
 // TestReferences_TypespecRefsSeparatedFromCalls covers a module that declares
 // both `@type schema` and `defmacro schema/2`, as Ecto.Schema does. A
 // `Mod.schema()` written in an `@spec` names the type, so it must not appear
@@ -7066,6 +7092,43 @@ end
 	}
 }
 
+func TestRenameModuleKeepsCustomInjectedAliasSpelling(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	repo := `defmodule MyApp.Repo do
+  defmacro __using__(_) do
+    quote do
+      alias MyApp.Repo, as: Database
+    end
+  end
+end
+`
+	consumer := `defmodule MyApp.Consumer do
+  use MyApp.Repo
+  def all, do: Database.all(User)
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/repo.ex", repo)
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/consumer.ex", consumer)
+
+	repoPath := filepath.Join(server.projectRoot, "lib/my_app/repo.ex")
+	consumerPath := filepath.Join(server.projectRoot, "lib/my_app/consumer.ex")
+	repoURI := "file://" + repoPath
+	server.docs.Set(repoURI, repo)
+
+	if edit := renameAt(t, server, repoURI, 0, 16, "Storage"); edit == nil {
+		t.Fatal("expected non-nil edit")
+	}
+	got, err := os.ReadFile(consumerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "Database.all(User)") {
+		t.Errorf("custom alias spelling should remain stable:\n%s", got)
+	}
+}
+
 func TestRenameChildModuleViaUseInjectedParentAlias(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
@@ -7254,6 +7317,154 @@ end
 	}
 	if !strings.Contains(string(got), "Database.all(User)") {
 		t.Errorf("the second dispatch on the shared line injects the alias, got:\n%s", got)
+	}
+}
+
+func TestRenameInjectedAliasPairsSameLineUseWithItsModule(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	repo := `defmodule MyApp.Repo do
+end
+`
+	entry := `defmodule MyApp.Entry do
+  defmacro __using__(which) when is_atom(which), do: apply(__MODULE__, which, [])
+
+  def plain do
+    quote do
+      :ok
+    end
+  end
+
+  def repo do
+    quote do
+      alias MyApp.Repo
+    end
+  end
+end
+`
+	other := `defmodule MyApp.Other do
+  defmacro __using__(_), do: quote(do: :ok)
+end
+`
+	consumer := `defmodule MyApp.Consumer do
+  alias MyApp.Entry
+  use Entry, :plain; use MyApp.Other, :repo
+  def all, do: Repo.all(User)
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/repo.ex", repo)
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/entry.ex", entry)
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/other.ex", other)
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/consumer.ex", consumer)
+
+	repoPath := filepath.Join(server.projectRoot, "lib/my_app/repo.ex")
+	consumerPath := filepath.Join(server.projectRoot, "lib/my_app/consumer.ex")
+	repoURI := "file://" + repoPath
+	server.docs.Set(repoURI, repo)
+
+	if edit := renameAt(t, server, repoURI, 0, 16, "Database"); edit == nil {
+		t.Fatal("expected non-nil edit")
+	}
+	got, err := os.ReadFile(consumerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "Repo.all(User)") {
+		t.Errorf("a sibling use was paired with MyApp.Entry and leaked its alias:\n%s", got)
+	}
+}
+
+func TestRenameInjectedAliasUseBeforeSameLineEndStaysBlockScoped(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/repo.ex", injectedAliasFixture)
+	consumer := `defmodule MyApp.InlineEnd do
+  if true do use MyApp.Repo end
+  def all, do: Repo.all(User)
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/inline_end.ex", consumer)
+
+	repoPath := filepath.Join(server.projectRoot, "lib/my_app/repo.ex")
+	consumerPath := filepath.Join(server.projectRoot, "lib/my_app/inline_end.ex")
+	repoURI := "file://" + repoPath
+	server.docs.Set(repoURI, injectedAliasFixture)
+
+	if edit := renameAt(t, server, repoURI, 0, 16, "Database"); edit == nil {
+		t.Fatal("expected non-nil edit")
+	}
+	got, err := os.ReadFile(consumerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "Repo.all(User)") {
+		t.Errorf("alias from the closed block escaped into module scope:\n%s", got)
+	}
+}
+
+func TestRenameInjectedAliasCallBeforeSameLineEndStaysInScope(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/repo.ex", injectedAliasFixture)
+	consumer := `defmodule MyApp.InlineCall do
+  if true do use MyApp.Repo; Repo.all(User) end
+  def all, do: Repo.all(User)
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/inline_call.ex", consumer)
+
+	repoPath := filepath.Join(server.projectRoot, "lib/my_app/repo.ex")
+	consumerPath := filepath.Join(server.projectRoot, "lib/my_app/inline_call.ex")
+	repoURI := "file://" + repoPath
+	server.docs.Set(repoURI, injectedAliasFixture)
+
+	if edit := renameAt(t, server, repoURI, 0, 16, "Database"); edit == nil {
+		t.Fatal("expected non-nil edit")
+	}
+	got, err := os.ReadFile(consumerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(got)
+	if !strings.Contains(text, "Database.all(User) end") {
+		t.Errorf("call before the same-line end was missed:\n%s", text)
+	}
+	if !strings.Contains(text, "def all, do: Repo.all(User)") {
+		t.Errorf("alias escaped to the call after the block:\n%s", text)
+	}
+}
+
+func TestRenameInjectedAliasUseBeforeSameLineDoRemainsModuleScoped(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/repo.ex", injectedAliasFixture)
+	consumer := `defmodule MyApp.InlineDo do
+  use MyApp.Repo; if true do
+    :ok
+  end
+  def all, do: Repo.all(User)
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/inline_do.ex", consumer)
+
+	repoPath := filepath.Join(server.projectRoot, "lib/my_app/repo.ex")
+	consumerPath := filepath.Join(server.projectRoot, "lib/my_app/inline_do.ex")
+	repoURI := "file://" + repoPath
+	server.docs.Set(repoURI, injectedAliasFixture)
+
+	if edit := renameAt(t, server, repoURI, 0, 16, "Database"); edit == nil {
+		t.Fatal("expected non-nil edit")
+	}
+	got, err := os.ReadFile(consumerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "Database.all(User)") {
+		t.Errorf("module-scoped alias was incorrectly nested under the later block:\n%s", got)
 	}
 }
 

@@ -2535,6 +2535,11 @@ type injectedAlias struct {
 	injectors []string // modules whose `use` brings the alias in, transitively closed
 }
 
+type injectedAliasReference struct {
+	store.ModuleReferenceResult
+	written string
+}
+
 // matchInjectedAlias maps an alias declaration to the spelling and canonical
 // module used for a target lookup. The alias may name the target, a descendant
 // of it, or an ancestor of it.
@@ -2674,14 +2679,15 @@ func (s *Server) usingInjectsAlias(module, which, targetModule, written, resolve
 }
 
 // lexicalScopeAt returns stable token positions for the block ancestry at a
-// 1-based line. A module-level directive is visible in later nested blocks,
-// while one inside an if/case/fn is not visible after that block ends.
-func lexicalScopeAt(tf *TokenizedFile, line int) []int {
+// 1-based line, or immediately before beforeToken when it is non-negative. A
+// token position is necessary for directives on lines that also open or close
+// another block.
+func lexicalScopeAt(tf *TokenizedFile, line, beforeToken int) []int {
 	w := parser.NewTokenWalker(tf.source, tf.tokens)
 	stack := make([]int, 0, 8)
 	for w.More() {
 		tok := w.Current()
-		if tok.Line > line {
+		if (beforeToken >= 0 && w.Pos() >= beforeToken) || (beforeToken < 0 && tok.Line > line) {
 			break
 		}
 		switch tok.Kind {
@@ -2824,25 +2830,29 @@ func (s *Server) closeOverInjectors(direct []string, usingByFile map[string][]st
 // A functionName narrows the result to calls of that function through the
 // injected alias (`Repo.all(...)` for MyApp.Repo.all); empty matches the
 // module itself and every module under it.
-func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs []store.ModuleReferenceResult, moduleSitesOnly bool) []store.ModuleReferenceResult {
+func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs []store.ModuleReferenceResult, moduleSitesOnly bool) []injectedAliasReference {
 	aliases := s.findInjectedAliasesFor(targetModule, targetRefs)
 	if len(aliases) == 0 {
 		return nil
 	}
 
-	var out []store.ModuleReferenceResult
+	var out []injectedAliasReference
 	type useSite struct {
 		filePath string
 		line     int
+		scope    []int
 	}
 	useSiteCache := make(map[string][]useSite)
+	useCallCache := make(map[string][]UseCall)
 	tokenizedFiles := make(map[string]*TokenizedFile)
 	missingFiles := make(map[string]bool)
-	type scopeKey struct {
+	type refScopeKey struct {
 		filePath string
 		line     int
+		module   string
+		function string
 	}
-	scopeCache := make(map[scopeKey][]int)
+	refScopeCache := make(map[refScopeKey][][]int)
 	tokenizedAt := func(filePath string) (*TokenizedFile, bool) {
 		tf, ok := tokenizedFiles[filePath]
 		if !ok {
@@ -2866,37 +2876,67 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 		}
 		return extractEnclosingModuleFromTokens(tf.source, tf.tokens, line-1), true
 	}
-	scopeAt := func(filePath string, line int) ([]int, bool) {
-		key := scopeKey{filePath, line}
-		if scope, ok := scopeCache[key]; ok {
-			return scope, true
+	refScopesAt := func(filePath string, line int, module, function string) ([][]int, bool) {
+		key := refScopeKey{filePath, line, module, function}
+		if scopes, ok := refScopeCache[key]; ok {
+			return scopes, true
 		}
 		tf, ok := tokenizedAt(filePath)
 		if !ok {
 			return nil, false
 		}
-		scope := lexicalScopeAt(tf, line)
-		scopeCache[key] = scope
-		return scope, true
+		var scopes [][]int
+		for i := 0; i < tf.n; i++ {
+			if tf.tokens[i].Line > line {
+				break
+			}
+			if tf.tokens[i].Line != line || tf.tokens[i].Kind != parser.TokModule {
+				continue
+			}
+			modName, next := tokCollectModuleName(tf.source, tf.tokens, tf.n, i)
+			if modName != module {
+				continue
+			}
+			if function != "" && (next+1 >= tf.n || tf.tokens[next].Kind != parser.TokDot || tf.tokens[next+1].Kind != parser.TokIdent || parser.TokenText(tf.source, tf.tokens[next+1]) != function) {
+				continue
+			}
+			scopes = append(scopes, lexicalScopeAt(tf, line, i))
+			i = next - 1
+		}
+		refScopeCache[key] = scopes
+		return scopes, len(scopes) > 0
 	}
 	useCallsAt := func(filePath string, line int) []UseCall {
 		tf, ok := tokenizedAt(filePath)
 		if !ok {
 			return nil
 		}
+		all, found := useCallCache[filePath]
+		if !found {
+			all = tf.ExtractUsesWithOpts(nil)
+			useCallCache[filePath] = all
+		}
 		var calls []UseCall
-		for _, call := range tf.ExtractUsesWithOpts(nil) {
+		for _, call := range all {
 			if call.line == line {
 				calls = append(calls, call)
 			}
 		}
 		return calls
 	}
+	resolvedUseModule := func(tf *TokenizedFile, call UseCall, want string) string {
+		if call.Module == want {
+			return call.Module
+		}
+		aliases := tf.ExtractAliasesInScope(call.line - 1)
+		current := extractEnclosingModuleFromTokens(tf.source, tf.tokens, call.line-1)
+		return parser.ResolveModuleRef(call.moduleExpr, aliases, current)
+	}
 	for _, ia := range aliases {
 		// Exact lexical module scopes whose `use` brings this alias in. Keeping
 		// the line also prevents an earlier bare name in the same module from
 		// being mistaken for an alias that is introduced later.
-		consumers := make(map[string][]int)
+		consumers := make(map[string][]useSite)
 		for _, inj := range ia.injectors {
 			cacheKey := inj + "\x00" + ia.shortName + "\x00" + ia.module
 			sites, ok := useSiteCache[cacheKey]
@@ -2906,11 +2946,15 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 						if r.Kind != "use" {
 							continue
 						}
+						tf, exists := tokenizedAt(r.FilePath)
+						if !exists {
+							continue
+						}
 						for _, call := range useCallsAt(r.FilePath, r.Line) {
-							if call.local || !s.usingInjectsAlias(inj, call.dispatchAtom(), targetModule, ia.shortName, ia.module, make(map[string]bool)) {
+							if resolvedUseModule(tf, call, inj) != inj || call.local || !s.usingInjectsAlias(inj, call.dispatchAtom(), targetModule, ia.shortName, ia.module, make(map[string]bool)) {
 								continue
 							}
-							sites = append(sites, useSite{r.FilePath, r.Line})
+							sites = append(sites, useSite{r.FilePath, r.Line, lexicalScopeAt(tf, r.Line, call.token)})
 							break
 						}
 					}
@@ -2918,33 +2962,37 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 				useSiteCache[cacheKey] = sites
 			}
 			for _, site := range sites {
-				consumers[site.filePath] = append(consumers[site.filePath], site.line)
+				consumers[site.filePath] = append(consumers[site.filePath], site)
 			}
 		}
 		if len(consumers) == 0 {
 			continue
 		}
-		isConsumer := func(filePath string, line int) bool {
-			useLines := consumers[filePath]
-			if len(useLines) == 0 {
+		isConsumer := func(filePath string, line int, module, function string) bool {
+			useSites := consumers[filePath]
+			if len(useSites) == 0 {
 				return false
 			}
 			refModule, ok := moduleAt(filePath, line)
 			if !ok {
 				return false
 			}
-			refScope, ok := scopeAt(filePath, line)
+			refScopes, ok := refScopesAt(filePath, line, module, function)
 			if !ok {
 				return false
 			}
-			for _, useLine := range useLines {
-				if useLine > line {
+			for _, site := range useSites {
+				if site.line > line {
 					continue
 				}
-				useModule, found := moduleAt(filePath, useLine)
-				useScope, scoped := scopeAt(filePath, useLine)
-				if found && scoped && useModule == refModule && scopeContains(refScope, useScope) {
-					return true
+				useModule, found := moduleAt(filePath, site.line)
+				if !found || useModule != refModule {
+					continue
+				}
+				for _, refScope := range refScopes {
+					if scopeContains(refScope, site.scope) {
+						return true
+					}
 				}
 			}
 			return false
@@ -2956,14 +3004,17 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 				continue
 			}
 			for _, r := range refs {
-				if !isConsumer(r.FilePath, r.Line) {
+				if !isConsumer(r.FilePath, r.Line, ia.shortName, functionName) {
 					continue
 				}
-				out = append(out, store.ModuleReferenceResult{
-					Module:   ia.module,
-					FilePath: r.FilePath,
-					Line:     r.Line,
-					Kind:     r.Kind,
+				out = append(out, injectedAliasReference{
+					ModuleReferenceResult: store.ModuleReferenceResult{
+						Module:   ia.module,
+						FilePath: r.FilePath,
+						Line:     r.Line,
+						Kind:     r.Kind,
+					},
+					written: ia.shortName,
 				})
 			}
 			continue
@@ -2979,11 +3030,12 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 			if moduleSitesOnly && r.Kind != "alias" && r.Kind != "import" && r.Kind != "use" && r.Kind != "require" {
 				continue
 			}
-			if !isConsumer(r.FilePath, r.Line) {
+			if !isConsumer(r.FilePath, r.Line, r.Module, "") {
 				continue
 			}
+			written := r.Module
 			r.Module = ia.module + r.Module[len(ia.shortName):]
-			out = append(out, r)
+			out = append(out, injectedAliasReference{ModuleReferenceResult: r, written: written})
 		}
 	}
 	return out
@@ -5664,12 +5716,20 @@ func (mr *moduleRename) collectSites() {
 		// written through an `as:` name spells neither and needs no edit —
 		// the alias line inside the __using__ body carries the rename.
 		for _, r := range mr.server.injectedAliasRefs(mr.oldModule, "", refs, false) {
-			if _, ok := mr.moduleRenames[r.Module]; !ok {
-				newMod := mr.newModule + r.Module[len(mr.oldModule):]
+			newMod, ok := mr.moduleRenames[r.Module]
+			if !ok {
+				newMod = mr.newModule + r.Module[len(mr.oldModule):]
 				mr.moduleRenames[r.Module] = newMod
 				mr.tokenReplacements[r.Module] = newMod
 			}
-			addSite(r.FilePath, r.Line, r.Module)
+			if r.written == r.Module || strings.HasSuffix(r.Module, "."+r.written) {
+				parts := strings.Split(newMod, ".")
+				writtenParts := strings.Count(r.written, ".") + 1
+				if writtenParts <= len(parts) {
+					mr.tokenReplacements[r.written] = strings.Join(parts[len(parts)-writtenParts:], ".")
+					addSite(r.FilePath, r.Line, r.written)
+				}
+			}
 		}
 	}
 }
