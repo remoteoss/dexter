@@ -7271,6 +7271,82 @@ end
 	}
 }
 
+func TestRenameInjectedAliasDoesNotCrossElseBranch(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/repo.ex", injectedAliasFixture)
+	consumer := `defmodule MyApp.Branches do
+  if enabled?() do
+    use MyApp.Repo
+    def enabled, do: Repo.all(:enabled)
+  else
+    def disabled, do: Repo.all(:disabled)
+  end
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/branches.ex", consumer)
+
+	repoPath := filepath.Join(server.projectRoot, "lib/my_app/repo.ex")
+	consumerPath := filepath.Join(server.projectRoot, "lib/my_app/branches.ex")
+	repoURI := "file://" + repoPath
+	server.docs.Set(repoURI, injectedAliasFixture)
+
+	if edit := renameAt(t, server, repoURI, 0, 16, "Database"); edit == nil {
+		t.Fatal("expected non-nil edit")
+	}
+	got, err := os.ReadFile(consumerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(got)
+	if !strings.Contains(text, "Database.all(:enabled)") {
+		t.Errorf("alias was not applied inside its branch:\n%s", text)
+	}
+	if !strings.Contains(text, "Repo.all(:disabled)") {
+		t.Errorf("alias crossed into the else branch:\n%s", text)
+	}
+}
+
+func TestRenameInjectedAliasDoesNotCrossStabClause(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/repo.ex", injectedAliasFixture)
+	consumer := `defmodule MyApp.Clauses do
+  case mode() do
+    :enabled ->
+      use MyApp.Repo
+      Repo.all(:enabled)
+
+    :disabled ->
+      Repo.all(:disabled)
+  end
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/clauses.ex", consumer)
+
+	repoPath := filepath.Join(server.projectRoot, "lib/my_app/repo.ex")
+	consumerPath := filepath.Join(server.projectRoot, "lib/my_app/clauses.ex")
+	repoURI := "file://" + repoPath
+	server.docs.Set(repoURI, injectedAliasFixture)
+
+	if edit := renameAt(t, server, repoURI, 0, 16, "Database"); edit == nil {
+		t.Fatal("expected non-nil edit")
+	}
+	got, err := os.ReadFile(consumerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(got)
+	if !strings.Contains(text, "Database.all(:enabled)") {
+		t.Errorf("alias was not applied inside its clause:\n%s", text)
+	}
+	if !strings.Contains(text, "Repo.all(:disabled)") {
+		t.Errorf("alias crossed into the next stab clause:\n%s", text)
+	}
+}
+
 func TestRenameInjectedAliasChecksEveryUseDispatchOnSameLine(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
@@ -7372,6 +7448,52 @@ end
 	}
 	if !strings.Contains(string(got), "Repo.all(User)") {
 		t.Errorf("a sibling use was paired with MyApp.Entry and leaked its alias:\n%s", got)
+	}
+}
+
+func TestRenameInjectedAliasResolvesAliasAtUseToken(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	repo := `defmodule MyApp.Repo do
+end
+`
+	entry := `defmodule MyApp.Entry do
+  defmacro __using__(_) do
+    quote do
+      alias MyApp.Repo
+    end
+  end
+end
+`
+	other := `defmodule MyApp.Other do
+end
+`
+	consumer := `defmodule MyApp.Consumer do
+  alias MyApp.Entry, as: Injector
+  use Injector; alias MyApp.Other, as: Injector
+  def all, do: Repo.all(User)
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/repo.ex", repo)
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/entry.ex", entry)
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/other.ex", other)
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/consumer.ex", consumer)
+
+	repoPath := filepath.Join(server.projectRoot, "lib/my_app/repo.ex")
+	consumerPath := filepath.Join(server.projectRoot, "lib/my_app/consumer.ex")
+	repoURI := "file://" + repoPath
+	server.docs.Set(repoURI, repo)
+
+	if edit := renameAt(t, server, repoURI, 0, 16, "Database"); edit == nil {
+		t.Fatal("expected non-nil edit")
+	}
+	got, err := os.ReadFile(consumerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "Database.all(User)") {
+		t.Errorf("later alias rebind changed the earlier use target:\n%s", got)
 	}
 }
 
@@ -7584,6 +7706,71 @@ end
 	}
 	if !strings.Contains(string(got), "Repo.all(User)") {
 		t.Errorf("alias from split inline block escaped into module scope:\n%s", got)
+	}
+}
+
+func TestRenameInjectedAliasDoesNotApplyBeforeSameLineUse(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/repo.ex", injectedAliasFixture)
+	consumer := `defmodule MyApp.SameLineOrder do
+  Repo.all(:before); use MyApp.Repo; Repo.all(:after)
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/same_line_order.ex", consumer)
+
+	repoPath := filepath.Join(server.projectRoot, "lib/my_app/repo.ex")
+	consumerPath := filepath.Join(server.projectRoot, "lib/my_app/same_line_order.ex")
+	repoURI := "file://" + repoPath
+	server.docs.Set(repoURI, injectedAliasFixture)
+
+	if edit := renameAt(t, server, repoURI, 0, 16, "Database"); edit == nil {
+		t.Fatal("expected non-nil edit")
+	}
+	got, err := os.ReadFile(consumerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(got)
+	if !strings.Contains(text, "Repo.all(:before)") {
+		t.Errorf("alias applied before the use token:\n%s", text)
+	}
+	if !strings.Contains(text, "Database.all(:after)") {
+		t.Errorf("alias did not apply after the use token:\n%s", text)
+	}
+	if !strings.Contains(text, "use MyApp.Database") {
+		t.Errorf("the use site itself was not renamed:\n%s", text)
+	}
+}
+
+func TestRenameInjectedAliasDistinguishesSameLineModules(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/repo.ex", injectedAliasFixture)
+	consumer := `defmodule MyApp.Consumer do use MyApp.Repo; Repo.all(:inside) end; defmodule MyApp.Other do Repo.all(:outside) end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/same_line_modules.ex", consumer)
+
+	repoPath := filepath.Join(server.projectRoot, "lib/my_app/repo.ex")
+	consumerPath := filepath.Join(server.projectRoot, "lib/my_app/same_line_modules.ex")
+	repoURI := "file://" + repoPath
+	server.docs.Set(repoURI, injectedAliasFixture)
+
+	if edit := renameAt(t, server, repoURI, 0, 16, "Database"); edit == nil {
+		t.Fatal("expected non-nil edit")
+	}
+	got, err := os.ReadFile(consumerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(got)
+	if !strings.Contains(text, "Database.all(:inside)") {
+		t.Errorf("alias was not applied in its same-line module:\n%s", text)
+	}
+	if !strings.Contains(text, "Repo.all(:outside)") {
+		t.Errorf("alias crossed into the next same-line module:\n%s", text)
 	}
 }
 

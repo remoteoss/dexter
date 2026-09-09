@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -2538,6 +2539,7 @@ type injectedAlias struct {
 type injectedAliasReference struct {
 	store.ModuleReferenceResult
 	written string
+	columns []int
 }
 
 // matchInjectedAlias maps an alias declaration to the spelling and canonical
@@ -2685,12 +2687,15 @@ func (s *Server) usingInjectsAlias(module, which, targetModule, written, resolve
 func lexicalScopeAt(tf *TokenizedFile, line, beforeToken int) []int {
 	w := parser.NewTokenWalker(tf.source, tf.tokens)
 	stack := make([]int, 0, 8)
+	typespecEnd := -1
 	for w.More() {
 		tok := w.Current()
 		if (beforeToken >= 0 && w.Pos() >= beforeToken) || (beforeToken < 0 && tok.Line > line) {
 			break
 		}
 		switch tok.Kind {
+		case parser.TokAttrType, parser.TokAttrSpec, parser.TokAttrCallback:
+			typespecEnd = parser.ScanTypespecEnd(tf.source, tf.tokens, tf.n, w.Pos())
 		case parser.TokDo, parser.TokFn:
 			// `do:` and `fn:` keyword keys do not open blocks.
 			next := parser.NextSigToken(tf.tokens, tf.n, w.Pos()+1)
@@ -2700,6 +2705,18 @@ func lexicalScopeAt(tf *TokenizedFile, line, beforeToken int) []int {
 		case parser.TokEnd:
 			if len(stack) > 0 {
 				stack = stack[:len(stack)-1]
+			}
+		case parser.TokRightArrow:
+			if w.Depth() == 0 && w.Pos() >= typespecEnd && len(stack) > 0 {
+				stack[len(stack)-1] = w.Pos()
+			}
+		case parser.TokIdent:
+			switch w.CurrentText() {
+			case "else", "rescue", "catch", "after":
+				next := parser.NextSigToken(tf.tokens, tf.n, w.Pos()+1)
+				if w.Pos() >= typespecEnd && len(stack) > 0 && (next >= tf.n || tf.tokens[next].Kind != parser.TokColon) {
+					stack[len(stack)-1] = w.Pos()
+				}
 			}
 		}
 		w.Advance()
@@ -2840,19 +2857,25 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 	type useSite struct {
 		filePath string
 		line     int
+		token    int
 		scope    []int
 	}
 	useSiteCache := make(map[string][]useSite)
 	useCallCache := make(map[string][]UseCall)
 	tokenizedFiles := make(map[string]*TokenizedFile)
 	missingFiles := make(map[string]bool)
-	type refScopeKey struct {
+	type refKey struct {
 		filePath string
 		line     int
 		module   string
 		function string
 	}
-	refScopeCache := make(map[refScopeKey][][]int)
+	type refOccurrence struct {
+		token  int
+		column int
+		scope  []int
+	}
+	refCache := make(map[refKey][]refOccurrence)
 	tokenizedAt := func(filePath string) (*TokenizedFile, bool) {
 		tf, ok := tokenizedFiles[filePath]
 		if !ok {
@@ -2876,16 +2899,16 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 		}
 		return extractEnclosingModuleFromTokens(tf.source, tf.tokens, line-1), true
 	}
-	refScopesAt := func(filePath string, line int, module, function string) ([][]int, bool) {
-		key := refScopeKey{filePath, line, module, function}
-		if scopes, ok := refScopeCache[key]; ok {
-			return scopes, true
+	refOccurrencesAt := func(filePath string, line int, module, function string) ([]refOccurrence, bool) {
+		key := refKey{filePath, line, module, function}
+		if occurrences, ok := refCache[key]; ok {
+			return occurrences, true
 		}
 		tf, ok := tokenizedAt(filePath)
 		if !ok {
 			return nil, false
 		}
-		var scopes [][]int
+		var occurrences []refOccurrence
 		for i := 0; i < tf.n; i++ {
 			if tf.tokens[i].Line > line {
 				break
@@ -2900,11 +2923,15 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 			if function != "" && (next+1 >= tf.n || tf.tokens[next].Kind != parser.TokDot || tf.tokens[next+1].Kind != parser.TokIdent || parser.TokenText(tf.source, tf.tokens[next+1]) != function) {
 				continue
 			}
-			scopes = append(scopes, lexicalScopeAt(tf, line, i))
+			occurrences = append(occurrences, refOccurrence{
+				token:  i,
+				column: tf.tokens[i].Start - tf.lineStarts[line-1],
+				scope:  lexicalScopeAt(tf, line, i),
+			})
 			i = next - 1
 		}
-		refScopeCache[key] = scopes
-		return scopes, len(scopes) > 0
+		refCache[key] = occurrences
+		return occurrences, len(occurrences) > 0
 	}
 	useCallsAt := func(filePath string, line int) []UseCall {
 		tf, ok := tokenizedAt(filePath)
@@ -2928,7 +2955,7 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 		if call.Module == want {
 			return call.Module
 		}
-		aliases := tf.ExtractAliasesInScope(call.line - 1)
+		aliases := extractAliasesFromTokens(tf.source, tf.tokens[:call.token], call.line-1)
 		current := extractEnclosingModuleFromTokens(tf.source, tf.tokens, call.line-1)
 		return parser.ResolveModuleRef(call.moduleExpr, aliases, current)
 	}
@@ -2954,8 +2981,7 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 							if resolvedUseModule(tf, call, inj) != inj || call.local || !s.usingInjectsAlias(inj, call.dispatchAtom(), targetModule, ia.shortName, ia.module, make(map[string]bool)) {
 								continue
 							}
-							sites = append(sites, useSite{r.FilePath, r.Line, lexicalScopeAt(tf, r.Line, call.token)})
-							break
+							sites = append(sites, useSite{r.FilePath, r.Line, call.token, lexicalScopeAt(tf, r.Line, call.token)})
 						}
 					}
 				}
@@ -2968,19 +2994,20 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 		if len(consumers) == 0 {
 			continue
 		}
-		isConsumer := func(filePath string, line int, module, function string) bool {
+		consumerColumns := func(filePath string, line int, module, function string) []int {
 			useSites := consumers[filePath]
 			if len(useSites) == 0 {
-				return false
+				return nil
 			}
 			refModule, ok := moduleAt(filePath, line)
 			if !ok {
-				return false
+				return nil
 			}
-			refScopes, ok := refScopesAt(filePath, line, module, function)
+			occurrences, ok := refOccurrencesAt(filePath, line, module, function)
 			if !ok {
-				return false
+				return nil
 			}
+			var columns []int
 			for _, site := range useSites {
 				if site.line > line {
 					continue
@@ -2989,13 +3016,16 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 				if !found || useModule != refModule {
 					continue
 				}
-				for _, refScope := range refScopes {
-					if scopeContains(refScope, site.scope) {
-						return true
+				for _, occurrence := range occurrences {
+					if site.line == line && site.token >= occurrence.token {
+						continue
+					}
+					if scopeContains(occurrence.scope, site.scope) && !slices.Contains(columns, occurrence.column) {
+						columns = append(columns, occurrence.column)
 					}
 				}
 			}
-			return false
+			return columns
 		}
 
 		if functionName != "" {
@@ -3004,7 +3034,8 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 				continue
 			}
 			for _, r := range refs {
-				if !isConsumer(r.FilePath, r.Line, ia.shortName, functionName) {
+				columns := consumerColumns(r.FilePath, r.Line, ia.shortName, functionName)
+				if len(columns) == 0 {
 					continue
 				}
 				out = append(out, injectedAliasReference{
@@ -3015,6 +3046,7 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 						Kind:     r.Kind,
 					},
 					written: ia.shortName,
+					columns: columns,
 				})
 			}
 			continue
@@ -3030,12 +3062,13 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 			if moduleSitesOnly && r.Kind != "alias" && r.Kind != "import" && r.Kind != "use" && r.Kind != "require" {
 				continue
 			}
-			if !isConsumer(r.FilePath, r.Line, r.Module, "") {
+			columns := consumerColumns(r.FilePath, r.Line, r.Module, "")
+			if len(columns) == 0 {
 				continue
 			}
 			written := r.Module
 			r.Module = ia.module + r.Module[len(ia.shortName):]
-			out = append(out, injectedAliasReference{ModuleReferenceResult: r, written: written})
+			out = append(out, injectedAliasReference{ModuleReferenceResult: r, written: written, columns: columns})
 		}
 	}
 	return out
@@ -5593,6 +5626,7 @@ type moduleEditSite struct {
 	filePath string
 	line     int
 	token    string
+	columns  []int
 }
 
 type moduleFileInfo struct {
@@ -5673,16 +5707,27 @@ func (mr *moduleRename) isExcluded(filePath string) bool {
 }
 
 func (mr *moduleRename) collectSites() {
-	seen := make(map[string]bool)
-	addSite := func(filePath string, line int, token string) {
+	sitePositions := make(map[string]int)
+	addSite := func(filePath string, line int, token string, columns []int) {
 		if mr.isExcluded(filePath) {
 			return
 		}
 		k := filePath + "\x00" + strconv.Itoa(line) + "\x00" + token
-		if !seen[k] {
-			seen[k] = true
-			mr.sitesByFile[filePath] = append(mr.sitesByFile[filePath], moduleEditSite{filePath, line, token})
+		if pos, exists := sitePositions[k]; exists {
+			site := &mr.sitesByFile[filePath][pos]
+			if site.columns == nil || columns == nil {
+				site.columns = nil
+				return
+			}
+			for _, col := range columns {
+				if !slices.Contains(site.columns, col) {
+					site.columns = append(site.columns, col)
+				}
+			}
+			return
 		}
+		sitePositions[k] = len(mr.sitesByFile[filePath])
+		mr.sitesByFile[filePath] = append(mr.sitesByFile[filePath], moduleEditSite{filePath, line, token, columns})
 	}
 
 	// Definition sites
@@ -5690,7 +5735,7 @@ func (mr *moduleRename) collectSites() {
 	if err == nil {
 		for _, r := range allModuleDefs {
 			if _, ok := mr.moduleRenames[r.Module]; ok {
-				addSite(r.FilePath, r.Line, r.Module)
+				addSite(r.FilePath, r.Line, r.Module, nil)
 			}
 		}
 	}
@@ -5705,7 +5750,7 @@ func (mr *moduleRename) collectSites() {
 				mr.moduleRenames[r.Module] = newMod
 				mr.tokenReplacements[r.Module] = newMod
 			}
-			addSite(r.FilePath, r.Line, r.Module)
+			addSite(r.FilePath, r.Line, r.Module, nil)
 		}
 
 		// Sites reached through an alias injected by a __using__ block. The
@@ -5727,7 +5772,7 @@ func (mr *moduleRename) collectSites() {
 				writtenParts := strings.Count(r.written, ".") + 1
 				if writtenParts <= len(parts) {
 					mr.tokenReplacements[r.written] = strings.Join(parts[len(parts)-writtenParts:], ".")
-					addSite(r.FilePath, r.Line, r.written)
+					addSite(r.FilePath, r.Line, r.written, r.columns)
 				}
 			}
 		}
@@ -5856,20 +5901,41 @@ type moduleEditResult struct {
 	newToken string
 }
 
+func (mr *moduleRename) editsForSite(lineText string, site moduleEditSite) []moduleEditResult {
+	edits := mr.findModuleEdits(lineText, site.token)
+	if site.columns == nil {
+		return edits
+	}
+	filtered := edits[:0]
+	for _, edit := range edits {
+		if slices.Contains(site.columns, edit.col) {
+			filtered = append(filtered, edit)
+		}
+	}
+	return filtered
+}
+
 func (mr *moduleRename) applyEditsToLines(lines []string, sites []moduleEditSite) []string {
 	result := make([]string, len(lines))
 	copy(result, lines)
+	claimed := make(map[int][]moduleEditResult)
 	for _, es := range sites {
 		if es.line-1 >= len(result) {
 			continue
 		}
-		lineText := result[es.line-1]
-		edits := mr.findModuleEdits(lineText, es.token)
-		for i := len(edits) - 1; i >= 0; i-- {
-			e := edits[i]
-			lineText = lineText[:e.col] + e.newToken + lineText[e.col+e.length:]
+		for _, edit := range mr.editsForSite(lines[es.line-1], es) {
+			if !overlapsClaimed(claimed[es.line], edit) {
+				claimed[es.line] = append(claimed[es.line], edit)
+			}
 		}
-		result[es.line-1] = lineText
+	}
+	for line, edits := range claimed {
+		sort.Slice(edits, func(i, j int) bool { return edits[i].col > edits[j].col })
+		lineText := result[line-1]
+		for _, edit := range edits {
+			lineText = lineText[:edit.col] + edit.newToken + lineText[edit.col+edit.length:]
+		}
+		result[line-1] = lineText
 	}
 	return result
 }
@@ -6002,7 +6068,7 @@ func (mr *moduleRename) applyEdits(fileCache map[string]moduleFileInfo, movedFil
 					continue
 				}
 				lineText := fi.lines[es.line-1]
-				for _, e := range mr.findModuleEdits(lineText, es.token) {
+				for _, e := range mr.editsForSite(lineText, es) {
 					if overlapsClaimed(claimed[es.line], e) {
 						continue
 					}
