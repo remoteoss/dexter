@@ -99,6 +99,7 @@ func (b *binding) close() {
 	if err := b.store.Close(); err != nil {
 		log.Printf("Warning: closing store for %s: %v", b.root, err)
 	}
+	log.Printf("MCP workspace closed: %s", b.root)
 }
 
 // openStore opens the index at root with the recovery a long-running server

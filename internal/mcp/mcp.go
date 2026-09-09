@@ -9,6 +9,7 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"log"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -124,8 +125,10 @@ func (h *Handler) bindingFor(ctx context.Context, ss *mcp.ServerSession) (*bindi
 	if err != nil {
 		return nil, err
 	}
+	source := "client roots"
 	if !ok {
 		root = h.fallbackRoot
+		source = "fallback"
 	}
 
 	var created, orphan *binding
@@ -149,6 +152,7 @@ func (h *Handler) bindingFor(ctx context.Context, ss *mcp.ServerSession) (*bindi
 		orphan = h.releaseLocked(ss, cur)
 	}
 	h.sessions[ss] = nb
+	log.Printf("MCP session workspace: %s (%s)", root, source)
 	if !h.watched[ss] {
 		h.watched[ss] = true
 		go func() {
