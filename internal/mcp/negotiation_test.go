@@ -24,10 +24,22 @@ type negotiationEnv struct {
 
 func setupNegotiation(t *testing.T) *negotiationEnv {
 	t.Helper()
-	fallback := t.TempDir()
+	fallback := canonTempDir(t)
 	h := NewHandler(Config{ProjectRoot: fallback, NegotiateRoots: true})
 	t.Cleanup(h.Close)
 	return &negotiationEnv{t: t, h: h, fallback: fallback}
+}
+
+// canonTempDir returns a symlink-free temp dir: negotiated roots are
+// canonicalized, so expectations must be built from canonical paths
+// (t.TempDir itself is symlinked on macOS).
+func canonTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dir
 }
 
 // connect wires a new client session to the negotiating server. Roots are
@@ -58,7 +70,7 @@ func (e *negotiationEnv) connect(opts *mcp.ClientOptions, rootURIs ...string) (*
 // its path and file URI.
 func projectDir(t *testing.T, module string) (string, string) {
 	t.Helper()
-	dir := t.TempDir()
+	dir := canonTempDir(t)
 	writeSource(t, dir, "lib/mod.ex", "defmodule "+module+" do\n  def hello, do: :ok\nend\n")
 	return dir, fileURI(dir)
 }
@@ -177,7 +189,7 @@ func TestNegotiation_FallsBackWithoutUsableRoots(t *testing.T) {
 // does not stop the walk.
 func TestNegotiation_ResolvesRootLikeLSP(t *testing.T) {
 	e := setupNegotiation(t)
-	repo := t.TempDir()
+	repo := canonTempDir(t)
 	if err := os.MkdirAll(filepath.Join(repo, ".git"), 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -329,7 +341,7 @@ func TestNegotiation_SameRootChangeIsNoop(t *testing.T) {
 // A workspace root with characters that URI-encode (spaces) binds correctly.
 func TestNegotiation_RootWithSpaces(t *testing.T) {
 	e := setupNegotiation(t)
-	root := filepath.Join(t.TempDir(), "my project")
+	root := filepath.Join(canonTempDir(t), "my project")
 	writeSource(t, root, "lib/mod.ex", "defmodule NegSpace.Mod do\nend\n")
 	uri := fileURI(root)
 	if !strings.Contains(uri, "%20") {
@@ -367,6 +379,69 @@ func TestNegotiation_ReportsInitializing(t *testing.T) {
 	}
 	close(b.indexed) // let Close tear it down without blocking
 	b.initErr = context.Canceled
+}
+
+// Symlink aliases of one directory must share a workspace: two live
+// workspaces over one database would race each other's index writes.
+func TestNegotiation_SymlinkedRootsShareWorkspace(t *testing.T) {
+	e := setupNegotiation(t)
+	root, uri := projectDir(t, "NegLink.Mod")
+	link := filepath.Join(canonTempDir(t), "link")
+	if err := os.Symlink(root, link); err != nil {
+		t.Fatal(err)
+	}
+	cs1, _ := e.connect(nil, uri)
+	cs2, _ := e.connect(nil, fileURI(link))
+
+	wantContains(t, mustTool(t, cs1, "dexter_search", map[string]any{"query": "NegLink"}), "NegLink.Mod")
+	wantContains(t, mustTool(t, cs2, "dexter_search", map[string]any{"query": "NegLink"}), "NegLink.Mod")
+
+	e.h.mu.Lock()
+	nbindings := len(e.h.bindings)
+	e.h.mu.Unlock()
+	if nbindings != 1 {
+		t.Errorf("symlink alias created %d workspaces, want 1", nbindings)
+	}
+}
+
+// While a root's last workspace is still tearing down, a new session for that
+// root must wait it out instead of opening a second store over the same
+// database mid-teardown.
+func TestNegotiation_WaitsForDrainingWorkspace(t *testing.T) {
+	e := setupNegotiation(t)
+	root, uri := projectDir(t, "NegDrain.Mod")
+
+	drain := make(chan struct{})
+	e.h.mu.Lock()
+	e.h.draining[root] = drain
+	e.h.mu.Unlock()
+
+	cs, _ := e.connect(nil, uri)
+	result := make(chan string, 1)
+	go func() {
+		out, _ := toolText(t, cs, "dexter_search", map[string]any{"query": "NegDrain"})
+		result <- out
+	}()
+
+	select {
+	case out := <-result:
+		t.Fatalf("call proceeded while the workspace was draining: %s", out)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	e.h.mu.Lock()
+	delete(e.h.draining, root)
+	e.h.mu.Unlock()
+	close(drain)
+
+	select {
+	case out := <-result:
+		if !strings.Contains(out, "NegDrain.Mod") {
+			t.Errorf("call after drain did not find the module: %s", out)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("call never completed after the drain finished")
+	}
 }
 
 // A session disconnecting releases its workspace.

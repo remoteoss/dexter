@@ -49,6 +49,7 @@ type Handler struct {
 	sessions     map[*mcp.ServerSession]*binding // session → its workspace
 	dirty        map[*mcp.ServerSession]bool     // roots changed; re-resolve on next call
 	watched      map[*mcp.ServerSession]bool     // a Wait goroutine will detach this session
+	draining     map[string]chan struct{}        // roots whose last workspace is still closing
 	closed       bool
 }
 
@@ -67,11 +68,12 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.NegotiateRoots {
 		return &Handler{
 			negotiate:    true,
-			fallbackRoot: cfg.ProjectRoot,
+			fallbackRoot: canonicalRoot(cfg.ProjectRoot),
 			bindings:     make(map[string]*binding),
 			sessions:     make(map[*mcp.ServerSession]*binding),
 			dirty:        make(map[*mcp.ServerSession]bool),
 			watched:      make(map[*mcp.ServerSession]bool),
+			draining:     make(map[string]chan struct{}),
 		}
 	}
 	return &Handler{
@@ -131,44 +133,73 @@ func (h *Handler) bindingFor(ctx context.Context, ss *mcp.ServerSession) (*bindi
 		source = "fallback"
 	}
 
-	var created, orphan *binding
-	h.mu.Lock()
-	if h.closed {
+	for {
+		var created, orphan *binding
+		h.mu.Lock()
+		if h.closed {
+			h.mu.Unlock()
+			return nil, errClosed
+		}
+		// The last workspace for this root may still be tearing down; opening
+		// a second store over the same database would race its final writes.
+		if ch, ok := h.draining[root]; ok {
+			h.mu.Unlock()
+			select {
+			case <-ch:
+				continue
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		delete(h.dirty, ss)
+		if cur, bound := h.sessions[ss]; bound && cur.root == root {
+			h.mu.Unlock()
+			return cur, nil
+		}
+		nb, exists := h.bindings[root]
+		if !exists {
+			nb = &binding{root: root, initDone: make(chan struct{}), indexed: make(chan struct{})}
+			h.bindings[root] = nb
+			created = nb
+		}
+		if cur, bound := h.sessions[ss]; bound {
+			orphan = h.releaseLocked(ss, cur)
+		}
+		h.sessions[ss] = nb
+		log.Printf("MCP session workspace: %s (%s)", root, source)
+		if !h.watched[ss] {
+			h.watched[ss] = true
+			go func() {
+				_ = ss.Wait()
+				h.detachSession(ss)
+			}()
+		}
 		h.mu.Unlock()
-		return nil, errClosed
-	}
-	delete(h.dirty, ss)
-	if cur, bound := h.sessions[ss]; bound && cur.root == root {
-		h.mu.Unlock()
-		return cur, nil
-	}
-	nb, exists := h.bindings[root]
-	if !exists {
-		nb = &binding{root: root, initDone: make(chan struct{}), indexed: make(chan struct{})}
-		h.bindings[root] = nb
-		created = nb
-	}
-	if cur, bound := h.sessions[ss]; bound {
-		orphan = h.releaseLocked(ss, cur)
-	}
-	h.sessions[ss] = nb
-	log.Printf("MCP session workspace: %s (%s)", root, source)
-	if !h.watched[ss] {
-		h.watched[ss] = true
-		go func() {
-			_ = ss.Wait()
-			h.detachSession(ss)
-		}()
-	}
-	h.mu.Unlock()
 
-	if orphan != nil {
-		go orphan.close()
+		if orphan != nil {
+			h.drainOrphan(orphan)
+		}
+		if created != nil {
+			created.init()
+		}
+		return nb, nil
 	}
-	if created != nil {
-		created.init()
-	}
-	return nb, nil
+}
+
+// drainOrphan closes an unbound workspace in the background, keeping its root
+// marked as draining until the close finishes so no new workspace opens over
+// the same database in the meantime. releaseLocked marked the root.
+func (h *Handler) drainOrphan(b *binding) {
+	go func() {
+		b.close()
+		h.mu.Lock()
+		ch := h.draining[b.root]
+		delete(h.draining, b.root)
+		h.mu.Unlock()
+		if ch != nil {
+			close(ch)
+		}
+	}()
 }
 
 // releaseLocked unbinds ss from b and reports b when no other session uses it
@@ -184,6 +215,7 @@ func (h *Handler) releaseLocked(ss *mcp.ServerSession, b *binding) (orphan *bind
 	if h.bindings[b.root] == b {
 		delete(h.bindings, b.root)
 	}
+	h.draining[b.root] = make(chan struct{})
 	return b
 }
 
@@ -199,7 +231,7 @@ func (h *Handler) detachSession(ss *mcp.ServerSession) {
 	delete(h.watched, ss)
 	h.mu.Unlock()
 	if orphan != nil {
-		orphan.close()
+		h.drainOrphan(orphan)
 	}
 }
 
@@ -252,9 +284,16 @@ func (h *Handler) Close() {
 	}
 	h.bindings = nil
 	h.sessions = nil
+	draining := make([]chan struct{}, 0, len(h.draining))
+	for _, ch := range h.draining {
+		draining = append(draining, ch)
+	}
 	h.mu.Unlock()
 	for _, b := range bindings {
 		b.close()
+	}
+	for _, ch := range draining {
+		<-ch
 	}
 }
 

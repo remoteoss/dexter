@@ -60,7 +60,17 @@ func negotiatedRoot(ctx context.Context, ss *mcp.ServerSession) (root string, ok
 		if err != nil || !info.IsDir() {
 			return "", false, fmt.Errorf("client root %q is not a directory", path)
 		}
-		return store.FindProjectRoot(path), true, nil
+		return store.FindProjectRoot(canonicalRoot(path)), true, nil
 	}
 	return "", false, nil
+}
+
+// canonicalRoot resolves symlinks so every alias of a directory keys the same
+// workspace; two live workspaces over one database would race each other's
+// index writes.
+func canonicalRoot(path string) string {
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return resolved
+	}
+	return path
 }
