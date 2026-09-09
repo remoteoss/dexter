@@ -404,6 +404,30 @@ func TestNegotiation_SymlinkedRootsShareWorkspace(t *testing.T) {
 	}
 }
 
+// A symlinked fallback root and a negotiated root for the same directory must
+// key one workspace, so no-roots and roots-advertising sessions share it.
+func TestNegotiation_SymlinkedFallbackSharesWorkspace(t *testing.T) {
+	root, uri := projectDir(t, "NegFallLink.Mod")
+	link := filepath.Join(canonTempDir(t), "link")
+	if err := os.Symlink(root, link); err != nil {
+		t.Fatal(err)
+	}
+	e := &negotiationEnv{t: t, h: NewHandler(Config{ProjectRoot: link, NegotiateRoots: true}), fallback: root}
+	t.Cleanup(e.h.Close)
+
+	noRoots, _ := e.connect(&mcp.ClientOptions{Capabilities: &mcp.ClientCapabilities{}})
+	withRoots, _ := e.connect(nil, uri)
+	wantContains(t, mustTool(t, noRoots, "dexter_search", map[string]any{"query": "NegFallLink"}), "NegFallLink.Mod")
+	wantContains(t, mustTool(t, withRoots, "dexter_search", map[string]any{"query": "NegFallLink"}), "NegFallLink.Mod")
+
+	e.h.mu.Lock()
+	nbindings := len(e.h.bindings)
+	e.h.mu.Unlock()
+	if nbindings != 1 {
+		t.Errorf("fallback and negotiated sessions hold %d workspaces, want 1 shared", nbindings)
+	}
+}
+
 // While a root's last workspace is still tearing down, a new session for that
 // root must wait it out instead of opening a second store over the same
 // database mid-teardown.

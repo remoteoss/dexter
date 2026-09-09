@@ -495,6 +495,15 @@ func openStoreForServer(projectRoot string) *store.Store {
 // negotiated through MCP roots, with projectRoot (the launch directory) as
 // the fallback for clients that provide none.
 func cmdMCP(projectRoot string, listen string, explicitRoot bool) {
+	if !explicitRoot {
+		// The fallback root must key the same workspace a negotiated root
+		// would, and negotiated roots resolve symlinks before walking for
+		// project markers: a marker above a symlink's target is invisible
+		// from the symlink's logical parents.
+		if resolved, err := filepath.EvalSymlinks(projectRoot); err == nil {
+			projectRoot = resolved
+		}
+	}
 	projectRoot = findProjectRoot(projectRoot)
 	log.SetOutput(os.Stderr)
 
