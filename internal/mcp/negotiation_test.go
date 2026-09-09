@@ -257,7 +257,7 @@ func TestNegotiation_RootsChangedSwapsWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer oldStore.Close()
+	defer func() { _ = oldStore.Close() }()
 	if results, err := oldStore.LookupModule("NegSwapA.Late"); err != nil || len(results) != 0 {
 		t.Errorf("old workspace's watcher still indexing after teardown: %v, %v", results, err)
 	}
