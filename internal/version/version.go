@@ -1,8 +1,8 @@
 package version
 
-const Version = "0.7.2"
+const Version = "0.7.3"
 
 // IndexVersion is incremented whenever the index schema or parser changes in a
 // way that requires a full rebuild. Bump this alongside Version when releasing
 // a change that makes existing indexes stale.
-const IndexVersion = 17
+const IndexVersion = 18

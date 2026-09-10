@@ -64,8 +64,8 @@ func ParseFile(path string) ([]Definition, []Reference, error) {
 // The path is used to populate FilePath fields but the text is not read from disk.
 func ParseText(path, text string) ([]Definition, []Reference, error) {
 	source := []byte(text)
-	tokens := Tokenize(source)
-	return parseTextFromTokens(path, source, tokens)
+	result := TokenizeFull(source)
+	return parseTextFromTokens(path, source, result.Tokens, result.Interp)
 }
 
 // ScanFuncName reads a function/type name ([a-z_][a-z0-9_?!]*) from the start of s.

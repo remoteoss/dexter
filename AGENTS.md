@@ -45,6 +45,7 @@ way to force anything to happen on a store that has no rows.
 | `resolveBareFunctionModule` | All callers pass `lineNum` — used by `LookupFunctionInFile` to prefer the enclosing module |
 | Rename edits (`buildTextEdits`) | `findFunctionTokenColumns` (skips keyword keys), `includeKeyword` flag on import sites |
 | Variable scoping (`variables.go`) | Pin operator handling, `with` multi-clause, stab body rebinds |
+| Tokenizer string/heredoc/sigil scanning | `TokenResult.Interp` (the `#{}` token stream), `flushInterpRefs`, `TokenizedFile.ExpressionAtCursor` |
 | `ExtractAliases` | LSP handlers use `ExtractAliasesInScope(text, lineNum)` — scope-aware. Only `Completion` and `CodeAction` use the unscoped `ExtractAliases` intentionally |
 | Any new store query | Add an index if the query will run on hot paths (definition, hover, references) |
 

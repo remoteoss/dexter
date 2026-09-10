@@ -16,6 +16,10 @@ type TokenizedFile struct {
 	tokens     []parser.Token
 	n          int
 	lineStarts []int
+	// interp holds the code tokens inside #{} interpolations, kept out of the
+	// main stream by the tokenizer. Cursor lookups fall back to it, so a call
+	// written inside a string still resolves.
+	interp []parser.Token
 }
 
 // NewTokenizedFile tokenizes the text once for reuse across multiple queries.
@@ -27,29 +31,41 @@ func NewTokenizedFile(text string) *TokenizedFile {
 		tokens:     result.Tokens,
 		n:          len(result.Tokens),
 		lineStarts: result.LineStarts,
+		interp:     result.Interp,
 	}
 }
 
 // NewTokenizedFileFromCache wraps pre-existing tokens (e.g. from DocumentStore cache).
-func NewTokenizedFileFromCache(tokens []parser.Token, source []byte, lineStarts []int) *TokenizedFile {
+func NewTokenizedFileFromCache(tokens []parser.Token, source []byte, lineStarts []int, interp []parser.Token) *TokenizedFile {
 	return &TokenizedFile{
 		source:     source,
 		tokens:     tokens,
 		n:          len(tokens),
 		lineStarts: lineStarts,
+		interp:     interp,
 	}
 }
 
 // ExpressionAtCursor extracts the dotted expression at the given 0-based line
 // and col, using the cached token stream.
 func (tf *TokenizedFile) ExpressionAtCursor(line, col int) CursorContext {
-	return ExpressionAtCursor(tf.tokens, tf.source, tf.lineStarts, line, col)
+	ctx := ExpressionAtCursor(tf.tokens, tf.source, tf.lineStarts, line, col)
+	if ctx.Empty() && len(tf.interp) > 0 {
+		// The cursor sits inside a string literal, which is one token in the
+		// main stream. The code inside #{} lives in the interpolation stream.
+		ctx = ExpressionAtCursor(tf.interp, tf.source, tf.lineStarts, line, col)
+	}
+	return ctx
 }
 
 // FullExpressionAtCursor extracts the complete dotted expression at the given
 // 0-based line and col without truncating at the cursor's segment.
 func (tf *TokenizedFile) FullExpressionAtCursor(line, col int) CursorContext {
-	return FullExpressionAtCursor(tf.tokens, tf.source, tf.lineStarts, line, col)
+	ctx := FullExpressionAtCursor(tf.tokens, tf.source, tf.lineStarts, line, col)
+	if ctx.Empty() && len(tf.interp) > 0 {
+		ctx = FullExpressionAtCursor(tf.interp, tf.source, tf.lineStarts, line, col)
+	}
+	return ctx
 }
 
 // FirstDefmodule returns the first defmodule name found, or "".

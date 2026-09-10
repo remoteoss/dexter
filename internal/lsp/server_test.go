@@ -7815,3 +7815,99 @@ end
 		t.Errorf("expected the transitively injected call site to be renamed, got:\n%s", got)
 	}
 }
+
+// A call written inside a #{} interpolation is a call. The whole string used
+// to be one opaque token, so go-to-definition, hover and find-references all
+// stopped at the quote.
+func TestDefinition_InsideStringInterpolation(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/config.ex", `defmodule SharedLib.Config do
+  @doc "Builds an admin URL."
+  def admin_url(slug), do: slug
+end`)
+	src := `defmodule MyApp.Notifier do
+  alias SharedLib.Config
+
+  def line(slug) do
+    "<#{Config.admin_url(slug)}|#{slug}>"
+  end
+end`
+	indexFile(t, server.store, server.projectRoot, "lib/notifier.ex", src)
+	fileURI := "file://" + filepath.Join(server.projectRoot, "lib/notifier.ex")
+	server.docs.Set(fileURI, src)
+
+	// line 4 is `    "<#{Config.admin_url(slug)}|#{slug}>"`
+	// col 8 is on Config, col 16 on admin_url
+	for _, col := range []uint32{8, 16} {
+		locs := definitionAt(t, server, fileURI, 4, col)
+		if len(locs) == 0 {
+			t.Fatalf("col %d: expected a definition inside the interpolation", col)
+		}
+		if !strings.HasSuffix(string(locs[0].URI), "lib/config.ex") {
+			t.Errorf("col %d: jumped to %s, want lib/config.ex", col, locs[0].URI)
+		}
+	}
+}
+
+func TestDefinition_InsideNestedStringInterpolation(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/config.ex", `defmodule SharedLib.Config do
+  def format(x), do: x
+end`)
+	src := `defmodule MyApp.Notifier do
+  alias SharedLib.Config
+
+  def nested(x) do
+    "outer #{"inner #{Config.format(x)}"} tail"
+  end
+end`
+	indexFile(t, server.store, server.projectRoot, "lib/notifier.ex", src)
+	fileURI := "file://" + filepath.Join(server.projectRoot, "lib/notifier.ex")
+	server.docs.Set(fileURI, src)
+
+	// col 22 is on Config inside the inner interpolation
+	locs := definitionAt(t, server, fileURI, 4, 22)
+	if len(locs) == 0 {
+		t.Fatal("expected a definition inside the nested interpolation")
+	}
+	if !strings.HasSuffix(string(locs[0].URI), "lib/config.ex") {
+		t.Errorf("jumped to %s, want lib/config.ex", locs[0].URI)
+	}
+}
+
+func TestReferences_CallSiteInsideInterpolation(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	src := `defmodule SharedLib.Config do
+  def admin_url(slug), do: slug
+end`
+	indexFile(t, server.store, server.projectRoot, "lib/config.ex", src)
+	indexFile(t, server.store, server.projectRoot, "lib/notifier.ex", `defmodule MyApp.Notifier do
+  alias SharedLib.Config
+
+  def line(slug) do
+    """
+    Link: #{Config.admin_url(slug)}
+    """
+  end
+end`)
+	fileURI := "file://" + filepath.Join(server.projectRoot, "lib/config.ex")
+	server.docs.Set(fileURI, src)
+
+	// cursor on the admin_url definition (line 1, col 6)
+	locs := referencesAt(t, server, fileURI, 1, 6)
+	found := false
+	for _, loc := range locs {
+		if strings.HasSuffix(string(loc.URI), "lib/notifier.ex") && loc.Range.Start.Line == 5 {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected the heredoc interpolation call site, got %+v", locs)
+	}
+}

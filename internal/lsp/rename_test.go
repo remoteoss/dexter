@@ -3255,3 +3255,74 @@ end
 		t.Errorf("no Repo. call site should be left behind, got:\n%s", got)
 	}
 }
+
+// A rename that stops at the quote leaves broken code behind: the call inside
+// the interpolation still names the old module.
+func TestRenameModule_UpdatesInterpolationSite(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/config.ex", `defmodule SharedLib.Config do
+  def admin_url(slug), do: slug
+end`)
+	notifier := `defmodule MyApp.Notifier do
+  alias SharedLib.Config
+
+  def line(slug) do
+    "<#{Config.admin_url(slug)}|#{slug}>"
+  end
+end`
+	indexFile(t, server.store, server.projectRoot, "lib/notifier.ex", notifier)
+	configURI := "file://" + filepath.Join(server.projectRoot, "lib/config.ex")
+	server.docs.Set(configURI, `defmodule SharedLib.Config do
+  def admin_url(slug), do: slug
+end`)
+
+	// cursor on Config in `defmodule SharedLib.Config`
+	edit := renameAt(t, server, configURI, 0, 20, "Settings")
+	if edit == nil {
+		t.Fatal("expected rename edits")
+	}
+	// notifier.ex is not open, so the server writes it rather than returning
+	// edits for the editor to apply.
+	got, err := os.ReadFile(filepath.Join(server.projectRoot, "lib/notifier.ex"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), `"<#{Settings.admin_url(slug)}|#{slug}>"`) {
+		t.Errorf("interpolation site not renamed:\n%s", got)
+	}
+}
+
+func TestRenameFunction_UpdatesInterpolationSite(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	config := `defmodule SharedLib.Config do
+  def admin_url(slug), do: slug
+end`
+	indexFile(t, server.store, server.projectRoot, "lib/config.ex", config)
+	notifier := `defmodule MyApp.Notifier do
+  alias SharedLib.Config
+
+  def line(slug) do
+    "<#{Config.admin_url(slug)}|#{slug}>"
+  end
+end`
+	indexFile(t, server.store, server.projectRoot, "lib/notifier.ex", notifier)
+	configURI := "file://" + filepath.Join(server.projectRoot, "lib/config.ex")
+	server.docs.Set(configURI, config)
+
+	// cursor on admin_url in its definition
+	edit := renameAt(t, server, configURI, 1, 7, "admin_link")
+	if edit == nil {
+		t.Fatal("expected rename edits")
+	}
+	got, err := os.ReadFile(filepath.Join(server.projectRoot, "lib/notifier.ex"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), `"<#{Config.admin_link(slug)}|#{slug}>"`) {
+		t.Errorf("interpolation site not renamed:\n%s", got)
+	}
+}

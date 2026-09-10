@@ -1293,3 +1293,32 @@ end
 		t.Errorf("expected the type declaration in a spec, got:\n%s", spec.Contents.Value)
 	}
 }
+
+func TestHover_InsideStringInterpolation(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/config.ex", `defmodule SharedLib.Config do
+  @doc "Builds an admin URL."
+  def admin_url(slug), do: slug
+end`)
+	src := `defmodule MyApp.Notifier do
+  alias SharedLib.Config
+
+  def line(slug) do
+    "<#{Config.admin_url(slug)}|#{slug}>"
+  end
+end`
+	indexFile(t, server.store, server.projectRoot, "lib/notifier.ex", src)
+	fileURI := "file://" + filepath.Join(server.projectRoot, "lib/notifier.ex")
+	server.docs.Set(fileURI, src)
+
+	// col 16 is on admin_url inside the interpolation
+	h := hoverAt(t, server, fileURI, 4, 16)
+	if h == nil {
+		t.Fatal("expected hover inside the interpolation")
+	}
+	if !strings.Contains(h.Contents.Value, "Builds an admin URL.") {
+		t.Errorf("hover missing the doc: %q", h.Contents.Value)
+	}
+}

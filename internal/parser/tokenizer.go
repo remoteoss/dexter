@@ -90,6 +90,14 @@ type Token struct {
 type TokenResult struct {
 	Tokens     []Token
 	LineStarts []int
+	// Interp holds the code tokens found inside #{} interpolations, in byte
+	// order. They are kept out of Tokens on purpose: a string literal stays one
+	// token there, so block-depth tracking, @doc extraction and the binary
+	// search in TokenAtOffset all keep working unchanged. Only TokModule,
+	// TokIdent, TokDot and TokAttr are recorded — enough to resolve a module
+	// reference or a call, and never a do/end/fn that a depth tracker could
+	// miscount. Nil when no interpolation carries code.
+	Interp []Token
 }
 
 // keywordKinds maps keyword strings to their token kind.
@@ -132,6 +140,7 @@ func Tokenize(source []byte) []Token {
 
 func TokenizeFull(source []byte) TokenResult {
 	tokens := make([]Token, 0, len(source)/8)
+	var interp []Token // code tokens inside #{}; stays nil for sources without one
 	lineStarts := make([]int, 1, 64)
 	lineStarts[0] = 0 // line 1 starts at byte 0
 	line := 1
@@ -204,13 +213,13 @@ func TokenizeFull(source []byte) TokenResult {
 				startLine := line
 				i += 3 // consume opening """
 				// scan to closing """ on its own line
-				i, line = scanHeredocContent(source, i, line, '"', &lineStarts)
+				i, line = scanHeredocContent(source, i, line, '"', &lineStarts, &interp)
 				tokens = append(tokens, Token{Kind: TokHeredoc, Start: start, End: i, Line: startLine})
 			} else {
 				start := i
 				startLine := line
 				i++ // consume opening "
-				i, line = scanStringContent(source, i, line, '"', &lineStarts)
+				i, line = scanStringContent(source, i, line, '"', &lineStarts, &interp)
 				tokens = append(tokens, Token{Kind: TokString, Start: start, End: i, Line: startLine})
 			}
 
@@ -220,13 +229,13 @@ func TokenizeFull(source []byte) TokenResult {
 				start := i
 				startLine := line
 				i += 3 // consume opening '''
-				i, line = scanHeredocContent(source, i, line, '\'', &lineStarts)
+				i, line = scanHeredocContent(source, i, line, '\'', &lineStarts, &interp)
 				tokens = append(tokens, Token{Kind: TokHeredoc, Start: start, End: i, Line: startLine})
 			} else {
 				start := i
 				startLine := line
 				i++ // consume opening '
-				i, line = scanStringContent(source, i, line, '\'', &lineStarts)
+				i, line = scanStringContent(source, i, line, '\'', &lineStarts, &interp)
 				tokens = append(tokens, Token{Kind: TokString, Start: start, End: i, Line: startLine})
 			}
 
@@ -246,7 +255,7 @@ func TokenizeFull(source []byte) TokenResult {
 					}
 				}
 				if i < len(source) {
-					i, line = scanSigilContent(source, i, line, sigilLetter, &lineStarts)
+					i, line = scanSigilContent(source, i, line, sigilLetter, &lineStarts, &interp)
 				}
 				tokens = append(tokens, Token{Kind: TokSigil, Start: start, End: i, Line: startLine})
 			} else {
@@ -263,14 +272,14 @@ func TokenizeFull(source []byte) TokenResult {
 				start := i
 				startLine := line
 				i += 2 // consume :"
-				i, line = scanStringContent(source, i, line, '"', &lineStarts)
+				i, line = scanStringContent(source, i, line, '"', &lineStarts, &interp)
 				tokens = append(tokens, Token{Kind: TokAtom, Start: start, End: i, Line: startLine})
 			} else if i+1 < len(source) && source[i+1] == '\'' {
 				// Atom with quoted charlist: :'...'
 				start := i
 				startLine := line
 				i += 2 // consume :'
-				i, line = scanStringContent(source, i, line, '\'', &lineStarts)
+				i, line = scanStringContent(source, i, line, '\'', &lineStarts, &interp)
 				tokens = append(tokens, Token{Kind: TokAtom, Start: start, End: i, Line: startLine})
 			} else if i+1 < len(source) && (isLower(source[i+1]) || source[i+1] == '_' || isUpperAtomStart(source, i+1)) {
 				start := i
@@ -551,13 +560,13 @@ func TokenizeFull(source []byte) TokenResult {
 	}
 
 	tokens = append(tokens, Token{Kind: TokEOF, Start: len(source), End: len(source), Line: line})
-	return TokenResult{Tokens: tokens, LineStarts: lineStarts}
+	return TokenResult{Tokens: tokens, LineStarts: lineStarts, Interp: interp}
 }
 
 // scanStringContent scans from after the opening delimiter to (and including) the matching closing delimiter.
 // Returns the new position (after closing delimiter) and updated line count.
 // Handles escape sequences and #{} interpolation with proper brace depth tracking.
-func scanStringContent(source []byte, i, line int, delim byte, lineStarts *[]int) (int, int) {
+func scanStringContent(source []byte, i, line int, delim byte, lineStarts *[]int, interp *[]Token) (int, int) {
 	for i < len(source) {
 		ch := source[i]
 		if ch == '\n' {
@@ -572,7 +581,7 @@ func scanStringContent(source []byte, i, line int, delim byte, lineStarts *[]int
 			i += 2 // skip backslash and next char
 		} else if ch == '#' && i+1 < len(source) && source[i+1] == '{' {
 			i += 2 // consume #{
-			i, line = scanInterpolation(source, i, line, lineStarts)
+			i, line = scanInterpolation(source, i, line, lineStarts, interp)
 		} else if ch == delim {
 			i++ // consume closing delimiter
 			return i, line
@@ -586,11 +595,61 @@ func scanStringContent(source []byte, i, line int, delim byte, lineStarts *[]int
 // scanInterpolation scans the body of a #{} interpolation block, starting after the #{.
 // Tracks brace depth and properly handles nested strings, char literals, and sigils
 // so that } inside those constructs doesn't prematurely close the interpolation.
-func scanInterpolation(source []byte, i, line int, lineStarts *[]int) (int, int) {
+//
+// The body is code, so identifiers, module segments, dots and module attributes
+// are recorded in interp — a reference written only inside an interpolation is
+// still a reference. Keywords (do, end, fn, def...) are deliberately dropped:
+// they carry no reference and would only give a depth tracker something to
+// miscount. Nested strings and nested interpolations recurse, which is legal
+// Elixir: "outer #{"inner #{x}"}".
+func scanInterpolation(source []byte, i, line int, lineStarts *[]int, interp *[]Token) (int, int) {
 	depth := 1
+	afterDot := false
 	for i < len(source) && depth > 0 {
 		c := source[i]
+		isDot := c == '.'
 		switch {
+		case c == '.':
+			// A dot joins the segments of Mod.Sub.fun. Two dots in a row are a
+			// range operator; harmless, nothing reads a lone dot.
+			*interp = append(*interp, Token{Kind: TokDot, Start: i, End: i + 1, Line: line})
+			i++
+		case c == '@':
+			// @attr — record the attribute, and keep its name out of the stream
+			// so it cannot read as a bare call.
+			start := i
+			j := i + 1
+			if j < len(source) && (isLetter(source[j]) || source[j] == '_') {
+				j = scanIdentContinue(source, j+1)
+				*interp = append(*interp, Token{Kind: TokAttr, Start: start, End: j, Line: line})
+				i = j
+			} else {
+				i++
+			}
+		case c == ':' && i+1 < len(source) && (isLetter(source[i+1]) || source[i+1] == '_') && (i == 0 || source[i-1] != ':'):
+			// :atom — the name is not an identifier reference.
+			i = scanIdentContinue(source, i+2)
+		case isUpper(c):
+			start := i
+			i = scanIdentContinueMod(source, i+1)
+			*interp = append(*interp, Token{Kind: TokModule, Start: start, End: i, Line: line})
+		case isLower(c) || c == '_':
+			start := i
+			if c == '_' && i+9 < len(source) && string(source[i:i+10]) == "__MODULE__" && !isIdentContinueAt(source, i+10) {
+				i += 10
+				*interp = append(*interp, Token{Kind: TokModule, Start: start, End: i, Line: line})
+				break
+			}
+			i = scanIdentContinue(source, i+1)
+			if afterDot {
+				// Mod.end is a call to a function named end, not a keyword.
+				*interp = append(*interp, Token{Kind: TokIdent, Start: start, End: i, Line: line})
+				break
+			}
+			if _, isKeyword := keywordKinds[string(source[start:i])]; isKeyword && !isKeywordKey(source, i) {
+				break
+			}
+			*interp = append(*interp, Token{Kind: TokIdent, Start: start, End: i, Line: line})
 		case c == '\n':
 			line++
 			i++
@@ -604,7 +663,7 @@ func scanInterpolation(source []byte, i, line int, lineStarts *[]int) (int, int)
 		case c == '"' || c == '\'':
 			innerDelim := c
 			i++
-			i, line = scanStringContent(source, i, line, innerDelim, lineStarts)
+			i, line = scanStringContent(source, i, line, innerDelim, lineStarts, interp)
 		case c == '?' && i+1 < len(source) && !endsIdentifier(source, i):
 			i++ // consume '?'
 			if source[i] == '\\' && i+1 < len(source) {
@@ -620,11 +679,11 @@ func scanInterpolation(source []byte, i, line int, lineStarts *[]int) (int, int)
 			sigilLetter := source[i+1]
 			i += 2 // consume ~ and letter
 			if i < len(source) {
-				i, line = scanSigilContent(source, i, line, sigilLetter, lineStarts)
+				i, line = scanSigilContent(source, i, line, sigilLetter, lineStarts, interp)
 			}
 		case c == '#' && i+1 < len(source) && source[i+1] == '{':
 			i += 2
-			i, line = scanInterpolation(source, i, line, lineStarts)
+			i, line = scanInterpolation(source, i, line, lineStarts, interp)
 		case c == '{':
 			depth++
 			i++
@@ -634,13 +693,14 @@ func scanInterpolation(source []byte, i, line int, lineStarts *[]int) (int, int)
 		default:
 			i++
 		}
+		afterDot = isDot
 	}
 	return i, line
 }
 
 // scanHeredocContent scans from after the opening """ (or ”') to (and including) the closing """ on its own line.
 // The closing delimiter must appear at the start of a line (possibly with leading whitespace).
-func scanHeredocContent(source []byte, i, line int, delim byte, lineStarts *[]int) (int, int) {
+func scanHeredocContent(source []byte, i, line int, delim byte, lineStarts *[]int, interp *[]Token) (int, int) {
 	for i < len(source) {
 		ch := source[i]
 		if ch == '\n' {
@@ -664,7 +724,7 @@ func scanHeredocContent(source []byte, i, line int, delim byte, lineStarts *[]in
 			i += 2
 		} else if ch == '#' && i+1 < len(source) && source[i+1] == '{' {
 			i += 2
-			i, line = scanInterpolation(source, i, line, lineStarts)
+			i, line = scanInterpolation(source, i, line, lineStarts, interp)
 		} else {
 			i++
 		}
@@ -676,7 +736,7 @@ func scanHeredocContent(source []byte, i, line int, delim byte, lineStarts *[]in
 // including any trailing modifier letters. Returns new position and updated line count.
 // sigilLetter is the letter after ~ (e.g. 's' in ~s, 'S' in ~S). Uppercase sigil letters
 // mean the content is "raw" — backslash is NOT an escape character.
-func scanSigilContent(source []byte, i, line int, sigilLetter byte, lineStarts *[]int) (int, int) {
+func scanSigilContent(source []byte, i, line int, sigilLetter byte, lineStarts *[]int, interp *[]Token) (int, int) {
 	if i >= len(source) {
 		return i, line
 	}
@@ -688,7 +748,7 @@ func scanSigilContent(source []byte, i, line int, sigilLetter byte, lineStarts *
 	if openCh == '"' && i+2 < len(source) && source[i+1] == '"' && source[i+2] == '"' {
 		i += 3 // consume """
 		if escapes {
-			i, line = scanHeredocContent(source, i, line, '"', lineStarts)
+			i, line = scanHeredocContent(source, i, line, '"', lineStarts, interp)
 		} else {
 			i, line = scanRawHeredocContent(source, i, line, '"', lineStarts)
 		}
@@ -697,7 +757,7 @@ func scanSigilContent(source []byte, i, line int, sigilLetter byte, lineStarts *
 	if openCh == '\'' && i+2 < len(source) && source[i+1] == '\'' && source[i+2] == '\'' {
 		i += 3 // consume '''
 		if escapes {
-			i, line = scanHeredocContent(source, i, line, '\'', lineStarts)
+			i, line = scanHeredocContent(source, i, line, '\'', lineStarts, interp)
 		} else {
 			i, line = scanRawHeredocContent(source, i, line, '\'', lineStarts)
 		}
@@ -741,6 +801,12 @@ func scanSigilContent(source []byte, i, line int, sigilLetter byte, lineStarts *
 					*lineStarts = append(*lineStarts, i+2)
 				}
 				i += 2
+			} else if escapes && ch == '#' && i+1 < len(source) && source[i+1] == '{' {
+				// A lowercase sigil interpolates: ~s(#{Mod.fun()}). Consuming
+				// the whole #{} here also keeps its braces and its delimiter
+				// characters from being read as the sigil's own.
+				i += 2
+				i, line = scanInterpolation(source, i, line, lineStarts, interp)
 			} else if ch == openCh {
 				depth++
 				i++
@@ -764,6 +830,11 @@ func scanSigilContent(source []byte, i, line int, sigilLetter byte, lineStarts *
 					*lineStarts = append(*lineStarts, i+2)
 				}
 				i += 2
+			} else if escapes && ch == '#' && i+1 < len(source) && source[i+1] == '{' {
+				// ~r/#{Mod.fun()}/ — the interpolation is code, and a closing
+				// delimiter inside it does not end the sigil.
+				i += 2
+				i, line = scanInterpolation(source, i, line, lineStarts, interp)
 			} else if ch == closeCh {
 				i++ // consume closing delimiter
 				break

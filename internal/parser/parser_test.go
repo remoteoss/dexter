@@ -2045,7 +2045,8 @@ func TestParseFile_CharLiteralDoesNotConfuseStringBlanking(t *testing.T) {
 }
 
 func TestParseFile_InterpolationDoesNotConfuseRefExtraction(t *testing.T) {
-	// Bug 2: string interpolation with nested quotes containing module refs
+	// Bug 2: string interpolation with nested quotes containing module refs.
+	// The code after the string must still be indexed.
 	path := writeTempFile(t, "defmodule MyApp.Foo do\n  def bar do\n    x = \"hello #{Real.Module.call(\\\"arg\\\"}\"\n    Other.Module.work()\n  end\nend\n")
 
 	_, refs, err := ParseFile(path)
@@ -2053,10 +2054,16 @@ func TestParseFile_InterpolationDoesNotConfuseRefExtraction(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The interpolated call is a real reference; what must not happen is the
+	// interpolation swallowing the code that follows it.
+	interpolated := false
 	for _, r := range refs {
-		if r.Module == "Real.Module" {
-			t.Errorf("should not extract refs from inside string interpolation, got %+v", r)
+		if r.Module == "Real.Module" && r.Function == "call" {
+			interpolated = true
 		}
+	}
+	if !interpolated {
+		t.Errorf("expected the interpolated Real.Module.call ref, got %+v", refs)
 	}
 
 	found := false
@@ -3064,5 +3071,159 @@ end
 	}
 	if !found {
 		t.Errorf("expected the call after a char literal in an interpolation, got %+v", refs)
+	}
+}
+
+// Code inside a #{} interpolation is real code: it calls functions and names
+// modules. The tokenizer used to read a string literal as one opaque token, so
+// every call site inside an interpolation was missing from the index —
+// find-references skipped it and a rename left it behind.
+func TestParseText_InterpolationRefsAreIndexed(t *testing.T) {
+	src := `defmodule MyApp.Notifier do
+  alias SharedLib.Config
+  alias SharedLib.Helpers
+
+  def line(slug) do
+    "<#{Config.admin_url(slug)}|#{slug}>"
+  end
+
+  def block(run) do
+    """
+    Run: #{Helpers.link(Config.run_url(run.slug), run.name)}
+    """
+  end
+
+  def nested(x) do
+    "outer #{"inner #{Config.format(x)}"} tail"
+  end
+
+  def struct_in_interpolation(x) do
+    "#{%SharedLib.Point{x: x}}"
+  end
+end
+`
+	_, refs, err := ParseText("/tmp/notifier.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type want struct {
+		module   string
+		function string
+		line     int
+	}
+	wants := []want{
+		{"SharedLib.Config", "admin_url", 6},
+		{"SharedLib.Helpers", "link", 11},
+		{"SharedLib.Config", "run_url", 11},
+		{"SharedLib.Config", "format", 16},
+		{"SharedLib.Point", "", 20},
+	}
+	for _, w := range wants {
+		found := false
+		for _, r := range refs {
+			if r.Module == w.module && r.Function == w.function && r.Line == w.line {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("missing ref %s.%s on line %d; got %+v", w.module, w.function, w.line, refs)
+		}
+	}
+}
+
+// Only the interpolated code counts. Literal text that happens to look like a
+// module or a call must stay out of the index, or every log message would add
+// phantom references.
+func TestParseText_LiteralStringTextIsNotAReference(t *testing.T) {
+	src := `defmodule MyApp.Logger do
+  def report(x) do
+    "SharedLib.Ghost.call() said #{SharedLib.Real.call(x)}"
+  end
+
+  @doc """
+  SharedLib.DocGhost.call() is only prose.
+  """
+  def documented, do: :ok
+end
+`
+	_, refs, err := ParseText("/tmp/logger.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range refs {
+		if r.Module == "SharedLib.Ghost" || r.Module == "SharedLib.DocGhost" {
+			t.Errorf("literal string text produced a reference: %+v", r)
+		}
+	}
+	found := false
+	for _, r := range refs {
+		if r.Module == "SharedLib.Real" && r.Function == "call" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected SharedLib.Real.call from the interpolation, got %+v", refs)
+	}
+}
+
+// A keyword inside an interpolation (`do`, `end`, `fn`) must not reach the
+// block-depth tracker, or the module frame pops early and every definition
+// after it is attributed to the wrong module.
+func TestParseText_InterpolationKeywordsKeepModuleAttribution(t *testing.T) {
+	src := `defmodule MyApp.Report do
+  def render(list) do
+    "#{Enum.map(list, fn i -> i end)} #{if list == [], do: "none", else: "some"}"
+  end
+
+  def after_it, do: :ok
+end
+`
+	defs, _, err := ParseText("/tmp/report.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, d := range defs {
+		if d.Function == "after_it" {
+			found = true
+			if d.Module != "MyApp.Report" {
+				t.Errorf("after_it attributed to %q, want MyApp.Report", d.Module)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("expected after_it to be indexed, got %+v", defs)
+	}
+}
+
+// A lowercase sigil interpolates, so the code inside #{} is real code there
+// too. An uppercase sigil does not: ~S is raw text.
+func TestParseText_SigilInterpolationRefs(t *testing.T) {
+	src := `defmodule MyApp.Matcher do
+  def pattern(name), do: ~r/^#{SharedLib.Escaper.escape(name)}$/
+
+  def raw, do: ~S(#{SharedLib.Ghost.call()})
+
+  def joined(a), do: ~s(prefix-#{SharedLib.Fmt.pad(a)})
+end
+`
+	_, refs, err := ParseText("/tmp/matcher.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byModule := map[string]string{}
+	for _, r := range refs {
+		byModule[r.Module] = r.Function
+	}
+	if byModule["SharedLib.Escaper"] != "escape" {
+		t.Errorf("expected SharedLib.Escaper.escape from the ~r sigil, got %+v", refs)
+	}
+	if byModule["SharedLib.Fmt"] != "pad" {
+		t.Errorf("expected SharedLib.Fmt.pad from the ~s sigil, got %+v", refs)
+	}
+	if _, ok := byModule["SharedLib.Ghost"]; ok {
+		t.Errorf("an uppercase sigil is raw text, it must not produce a reference: %+v", refs)
 	}
 }
