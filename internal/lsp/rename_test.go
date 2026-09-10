@@ -3256,6 +3256,111 @@ end
 	}
 }
 
+// An injected alias is lexically scoped like a written one, so a module
+// nested inside the module that `use`s the injector sees it too. Missing the
+// call site there leaves a rename half-applied and the file broken.
+func TestRenameModuleUpdatesInjectedAliasCallSiteInNestedModule(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	repoContent := `defmodule MyApp.Repo do
+  defmacro __using__(_) do
+    quote do
+      alias MyApp.Repo
+    end
+  end
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/repo.ex", repoContent)
+
+	accountsContent := `defmodule MyApp.Accounts do
+  use MyApp.Repo
+
+  defmodule Inner do
+    def list_users do
+      Repo.all(User)
+    end
+  end
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/accounts.ex", accountsContent)
+
+	repoPath := filepath.Join(server.projectRoot, "lib/my_app/repo.ex")
+	accountsPath := filepath.Join(server.projectRoot, "lib/my_app/accounts.ex")
+	repoURI := "file://" + repoPath
+	server.docs.Set(repoURI, repoContent)
+
+	if edit := renameAt(t, server, repoURI, 0, 16, "Database"); edit == nil {
+		t.Fatal("expected non-nil edit")
+	}
+
+	// accounts.ex is not open, so the server writes it rather than returning
+	// edits for the editor to apply.
+	got, err := os.ReadFile(accountsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "Database.all(User)") {
+		t.Errorf("expected the bare call site to become Database.all(User), got:\n%s", got)
+	}
+	if strings.Contains(string(got), "Repo.") {
+		t.Errorf("no Repo. call site should be left behind, got:\n%s", got)
+	}
+}
+
+// A sibling module in the same file does not `use` the injector, so the same
+// short name there is a different module and must not be rewritten.
+func TestRenameModuleLeavesInjectedAliasSpellingInSiblingModule(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	repoContent := `defmodule MyApp.Repo do
+  defmacro __using__(_) do
+    quote do
+      alias MyApp.Repo
+    end
+  end
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/repo.ex", repoContent)
+
+	accountsContent := `defmodule MyApp.Accounts do
+  use MyApp.Repo
+
+  def list_users do
+    Repo.all(User)
+  end
+end
+
+defmodule MyApp.Other do
+  def nope, do: Repo.all(User)
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/accounts.ex", accountsContent)
+
+	repoPath := filepath.Join(server.projectRoot, "lib/my_app/repo.ex")
+	accountsPath := filepath.Join(server.projectRoot, "lib/my_app/accounts.ex")
+	repoURI := "file://" + repoPath
+	server.docs.Set(repoURI, repoContent)
+
+	if edit := renameAt(t, server, repoURI, 0, 16, "Database"); edit == nil {
+		t.Fatal("expected non-nil edit")
+	}
+
+	// accounts.ex is not open, so the server writes it rather than returning
+	// edits for the editor to apply.
+	got, err := os.ReadFile(accountsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "Database.all(User)") {
+		t.Errorf("expected the bare call site to become Database.all(User), got:\n%s", got)
+	}
+	if strings.Count(string(got), "Repo.all") != 1 {
+		t.Errorf("the sibling module does not use MyApp.Repo; its Repo.all must be untouched, got:\n%s", got)
+	}
+}
+
 // A call site that is reached through a `use`-injected alias AND written
 // inside a #{} interpolation needs both paths at once: the index holds it
 // under the bare short name, and the main token stream keeps the whole string

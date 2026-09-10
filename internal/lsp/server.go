@@ -2733,6 +2733,15 @@ func lexicalScopeAt(tf *TokenizedFile, line, beforeToken int) []int {
 	return stack
 }
 
+// moduleEncloses reports whether a `use` written in outer can inject into a
+// reference written in inner: the same module, or one nested inside it, since
+// an injected alias is lexically scoped like a written one. Name nesting is
+// necessary but not sufficient — two top-level modules can be named MyApp.A
+// and MyApp.A.B — so the caller still checks scopeContains on the same file.
+func moduleEncloses(outer, inner string) bool {
+	return outer == inner || strings.HasPrefix(inner, outer+".")
+}
+
 func scopeContains(scope, parent []int) bool {
 	if len(scope) < len(parent) {
 		return false
@@ -3050,7 +3059,7 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 					continue
 				}
 				useModule, found := moduleAt(filePath, site.line)
-				if !found || useModule != refModule {
+				if !found || !moduleEncloses(useModule, refModule) {
 					continue
 				}
 				for _, occurrence := range occurrences {
