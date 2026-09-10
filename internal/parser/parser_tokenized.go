@@ -31,12 +31,6 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 		return NextSigToken(tokens, n, from)
 	}
 
-	// isUserModuleToken returns true if the TokModule token represents a user-defined
-	// module name (starts with ASCII uppercase). Returns false for __MODULE__.
-	isUserModuleToken := func(t Token) bool {
-		return source[t.Start] >= 'A' && source[t.Start] <= 'Z'
-	}
-
 	collectModuleName := func(i int) (string, int) {
 		return CollectModuleName(source, tokens, n, i)
 	}
@@ -574,7 +568,7 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 
 		case TokPercent:
 			// %Module{ struct literal
-			if i+1 < n && tokens[i+1].Kind == TokModule && isUserModuleToken(tokens[i+1]) {
+			if i+1 < n && tokens[i+1].Kind == TokModule && isUserModule(source, tokens[i+1]) {
 				modName, k := collectModuleName(i + 1)
 				if k < n && tokens[k].Kind == TokOpenBrace {
 					cm := currentModule()
@@ -591,7 +585,7 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 
 		case TokModule:
 			// Skip __MODULE__ and other non-ASCII-uppercase module tokens
-			if !isUserModuleToken(tok) {
+			if !isUserModule(source, tok) {
 				i++
 				continue
 			}

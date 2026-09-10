@@ -2390,7 +2390,13 @@ func ModuleAttributeAtCursor(tokens []parser.Token, source []byte, lineStarts []
 
 // ExtractModuleAttribute is the TokenizedFile method version of ModuleAttributeAtCursor.
 func (tf *TokenizedFile) ModuleAttributeAtCursor(line, col int) string {
-	return ModuleAttributeAtCursor(tf.tokens, tf.source, tf.lineStarts, line, col)
+	name := ModuleAttributeAtCursor(tf.tokens, tf.source, tf.lineStarts, line, col)
+	if name == "" && len(tf.interp) > 0 {
+		// "#{@base_url}/path" — the attribute is inside a string literal, so
+		// it lives in the interpolation stream.
+		name = ModuleAttributeAtCursor(tf.interp, tf.source, tf.lineStarts, line, col)
+	}
+	return name
 }
 
 // reservedModuleAttrs are Elixir built-in module attributes that are not

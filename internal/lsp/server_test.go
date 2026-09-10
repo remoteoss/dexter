@@ -7911,3 +7911,30 @@ end`)
 		t.Errorf("expected the heredoc interpolation call site, got %+v", locs)
 	}
 }
+
+// The tokenizer records a module attribute written inside an interpolation, so
+// "#{@base_url}/path" must resolve like any other reference to it.
+func TestDefinition_ModuleAttributeInsideInterpolation(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	src := `defmodule MyApp.Notifier do
+  @base_url "https://example.test"
+
+  def link(path) do
+    "#{@base_url}/#{path}"
+  end
+end`
+	indexFile(t, server.store, server.projectRoot, "lib/notifier.ex", src)
+	fileURI := "file://" + filepath.Join(server.projectRoot, "lib/notifier.ex")
+	server.docs.Set(fileURI, src)
+
+	// col 8 is on @base_url inside the interpolation
+	locs := definitionAt(t, server, fileURI, 4, 8)
+	if len(locs) == 0 {
+		t.Fatal("expected the attribute definition")
+	}
+	if locs[0].Range.Start.Line != 1 {
+		t.Errorf("jumped to line %d, want line 1", locs[0].Range.Start.Line)
+	}
+}

@@ -346,17 +346,11 @@ func (ds *DocumentStore) GetTokens(uri string) ([]parser.Token, []byte, bool) {
 	return doc.tokens, doc.tokSrc, true
 }
 
-// GetTokensFull returns cached tokenizer output including line starts for
-// efficient (line, col) → byte offset conversion.
-func (ds *DocumentStore) GetTokensFull(uri string) ([]parser.Token, []byte, []int, bool) {
-	tokens, src, lineStarts, _, ok := ds.GetTokensFullInterp(uri)
-	return tokens, src, lineStarts, ok
-}
-
-// GetTokensFullInterp is GetTokensFull plus the interpolation token stream —
-// the code inside #{}, which the main stream keeps folded into one string
-// token.
-func (ds *DocumentStore) GetTokensFullInterp(uri string) ([]parser.Token, []byte, []int, []parser.Token, bool) {
+// GetTokensFull returns cached tokenizer output: the token stream, the source
+// it points into, the line starts for efficient (line, col) → byte offset
+// conversion, and the interpolation stream — the code inside #{}, which the
+// main stream keeps folded into one string token.
+func (ds *DocumentStore) GetTokensFull(uri string) ([]parser.Token, []byte, []int, []parser.Token, bool) {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	doc, ok := ds.docs[uri]
@@ -377,7 +371,7 @@ func (ds *DocumentStore) GetTokensFullInterp(uri string) ([]parser.Token, []byte
 // if the document is not tracked. This is the preferred way to get a
 // TokenizedFile from the document store.
 func (ds *DocumentStore) GetTokenizedFile(uri string) *TokenizedFile {
-	tokens, src, lineStarts, interp, ok := ds.GetTokensFullInterp(uri)
+	tokens, src, lineStarts, interp, ok := ds.GetTokensFull(uri)
 	if !ok {
 		return nil
 	}
