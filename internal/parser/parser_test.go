@@ -3227,3 +3227,145 @@ end
 		t.Errorf("an uppercase sigil is raw text, it must not produce a reference: %+v", refs)
 	}
 }
+
+// Interpolations nest, and Elixir allows almost anything inside one. Every
+// case below was checked against the Elixir compiler itself, so a failure here
+// is dexter's and not the fixture's. Each asserts two things: the reference
+// written inside the interpolation is indexed, and the definition written
+// after it survives — a scanner that loses the end of an interpolation reads
+// the rest of the file as string content and drops all of it.
+func TestParseText_InterpolationEdgeCases(t *testing.T) {
+	cases := []struct {
+		name    string
+		body    string
+		wantRef string
+		absent  string
+	}{
+		{
+			name:    "four levels of nesting",
+			body:    `    "a#{"b#{"c#{"d#{SharedLib.Deep.four(x)}"}"}"}"`,
+			wantRef: "SharedLib.Deep.four",
+		},
+		{
+			name: "comment holding a brace and a quote",
+			body: `    "#{
+      # a comment holding a } brace and a " quote
+      SharedLib.Deep.cmt(x)
+    }"`,
+			wantRef: "SharedLib.Deep.cmt",
+		},
+		{
+			name:    "char literals for brace and quote",
+			body:    `    "#{[?}, ?{, ?"] ++ SharedLib.Deep.chars(x)}"`,
+			wantRef: "SharedLib.Deep.chars",
+		},
+		{
+			name:    "closing brace inside a nested string",
+			body:    `    "#{SharedLib.Deep.brace("}")}"`,
+			wantRef: "SharedLib.Deep.brace",
+		},
+		{
+			name: "heredoc inside an interpolation",
+			body: `    "#{SharedLib.Deep.hd("""
+    inner #{SharedLib.Deep.inner(x)}
+    """)}"`,
+			wantRef: "SharedLib.Deep.inner",
+		},
+		{
+			name:    "sigil delimited by braces",
+			body:    `    "#{~s{a#{SharedLib.Deep.sbrace(x)}b}}"`,
+			wantRef: "SharedLib.Deep.sbrace",
+		},
+		{
+			name:    "raw sigil stays raw",
+			body:    `    SharedLib.Deep.raw(~S"#{SharedLib.Ghost.call()}", x)`,
+			wantRef: "SharedLib.Deep.raw",
+			absent:  "SharedLib.Ghost",
+		},
+		{
+			name:    "fn and end deep inside",
+			body:    `    "a#{"b#{Enum.map([x], fn i -> SharedLib.Deep.fnend(i) end)}"}"`,
+			wantRef: "SharedLib.Deep.fnend",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := "defmodule MyApp.Edge do\n  def probe(x) do\n" + tc.body +
+				"\n  end\n\n  def sentinel(y), do: SharedLib.Sentinel.mark(y)\nend\n"
+			defs, refs, err := ParseText("/tmp/edge.ex", src)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			seen := map[string]bool{}
+			for _, r := range refs {
+				seen[r.Module+"."+r.Function] = true
+				if tc.absent != "" && r.Module == tc.absent {
+					t.Errorf("raw text produced a reference: %+v", r)
+				}
+			}
+			if !seen[tc.wantRef] {
+				t.Errorf("missing %s; got %+v", tc.wantRef, refs)
+			}
+
+			// The interpolation must end where Elixir ends it: everything
+			// after it is still code.
+			if !seen["SharedLib.Sentinel.mark"] {
+				t.Errorf("the call after the interpolation was swallowed; got %+v", refs)
+			}
+			sentinel := false
+			for _, d := range defs {
+				if d.Function == "sentinel" {
+					sentinel = true
+					if d.Module != "MyApp.Edge" {
+						t.Errorf("sentinel/1 attributed to %q, want MyApp.Edge", d.Module)
+					}
+				}
+			}
+			if !sentinel {
+				t.Errorf("the definition after the interpolation was swallowed; got %+v", defs)
+			}
+		})
+	}
+}
+
+// A multi-line interpolation must report the line the code is actually on,
+// including inside a heredoc nested in one, or every jump lands in the wrong
+// place.
+func TestParseText_InterpolationLineNumbers(t *testing.T) {
+	src := `defmodule MyApp.Lines do
+  def heredoc_in_interp(x) do
+    "#{SharedLib.Deep.hd("""
+    inner #{SharedLib.Deep.inner(x)}
+    """)}"
+  end
+
+  def multiline_call(x) do
+    "#{SharedLib.Deep.multi(
+      x,
+      "arg #{SharedLib.Deep.arg(x)}"
+    )}"
+  end
+end
+`
+	_, refs, err := ParseText("/tmp/lines.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]int{
+		"SharedLib.Deep.hd":    3,
+		"SharedLib.Deep.inner": 4,
+		"SharedLib.Deep.multi": 9,
+		"SharedLib.Deep.arg":   11,
+	}
+	got := map[string]int{}
+	for _, r := range refs {
+		got[r.Module+"."+r.Function] = r.Line
+	}
+	for name, line := range want {
+		if got[name] != line {
+			t.Errorf("%s on line %d, want %d", name, got[name], line)
+		}
+	}
+}

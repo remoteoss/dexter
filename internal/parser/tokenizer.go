@@ -684,6 +684,13 @@ func scanInterpolation(source []byte, i, line int, lineStarts *[]int, interp *[]
 		case c == '#' && i+1 < len(source) && source[i+1] == '{':
 			i += 2
 			i, line = scanInterpolation(source, i, line, lineStarts, interp)
+		case c == '#':
+			// A comment inside an interpolation runs to the end of the line,
+			// and its text is inert: a } or a " written in it closes nothing.
+			// The newline is left for the case above, which counts the line.
+			for i < len(source) && source[i] != '\n' {
+				i++
+			}
 		case c == '{':
 			depth++
 			i++
