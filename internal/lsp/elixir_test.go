@@ -2994,6 +2994,27 @@ end`
 	}
 }
 
+func TestExtractAliasesInScope_NestedModuleAliasChain(t *testing.T) {
+	text := `defmodule MyApp.Outer do
+  alias My.App.Repo
+
+  defmodule Inner do
+    alias Repo.Helper
+    require Repo, as: R
+
+    def bar, do: Helper.help()
+  end
+end`
+	inner := ExtractAliasesInScope(text, 7)
+
+	if inner["Helper"] != "My.App.Repo.Helper" {
+		t.Errorf("Helper: got %q, want %q", inner["Helper"], "My.App.Repo.Helper")
+	}
+	if inner["R"] != "My.App.Repo" {
+		t.Errorf("R: got %q, want %q", inner["R"], "My.App.Repo")
+	}
+}
+
 func TestExtractAliasesInScope_MultilineBlockTrailingComma(t *testing.T) {
 	text := `defmodule MyApp.Web do
   alias MyApp.{

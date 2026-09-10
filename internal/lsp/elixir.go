@@ -1105,7 +1105,20 @@ func extractAliasesFromTokens(source []byte, tokens []parser.Token, targetLine i
 		}
 		if hasDo {
 			depth++
-			stack = append(stack, moduleFrame{name: name, depth: depth})
+			// Alias chains cross a nested defmodule: `alias My.App.Repo` in the
+			// parent then `alias Repo.Helper` inside the child must expand to
+			// My.App.Repo.Helper. Seed the child scope with what the parent
+			// already declared. This map only drives that expansion; which
+			// aliases a target line finally sees is still the scope filter.
+			inherited := curAliases()
+			frame := moduleFrame{name: name, depth: depth}
+			if len(inherited) > 0 {
+				frame.aliases = make(map[string]string, len(inherited)+8)
+				for short, full := range inherited {
+					frame.aliases[short] = full
+				}
+			}
+			stack = append(stack, frame)
 		}
 		return nextPos
 	}
