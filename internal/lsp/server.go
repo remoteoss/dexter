@@ -2908,6 +2908,50 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 		}
 		return extractEnclosingModuleFromTokens(tf.source, tf.tokens, line-1), true
 	}
+	// scanRefStream collects the occurrences of module (optionally followed by
+	// .function) on one line of a token stream. The interpolation stream is
+	// scanned the same way, but its tokens have no place in the main stream, so
+	// each occurrence borrows the position of the string token that holds it:
+	// that is what lexical scope and use-site ordering are measured against.
+	scanRefStream := func(tf *TokenizedFile, tokens []parser.Token, line int, module, function string, interp bool) []refOccurrence {
+		n := len(tokens)
+		var occurrences []refOccurrence
+		for i := 0; i < n; i++ {
+			if tokens[i].Line > line {
+				break
+			}
+			if tokens[i].Line != line || tokens[i].Kind != parser.TokModule {
+				continue
+			}
+			modName, next := tokCollectModuleName(tf.source, tokens, n, i)
+			if modName != module {
+				continue
+			}
+			if function != "" && (next+1 >= n || tokens[next].Kind != parser.TokDot || tokens[next+1].Kind != parser.TokIdent || parser.TokenText(tf.source, tokens[next+1]) != function) {
+				continue
+			}
+			position := i
+			column := tokens[i].Start - tf.lineStarts[line-1]
+			if interp {
+				// The last main-stream token starting at or before the
+				// interpolation is the string literal that encloses it.
+				position = sort.Search(tf.n, func(k int) bool { return tf.tokens[k].Start > tokens[i].Start }) - 1
+				if position < 0 {
+					position = 0
+				}
+				// LineStarts skips the newlines inside a string, so the column
+				// of a token in a heredoc comes from the source itself.
+				column = tokens[i].Start - bytes.LastIndexByte(tf.source[:tokens[i].Start], '\n') - 1
+			}
+			occurrences = append(occurrences, refOccurrence{
+				token:  position,
+				column: column,
+				scope:  lexicalScopeAt(tf, line, position),
+			})
+			i = next - 1
+		}
+		return occurrences
+	}
 	refOccurrencesAt := func(filePath string, line int, module, function string) ([]refOccurrence, bool) {
 		key := refKey{filePath, line, module, function}
 		if occurrences, ok := refCache[key]; ok {
@@ -2917,27 +2961,11 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 		if !ok {
 			return nil, false
 		}
-		var occurrences []refOccurrence
-		for i := 0; i < tf.n; i++ {
-			if tf.tokens[i].Line > line {
-				break
-			}
-			if tf.tokens[i].Line != line || tf.tokens[i].Kind != parser.TokModule {
-				continue
-			}
-			modName, next := tokCollectModuleName(tf.source, tf.tokens, tf.n, i)
-			if modName != module {
-				continue
-			}
-			if function != "" && (next+1 >= tf.n || tf.tokens[next].Kind != parser.TokDot || tf.tokens[next+1].Kind != parser.TokIdent || parser.TokenText(tf.source, tf.tokens[next+1]) != function) {
-				continue
-			}
-			occurrences = append(occurrences, refOccurrence{
-				token:  i,
-				column: tf.tokens[i].Start - tf.lineStarts[line-1],
-				scope:  lexicalScopeAt(tf, line, i),
-			})
-			i = next - 1
+		occurrences := scanRefStream(tf, tf.tokens, line, module, function, false)
+		if len(tf.interp) > 0 {
+			// A call written inside a #{} interpolation is indexed like any
+			// other, but the main stream keeps the whole string as one token.
+			occurrences = append(occurrences, scanRefStream(tf, tf.interp, line, module, function, true)...)
 		}
 		refCache[key] = occurrences
 		return occurrences, len(occurrences) > 0

@@ -3256,6 +3256,57 @@ end
 	}
 }
 
+// A call site that is reached through a `use`-injected alias AND written
+// inside a #{} interpolation needs both paths at once: the index holds it
+// under the bare short name, and the main token stream keeps the whole string
+// as one token, so the columns come from the interpolation stream.
+func TestRenameModuleUpdatesInjectedAliasCallSiteInsideInterpolation(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	repoContent := `defmodule MyApp.Repo do
+  defmacro __using__(_) do
+    quote do
+      alias MyApp.Repo
+    end
+  end
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/repo.ex", repoContent)
+
+	accountsContent := `defmodule MyApp.Accounts do
+  use MyApp.Repo
+
+  def describe(user) do
+    "count: #{Repo.aggregate(user)}"
+  end
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/accounts.ex", accountsContent)
+
+	repoPath := filepath.Join(server.projectRoot, "lib/my_app/repo.ex")
+	accountsPath := filepath.Join(server.projectRoot, "lib/my_app/accounts.ex")
+	repoURI := "file://" + repoPath
+	server.docs.Set(repoURI, repoContent)
+
+	if edit := renameAt(t, server, repoURI, 0, 16, "Database"); edit == nil {
+		t.Fatal("expected non-nil edit")
+	}
+
+	// accounts.ex is not open, so the server writes it rather than returning
+	// edits for the editor to apply.
+	got, err := os.ReadFile(accountsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "Database.aggregate(user)") {
+		t.Errorf("expected the interpolated call site to become Database.aggregate(user), got:\n%s", got)
+	}
+	if strings.Contains(string(got), "Repo.") {
+		t.Errorf("no Repo. call site should be left behind, got:\n%s", got)
+	}
+}
+
 // A rename that stops at the quote leaves broken code behind: the call inside
 // the interpolation still names the old module.
 func TestRenameModule_UpdatesInterpolationSite(t *testing.T) {
