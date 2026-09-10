@@ -829,14 +829,18 @@ end
 		}
 	})
 
-	t.Run("inner scope sees inner aliases only", func(t *testing.T) {
+	t.Run("inner scope sees its own and the enclosing aliases", func(t *testing.T) {
 		// Line 8 = "Invoice.get()" inside Inner
 		aliases := ExtractAliasesInScope(src, 8)
 		if aliases["Invoice"] != "MyApp.Billing.Invoice" {
 			t.Errorf("expected Invoice alias in inner scope, got %q", aliases["Invoice"])
 		}
-		if _, ok := aliases["Repo"]; ok {
-			t.Error("Repo alias should NOT be visible in inner scope")
+		// Elixir aliases are lexically scoped: Inner sees what Outer declared.
+		if aliases["Repo"] != "MyApp.Repo" {
+			t.Errorf("expected the outer Repo alias in inner scope, got %q", aliases["Repo"])
+		}
+		if aliases["Config"] != "MyApp.Config" {
+			t.Errorf("expected the outer Config alias in inner scope, got %q", aliases["Config"])
 		}
 	})
 
@@ -2989,9 +2993,82 @@ end`
 	if outerAliases["Helpers"] != "MyApp.Helpers" {
 		t.Error("outer module should have the alias")
 	}
-	if _, ok := innerAliases["Helpers"]; ok {
-		t.Error("inner module should NOT inherit outer alias")
+	if innerAliases["Helpers"] != "MyApp.Helpers" {
+		t.Errorf("inner module should inherit the outer alias, got %q", innerAliases["Helpers"])
 	}
+}
+
+func TestExtractAliasesInScope_LexicalScopeBoundaries(t *testing.T) {
+	t.Run("parent alias below the nested module is not in scope inside it", func(t *testing.T) {
+		text := `defmodule Outer do
+  defmodule Inner do
+    def run, do: :ok
+  end
+
+  alias My.App.Late
+end`
+		inner := ExtractAliasesInScope(text, 2)
+		if _, ok := inner["Late"]; ok {
+			t.Errorf("Late was declared after Inner closed, got %v", inner)
+		}
+	})
+
+	t.Run("sibling module aliases do not leak", func(t *testing.T) {
+		text := `defmodule A do
+  alias My.App.OnlyA
+  def a, do: :ok
+end
+
+defmodule B do
+  alias My.App.OnlyB
+  def b, do: :ok
+end`
+		b := ExtractAliasesInScope(text, 7)
+		if b["OnlyB"] != "My.App.OnlyB" {
+			t.Errorf("OnlyB: got %q, want My.App.OnlyB", b["OnlyB"])
+		}
+		if _, ok := b["OnlyA"]; ok {
+			t.Errorf("OnlyA belongs to a sibling module, got %v", b)
+		}
+	})
+
+	t.Run("nested module shadows a parent alias", func(t *testing.T) {
+		text := `defmodule Outer do
+  alias My.App.Repo
+
+  defmodule Inner do
+    alias Other.Repo
+    def run, do: Repo.all()
+  end
+end`
+		inner := ExtractAliasesInScope(text, 5)
+		if inner["Repo"] != "Other.Repo" {
+			t.Errorf("Repo: got %q, want Other.Repo", inner["Repo"])
+		}
+	})
+
+	t.Run("three levels deep", func(t *testing.T) {
+		text := `defmodule L1 do
+  alias My.App.One
+
+  defmodule L2 do
+    alias My.App.Two
+
+    defmodule L3 do
+      alias My.App.Three
+      def run, do: :ok
+    end
+  end
+end`
+		deep := ExtractAliasesInScope(text, 8)
+		for short, want := range map[string]string{
+			"One": "My.App.One", "Two": "My.App.Two", "Three": "My.App.Three",
+		} {
+			if deep[short] != want {
+				t.Errorf("%s: got %q, want %q", short, deep[short], want)
+			}
+		}
+	})
 }
 
 func TestExtractAliasesInScope_NestedModuleAliasChain(t *testing.T) {
@@ -3167,13 +3244,13 @@ do
   def outer_run, do: OuterOnly.call()
 end`
 
-	// Line 6 is inside Inner — should see InnerOnly but not OuterOnly
+	// Line 6 is inside Inner — sees InnerOnly, and OuterOnly from the parent
 	innerAliases := ExtractAliasesInScope(text, 6)
 	if innerAliases["InnerOnly"] != "MyApp.InnerOnly" {
 		t.Errorf("InnerOnly: got %q, want MyApp.InnerOnly", innerAliases["InnerOnly"])
 	}
-	if _, ok := innerAliases["OuterOnly"]; ok {
-		t.Error("OuterOnly should NOT be visible inside Inner")
+	if innerAliases["OuterOnly"] != "MyApp.OuterOnly" {
+		t.Errorf("OuterOnly inside Inner: got %q, want MyApp.OuterOnly", innerAliases["OuterOnly"])
 	}
 
 	// Line 9 is inside Outer after Inner ends — should see OuterOnly but not InnerOnly
@@ -3429,12 +3506,13 @@ end`,
 						tc.innerLine, tc.wantInnerAlias, innerAliases)
 				}
 			}
-			// Only check alias leakage if inner and outer are different scopes
-			// (same module name means they're in the same scope or separate top-level modules)
+			// Where inner and outer are different scopes, inner is nested in
+			// outer, and every case declares the outer alias above the nested
+			// module — so Elixir's lexical scoping makes it visible inside.
 			if tc.wantOuterAlias != "" && tc.wantOuterAlias != tc.wantInnerAlias && tc.wantInnerMod != tc.wantOuterMod {
-				if _, ok := innerAliases[tc.wantOuterAlias]; ok {
-					t.Errorf("inner line %d: outer alias %q should not be visible",
-						tc.innerLine, tc.wantOuterAlias)
+				if _, ok := innerAliases[tc.wantOuterAlias]; !ok {
+					t.Errorf("inner line %d: enclosing alias %q should be visible, got %v",
+						tc.innerLine, tc.wantOuterAlias, innerAliases)
 				}
 			}
 

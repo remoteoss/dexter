@@ -1033,7 +1033,11 @@ func extractAliasesFromTokens(source []byte, tokens []parser.Token, targetLine i
 	type moduleFrame struct {
 		name  string
 		depth int
-		// aliases declared so far in this scope, for alias-chain resolution.
+		// id identifies this scope; parentScopes[id] is the enclosing one.
+		id int
+		// aliases in scope here, seeded from the parent (Elixir aliases are
+		// lexically scoped, so a nested module sees the enclosing ones) and
+		// extended as this scope declares more. Drives chain resolution.
 		// Allocated lazily — most scopes declare none.
 		aliases map[string]string
 	}
@@ -1042,14 +1046,27 @@ func extractAliasesFromTokens(source []byte, tokens []parser.Token, targetLine i
 	depth := 0
 	var topAliases map[string]string
 
+	// parentScopes[id] is the id of the scope enclosing scope id. Scope 0 is
+	// the file itself; frames pop off the stack, so this keeps the chain
+	// available for the ancestor walk at the end.
+	parentScopes := []int{0}
+
 	type aliasEntry struct {
-		scope, short, full string
+		scope, line int
+		short, full string
 	}
 	var allAliases []aliasEntry
-	var targetModule string
+	targetScope := -1 // -1: the target line's scope is not known yet
 	unscoped := targetLine < 0
 	// targetLine is 0-based; token.Line is 1-based
 	targetLine1 := targetLine + 1
+
+	currentScope := func() int {
+		if len(stack) > 0 {
+			return stack[len(stack)-1].id
+		}
+		return 0
+	}
 
 	currentModule := func() string {
 		if len(stack) > 0 {
@@ -1075,8 +1092,8 @@ func extractAliasesFromTokens(source []byte, tokens []parser.Token, targetLine i
 
 	// record stores an alias both in the flat list (for the final scope filter)
 	// and in the current scope's map (for chain resolution of later lines).
-	record := func(scope, short, full string) {
-		allAliases = append(allAliases, aliasEntry{scope, short, full})
+	record := func(line int, short, full string) {
+		allAliases = append(allAliases, aliasEntry{currentScope(), line, short, full})
 		if len(stack) > 0 {
 			if stack[len(stack)-1].aliases == nil {
 				stack[len(stack)-1].aliases = make(map[string]string, 8)
@@ -1105,14 +1122,12 @@ func extractAliasesFromTokens(source []byte, tokens []parser.Token, targetLine i
 		}
 		if hasDo {
 			depth++
-			// Alias chains cross a nested defmodule: `alias My.App.Repo` in the
-			// parent then `alias Repo.Helper` inside the child must expand to
-			// My.App.Repo.Helper. Seed the child scope with what the parent
-			// already declared. This map only drives that expansion; which
-			// aliases a target line finally sees is still the scope filter.
-			inherited := curAliases()
-			frame := moduleFrame{name: name, depth: depth}
-			if len(inherited) > 0 {
+			parentScopes = append(parentScopes, currentScope())
+			frame := moduleFrame{name: name, depth: depth, id: len(parentScopes) - 1}
+			// Copy in what the enclosing scope has declared so far, so a chain
+			// crosses the defmodule: `alias My.App.Repo` in the parent then
+			// `alias Repo.Helper` here expands to My.App.Repo.Helper.
+			if inherited := curAliases(); len(inherited) > 0 {
 				frame.aliases = make(map[string]string, len(inherited)+8)
 				for short, full := range inherited {
 					frame.aliases[short] = full
@@ -1127,8 +1142,8 @@ func extractAliasesFromTokens(source []byte, tokens []parser.Token, targetLine i
 		tok := tokens[i]
 
 		// Track target line's module scope (check before any depth changes)
-		if !unscoped && targetModule == "" && tok.Line >= targetLine1 {
-			targetModule = currentModule()
+		if !unscoped && targetScope < 0 && tok.Line >= targetLine1 {
+			targetScope = currentScope()
 		}
 
 		switch tok.Kind {
@@ -1146,7 +1161,7 @@ func extractAliasesFromTokens(source []byte, tokens []parser.Token, targetLine i
 			continue
 
 		case parser.TokAlias:
-			cm := currentModule()
+			line := tok.Line
 			j := tokNextSig(tokens, n, i+1)
 			modName, k := tokCollectModuleName(source, tokens, n, j)
 			if modName == "" {
@@ -1160,7 +1175,7 @@ func extractAliasesFromTokens(source []byte, tokens []parser.Token, targetLine i
 					continue
 				}
 				for _, child := range children {
-					record(cm, parser.AliasShortName(child), base+"."+child)
+					record(line, parser.AliasShortName(child), base+"."+child)
 				}
 				i = nextPos - 1
 				continue
@@ -1170,7 +1185,7 @@ func extractAliasesFromTokens(source []byte, tokens []parser.Token, targetLine i
 			if asName, nextPos, ok := parser.ScanKeywordOptionValue(source, tokens, n, k, "as"); ok {
 				resolved := resolveRef(modName)
 				if !strings.Contains(resolved, "__MODULE__") {
-					record(cm, asName, resolved)
+					record(line, asName, resolved)
 				}
 				i = nextPos - 1
 				continue
@@ -1179,12 +1194,12 @@ func extractAliasesFromTokens(source []byte, tokens []parser.Token, targetLine i
 			// Simple alias
 			resolved := resolveRef(modName)
 			if !strings.Contains(resolved, "__MODULE__") {
-				record(cm, parser.AliasShortName(resolved), resolved)
+				record(line, parser.AliasShortName(resolved), resolved)
 			}
 			i = k - 1
 
 		case parser.TokRequire:
-			cm := currentModule()
+			line := tok.Line
 			j := tokNextSig(tokens, n, i+1)
 			modName, k := tokCollectModuleName(source, tokens, n, j)
 			if modName == "" {
@@ -1195,7 +1210,7 @@ func extractAliasesFromTokens(source []byte, tokens []parser.Token, targetLine i
 			if asName, nextPos, ok := parser.ScanKeywordOptionValue(source, tokens, n, k, "as"); ok {
 				resolved := resolveRef(modName)
 				if !strings.Contains(resolved, "__MODULE__") {
-					record(cm, asName, resolved)
+					record(line, asName, resolved)
 				}
 				i = nextPos - 1
 				continue
@@ -1205,13 +1220,34 @@ func extractAliasesFromTokens(source []byte, tokens []parser.Token, targetLine i
 	}
 
 	// If targetLine was past all tokens, resolve now
-	if !unscoped && targetModule == "" {
-		targetModule = currentModule()
+	if !unscoped && targetScope < 0 {
+		targetScope = currentScope()
+	}
+
+	// An alias is in scope at the target line if it was declared in the
+	// target's own scope, or in an enclosing one before the target line.
+	// Enclosing scopes need the line test: a parent alias written after the
+	// nested module closed was never in scope inside it.
+	inScope := func(a aliasEntry) bool {
+		if unscoped || a.scope == targetScope {
+			return true
+		}
+		if a.line >= targetLine1 {
+			return false
+		}
+		for s := parentScopes[targetScope]; ; s = parentScopes[s] {
+			if a.scope == s {
+				return true
+			}
+			if s == 0 {
+				return false
+			}
+		}
 	}
 
 	aliases := make(map[string]string)
 	for _, a := range allAliases {
-		if unscoped || a.scope == targetModule {
+		if inScope(a) {
 			aliases[a.short] = a.full
 		}
 	}
