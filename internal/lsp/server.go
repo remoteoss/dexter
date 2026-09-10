@@ -102,6 +102,12 @@ type Server struct {
 	showDocumentSupported  bool          // client supports window/showDocument (LSP 3.16+)
 	renameFileOpsSupported bool          // client applies rename resource operations in a WorkspaceEdit
 	snippetSupport         bool          // client supports snippet insert text in completions
+	// positionEncoding is the unit the client counts Position.Character in.
+	// Dexter never negotiates, so this is always UTF-16 in practice — see the
+	// type's doc comment for why — and columns are converted at the edges by
+	// inCol/outCol. It stays a field rather than a constant so a future
+	// negotiation can set it without touching every call site.
+	positionEncoding PositionEncoding
 
 	reindexing sync.Mutex // serializes concurrent backgroundReindex calls
 
@@ -141,6 +147,9 @@ func NewServer(s *store.Store, projectRoot string) *Server {
 		erlangRuntimeCache: make(map[string]*erlangRuntimeCache),
 		usingCache:         make(map[string]*usingCacheEntry),
 		depsCache:          make(map[string]bool),
+		// What every client sends when the server declares no encoding, which
+		// Dexter does not.
+		positionEncoding: EncodingUTF16,
 	}
 }
 
@@ -838,7 +847,7 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 
 	lines := strings.Split(text, "\n")
 	lineNum := int(params.Position.Line)
-	col := int(params.Position.Character)
+	col := s.inCol(lines, lineNum, params.Position.Character)
 
 	if lineNum >= len(lines) {
 		return nil, nil
@@ -1510,7 +1519,7 @@ func (s *Server) CodeAction(ctx context.Context, params *protocol.CodeActionPara
 
 	// Find the full dotted expression at the cursor so that "DocuSign.Client.request"
 	// gives us the complete module reference, not just the segment under the cursor.
-	col := int(params.Range.Start.Character)
+	col := s.inCol(lines, lineNum, params.Range.Start.Character)
 	tf := s.docs.GetTokenizedFile(docURI)
 	if tf == nil {
 		tf = NewTokenizedFile(text)
@@ -1562,8 +1571,8 @@ func (s *Server) CodeAction(ctx context.Context, params *protocol.CodeActionPara
 			// Replace the qualified module reference with the short name
 			edits = append(edits, protocol.TextEdit{
 				Range: protocol.Range{
-					Start: protocol.Position{Line: uint32(lineNum), Character: uint32(exprStart)},
-					End:   protocol.Position{Line: uint32(lineNum), Character: uint32(exprStart + len(moduleRef))},
+					Start: s.outPos(lines, lineNum, exprStart),
+					End:   s.outPos(lines, lineNum, exprStart+len(moduleRef)),
 				},
 				NewText: lastSegment,
 			})
@@ -1676,7 +1685,7 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 
 	lines := strings.Split(text, "\n")
 	lineNum := int(params.Position.Line)
-	col := int(params.Position.Character)
+	col := s.inCol(lines, lineNum, params.Position.Character)
 
 	if lineNum >= len(lines) {
 		return nil, nil
@@ -1736,8 +1745,8 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 	// Range covering the already-typed prefix through cursor — used for
 	// textEdit on module items so the editor replaces rather than appends.
 	prefixRange := protocol.Range{
-		Start: protocol.Position{Line: uint32(lineNum), Character: uint32(prefixStartCol)},
-		End:   protocol.Position{Line: uint32(lineNum), Character: uint32(col)},
+		Start: s.outPos(lines, lineNum, prefixStartCol),
+		End:   s.outPos(lines, lineNum, col),
 	}
 	inPipe := IsPipeContext(lines[lineNum], prefixStartCol)
 
@@ -2942,7 +2951,7 @@ func (s *Server) Declaration(ctx context.Context, params *protocol.DeclarationPa
 	path := uriToPath(params.TextDocument.URI)
 	lines := strings.Split(text, "\n")
 	lineNum := int(params.Position.Line)
-	col := int(params.Position.Character)
+	col := s.inCol(lines, lineNum, params.Position.Character)
 
 	if lineNum >= len(lines) {
 		return nil, nil
@@ -3166,8 +3175,9 @@ func (s *Server) DocumentHighlight(ctx context.Context, params *protocol.Documen
 		return nil, nil
 	}
 
+	lines := strings.Split(text, "\n")
 	lineNum := int(params.Position.Line)
-	col := int(params.Position.Character)
+	col := s.inCol(lines, lineNum, params.Position.Character)
 
 	tree, src, release, hasTree := s.docs.GetTree(docURI)
 	if !hasTree {
@@ -3182,8 +3192,8 @@ func (s *Server) DocumentHighlight(ctx context.Context, params *protocol.Documen
 		for _, occ := range occs {
 			highlights = append(highlights, protocol.DocumentHighlight{
 				Range: protocol.Range{
-					Start: protocol.Position{Line: uint32(occ.Line), Character: uint32(occ.StartCol)},
-					End:   protocol.Position{Line: uint32(occ.Line), Character: uint32(occ.EndCol)},
+					Start: s.outPos(lines, int(occ.Line), int(occ.StartCol)),
+					End:   s.outPos(lines, int(occ.Line), int(occ.EndCol)),
 				},
 				Kind: protocol.DocumentHighlightKindText,
 			})
@@ -3218,8 +3228,8 @@ func (s *Server) DocumentHighlight(ctx context.Context, params *protocol.Documen
 	for _, occ := range occs {
 		highlights = append(highlights, protocol.DocumentHighlight{
 			Range: protocol.Range{
-				Start: protocol.Position{Line: uint32(occ.Line), Character: uint32(occ.StartCol)},
-				End:   protocol.Position{Line: uint32(occ.Line), Character: uint32(occ.EndCol)},
+				Start: s.outPos(lines, int(occ.Line), int(occ.StartCol)),
+				End:   s.outPos(lines, int(occ.Line), int(occ.EndCol)),
 			},
 			Kind: protocol.DocumentHighlightKindText,
 		})
@@ -3339,7 +3349,7 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 				continue
 			}
 			lineIdx := tok.Line - 1
-			endPos := protocol.Position{Line: uint32(lineIdx), Character: uint32(lineEndChar(lineIdx))}
+			endPos := s.outPos(lines, lineIdx, lineEndChar(lineIdx))
 
 			prevDepth := depth
 			parser.TrackBlockDepth(tok.Kind, &depth)
@@ -3397,8 +3407,8 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 						End:   protocol.Position{Line: uint32(lastLine), Character: 0},
 					},
 					SelectionRange: protocol.Range{
-						Start: protocol.Position{Line: uint32(lineIdx), Character: uint32(nameCol)},
-						End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(nameCol + len(name))},
+						Start: s.outPos(lines, lineIdx, nameCol),
+						End:   s.outPos(lines, lineIdx, nameCol+len(name)),
 					},
 				},
 				module:    curMod,
@@ -3435,7 +3445,7 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 
 			_, nextPos, hasDoBlock := parser.ScanForwardToBlockDo(tokens, n, j)
 
-			rangeEnd := protocol.Position{Line: uint32(lineIdx), Character: uint32(lineEndChar(lineIdx))}
+			rangeEnd := s.outPos(lines, lineIdx, lineEndChar(lineIdx))
 			if hasDoBlock {
 				rangeEnd = protocol.Position{Line: uint32(lastLine), Character: 0}
 			}
@@ -3451,8 +3461,8 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 						End:   rangeEnd,
 					},
 					SelectionRange: protocol.Range{
-						Start: protocol.Position{Line: uint32(lineIdx), Character: uint32(nameCol)},
-						End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(nameCol + len(funcName))},
+						Start: s.outPos(lines, lineIdx, nameCol),
+						End:   s.outPos(lines, lineIdx, nameCol+len(funcName)),
 					},
 				},
 				module:    curMod,
@@ -3482,11 +3492,11 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 					Kind:   defKindToSymbolKind("defstruct"),
 					Range: protocol.Range{
 						Start: protocol.Position{Line: uint32(lineIdx), Character: 0},
-						End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(lineEndChar(lineIdx))},
+						End:   s.outPos(lines, lineIdx, lineEndChar(lineIdx)),
 					},
 					SelectionRange: protocol.Range{
-						Start: protocol.Position{Line: uint32(lineIdx), Character: uint32(indent)},
-						End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(indent + 9)},
+						Start: s.outPos(lines, lineIdx, indent),
+						End:   s.outPos(lines, lineIdx, indent+9),
 					},
 				},
 				module:    curMod,
@@ -3510,11 +3520,11 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 					Kind:   defKindToSymbolKind("defexception"),
 					Range: protocol.Range{
 						Start: protocol.Position{Line: uint32(lineIdx), Character: 0},
-						End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(lineEndChar(lineIdx))},
+						End:   s.outPos(lines, lineIdx, lineEndChar(lineIdx)),
 					},
 					SelectionRange: protocol.Range{
-						Start: protocol.Position{Line: uint32(lineIdx), Character: uint32(indent)},
-						End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(indent + 12)},
+						Start: s.outPos(lines, lineIdx, indent),
+						End:   s.outPos(lines, lineIdx, indent+12),
 					},
 				},
 				module:    curMod,
@@ -3560,11 +3570,11 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 					Kind:   defKindToSymbolKind(kind),
 					Range: protocol.Range{
 						Start: protocol.Position{Line: uint32(lineIdx), Character: 0},
-						End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(lineEndChar(lineIdx))},
+						End:   s.outPos(lines, lineIdx, lineEndChar(lineIdx)),
 					},
 					SelectionRange: protocol.Range{
-						Start: protocol.Position{Line: uint32(lineIdx), Character: uint32(nameCol)},
-						End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(nameCol + len(name))},
+						Start: s.outPos(lines, lineIdx, nameCol),
+						End:   s.outPos(lines, lineIdx, nameCol+len(name)),
 					},
 				},
 				module:    curMod,
@@ -3608,11 +3618,11 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 					Kind:   defKindToSymbolKind(kind),
 					Range: protocol.Range{
 						Start: protocol.Position{Line: uint32(lineIdx), Character: 0},
-						End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(lineEndChar(lineIdx))},
+						End:   s.outPos(lines, lineIdx, lineEndChar(lineIdx)),
 					},
 					SelectionRange: protocol.Range{
-						Start: protocol.Position{Line: uint32(lineIdx), Character: uint32(nameCol)},
-						End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(nameCol + len(name))},
+						Start: s.outPos(lines, lineIdx, nameCol),
+						End:   s.outPos(lines, lineIdx, nameCol+len(name)),
 					},
 				},
 				module:    curMod,
@@ -3668,8 +3678,8 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 						End:   protocol.Position{Line: uint32(lastLine), Character: 0},
 					},
 					SelectionRange: protocol.Range{
-						Start: protocol.Position{Line: uint32(lineIdx), Character: uint32(indent)},
-						End:   protocol.Position{Line: uint32(lineIdx), Character: uint32(indent + len(macroName))},
+						Start: s.outPos(lines, lineIdx, indent),
+						End:   s.outPos(lines, lineIdx, indent+len(macroName)),
 					},
 				},
 				module:    curMod,
@@ -3893,7 +3903,7 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 
 	lines := strings.Split(text, "\n")
 	lineNum := int(params.Position.Line)
-	col := int(params.Position.Character)
+	col := s.inCol(lines, lineNum, params.Position.Character)
 
 	if lineNum >= len(lines) {
 		return nil, nil
@@ -4008,7 +4018,7 @@ func (s *Server) Implementation(ctx context.Context, params *protocol.Implementa
 
 	lines := strings.Split(text, "\n")
 	lineNum := int(params.Position.Line)
-	col := int(params.Position.Character)
+	col := s.inCol(lines, lineNum, params.Position.Character)
 
 	if lineNum >= len(lines) {
 		return nil, nil
@@ -4075,7 +4085,7 @@ func (s *Server) PrepareRename(ctx context.Context, params *protocol.PrepareRena
 
 	lines := strings.Split(text, "\n")
 	lineNum := int(params.Position.Line)
-	col := int(params.Position.Character)
+	col := s.inCol(lines, lineNum, params.Position.Character)
 	if lineNum >= len(lines) {
 		return nil, nil
 	}
@@ -4097,14 +4107,14 @@ func (s *Server) PrepareRename(ctx context.Context, params *protocol.PrepareRena
 				for _, occ := range occs {
 					if occ.Line == uint(lineNum) && uint(col) >= occ.StartCol && uint(col) < occ.EndCol {
 						return &protocol.Range{
-							Start: protocol.Position{Line: uint32(occ.Line), Character: uint32(occ.StartCol)},
-							End:   protocol.Position{Line: uint32(occ.Line), Character: uint32(occ.EndCol)},
+							Start: s.outPos(lines, int(occ.Line), int(occ.StartCol)),
+							End:   s.outPos(lines, int(occ.Line), int(occ.EndCol)),
 						}, nil
 					}
 				}
 				return &protocol.Range{
-					Start: protocol.Position{Line: uint32(occs[0].Line), Character: uint32(occs[0].StartCol)},
-					End:   protocol.Position{Line: uint32(occs[0].Line), Character: uint32(occs[0].EndCol)},
+					Start: s.outPos(lines, int(occs[0].Line), int(occs[0].StartCol)),
+					End:   s.outPos(lines, int(occs[0].Line), int(occs[0].EndCol)),
 				}, nil
 			}
 		}
@@ -4124,8 +4134,8 @@ func (s *Server) PrepareRename(ctx context.Context, params *protocol.PrepareRena
 			if resolved, ok := aliases[moduleRef]; ok && moduleLastSegment(resolved) != moduleRef {
 				// File-local alias rename: find all occurrences in this file
 				return &protocol.Range{
-					Start: protocol.Position{Line: uint32(lineNum), Character: uint32(exprStart)},
-					End:   protocol.Position{Line: uint32(lineNum), Character: uint32(exprStart + len(moduleRef))},
+					Start: s.outPos(lines, lineNum, exprStart),
+					End:   s.outPos(lines, lineNum, exprStart+len(moduleRef)),
 				}, nil
 			}
 		}
@@ -4192,8 +4202,8 @@ func (s *Server) PrepareRename(ctx context.Context, params *protocol.PrepareRena
 			if tokenOffset >= 0 {
 				tokenStart := exprStart + tokenOffset
 				return &protocol.Range{
-					Start: protocol.Position{Line: uint32(lineNum), Character: uint32(tokenStart)},
-					End:   protocol.Position{Line: uint32(lineNum), Character: uint32(tokenStart + len(tokenName))},
+					Start: s.outPos(lines, lineNum, tokenStart),
+					End:   s.outPos(lines, lineNum, tokenStart+len(tokenName)),
 				}, nil
 			}
 		}
@@ -4220,7 +4230,7 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 
 	lines := strings.Split(text, "\n")
 	lineNum := int(params.Position.Line)
-	col := int(params.Position.Character)
+	col := s.inCol(lines, lineNum, params.Position.Character)
 
 	if lineNum >= len(lines) {
 		s.debugf("References: line %d out of range (total %d)", lineNum, len(lines))
@@ -4297,8 +4307,8 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 					locations = append(locations, protocol.Location{
 						URI: params.TextDocument.URI,
 						Range: protocol.Range{
-							Start: protocol.Position{Line: uint32(occ.Line), Character: uint32(occ.StartCol)},
-							End:   protocol.Position{Line: uint32(occ.Line), Character: uint32(occ.EndCol)},
+							Start: s.outPos(lines, int(occ.Line), int(occ.StartCol)),
+							End:   s.outPos(lines, int(occ.Line), int(occ.EndCol)),
 						},
 					})
 				}
@@ -4490,7 +4500,7 @@ func (s *Server) RenameEdit(ctx context.Context, params *protocol.RenameParams) 
 
 	lines := strings.Split(text, "\n")
 	lineNum := int(params.Position.Line)
-	col := int(params.Position.Character)
+	col := s.inCol(lines, lineNum, params.Position.Character)
 	if lineNum >= len(lines) {
 		return nil, nil
 	}
@@ -4515,8 +4525,8 @@ func (s *Server) RenameEdit(ctx context.Context, params *protocol.RenameParams) 
 				for _, occ := range occs {
 					changes[protocol.DocumentURI(docURI)] = append(changes[protocol.DocumentURI(docURI)], protocol.TextEdit{
 						Range: protocol.Range{
-							Start: protocol.Position{Line: uint32(occ.Line), Character: uint32(occ.StartCol)},
-							End:   protocol.Position{Line: uint32(occ.Line), Character: uint32(occ.EndCol)},
+							Start: s.outPos(lines, int(occ.Line), int(occ.StartCol)),
+							End:   s.outPos(lines, int(occ.Line), int(occ.EndCol)),
 						},
 						NewText: params.NewName,
 					})
@@ -4551,8 +4561,8 @@ func (s *Server) RenameEdit(ctx context.Context, params *protocol.RenameParams) 
 						}
 						changes[fileURI] = append(changes[fileURI], protocol.TextEdit{
 							Range: protocol.Range{
-								Start: protocol.Position{Line: uint32(i), Character: uint32(col)},
-								End:   protocol.Position{Line: uint32(i), Character: uint32(col + len(moduleRef))},
+								Start: s.outPos(lines, i, col),
+								End:   s.outPos(lines, i, col+len(moduleRef)),
 							},
 							NewText: params.NewName,
 						})
@@ -4773,7 +4783,7 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*Wor
 					edit.Changes[fileURI] = append(edit.Changes[fileURI], protocol.TextEdit{
 						Range: protocol.Range{
 							Start: protocol.Position{Line: uint32(spanStart), Character: 0},
-							End:   protocol.Position{Line: uint32(spanEnd - 1), Character: uint32(len(fileLines[spanEnd-1]))},
+							End:   s.outPos(fileLines, spanEnd-1, len(fileLines[spanEnd-1])),
 						},
 						NewText: strings.Join(updatedSpan, "\n"),
 					})
@@ -5273,8 +5283,8 @@ func (mr *moduleRename) applyEdits(fileCache map[string]moduleFileInfo, movedFil
 					claimed[es.line] = append(claimed[es.line], e)
 					openChanges[fileURI] = append(openChanges[fileURI], protocol.TextEdit{
 						Range: protocol.Range{
-							Start: protocol.Position{Line: uint32(es.line - 1), Character: uint32(e.col)},
-							End:   protocol.Position{Line: uint32(es.line - 1), Character: uint32(e.col + e.length)},
+							Start: mr.server.outPos(fi.lines, es.line-1, e.col),
+							End:   mr.server.outPos(fi.lines, es.line-1, e.col+e.length),
 						},
 						NewText: e.newToken,
 					})
@@ -5469,8 +5479,8 @@ func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string) *
 				for _, col := range cols {
 					openChanges[fileURI] = append(openChanges[fileURI], protocol.TextEdit{
 						Range: protocol.Range{
-							Start: protocol.Position{Line: uint32(site.line - 1), Character: uint32(col)},
-							End:   protocol.Position{Line: uint32(site.line - 1), Character: uint32(col + len(oldToken))},
+							Start: s.outPos(fi.lines, site.line-1, col),
+							End:   s.outPos(fi.lines, site.line-1, col+len(oldToken)),
 						},
 						NewText: newToken,
 					})
@@ -5656,8 +5666,9 @@ func (s *Server) SignatureHelp(ctx context.Context, params *protocol.SignatureHe
 		return nil, nil
 	}
 
+	lines := strings.Split(text, "\n")
 	lineNum := int(params.Position.Line)
-	col := int(params.Position.Character)
+	col := s.inCol(lines, lineNum, params.Position.Character)
 
 	// Get cached tokens for efficient multi-query operations
 	tf := s.docs.GetTokenizedFile(docURI)
@@ -5677,7 +5688,6 @@ func (s *Server) SignatureHelp(ctx context.Context, params *protocol.SignatureHe
 
 	aliases := tf.ExtractAliasesInScope(lineNum)
 	s.mergeAliasesFromUseTokenized(tf, aliases)
-	lines := strings.Split(text, "\n")
 
 	// Resolve the function to a store lookup result
 	var result *store.LookupResult
@@ -5825,7 +5835,7 @@ func (s *Server) TypeDefinition(ctx context.Context, params *protocol.TypeDefini
 
 	lines := strings.Split(text, "\n")
 	lineNum := int(params.Position.Line)
-	col := int(params.Position.Character)
+	col := s.inCol(lines, lineNum, params.Position.Character)
 	if lineNum >= len(lines) {
 		return nil, nil
 	}
@@ -5898,7 +5908,7 @@ func (s *Server) PrepareCallHierarchy(ctx context.Context, params *protocol.Call
 
 	lines := strings.Split(text, "\n")
 	lineNum := int(params.Position.Line)
-	col := int(params.Position.Character)
+	col := s.inCol(lines, lineNum, params.Position.Character)
 	if lineNum >= len(lines) {
 		return nil, nil
 	}
@@ -5932,10 +5942,9 @@ func (s *Server) PrepareCallHierarchy(ctx context.Context, params *protocol.Call
 
 	r := defResults[0]
 	nameCol := 0
-	if defLine, ok := s.getFileLine(r.FilePath, r.Line); ok {
-		if col := findTokenColumn(defLine, functionName); col >= 0 {
-			nameCol = col
-		}
+	defLine, _ := s.getFileLine(r.FilePath, r.Line)
+	if col := findTokenColumn(defLine, functionName); col >= 0 {
+		nameCol = col
 	}
 
 	item := protocol.CallHierarchyItem{
@@ -5945,8 +5954,8 @@ func (s *Server) PrepareCallHierarchy(ctx context.Context, params *protocol.Call
 		URI:    protocol.DocumentURI(uri.File(r.FilePath)),
 		Range:  lineRange(r.Line - 1),
 		SelectionRange: protocol.Range{
-			Start: protocol.Position{Line: uint32(r.Line - 1), Character: uint32(nameCol)},
-			End:   protocol.Position{Line: uint32(r.Line - 1), Character: uint32(nameCol + len(functionName))},
+			Start: s.outPosLine(defLine, r.Line-1, nameCol),
+			End:   s.outPosLine(defLine, r.Line-1, nameCol+len(functionName)),
 		},
 		Data: map[string]string{"module": fullModule, "function": functionName},
 	}
@@ -6014,10 +6023,9 @@ func (s *Server) IncomingCalls(ctx context.Context, params *protocol.CallHierarc
 		}
 
 		nameCol := 0
-		if defLine, ok := s.getFileLine(r.FilePath, callerLine); ok {
-			if col := findTokenColumn(defLine, callerFunc); col >= 0 {
-				nameCol = col
-			}
+		defLine, _ := s.getFileLine(r.FilePath, callerLine)
+		if col := findTokenColumn(defLine, callerFunc); col >= 0 {
+			nameCol = col
 		}
 
 		fromItem := protocol.CallHierarchyItem{
@@ -6026,8 +6034,8 @@ func (s *Server) IncomingCalls(ctx context.Context, params *protocol.CallHierarc
 			URI:   protocol.DocumentURI(uri.File(r.FilePath)),
 			Range: lineRange(callerLine - 1),
 			SelectionRange: protocol.Range{
-				Start: protocol.Position{Line: uint32(callerLine - 1), Character: uint32(nameCol)},
-				End:   protocol.Position{Line: uint32(callerLine - 1), Character: uint32(nameCol + len(callerFunc))},
+				Start: s.outPosLine(defLine, callerLine-1, nameCol),
+				End:   s.outPosLine(defLine, callerLine-1, nameCol+len(callerFunc)),
 			},
 			Data: map[string]string{"module": callerMod, "function": callerFunc},
 		}
@@ -6110,10 +6118,9 @@ func (s *Server) OutgoingCalls(ctx context.Context, params *protocol.CallHierarc
 		}
 
 		nameCol := 0
-		if defLine, ok := s.getFileLine(td.FilePath, td.Line); ok {
-			if col := findTokenColumn(defLine, key.function); col >= 0 {
-				nameCol = col
-			}
+		defLine, _ := s.getFileLine(td.FilePath, td.Line)
+		if col := findTokenColumn(defLine, key.function); col >= 0 {
+			nameCol = col
 		}
 
 		toItem := protocol.CallHierarchyItem{
@@ -6122,8 +6129,8 @@ func (s *Server) OutgoingCalls(ctx context.Context, params *protocol.CallHierarc
 			URI:   protocol.DocumentURI(uri.File(td.FilePath)),
 			Range: lineRange(td.Line - 1),
 			SelectionRange: protocol.Range{
-				Start: protocol.Position{Line: uint32(td.Line - 1), Character: uint32(nameCol)},
-				End:   protocol.Position{Line: uint32(td.Line - 1), Character: uint32(nameCol + len(key.function))},
+				Start: s.outPosLine(defLine, td.Line-1, nameCol),
+				End:   s.outPosLine(defLine, td.Line-1, nameCol+len(key.function)),
 			},
 			Data: map[string]string{"module": key.module, "function": key.function},
 		}

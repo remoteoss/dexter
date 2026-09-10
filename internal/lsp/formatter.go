@@ -1031,11 +1031,21 @@ func (s *Server) publishFormatDiagnostic(uri protocol.DocumentURI, formatErr *Fo
 		col--
 	}
 
+	// Elixir reports the column as a 1-based count of characters, not bytes,
+	// so it has to become a byte offset before it can be re-encoded for the
+	// client. Counting code points is exactly what utf-32 means here.
+	diagCol := col
+	if text, ok := s.docs.GetOrLoad(string(uri)); ok {
+		lineText := lineAt(strings.Split(text, "\n"), int(line))
+		byteCol := WireToByteCol(lineText, int(col), EncodingUTF32)
+		diagCol = uint32(ByteToWireCol(lineText, byteCol, s.positionEncoding))
+	}
+
 	diagnostics := []protocol.Diagnostic{
 		{
 			Range: protocol.Range{
-				Start: protocol.Position{Line: line, Character: col},
-				End:   protocol.Position{Line: line, Character: col},
+				Start: protocol.Position{Line: line, Character: diagCol}, // position-encoding: converted
+				End:   protocol.Position{Line: line, Character: diagCol}, // position-encoding: converted
 			},
 			Severity: protocol.DiagnosticSeverityError,
 			Source:   "dexter",

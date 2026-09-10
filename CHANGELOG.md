@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- **Positions were wrong on any line containing a non-ASCII character** — LSP counts `Position.character` in UTF-16 code units, and Dexter counted UTF-8 bytes. The two agree only while a line stays ASCII, so one accented character, bullet or emoji to the left of the cursor was enough to break go-to-definition, hover, references, completion and signature help. Worse, ranges were *emitted* in bytes too, so an editor applying a rename replaced a span shifted off the identifier and silently corrupted the source. Columns are now converted in both directions, on every client
+
 - **Module rename left the old file behind** — renaming a module from the file that defines it moved that file on disk while the editor still held the buffer, so the next save recreated the old file with the new module name and the project no longer compiled (`cannot define module X because it is currently being defined in ...`). Open files are now moved by the editor, through a `rename` resource operation in the reply, and the server touches neither path
 - **Grouped aliases were not renamed** — `alias Old.{A, B}` (and the `require`/`import` forms) kept pointing at the old module after a module rename, and in open buffers the shared prefix was rewritten once per member (`Old` → `NewNewNew...`)
 
