@@ -19,9 +19,20 @@ func TestApplyTextEdits(t *testing.T) {
 	tests := []struct {
 		name  string
 		text  string
+		enc   PositionEncoding // zero value means UTF-16, the default
 		edits []protocol.TextEdit
 		want  string
 	}{
+		{
+			name: "UTF-16 columns after a multi-byte character",
+			text: "ü = fetch_user(1)\n",
+			// "fetch_user" starts at UTF-16 column 4 but byte offset 5:
+			// slicing by the wire column would replace the wrong span.
+			edits: []protocol.TextEdit{
+				{Range: protocol.Range{Start: protocol.Position{Line: 0, Character: 4}, End: protocol.Position{Line: 0, Character: 14}}, NewText: "get_user"},
+			},
+			want: "ü = get_user(1)\n",
+		},
 		{
 			name: "single token on one line",
 			text: "def fetch_user(id) do\n  fetch_user(id)\nend\n",
@@ -40,8 +51,17 @@ func TestApplyTextEdits(t *testing.T) {
 			want: "get_user(get_user(1))\n",
 		},
 		{
-			name: "out-of-range column is skipped, not a panic",
+			name: "out-of-range column clamps to line end, not a panic",
 			text: "short\n",
+			edits: []protocol.TextEdit{
+				{Range: protocol.Range{Start: protocol.Position{Line: 0, Character: 40}, End: protocol.Position{Line: 0, Character: 50}}, NewText: "x"},
+			},
+			want: "shortx\n",
+		},
+		{
+			name: "out-of-range byte column is skipped, not a panic",
+			text: "short\n",
+			enc:  EncodingUTF8,
 			edits: []protocol.TextEdit{
 				{Range: protocol.Range{Start: protocol.Position{Line: 0, Character: 40}, End: protocol.Position{Line: 0, Character: 50}}, NewText: "x"},
 			},
@@ -58,7 +78,12 @@ func TestApplyTextEdits(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := applyTextEdits(tt.text, tt.edits); got != tt.want {
+			enc := tt.enc
+			if enc == "" {
+				enc = EncodingUTF16
+			}
+			srv := &Server{positionEncoding: enc}
+			if got := srv.applyTextEdits(tt.text, tt.edits); got != tt.want {
 				t.Errorf("got:\n%q\nwant:\n%q", got, tt.want)
 			}
 		})

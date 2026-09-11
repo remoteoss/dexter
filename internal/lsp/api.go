@@ -246,7 +246,7 @@ func (s *Server) deliverEdits(edit *WorkspaceEdit) error {
 		if !ok {
 			return fmt.Errorf("reading %s to apply rename edits", path)
 		}
-		if err := os.WriteFile(path, []byte(applyTextEdits(text, fileEdits)), 0644); err != nil {
+		if err := os.WriteFile(path, []byte(s.applyTextEdits(text, fileEdits)), 0644); err != nil {
 			return err
 		}
 	}
@@ -308,7 +308,7 @@ func (s *Server) prepareDeliveredEdit(edit *WorkspaceEdit) ([]deliveredFile, err
 			return nil, fmt.Errorf("reading %s to prepare rename edits", path)
 		}
 		if fileEdits := edits[path]; len(fileEdits) > 0 {
-			text = applyTextEdits(text, fileEdits)
+			text = s.applyTextEdits(text, fileEdits)
 		}
 		newPath := path
 		if renamed, ok := renames[path]; ok {
@@ -344,9 +344,10 @@ func (s *Server) recordDeliveredEdit(files []deliveredFile) {
 	}
 }
 
-// applyTextEdits applies non-overlapping TextEdits to text. Positions use the
-// same line/byte-column convention the rename machinery produces them in.
-func applyTextEdits(text string, edits []protocol.TextEdit) string {
+// applyTextEdits applies non-overlapping TextEdits to text. The rename
+// machinery emits Position.Character in the client's encoding (outPos), so
+// columns are converted back to byte offsets before slicing.
+func (s *Server) applyTextEdits(text string, edits []protocol.TextEdit) string {
 	sorted := make([]protocol.TextEdit, len(edits))
 	copy(sorted, edits)
 	sort.Slice(sorted, func(i, j int) bool {
@@ -363,11 +364,13 @@ func applyTextEdits(text string, edits []protocol.TextEdit) string {
 		if int(start.Line) >= len(lines) || int(end.Line) >= len(lines) {
 			continue
 		}
-		if int(start.Character) > len(lines[start.Line]) || int(end.Character) > len(lines[end.Line]) {
+		startCol := s.inCol(lines, int(start.Line), start.Character)
+		endCol := s.inCol(lines, int(end.Line), end.Character)
+		if startCol > len(lines[start.Line]) || endCol > len(lines[end.Line]) {
 			continue
 		}
-		prefix := lines[start.Line][:start.Character]
-		suffix := lines[end.Line][end.Character:]
+		prefix := lines[start.Line][:startCol]
+		suffix := lines[end.Line][endCol:]
 		replacement := strings.Split(prefix+e.NewText+suffix, "\n")
 		lines = append(lines[:start.Line], append(replacement, lines[end.Line+1:]...)...)
 	}
