@@ -289,7 +289,7 @@ func TestDocumentStore_GetTokens_DiskLoaded(t *testing.T) {
 		t.Fatalf("GetOrLoad failed")
 	}
 
-	tokens, src, lineStarts, ok := ds.GetTokensFull(docURI)
+	tokens, src, lineStarts, _, ok := ds.GetTokensFull(docURI)
 	if !ok {
 		t.Fatalf("GetTokensFull returned ok=false for disk-loaded entry")
 	}

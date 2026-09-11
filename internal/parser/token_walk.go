@@ -16,6 +16,78 @@ func IsStatementBoundaryToken(kind TokenKind) bool {
 	return false
 }
 
+// ScanTypespecEnd returns the first token outside the typespec that starts at
+// start. Typespecs commonly span lines inside brackets, after :: or a comma,
+// and before a trailing `when`; an ordinary newline at depth zero ends them.
+// Keeping this scanner here lets index parsing and open-document lookups use
+// exactly the same boundary rules.
+func ScanTypespecEnd(source []byte, tokens []Token, n, start int) int {
+	depth := 0
+	lastSig := start
+	for i := start + 1; i < n; i++ {
+		tok := tokens[i]
+		switch tok.Kind {
+		case TokOpenParen, TokOpenBracket, TokOpenBrace, TokOpenAngle:
+			depth++
+			lastSig = i
+		case TokCloseParen, TokCloseBracket, TokCloseBrace, TokCloseAngle:
+			if depth > 0 {
+				depth--
+			}
+			lastSig = i
+		case TokComment:
+			continue
+		case TokEOL:
+			if depth > 0 {
+				continue
+			}
+			next := NextSigToken(tokens, n, i+1)
+			if typespecContinuesAtLineBreak(source, tokens, n, lastSig, next) {
+				continue
+			}
+			return i
+		case TokEOF:
+			return i
+		default:
+			if depth == 0 {
+				if tok.Kind == TokOther && TokenText(source, tok) == ";" {
+					return i
+				}
+				if i > start+1 && IsStatementBoundaryToken(tok.Kind) {
+					return i
+				}
+			}
+			lastSig = i
+		}
+	}
+	return n
+}
+
+func typespecContinuesAtLineBreak(source []byte, tokens []Token, n, last, next int) bool {
+	if next < n {
+		switch tokens[next].Kind {
+		case TokWhen:
+			return true
+		case TokOther:
+			// A leading union operator continues `@type t :: A.t()\n | B.t()`.
+			if TokenText(source, tokens[next]) == "|" {
+				return true
+			}
+		}
+	}
+	if last < 0 || last >= n {
+		return false
+	}
+	switch tokens[last].Kind {
+	case TokDoubleColon, TokComma, TokWhen, TokRightArrow, TokLeftArrow,
+		TokAssoc, TokPipe, TokDot, TokBackslash, TokColon:
+		return true
+	case TokOther:
+		return TokenText(source, tokens[last]) != ";"
+	}
+	return false
+}
+
 // ScanForwardToBlockDo scans tokens[from:] for a block-opening TokDo.
 // It does not stop at EOL because Elixir allows split-line heads with `do`
 // on the next line. It stops at statement-boundary tokens so malformed or

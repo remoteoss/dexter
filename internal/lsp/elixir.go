@@ -16,6 +16,10 @@ type TokenizedFile struct {
 	tokens     []parser.Token
 	n          int
 	lineStarts []int
+	// interp holds the code tokens inside #{} interpolations, kept out of the
+	// main stream by the tokenizer. Cursor lookups fall back to it, so a call
+	// written inside a string still resolves.
+	interp []parser.Token
 }
 
 // NewTokenizedFile tokenizes the text once for reuse across multiple queries.
@@ -27,29 +31,41 @@ func NewTokenizedFile(text string) *TokenizedFile {
 		tokens:     result.Tokens,
 		n:          len(result.Tokens),
 		lineStarts: result.LineStarts,
+		interp:     result.Interp,
 	}
 }
 
 // NewTokenizedFileFromCache wraps pre-existing tokens (e.g. from DocumentStore cache).
-func NewTokenizedFileFromCache(tokens []parser.Token, source []byte, lineStarts []int) *TokenizedFile {
+func NewTokenizedFileFromCache(tokens []parser.Token, source []byte, lineStarts []int, interp []parser.Token) *TokenizedFile {
 	return &TokenizedFile{
 		source:     source,
 		tokens:     tokens,
 		n:          len(tokens),
 		lineStarts: lineStarts,
+		interp:     interp,
 	}
 }
 
 // ExpressionAtCursor extracts the dotted expression at the given 0-based line
 // and col, using the cached token stream.
 func (tf *TokenizedFile) ExpressionAtCursor(line, col int) CursorContext {
-	return ExpressionAtCursor(tf.tokens, tf.source, tf.lineStarts, line, col)
+	ctx := ExpressionAtCursor(tf.tokens, tf.source, tf.lineStarts, line, col)
+	if ctx.Empty() && len(tf.interp) > 0 {
+		// The cursor sits inside a string literal, which is one token in the
+		// main stream. The code inside #{} lives in the interpolation stream.
+		ctx = ExpressionAtCursor(tf.interp, tf.source, tf.lineStarts, line, col)
+	}
+	return ctx
 }
 
 // FullExpressionAtCursor extracts the complete dotted expression at the given
 // 0-based line and col without truncating at the cursor's segment.
 func (tf *TokenizedFile) FullExpressionAtCursor(line, col int) CursorContext {
-	return FullExpressionAtCursor(tf.tokens, tf.source, tf.lineStarts, line, col)
+	ctx := FullExpressionAtCursor(tf.tokens, tf.source, tf.lineStarts, line, col)
+	if ctx.Empty() && len(tf.interp) > 0 {
+		ctx = FullExpressionAtCursor(tf.interp, tf.source, tf.lineStarts, line, col)
+	}
+	return ctx
 }
 
 // FirstDefmodule returns the first defmodule name found, or "".
@@ -90,31 +106,89 @@ func (tf *TokenizedFile) ResolveModuleExpr(expr string, targetLine int) string {
 // FindFunctionDefinition searches for a def/defp/defmacro/defmacrop or @type/@typep/@opaque
 // matching the given function name. Returns the 1-based line number and true if found.
 func (tf *TokenizedFile) FindFunctionDefinition(functionName string) (int, bool) {
+	return tf.findDefinition(functionName, false)
+}
+
+// FindTypeDefinition is FindFunctionDefinition with the opposite preference:
+// use it when the cursor sits in a typespec, where a bare name refers to the
+// type rather than to a function of the same name.
+func (tf *TokenizedFile) FindTypeDefinition(functionName string) (int, bool) {
+	return tf.findDefinition(functionName, true)
+}
+
+// findDefinition returns the line of the first matching definition. A module
+// may declare both a type and a function under one name — Ecto.Schema has
+// `@type schema` above `defmacro schema/2` — so file order alone cannot decide
+// which one a bare reference means. preferType says which kind wins; the other
+// kind is still returned when no match of the preferred kind exists.
+func (tf *TokenizedFile) findDefinition(functionName string, preferType bool) (int, bool) {
+	funcLine, typeLine := 0, 0
+
 	for i := 0; i < tf.n; i++ {
 		tok := tf.tokens[i]
 
 		switch tok.Kind {
 		case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
 			parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate:
+			if funcLine != 0 {
+				continue
+			}
 			j := tokNextSig(tf.tokens, tf.n, i+1)
 			if j >= tf.n || tf.tokens[j].Kind != parser.TokIdent {
 				continue
 			}
 			if parser.TokenText(tf.source, tf.tokens[j]) == functionName {
-				return tok.Line, true
+				funcLine = tok.Line
+				if !preferType {
+					return funcLine, true
+				}
 			}
 
 		case parser.TokAttrType:
+			if typeLine != 0 {
+				continue
+			}
 			j := tokNextSig(tf.tokens, tf.n, i+1)
 			if j >= tf.n || tf.tokens[j].Kind != parser.TokIdent {
 				continue
 			}
 			if parser.TokenText(tf.source, tf.tokens[j]) == functionName {
-				return tok.Line, true
+				typeLine = tok.Line
+				if preferType {
+					return typeLine, true
+				}
 			}
 		}
 	}
+
+	if funcLine != 0 {
+		return funcLine, true
+	}
+	if typeLine != 0 {
+		return typeLine, true
+	}
 	return 0, false
+}
+
+// InTypespec reports whether the given 0-based line sits inside a @type,
+// @typep, @opaque, @spec, @callback or @macrocallback declaration.
+func (tf *TokenizedFile) InTypespec(targetLine int) bool {
+	targetLine1 := targetLine + 1
+	for i := 0; i < tf.n; i++ {
+		tok := tf.tokens[i]
+		if tok.Line > targetLine1 {
+			break
+		}
+		switch tok.Kind {
+		case parser.TokAttrType, parser.TokAttrSpec, parser.TokAttrCallback:
+			end := parser.ScanTypespecEnd(tf.source, tf.tokens, tf.n, i)
+			if end >= tf.n || tf.tokens[end].Line >= targetLine1 {
+				return true
+			}
+			i = end
+		}
+	}
+	return false
 }
 
 // ExtractAliasesInScope parses alias declarations visible at the given 0-based line.
@@ -709,7 +783,7 @@ func extractEnclosingModuleFromTokens(source []byte, tokens []parser.Token, targ
 		}
 		if hasDo {
 			depth++
-			stack = append(stack, moduleFrame{name, depth})
+			stack = append(stack, moduleFrame{name: name, depth: depth})
 		}
 		return nextPos
 	}
@@ -959,19 +1033,40 @@ func extractAliasesFromTokens(source []byte, tokens []parser.Token, targetLine i
 	type moduleFrame struct {
 		name  string
 		depth int
+		// id identifies this scope; parentScopes[id] is the enclosing one.
+		id int
+		// aliases in scope here, seeded from the parent (Elixir aliases are
+		// lexically scoped, so a nested module sees the enclosing ones) and
+		// extended as this scope declares more. Drives chain resolution.
+		// Allocated lazily — most scopes declare none.
+		aliases map[string]string
 	}
 
 	var stack []moduleFrame
 	depth := 0
+	var topAliases map[string]string
+
+	// parentScopes[id] is the id of the scope enclosing scope id. Scope 0 is
+	// the file itself; frames pop off the stack, so this keeps the chain
+	// available for the ancestor walk at the end.
+	parentScopes := []int{0}
 
 	type aliasEntry struct {
-		scope, short, full string
+		scope, line int
+		short, full string
 	}
 	var allAliases []aliasEntry
-	var targetModule string
+	targetScope := -1 // -1: the target line's scope is not known yet
 	unscoped := targetLine < 0
 	// targetLine is 0-based; token.Line is 1-based
 	targetLine1 := targetLine + 1
+
+	currentScope := func() int {
+		if len(stack) > 0 {
+			return stack[len(stack)-1].id
+		}
+		return 0
+	}
 
 	currentModule := func() string {
 		if len(stack) > 0 {
@@ -988,6 +1083,38 @@ func extractAliasesFromTokens(source []byte, tokens []parser.Token, targetLine i
 		return s
 	}
 
+	curAliases := func() map[string]string {
+		if len(stack) > 0 {
+			return stack[len(stack)-1].aliases
+		}
+		return topAliases
+	}
+
+	// record stores an alias both in the flat list (for the final scope filter)
+	// and in the current scope's map (for chain resolution of later lines).
+	record := func(line int, short, full string) {
+		allAliases = append(allAliases, aliasEntry{currentScope(), line, short, full})
+		if len(stack) > 0 {
+			if stack[len(stack)-1].aliases == nil {
+				stack[len(stack)-1].aliases = make(map[string]string, 8)
+			}
+			stack[len(stack)-1].aliases[short] = full
+			return
+		}
+		if topAliases == nil {
+			topAliases = make(map[string]string, 8)
+		}
+		topAliases[short] = full
+	}
+
+	// resolveRef turns a module reference on an alias/require line into a
+	// canonical name: it rewrites the leading segment through the aliases
+	// already declared in this scope (`alias A.B` then `require B, as: X`),
+	// then substitutes __MODULE__.
+	resolveRef := func(modRef string) string {
+		return resolve(parser.ExpandAliasPrefix(modRef, curAliases()))
+	}
+
 	processModuleDef := func(i int) int {
 		name, nextPos, hasDo := tokParseModuleDef(source, tokens, i, currentModule())
 		if name == "" {
@@ -995,7 +1122,18 @@ func extractAliasesFromTokens(source []byte, tokens []parser.Token, targetLine i
 		}
 		if hasDo {
 			depth++
-			stack = append(stack, moduleFrame{name, depth})
+			parentScopes = append(parentScopes, currentScope())
+			frame := moduleFrame{name: name, depth: depth, id: len(parentScopes) - 1}
+			// Copy in what the enclosing scope has declared so far, so a chain
+			// crosses the defmodule: `alias My.App.Repo` in the parent then
+			// `alias Repo.Helper` here expands to My.App.Repo.Helper.
+			if inherited := curAliases(); len(inherited) > 0 {
+				frame.aliases = make(map[string]string, len(inherited)+8)
+				for short, full := range inherited {
+					frame.aliases[short] = full
+				}
+			}
+			stack = append(stack, frame)
 		}
 		return nextPos
 	}
@@ -1004,8 +1142,8 @@ func extractAliasesFromTokens(source []byte, tokens []parser.Token, targetLine i
 		tok := tokens[i]
 
 		// Track target line's module scope (check before any depth changes)
-		if !unscoped && targetModule == "" && tok.Line >= targetLine1 {
-			targetModule = currentModule()
+		if !unscoped && targetScope < 0 && tok.Line >= targetLine1 {
+			targetScope = currentScope()
 		}
 
 		switch tok.Kind {
@@ -1023,7 +1161,7 @@ func extractAliasesFromTokens(source []byte, tokens []parser.Token, targetLine i
 			continue
 
 		case parser.TokAlias:
-			cm := currentModule()
+			line := tok.Line
 			j := tokNextSig(tokens, n, i+1)
 			modName, k := tokCollectModuleName(source, tokens, n, j)
 			if modName == "" {
@@ -1032,12 +1170,12 @@ func extractAliasesFromTokens(source []byte, tokens []parser.Token, targetLine i
 
 			// Multi-alias: alias Parent.{A, B, C}
 			if children, nextPos, ok := parser.ScanMultiAliasChildren(source, tokens, n, k, true); ok {
-				base := resolve(modName)
+				base := resolveRef(modName)
 				if strings.Contains(base, "__MODULE__") {
 					continue
 				}
 				for _, child := range children {
-					allAliases = append(allAliases, aliasEntry{cm, parser.AliasShortName(child), base + "." + child})
+					record(line, parser.AliasShortName(child), base+"."+child)
 				}
 				i = nextPos - 1
 				continue
@@ -1045,23 +1183,23 @@ func extractAliasesFromTokens(source []byte, tokens []parser.Token, targetLine i
 
 			// Check for alias Module, as: Name
 			if asName, nextPos, ok := parser.ScanKeywordOptionValue(source, tokens, n, k, "as"); ok {
-				resolved := resolve(modName)
+				resolved := resolveRef(modName)
 				if !strings.Contains(resolved, "__MODULE__") {
-					allAliases = append(allAliases, aliasEntry{cm, asName, resolved})
+					record(line, asName, resolved)
 				}
 				i = nextPos - 1
 				continue
 			}
 
 			// Simple alias
-			resolved := resolve(modName)
+			resolved := resolveRef(modName)
 			if !strings.Contains(resolved, "__MODULE__") {
-				allAliases = append(allAliases, aliasEntry{cm, parser.AliasShortName(resolved), resolved})
+				record(line, parser.AliasShortName(resolved), resolved)
 			}
 			i = k - 1
 
 		case parser.TokRequire:
-			cm := currentModule()
+			line := tok.Line
 			j := tokNextSig(tokens, n, i+1)
 			modName, k := tokCollectModuleName(source, tokens, n, j)
 			if modName == "" {
@@ -1070,9 +1208,9 @@ func extractAliasesFromTokens(source []byte, tokens []parser.Token, targetLine i
 
 			// Check for require Module, as: Name
 			if asName, nextPos, ok := parser.ScanKeywordOptionValue(source, tokens, n, k, "as"); ok {
-				resolved := resolve(modName)
+				resolved := resolveRef(modName)
 				if !strings.Contains(resolved, "__MODULE__") {
-					allAliases = append(allAliases, aliasEntry{cm, asName, resolved})
+					record(line, asName, resolved)
 				}
 				i = nextPos - 1
 				continue
@@ -1082,13 +1220,34 @@ func extractAliasesFromTokens(source []byte, tokens []parser.Token, targetLine i
 	}
 
 	// If targetLine was past all tokens, resolve now
-	if !unscoped && targetModule == "" {
-		targetModule = currentModule()
+	if !unscoped && targetScope < 0 {
+		targetScope = currentScope()
+	}
+
+	// An alias is in scope at the target line if it was declared in the
+	// target's own scope, or in an enclosing one before the target line.
+	// Enclosing scopes need the line test: a parent alias written after the
+	// nested module closed was never in scope inside it.
+	inScope := func(a aliasEntry) bool {
+		if unscoped || a.scope == targetScope {
+			return true
+		}
+		if a.line >= targetLine1 {
+			return false
+		}
+		for s := parentScopes[targetScope]; ; s = parentScopes[s] {
+			if a.scope == s {
+				return true
+			}
+			if s == 0 {
+				return false
+			}
+		}
 	}
 
 	aliases := make(map[string]string)
 	for _, a := range allAliases {
-		if unscoped || a.scope == targetModule {
+		if inScope(a) {
 			aliases[a.short] = a.full
 		}
 	}
@@ -1284,6 +1443,23 @@ func parseHelperQuoteBlockDetailed(lines []string, helperName string, fileAliase
 			aliases[parser.AliasShortName(resolved)] = resolved
 			i = k - 1
 
+		case parser.TokRequire:
+			// require Module, as: Name — injects an alias just like `alias`.
+			j := tokNextSig(tokens, n, i+1)
+			modName, k := tokCollectModuleName(source, tokens, n, j)
+			if modName == "" {
+				continue
+			}
+			if asName, nextPos, ok := parser.ScanKeywordOptionValue(source, tokens, n, k, "as"); ok {
+				if aliases == nil {
+					aliases = make(map[string]string)
+				}
+				aliases[asName] = resolveAlias(modName)
+				i = nextPos - 1
+				continue
+			}
+			i = k - 1
+
 		case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
 			parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate:
 			kind := string(source[tok.Start:tok.End])
@@ -1374,8 +1550,12 @@ func extractUsesFromTokens(source []byte, tokens []parser.Token) []string {
 
 // UseCall holds a `use Module` declaration with its keyword opts.
 type UseCall struct {
-	Module string            // the module being used (alias-resolved)
-	Opts   map[string]string // keyword args: opt_key → module name (alias-resolved)
+	Module     string            // the module being used (alias-resolved)
+	Opts       map[string]string // keyword args: opt_key → module name (alias-resolved)
+	line       int               // 1-based source line; zero for synthesized transitive calls
+	local      bool              // nested in an inline do: expression; cannot affect later lines
+	token      int               // TokUse position; zero for synthesized transitive calls
+	moduleExpr string            // source spelling, retained for scope-aware matching
 
 	// Which is the literal atom passed as the second argument, e.g. "controller"
 	// for `use MyAppWeb, :controller`. WhichKey is the first keyword key, e.g.
@@ -1406,6 +1586,16 @@ func ExtractUsesWithOpts(text string, aliases map[string]string) []UseCall {
 func extractUsesWithOptsFromTokens(source []byte, tokens []parser.Token, aliases map[string]string) []UseCall {
 	n := len(tokens)
 	var calls []UseCall
+	isBlockKey := func(colon int) bool {
+		if colon <= 0 || tokens[colon].Kind != parser.TokColon {
+			return false
+		}
+		switch parser.TokenText(source, tokens[colon-1]) {
+		case "do", "else", "rescue", "catch", "after":
+			return true
+		}
+		return false
+	}
 
 	for i := 0; i < n; i++ {
 		if tokens[i].Kind != parser.TokUse {
@@ -1417,14 +1607,31 @@ func extractUsesWithOptsFromTokens(source []byte, tokens []parser.Token, aliases
 			continue
 		}
 		module := parser.ResolveModuleRef(modName, aliases, "")
+		local := false
+		prev := i - 1
+		for prev >= 0 && (tokens[prev].Kind == parser.TokComment || tokens[prev].Kind == parser.TokEOL) {
+			prev--
+		}
+		if isBlockKey(prev) {
+			local = true
+		}
+		for p := i - 1; p >= 0 && tokens[p].Line == tokens[i].Line; p-- {
+			if parser.TokenText(source, tokens[p]) == ";" {
+				break
+			}
+			if isBlockKey(p) {
+				local = true
+				break
+			}
+		}
 
 		nk := tokNextSig(tokens, n, k)
 		if nk < n && tokens[nk].Kind == parser.TokComma {
 			opts := tokCollectKeywordModuleOpts(source, tokens, n, nk+1, aliases)
 			which, whichKey := tokCollectDispatchAtom(source, tokens, n, nk+1)
-			calls = append(calls, UseCall{Module: module, Opts: opts, Which: which, WhichKey: whichKey})
+			calls = append(calls, UseCall{Module: module, Opts: opts, Which: which, WhichKey: whichKey, line: tokens[i].Line, local: local, token: i, moduleExpr: modName})
 		} else {
-			calls = append(calls, UseCall{Module: module})
+			calls = append(calls, UseCall{Module: module, line: tokens[i].Line, local: local, token: i, moduleExpr: modName})
 		}
 		i = k
 	}
@@ -2013,6 +2220,25 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 			aliases[parser.AliasShortName(resolved)] = resolved
 			i = k
 
+		case parser.TokRequire:
+			// require Module, as: Name — injects an alias just like `alias`.
+			i++
+			j := nextSig(i)
+			modName, k := collectModuleName(j)
+			if modName == "" {
+				i = k
+				continue
+			}
+			if asName, nextPos, ok := parser.ScanKeywordOptionValue(source, tokens, n, k, "as"); ok {
+				if aliases == nil {
+					aliases = make(map[string]string)
+				}
+				aliases[asName] = resolveAlias(modName)
+				i = nextPos - 1
+				continue
+			}
+			i = k
+
 		case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
 			parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate:
 			kind := string(source[tok.Start:tok.End])
@@ -2213,7 +2439,13 @@ func ModuleAttributeAtCursor(tokens []parser.Token, source []byte, lineStarts []
 
 // ExtractModuleAttribute is the TokenizedFile method version of ModuleAttributeAtCursor.
 func (tf *TokenizedFile) ModuleAttributeAtCursor(line, col int) string {
-	return ModuleAttributeAtCursor(tf.tokens, tf.source, tf.lineStarts, line, col)
+	name := ModuleAttributeAtCursor(tf.tokens, tf.source, tf.lineStarts, line, col)
+	if name == "" && len(tf.interp) > 0 {
+		// "#{@base_url}/path" — the attribute is inside a string literal, so
+		// it lives in the interpolation stream.
+		name = ModuleAttributeAtCursor(tf.interp, tf.source, tf.lineStarts, line, col)
+	}
+	return name
 }
 
 // reservedModuleAttrs are Elixir built-in module attributes that are not

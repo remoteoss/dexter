@@ -2005,10 +2005,11 @@ end
 		t.Fatal(err)
 	}
 
-	// Module refs in the callback type annotation should be extracted as call refs.
+	// Module refs in the callback type annotation should still be extracted.
+	// They are recorded under the "typespec" kind: they name types, not calls.
 	refModules := map[string]bool{}
 	for _, r := range refs {
-		if r.Kind == "call" {
+		if r.Kind == "typespec" {
 			refModules[r.Module+"."+r.Function] = true
 		}
 	}
@@ -2044,7 +2045,8 @@ func TestParseFile_CharLiteralDoesNotConfuseStringBlanking(t *testing.T) {
 }
 
 func TestParseFile_InterpolationDoesNotConfuseRefExtraction(t *testing.T) {
-	// Bug 2: string interpolation with nested quotes containing module refs
+	// Bug 2: string interpolation with nested quotes containing module refs.
+	// The code after the string must still be indexed.
 	path := writeTempFile(t, "defmodule MyApp.Foo do\n  def bar do\n    x = \"hello #{Real.Module.call(\\\"arg\\\"}\"\n    Other.Module.work()\n  end\nend\n")
 
 	_, refs, err := ParseFile(path)
@@ -2052,10 +2054,16 @@ func TestParseFile_InterpolationDoesNotConfuseRefExtraction(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The interpolated call is a real reference; what must not happen is the
+	// interpolation swallowing the code that follows it.
+	interpolated := false
 	for _, r := range refs {
-		if r.Module == "Real.Module" {
-			t.Errorf("should not extract refs from inside string interpolation, got %+v", r)
+		if r.Module == "Real.Module" && r.Function == "call" {
+			interpolated = true
 		}
+	}
+	if !interpolated {
+		t.Errorf("expected the interpolated Real.Module.call ref, got %+v", refs)
 	}
 
 	found := false
@@ -2843,6 +2851,521 @@ func TestWalkAndCollectAgreeOnSymlinkedRoot(t *testing.T) {
 		_ = WalkElixirFiles(root, func(string, os.DirEntry) error { walked++; return nil })
 		if collected != 2 || walked != 2 {
 			t.Errorf("root %s: Collect=%d Walk=%d, want 2 and 2", root, collected, walked)
+		}
+	}
+}
+
+// TestParse_AliasOverExistingAlias covers alias chaining on alias lines:
+// `alias SharedLib.Accounts` then `alias Accounts.Users` must record the
+// canonical SharedLib.Accounts.Users, not the literal "Accounts.Users".
+func TestParse_AliasOverExistingAlias(t *testing.T) {
+	src := `defmodule MyApp.Web do
+  alias SharedLib.Accounts
+  alias Accounts.Users
+  alias Accounts.Sessions, as: S
+  alias Accounts.{Tokens, Roles}
+
+  def bar do
+    Users.list()
+    S.current()
+    Tokens.mint()
+    Roles.all()
+  end
+end`
+	_, refs, err := ParseText("lib/web.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := make(map[string]bool)
+	for _, r := range refs {
+		seen[r.Module] = true
+	}
+	for _, want := range []string{
+		"SharedLib.Accounts.Users",
+		"SharedLib.Accounts.Sessions",
+		"SharedLib.Accounts.Tokens",
+		"SharedLib.Accounts.Roles",
+	} {
+		if !seen[want] {
+			t.Errorf("expected a reference to %s; got %v", want, seen)
+		}
+	}
+	if seen["Accounts.Users"] || seen["Accounts.Sessions"] {
+		t.Errorf("unresolved chained alias leaked into refs: %v", seen)
+	}
+}
+
+// TestParse_TypespecRefsGetOwnKind covers module references that appear inside
+// a typespec. `@spec put_meta(SharedLib.Schema.schema(), meta)` names the type
+// SharedLib.Schema.schema, not the macro of the same name, so it must not be
+// recorded as a call.
+func TestParse_TypespecRefsGetOwnKind(t *testing.T) {
+	src := `defmodule MyApp.Ecto do
+  @type meta :: map()
+
+  @spec put_meta(SharedLib.Schema.schema(), meta) :: SharedLib.Schema.schema()
+        when meta: [source: SharedLib.Schema.source()]
+  def put_meta(struct, opts), do: {struct, opts}
+
+  @callback build(SharedLib.Schema.schema()) :: :ok
+
+  @type wrapper :: SharedLib.Schema.schema()
+
+  def go, do: SharedLib.Schema.schema("users")
+end`
+	_, refs, err := ParseText("lib/ecto.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	kindByLine := make(map[int]string)
+	for _, r := range refs {
+		if r.Module == "SharedLib.Schema" {
+			kindByLine[r.Line] = r.Kind
+		}
+	}
+
+	for _, line := range []int{4, 5, 8, 10} {
+		if kindByLine[line] != "typespec" {
+			t.Errorf("line %d: got kind %q, want typespec", line, kindByLine[line])
+		}
+	}
+	// The real call on line 12 stays a call.
+	if kindByLine[12] != "call" {
+		t.Errorf("line 12: got kind %q, want call", kindByLine[12])
+	}
+}
+
+func TestParse_TypespecEndsBeforeFollowingExpression(t *testing.T) {
+	src := `defmodule MyApp.Schema do
+  @spec field(SharedLib.Schema.schema()) :: :ok
+  SharedLib.Schema.schema("users")
+end`
+	_, refs, err := ParseText("lib/schema.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	kindByLine := make(map[int]string)
+	for _, r := range refs {
+		if r.Module == "SharedLib.Schema" {
+			kindByLine[r.Line] = r.Kind
+		}
+	}
+	if kindByLine[2] != "typespec" {
+		t.Errorf("typespec reference: got kind %q, want typespec", kindByLine[2])
+	}
+	if kindByLine[3] != "call" {
+		t.Errorf("following expression: got kind %q, want call", kindByLine[3])
+	}
+}
+
+// A predicate name inside a string interpolation ends in `?`, which also opens
+// a char literal in Elixir (`?a`). Reading `#{dry_run?}` the second way
+// swallows the closing brace, and everything after it in the file — every
+// definition and every reference — was lost.
+func TestParseText_InterpolatedPredicateNameKeepsRestOfFile(t *testing.T) {
+	src := `defmodule MyApp.Migration do
+  alias MyApp.Repo
+
+  def run(dry_run?) do
+    IO.puts("Backfilling (DRY RUN: #{dry_run?})...")
+    Repo.all(MyApp.Site)
+  end
+
+  defp insert!(changeset) do
+    Repo.insert!(changeset)
+  end
+end
+`
+	defs, refs, err := ParseText("/tmp/migration.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var haveInsert bool
+	for _, d := range defs {
+		if d.Function == "insert!" {
+			haveInsert = true
+		}
+	}
+	if !haveInsert {
+		t.Errorf("expected insert!/1 to be indexed after the interpolation, got %+v", defs)
+	}
+
+	lines := make(map[int]bool)
+	for _, r := range refs {
+		if r.Module == "MyApp.Repo" || r.Module == "Repo" {
+			lines[r.Line] = true
+		}
+	}
+	for _, want := range []int{6, 10} {
+		if !lines[want] {
+			t.Errorf("expected a Repo reference on line %d, got %+v", want, refs)
+		}
+	}
+}
+
+// Predicate identifiers may end in a non-ASCII letter. The interpolation
+// scanner must look at the preceding rune, not merely the preceding byte, or
+// it mistakes the trailing question mark for a character literal and consumes
+// the closing brace.
+func TestParseText_InterpolatedUnicodePredicateNameKeepsRestOfFile(t *testing.T) {
+	src := `defmodule MyApp.Validator do
+  alias MyApp.Repo
+
+  def run(validó?) do
+    IO.puts("valid: #{validó?}")
+    Repo.all(MyApp.Record)
+  end
+
+  def after_interpolation, do: Repo.count(MyApp.Record)
+end
+`
+	defs, refs, err := ParseText("/tmp/validator.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var haveAfter bool
+	for _, d := range defs {
+		if d.Function == "after_interpolation" {
+			haveAfter = true
+		}
+	}
+	if !haveAfter {
+		t.Errorf("expected the definition after the interpolation, got %+v", defs)
+	}
+
+	lines := make(map[int]bool)
+	for _, r := range refs {
+		if r.Module == "MyApp.Repo" {
+			lines[r.Line] = true
+		}
+	}
+	for _, want := range []int{6, 9} {
+		if !lines[want] {
+			t.Errorf("expected a Repo reference on line %d, got %+v", want, refs)
+		}
+	}
+}
+
+// The char literal itself still tokenizes: `?a` in operand position is a
+// number, not the tail of an identifier.
+func TestParseText_CharLiteralInInterpolation(t *testing.T) {
+	src := `defmodule MyApp.Chars do
+  def pad(s), do: String.pad_leading(s, 2, "#{[?0]}")
+
+  def run, do: Repo.all(MyApp.Site)
+end
+`
+	_, refs, err := ParseText("/tmp/chars.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, r := range refs {
+		if r.Function == "all" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected the call after a char literal in an interpolation, got %+v", refs)
+	}
+}
+
+// Code inside a #{} interpolation is real code: it calls functions and names
+// modules. The tokenizer used to read a string literal as one opaque token, so
+// every call site inside an interpolation was missing from the index —
+// find-references skipped it and a rename left it behind.
+func TestParseText_InterpolationRefsAreIndexed(t *testing.T) {
+	src := `defmodule MyApp.Notifier do
+  alias SharedLib.Config
+  alias SharedLib.Helpers
+
+  def line(slug) do
+    "<#{Config.admin_url(slug)}|#{slug}>"
+  end
+
+  def block(run) do
+    """
+    Run: #{Helpers.link(Config.run_url(run.slug), run.name)}
+    """
+  end
+
+  def nested(x) do
+    "outer #{"inner #{Config.format(x)}"} tail"
+  end
+
+  def struct_in_interpolation(x) do
+    "#{%SharedLib.Point{x: x}}"
+  end
+end
+`
+	_, refs, err := ParseText("/tmp/notifier.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type want struct {
+		module   string
+		function string
+		line     int
+	}
+	wants := []want{
+		{"SharedLib.Config", "admin_url", 6},
+		{"SharedLib.Helpers", "link", 11},
+		{"SharedLib.Config", "run_url", 11},
+		{"SharedLib.Config", "format", 16},
+		{"SharedLib.Point", "", 20},
+	}
+	for _, w := range wants {
+		found := false
+		for _, r := range refs {
+			if r.Module == w.module && r.Function == w.function && r.Line == w.line {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("missing ref %s.%s on line %d; got %+v", w.module, w.function, w.line, refs)
+		}
+	}
+}
+
+// Only the interpolated code counts. Literal text that happens to look like a
+// module or a call must stay out of the index, or every log message would add
+// phantom references.
+func TestParseText_LiteralStringTextIsNotAReference(t *testing.T) {
+	src := `defmodule MyApp.Logger do
+  def report(x) do
+    "SharedLib.Ghost.call() said #{SharedLib.Real.call(x)}"
+  end
+
+  @doc """
+  SharedLib.DocGhost.call() is only prose.
+  """
+  def documented, do: :ok
+end
+`
+	_, refs, err := ParseText("/tmp/logger.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range refs {
+		if r.Module == "SharedLib.Ghost" || r.Module == "SharedLib.DocGhost" {
+			t.Errorf("literal string text produced a reference: %+v", r)
+		}
+	}
+	found := false
+	for _, r := range refs {
+		if r.Module == "SharedLib.Real" && r.Function == "call" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected SharedLib.Real.call from the interpolation, got %+v", refs)
+	}
+}
+
+// A keyword inside an interpolation (`do`, `end`, `fn`) must not reach the
+// block-depth tracker, or the module frame pops early and every definition
+// after it is attributed to the wrong module.
+func TestParseText_InterpolationKeywordsKeepModuleAttribution(t *testing.T) {
+	src := `defmodule MyApp.Report do
+  def render(list) do
+    "#{Enum.map(list, fn i -> i end)} #{if list == [], do: "none", else: "some"}"
+  end
+
+  def after_it, do: :ok
+end
+`
+	defs, _, err := ParseText("/tmp/report.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, d := range defs {
+		if d.Function == "after_it" {
+			found = true
+			if d.Module != "MyApp.Report" {
+				t.Errorf("after_it attributed to %q, want MyApp.Report", d.Module)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("expected after_it to be indexed, got %+v", defs)
+	}
+}
+
+// A lowercase sigil interpolates, so the code inside #{} is real code there
+// too. An uppercase sigil does not: ~S is raw text.
+func TestParseText_SigilInterpolationRefs(t *testing.T) {
+	src := `defmodule MyApp.Matcher do
+  def pattern(name), do: ~r/^#{SharedLib.Escaper.escape(name)}$/
+
+  def raw, do: ~S(#{SharedLib.Ghost.call()})
+
+  def joined(a), do: ~s(prefix-#{SharedLib.Fmt.pad(a)})
+end
+`
+	_, refs, err := ParseText("/tmp/matcher.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byModule := map[string]string{}
+	for _, r := range refs {
+		byModule[r.Module] = r.Function
+	}
+	if byModule["SharedLib.Escaper"] != "escape" {
+		t.Errorf("expected SharedLib.Escaper.escape from the ~r sigil, got %+v", refs)
+	}
+	if byModule["SharedLib.Fmt"] != "pad" {
+		t.Errorf("expected SharedLib.Fmt.pad from the ~s sigil, got %+v", refs)
+	}
+	if _, ok := byModule["SharedLib.Ghost"]; ok {
+		t.Errorf("an uppercase sigil is raw text, it must not produce a reference: %+v", refs)
+	}
+}
+
+// Interpolations nest, and Elixir allows almost anything inside one. Every
+// case below was checked against the Elixir compiler itself, so a failure here
+// is dexter's and not the fixture's. Each asserts two things: the reference
+// written inside the interpolation is indexed, and the definition written
+// after it survives — a scanner that loses the end of an interpolation reads
+// the rest of the file as string content and drops all of it.
+func TestParseText_InterpolationEdgeCases(t *testing.T) {
+	cases := []struct {
+		name    string
+		body    string
+		wantRef string
+		absent  string
+	}{
+		{
+			name:    "four levels of nesting",
+			body:    `    "a#{"b#{"c#{"d#{SharedLib.Deep.four(x)}"}"}"}"`,
+			wantRef: "SharedLib.Deep.four",
+		},
+		{
+			name: "comment holding a brace and a quote",
+			body: `    "#{
+      # a comment holding a } brace and a " quote
+      SharedLib.Deep.cmt(x)
+    }"`,
+			wantRef: "SharedLib.Deep.cmt",
+		},
+		{
+			name:    "char literals for brace and quote",
+			body:    `    "#{[?}, ?{, ?"] ++ SharedLib.Deep.chars(x)}"`,
+			wantRef: "SharedLib.Deep.chars",
+		},
+		{
+			name:    "closing brace inside a nested string",
+			body:    `    "#{SharedLib.Deep.brace("}")}"`,
+			wantRef: "SharedLib.Deep.brace",
+		},
+		{
+			name: "heredoc inside an interpolation",
+			body: `    "#{SharedLib.Deep.hd("""
+    inner #{SharedLib.Deep.inner(x)}
+    """)}"`,
+			wantRef: "SharedLib.Deep.inner",
+		},
+		{
+			name:    "sigil delimited by braces",
+			body:    `    "#{~s{a#{SharedLib.Deep.sbrace(x)}b}}"`,
+			wantRef: "SharedLib.Deep.sbrace",
+		},
+		{
+			name:    "raw sigil stays raw",
+			body:    `    SharedLib.Deep.raw(~S"#{SharedLib.Ghost.call()}", x)`,
+			wantRef: "SharedLib.Deep.raw",
+			absent:  "SharedLib.Ghost",
+		},
+		{
+			name:    "fn and end deep inside",
+			body:    `    "a#{"b#{Enum.map([x], fn i -> SharedLib.Deep.fnend(i) end)}"}"`,
+			wantRef: "SharedLib.Deep.fnend",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := "defmodule MyApp.Edge do\n  def probe(x) do\n" + tc.body +
+				"\n  end\n\n  def sentinel(y), do: SharedLib.Sentinel.mark(y)\nend\n"
+			defs, refs, err := ParseText("/tmp/edge.ex", src)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			seen := map[string]bool{}
+			for _, r := range refs {
+				seen[r.Module+"."+r.Function] = true
+				if tc.absent != "" && r.Module == tc.absent {
+					t.Errorf("raw text produced a reference: %+v", r)
+				}
+			}
+			if !seen[tc.wantRef] {
+				t.Errorf("missing %s; got %+v", tc.wantRef, refs)
+			}
+
+			// The interpolation must end where Elixir ends it: everything
+			// after it is still code.
+			if !seen["SharedLib.Sentinel.mark"] {
+				t.Errorf("the call after the interpolation was swallowed; got %+v", refs)
+			}
+			sentinel := false
+			for _, d := range defs {
+				if d.Function == "sentinel" {
+					sentinel = true
+					if d.Module != "MyApp.Edge" {
+						t.Errorf("sentinel/1 attributed to %q, want MyApp.Edge", d.Module)
+					}
+				}
+			}
+			if !sentinel {
+				t.Errorf("the definition after the interpolation was swallowed; got %+v", defs)
+			}
+		})
+	}
+}
+
+// A multi-line interpolation must report the line the code is actually on,
+// including inside a heredoc nested in one, or every jump lands in the wrong
+// place.
+func TestParseText_InterpolationLineNumbers(t *testing.T) {
+	src := `defmodule MyApp.Lines do
+  def heredoc_in_interp(x) do
+    "#{SharedLib.Deep.hd("""
+    inner #{SharedLib.Deep.inner(x)}
+    """)}"
+  end
+
+  def multiline_call(x) do
+    "#{SharedLib.Deep.multi(
+      x,
+      "arg #{SharedLib.Deep.arg(x)}"
+    )}"
+  end
+end
+`
+	_, refs, err := ParseText("/tmp/lines.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]int{
+		"SharedLib.Deep.hd":    3,
+		"SharedLib.Deep.inner": 4,
+		"SharedLib.Deep.multi": 9,
+		"SharedLib.Deep.arg":   11,
+	}
+	got := map[string]int{}
+	for _, r := range refs {
+		got[r.Module+"."+r.Function] = r.Line
+	}
+	for name, line := range want {
+		if got[name] != line {
+			t.Errorf("%s on line %d, want %d", name, got[name], line)
 		}
 	}
 }

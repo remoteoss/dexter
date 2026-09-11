@@ -6,10 +6,34 @@ Dexter is a fast Elixir LSP server. It indexes module and function definitions f
 
 - `cmd/main.go` — CLI entrypoint: `init`, `reindex`, `lookup`, `lsp` subcommands
 - `internal/indexer/` — the cold build: walk and stat on all cores, parse on all cores, then one bulk transaction with the indexes dropped. `dexter init` and the LSP server (when it finds an empty index) both call `FullBuild`. `Options.InProcess` marks the server, which shares the database with live readers and so cannot use the connection-wide bulk pragmas.
-- `internal/parser/` — Elixir parser backed by a hand-rolled tokenizer (`tokenizer.go`). The tokenizer produces a flat token stream (handling heredocs, sigils, strings, comments as opaque tokens) and `parser_tokenized.go` walks it to extract defmodule, def, defp, defmacro, defdelegate, defguard, defprotocol, defimpl, @type, @callback, alias, import, use, and Module.function references. Handles module nesting, alias resolution for defdelegate targets, and multi-line expressions natively via bracket depth tracking.
+- `internal/parser/` — Elixir parser backed by a hand-rolled tokenizer (`tokenizer.go`). The tokenizer produces a flat token stream (handling heredocs, sigils, strings, comments as opaque tokens; the code inside a `#{}` interpolation is tokenized as well, into the separate `TokenResult.Interp` stream — see below) and `parser_tokenized.go` walks it to extract defmodule, def, defp, defmacro, defdelegate, defguard, defprotocol, defimpl, @type, @callback, alias, import, use, and Module.function references. Handles module nesting, alias resolution for defdelegate targets, and multi-line expressions natively via bracket depth tracking.
 - `internal/store/` — SQLite layer. Tables: `files` (path + mtime), `definitions` (module, function, kind, line, file_path, delegate_to, delegate_as), `refs` (module, function, line, file_path, kind).
 - `internal/lsp/` — LSP server. `server.go` handles all LSP methods. `elixir.go` contains pure functions for cursor expression extraction, alias/import/use extraction (tokenizer-based), and use-chain parsing. `rename.go` has rename helpers. `hover.go` has hover formatting. `documents.go` is an in-memory open-buffer store.
 - `internal/treesitter/` — Tree-sitter integration for scope-aware variable rename and go-to-references.
+
+
+## String interpolation (`TokenResult.Interp`)
+
+A string literal stays one token in the main stream, because `@doc` extraction
+reads the token text whole and the block-depth tracker must never see a `do` or
+an `end` that belongs to an interpolation. The code inside `#{}` is real code
+all the same, so the tokenizer records it in a second, byte-ordered stream:
+`TokenResult.Interp`, holding only `TokModule`, `TokIdent`, `TokDot` and
+`TokAttr` (keywords are dropped on purpose). Nesting recurses, which Elixir
+allows: `"outer #{"inner #{x}"}"`. Interpolating (lowercase) sigils are covered;
+uppercase sigils are raw text and are not.
+
+Two consumers read it:
+
+- `parseTextFromTokens` drains it in byte order as the main walker passes each
+  token (`flushInterpRefs`), so an interpolated reference is resolved with the
+  aliases and the enclosing module in force at that point in the file. Both
+  streams go through the same `collectModuleRefs`.
+- `TokenizedFile.ExpressionAtCursor` (and `FullExpressionAtCursor`) fall back to
+  it when the main-stream lookup finds nothing, which is what gives
+  go-to-definition, hover and document highlight inside an interpolation. The
+  fallback costs one binary search, and only when the cursor is not on an
+  expression in the main stream.
 
 ## LSP feature map
 

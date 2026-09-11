@@ -5,7 +5,7 @@ import "strings"
 // parseTextFromTokens is the token-stream replacement for the line-based ParseText.
 // It walks a []Token stream from the tokenizer and produces identical Definition
 // and Reference output.
-func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definition, []Reference, error) {
+func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]Definition, []Reference, error) {
 	var defs []Definition
 	var refs []Reference
 
@@ -29,12 +29,6 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 
 	nextSig := func(from int) int {
 		return NextSigToken(tokens, n, from)
-	}
-
-	// isUserModuleToken returns true if the TokModule token represents a user-defined
-	// module name (starts with ASCII uppercase). Returns false for __MODULE__.
-	isUserModuleToken := func(t Token) bool {
-		return source[t.Start] >= 'A' && source[t.Start] <= 'Z'
 	}
 
 	collectModuleName := func(i int) (string, int) {
@@ -98,6 +92,20 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 			})
 		}
 		return scanPos
+	}
+
+	// Module references inside a typespec name types, not functions:
+	// `@spec put_meta(Ecto.Schema.schema(), meta)` refers to the type
+	// Ecto.Schema.schema, not to the macro of that name. They are recorded
+	// under their own kind so a lookup for a function can leave them out and a
+	// lookup for a type can pick them out. The token range uses the same
+	// statement-boundary scanner as open-document lookup.
+	typespecStart, typespecEnd := -1, -1
+	callKind := func(pos int) string {
+		if pos >= typespecStart && pos < typespecEnd {
+			return "typespec"
+		}
+		return "call"
 	}
 
 	emitModuleRef := func(modName string, line int, kind string) {
@@ -175,56 +183,22 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 	// extractModuleRefs emits call/struct refs for module references in a token range.
 	// Only processes TokModule tokens that start with ASCII uppercase (matching old regex behavior).
 	extractModuleRefs := func(lineStart, lineEnd int) {
-		cm := currentModule()
-		for j := lineStart; j < lineEnd; j++ {
-			tok := tokens[j]
+		refs = collectModuleRefs(source, path, tokens, lineStart, lineEnd, aliases, currentModule(), callKind, refs)
+	}
 
-			// %Module{ struct literal
-			if tok.Kind == TokPercent && j+1 < lineEnd && tokens[j+1].Kind == TokModule && isUserModuleToken(tokens[j+1]) {
-				modName, k := collectModuleName(j + 1)
-				if k < lineEnd && tokens[k].Kind == TokOpenBrace {
-					resolved := ResolveModuleRef(modName, aliases, cm)
-					if resolved != "" {
-						refs = append(refs, Reference{Module: resolved, Line: tok.Line, FilePath: path, Kind: "call"})
-					}
-					j = k
-					continue
-				}
-			}
-
-			if tok.Kind != TokModule || !isUserModuleToken(tok) {
-				continue
-			}
-
-			modName, k := collectModuleName(j)
-
-			// Skip if preceded by % (struct literal already handled above)
-			if j > 0 && tokens[j-1].Kind == TokPercent {
-				j = k - 1
-				continue
-			}
-
-			// Module.function call
-			if k < lineEnd && tokens[k].Kind == TokDot && k+1 < lineEnd && tokens[k+1].Kind == TokIdent {
-				funcName := tokenText(tokens[k+1])
-				if !elixirKeyword[funcName] {
-					resolved := ResolveModuleRef(modName, aliases, cm)
-					if resolved != "" {
-						refs = append(refs, Reference{Module: resolved, Function: funcName, Line: tok.Line, FilePath: path, Kind: "call"})
-					}
-				}
-				j = k + 1
-				continue
-			}
-
-			// Standalone module ref (skip self-references)
-			if modName != cm {
-				resolved := ResolveModuleRef(modName, aliases, cm)
-				if resolved != "" {
-					refs = append(refs, Reference{Module: resolved, Line: tok.Line, FilePath: path, Kind: "call"})
-				}
-			}
-			j = k - 1
+	// flushInterpRefs emits the refs written inside a #{} interpolation. The
+	// tokenizer keeps those tokens in their own stream (see TokenResult.Interp),
+	// so they are drained here in byte order as the walker passes them, which
+	// is what gives them the aliases and the enclosing module in force at that
+	// point in the file.
+	interpPos := 0
+	flushInterpRefs := func(upTo int) {
+		start := interpPos
+		for interpPos < len(interp) && interp[interpPos].Start < upTo {
+			interpPos++
+		}
+		if interpPos > start {
+			refs = collectModuleRefs(source, path, interp, start, interpPos, aliases, currentModule(), callRefKind, refs)
 		}
 	}
 
@@ -252,6 +226,10 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 	i := 0
 	for i < n {
 		tok := tokens[i]
+
+		if interpPos < len(interp) {
+			flushInterpRefs(tok.Start)
+		}
 
 		switch tok.Kind {
 		case TokEOL, TokComment, TokString, TokHeredoc, TokSigil,
@@ -389,6 +367,10 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 			}
 			cm := currentModule()
 
+			// The module name on an alias line is itself resolved through the
+			// aliases already in scope: `alias A.B` then `alias B.C`.
+			modName = ExpandAliasPrefix(modName, aliases)
+
 			// Multi-alias: alias MyApp.{Users, Accounts}
 			if children, nextPos, ok := ScanMultiAliasChildren(source, tokens, n, k, false); ok {
 				parentResolved := resolveModule(modName, cm)
@@ -482,6 +464,8 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 			continue
 
 		case TokAttrType:
+			typespecStart = i
+			typespecEnd = ScanTypespecEnd(source, tokens, n, i)
 			cm := currentModule()
 			if cm != "" {
 				attrLine := tok.Line
@@ -538,6 +522,8 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 			goto extractRefsForLine
 
 		case TokAttrCallback:
+			typespecStart = i
+			typespecEnd = ScanTypespecEnd(source, tokens, n, i)
 			cm := currentModule()
 			if cm != "" {
 				attrLine := tok.Line
@@ -570,19 +556,25 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 			}
 			goto extractRefsForLine
 
-		case TokAttrDoc, TokAttrSpec, TokAttr:
+		case TokAttrSpec:
+			typespecStart = i
+			typespecEnd = ScanTypespecEnd(source, tokens, n, i)
+			i++
+			goto extractRefsForLine
+
+		case TokAttrDoc, TokAttr:
 			i++
 			goto extractRefsForLine
 
 		case TokPercent:
 			// %Module{ struct literal
-			if i+1 < n && tokens[i+1].Kind == TokModule && isUserModuleToken(tokens[i+1]) {
+			if i+1 < n && tokens[i+1].Kind == TokModule && isUserModule(source, tokens[i+1]) {
 				modName, k := collectModuleName(i + 1)
 				if k < n && tokens[k].Kind == TokOpenBrace {
 					cm := currentModule()
 					resolved := ResolveModuleRef(modName, aliases, cm)
 					if resolved != "" {
-						refs = append(refs, Reference{Module: resolved, Line: tok.Line, FilePath: path, Kind: "call"})
+						refs = append(refs, Reference{Module: resolved, Line: tok.Line, FilePath: path, Kind: callKind(i)})
 					}
 					i = k + 1
 					continue
@@ -593,7 +585,7 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 
 		case TokModule:
 			// Skip __MODULE__ and other non-ASCII-uppercase module tokens
-			if !isUserModuleToken(tok) {
+			if !isUserModule(source, tok) {
 				i++
 				continue
 			}
@@ -613,7 +605,7 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 				if !elixirKeyword[funcName] {
 					resolved := ResolveModuleRef(modName, aliases, cm)
 					if resolved != "" {
-						refs = append(refs, Reference{Module: resolved, Function: funcName, Line: tok.Line, FilePath: path, Kind: "call"})
+						refs = append(refs, Reference{Module: resolved, Function: funcName, Line: tok.Line, FilePath: path, Kind: callKind(i)})
 					}
 				}
 				i = k + 2
@@ -624,7 +616,7 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 			if modName != cm {
 				resolved := ResolveModuleRef(modName, aliases, cm)
 				if resolved != "" {
-					refs = append(refs, Reference{Module: resolved, Line: tok.Line, FilePath: path, Kind: "call"})
+					refs = append(refs, Reference{Module: resolved, Line: tok.Line, FilePath: path, Kind: callKind(i)})
 				}
 			}
 			i = k
@@ -638,7 +630,7 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 					name := tokenText(tokens[j])
 					if !elixirKeyword[name] {
 						for mod := range injectors {
-							refs = append(refs, Reference{Module: mod, Function: name, Line: tokens[j].Line, FilePath: path, Kind: "call"})
+							refs = append(refs, Reference{Module: mod, Function: name, Line: tokens[j].Line, FilePath: path, Kind: callKind(j)})
 						}
 					}
 				}
@@ -681,7 +673,7 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 						}
 						if emit {
 							for mod := range injectors {
-								refs = append(refs, Reference{Module: mod, Function: name, Line: tok.Line, FilePath: path, Kind: "call"})
+								refs = append(refs, Reference{Module: mod, Function: name, Line: tok.Line, FilePath: path, Kind: callKind(i)})
 							}
 						}
 					}
@@ -721,7 +713,7 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 							name := tokenText(tokens[pj])
 							if !elixirKeyword[name] {
 								for mod := range injectors {
-									refs = append(refs, Reference{Module: mod, Function: name, Line: tokens[pj].Line, FilePath: path, Kind: "call"})
+									refs = append(refs, Reference{Module: mod, Function: name, Line: tokens[pj].Line, FilePath: path, Kind: callKind(pj)})
 								}
 							}
 						}
@@ -736,7 +728,79 @@ func parseTextFromTokens(path string, source []byte, tokens []Token) ([]Definiti
 		}
 	}
 
+	if interpPos < len(interp) {
+		flushInterpRefs(len(source) + 1)
+	}
+
 	return defs, dedupeRefs(refs), nil
+}
+
+// callRefKind is the kind every interpolated reference carries: a typespec
+// holds no string, so the typespec/call distinction cannot arise there.
+func callRefKind(int) string { return "call" }
+
+// collectModuleRefs walks toks[from:to) and appends a reference for every
+// module name it finds: `Mod.fun(...)` as a call, `%Mod{}` and a bare `Mod` as
+// a module reference. It serves both token streams — the file's own tokens and
+// the interpolation tokens the tokenizer keeps beside them — so the two cannot
+// drift apart. kindAt gives the reference kind for a token index, which is how
+// a typespec reference is told apart from a call.
+func collectModuleRefs(source []byte, path string, toks []Token, from, to int, aliases map[string]string, cm string, kindAt func(int) string, refs []Reference) []Reference {
+	tn := len(toks)
+	for j := from; j < to; j++ {
+		tok := toks[j]
+
+		// %Module{ struct literal
+		if tok.Kind == TokPercent && j+1 < to && toks[j+1].Kind == TokModule && isUserModule(source, toks[j+1]) {
+			modName, k := CollectModuleName(source, toks, tn, j+1)
+			if k < to && toks[k].Kind == TokOpenBrace {
+				if resolved := ResolveModuleRef(modName, aliases, cm); resolved != "" {
+					refs = append(refs, Reference{Module: resolved, Line: tok.Line, FilePath: path, Kind: kindAt(j)})
+				}
+				j = k
+				continue
+			}
+		}
+
+		if tok.Kind != TokModule || !isUserModule(source, tok) {
+			continue
+		}
+
+		modName, k := CollectModuleName(source, toks, tn, j)
+
+		// Skip if preceded by % (struct literal already handled above)
+		if j > 0 && toks[j-1].Kind == TokPercent {
+			j = k - 1
+			continue
+		}
+
+		// Module.function call
+		if k < to && toks[k].Kind == TokDot && k+1 < to && toks[k+1].Kind == TokIdent {
+			funcName := TokenText(source, toks[k+1])
+			if !elixirKeyword[funcName] {
+				if resolved := ResolveModuleRef(modName, aliases, cm); resolved != "" {
+					refs = append(refs, Reference{Module: resolved, Function: funcName, Line: tok.Line, FilePath: path, Kind: kindAt(j)})
+				}
+			}
+			j = k + 1
+			continue
+		}
+
+		// Standalone module ref (skip self-references)
+		if modName != cm {
+			if resolved := ResolveModuleRef(modName, aliases, cm); resolved != "" {
+				refs = append(refs, Reference{Module: resolved, Line: tok.Line, FilePath: path, Kind: kindAt(j)})
+			}
+		}
+		j = k - 1
+	}
+	return refs
+}
+
+// isUserModule reports whether a TokModule token names a user-defined module
+// (an ASCII uppercase start), as opposed to __MODULE__.
+func isUserModule(source []byte, t Token) bool {
+	return source[t.Start] >= 'A' && source[t.Start] <= 'Z'
 }
 
 // dedupeRefs removes exact duplicate rows from refs, preserving first-occurrence

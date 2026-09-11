@@ -25,6 +25,7 @@ type cachedDoc struct {
 	tokens     []parser.Token // cached tokenizer output
 	tokSrc     []byte         // source bytes for tokens
 	lineStarts []int          // byte offset of each line start (from TokenizeFull)
+	interp     []parser.Token // code tokens inside #{} interpolations
 	// transient is true for entries loaded from disk via GetOrLoad - i.e.
 	// no editor sent didOpen for this URI. These entries are tracked in an
 	// LRU and evicted once the transient cap is reached. Editor-owned
@@ -340,35 +341,39 @@ func (ds *DocumentStore) GetTokens(uri string) ([]parser.Token, []byte, bool) {
 		result := parser.TokenizeFull(doc.tokSrc)
 		doc.tokens = result.Tokens
 		doc.lineStarts = result.LineStarts
+		doc.interp = result.Interp
 	}
 	return doc.tokens, doc.tokSrc, true
 }
 
-// GetTokensFull returns cached tokenizer output including line starts for
-// efficient (line, col) → byte offset conversion.
-func (ds *DocumentStore) GetTokensFull(uri string) ([]parser.Token, []byte, []int, bool) {
+// GetTokensFull returns cached tokenizer output: the token stream, the source
+// it points into, the line starts for efficient (line, col) → byte offset
+// conversion, and the interpolation stream — the code inside #{}, which the
+// main stream keeps folded into one string token.
+func (ds *DocumentStore) GetTokensFull(uri string) ([]parser.Token, []byte, []int, []parser.Token, bool) {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	doc, ok := ds.docs[uri]
 	if !ok {
-		return nil, nil, nil, false
+		return nil, nil, nil, nil, false
 	}
 	if doc.tokens == nil {
 		doc.tokSrc = []byte(doc.text)
 		result := parser.TokenizeFull(doc.tokSrc)
 		doc.tokens = result.Tokens
 		doc.lineStarts = result.LineStarts
+		doc.interp = result.Interp
 	}
-	return doc.tokens, doc.tokSrc, doc.lineStarts, true
+	return doc.tokens, doc.tokSrc, doc.lineStarts, doc.interp, true
 }
 
 // GetTokenizedFile returns a cached TokenizedFile for the given URI, or nil
 // if the document is not tracked. This is the preferred way to get a
 // TokenizedFile from the document store.
 func (ds *DocumentStore) GetTokenizedFile(uri string) *TokenizedFile {
-	tokens, src, lineStarts, ok := ds.GetTokensFull(uri)
+	tokens, src, lineStarts, interp, ok := ds.GetTokensFull(uri)
 	if !ok {
 		return nil
 	}
-	return NewTokenizedFileFromCache(tokens, src, lineStarts)
+	return NewTokenizedFileFromCache(tokens, src, lineStarts, interp)
 }
