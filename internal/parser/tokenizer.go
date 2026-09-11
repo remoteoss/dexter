@@ -705,6 +705,20 @@ func scanInterpolation(source []byte, i, line int, lineStarts *[]int, interp *[]
 	return i, line
 }
 
+// heredocCloser reports whether the line starting at i is the heredoc's
+// closing delimiter, which may be indented. It returns the offset just past
+// the delimiter when it is.
+func heredocCloser(source []byte, i int, delim byte) (int, bool) {
+	j := i
+	for j < len(source) && (source[j] == ' ' || source[j] == '\t') {
+		j++
+	}
+	if j+2 < len(source) && source[j] == delim && source[j+1] == delim && source[j+2] == delim {
+		return j + 3, true
+	}
+	return i, false
+}
+
 // scanHeredocContent scans from after the opening """ (or ”') to (and including) the closing """ on its own line.
 // The closing delimiter must appear at the start of a line (possibly with leading whitespace).
 func scanHeredocContent(source []byte, i, line int, delim byte, lineStarts *[]int, interp *[]Token) (int, int) {
@@ -714,19 +728,24 @@ func scanHeredocContent(source []byte, i, line int, delim byte, lineStarts *[]in
 			line++
 			i++
 			*lineStarts = append(*lineStarts, i)
-			// Check if the next non-space chars are the closing delimiter
-			j := i
-			for j < len(source) && (source[j] == ' ' || source[j] == '\t') {
-				j++
-			}
-			if j+2 < len(source) && source[j] == delim && source[j+1] == delim && source[j+2] == delim {
-				i = j + 3 // consume closing delimiter
-				return i, line
+			if end, closed := heredocCloser(source, i, delim); closed {
+				return end, line
 			}
 		} else if ch == '\\' && i+1 < len(source) {
 			if source[i+1] == '\n' {
 				line++
-				*lineStarts = append(*lineStarts, i+2)
+				i += 2
+				*lineStarts = append(*lineStarts, i)
+				// The continuation drops the newline from the heredoc's
+				// content, but the line it ends is still a line: a closing
+				// delimiter on the next one closes the heredoc, exactly as it
+				// would after a plain newline. Skipping this check left the
+				// heredoc open and scanned the rest of the file as string
+				// content.
+				if end, closed := heredocCloser(source, i, delim); closed {
+					return end, line
+				}
+				continue
 			}
 			i += 2
 		} else if ch == '#' && i+1 < len(source) && source[i+1] == '{' {

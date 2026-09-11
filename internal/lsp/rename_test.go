@@ -3482,3 +3482,88 @@ end`
 		t.Errorf("interpolation site not renamed:\n%s", got)
 	}
 }
+
+// TestRename_Module_ConventionalPathUnchanged covers a rename whose new module
+// maps to the file path it already has. The conventional path is the module's
+// last segment, snake_cased, inside the directory the file already sits in, and
+// camelToSnake folds an acronym and its capitalised form together: ABTest and
+// AbTest are both ab_test. Normalising that casing is an ordinary rename, and
+// the editor sends the bare new segment for it.
+//
+// A closed file used to be written to its "new" path and then removed from its
+// old one — the same path — which deleted the module outright.
+func TestRename_Module_ConventionalPathUnchanged(t *testing.T) {
+	cases := []struct {
+		name   string
+		oldSeg string
+		newSeg string
+		base   string
+	}{
+		{"acronym casing", "ABTest", "AbTest", "ab_test"},
+		{"acronym casing longer", "HTTPClient", "HttpClient", "http_client"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server, cleanup := setupTestServer(t)
+			defer cleanup()
+
+			relPath := "lib/my_app/" + tc.base + ".ex"
+			defContent := "defmodule MyApp." + tc.oldSeg + " do\n  def run, do: :ok\nend\n"
+			callerContent := "defmodule MyApp.Caller do\n  alias MyApp." + tc.oldSeg +
+				"\n\n  def go, do: " + tc.oldSeg + ".run()\nend\n"
+
+			defPath := filepath.Join(server.projectRoot, filepath.FromSlash(relPath))
+			callerPath := filepath.Join(server.projectRoot, "lib", "caller.ex")
+			indexFile(t, server.store, server.projectRoot, relPath, defContent)
+			indexFile(t, server.store, server.projectRoot, "lib/caller.ex", callerContent)
+
+			// The def file stays closed, so the server owns the move.
+			callerURI := "file://" + callerPath
+			server.docs.Set(callerURI, callerContent)
+
+			aliasLine := strings.Split(callerContent, "\n")[1]
+			col := uint32(strings.Index(aliasLine, tc.oldSeg))
+			edit := renameAt(t, server, callerURI, 1, col, tc.newSeg)
+			server.backgroundWork.Wait()
+
+			if _, err := os.Stat(defPath); err != nil {
+				t.Fatalf("%s was deleted by the rename: %v", relPath, err)
+			}
+			if !fileContains(defPath, "defmodule MyApp."+tc.newSeg) {
+				data, _ := os.ReadFile(defPath)
+				t.Errorf("expected %q in %s, got:\n%s", "defmodule MyApp."+tc.newSeg, relPath, string(data))
+			}
+			// Nothing moved, so the reply must not ask the client to move it.
+			if op := renameOp(edit, defPath); op != nil {
+				t.Errorf("unexpected rename operation %s -> %s", op.OldURI, op.NewURI)
+			}
+		})
+	}
+}
+
+// TestRename_Module_ConventionalPathUnchangedOpenFile is the same situation
+// with the defining file open: the client must not be handed a rename
+// operation whose old and new URI are the same path.
+func TestRename_Module_ConventionalPathUnchangedOpenFile(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+	server.renameFileOpsSupported = true
+
+	defContent := "defmodule MyApp.ABTest do\n  def run, do: :ok\nend\n"
+	defPath := filepath.Join(server.projectRoot, "lib", "my_app", "ab_test.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/ab_test.ex", defContent)
+
+	defURI := "file://" + defPath
+	server.docs.Set(defURI, defContent)
+
+	edit := renameAt(t, server, defURI, 0, uint32(strings.Index(defContent, "ABTest")), "AbTest")
+	server.backgroundWork.Wait()
+
+	if op := renameOp(edit, defPath); op != nil {
+		t.Errorf("rename op emitted for an unchanged path: %s -> %s", op.OldURI, op.NewURI)
+	}
+	if got := bufferAfterEdits(t, edit, defPath, defContent); !strings.Contains(got, "defmodule MyApp.AbTest") {
+		t.Errorf("expected 'defmodule MyApp.AbTest', got:\n%s", got)
+	}
+}
