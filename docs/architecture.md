@@ -10,6 +10,7 @@ Dexter is a fast Elixir LSP server. It indexes module and function definitions f
 - `internal/store/` — SQLite layer. Tables: `files` (path + mtime), `definitions` (module, function, kind, line, file_path, delegate_to, delegate_as), `refs` (module, function, line, file_path, kind).
 - `internal/lsp/` — LSP server. `server.go` handles all LSP methods. `elixir.go` contains pure functions for cursor expression extraction, alias/import/use extraction (tokenizer-based), and use-chain parsing. `rename.go` has rename helpers. `hover.go` has hover formatting. `documents.go` is an in-memory open-buffer store.
 - `internal/treesitter/` — Tree-sitter integration for scope-aware variable rename and go-to-references.
+- `internal/mcp/` — Model Context Protocol server (`dexter mcp`). One file per tool, gopls-style; tools are name-based (module/function, not file+position) and call the store plus the exported facade in `internal/lsp/api.go`.
 
 
 ## String interpolation (`TokenResult.Interp`)
@@ -137,6 +138,8 @@ A module rename also moves files whose names follow the module naming convention
 - **Open files, client without `resourceOperations: ["rename"]`** — the module is renamed in place and the file keeps its old name. Nothing is deleted underneath a live buffer.
 
 `protocol.WorkspaceEdit` from `go.lsp.dev/protocol` types `documentChanges` as `[]TextDocumentEdit` and cannot carry resource operations, so `internal/lsp/workspace_edit.go` defines the wire types and `renameHandler` answers `textDocument/rename` ahead of the generated dispatcher. A client that understands `documentChanges` ignores `changes` entirely, so once one file moves, every edit in the reply goes through `documentChanges`.
+
+For a rename the MCP server asked for rather than an editor, the builders keep every affected file and move in one `WorkspaceEdit`. In attached mode, `deliverEdits` forwards that complete edit as `workspace/applyEdit` — over the raw connection, since `protocol.ApplyWorkspaceEditParams` drops resource operations — and updates buffers and the index only after the editor accepts it. A rejected edit therefore leaves closed files untouched too. In headless mode, `deliverEdits` applies the same complete edit and moves on disk itself.
 
 ### Grouped aliases
 

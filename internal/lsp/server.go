@@ -26,7 +26,6 @@ import (
 	"go.lsp.dev/jsonrpc2"
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
-	"go.uber.org/zap"
 
 	"github.com/remoteoss/dexter/internal/indexer"
 	"github.com/remoteoss/dexter/internal/parser"
@@ -122,6 +121,12 @@ type Server struct {
 	notifiedOTPMismatch sync.Once // prevents repeated OTP mismatch warnings
 
 	backgroundWork sync.WaitGroup // tracks background reindex goroutines so the store isn't closed while they're running
+	ready          chan struct{}  // closed once the LSP initialize request has completed
+	readyOnce      sync.Once
+
+	gitHeadStop     chan struct{} // closed by StopGitHeadWatch to end the WatchGitHead goroutine
+	gitHeadStopOnce sync.Once
+	gitHeadWG       sync.WaitGroup
 }
 
 func (s *Server) debugf(format string, args ...interface{}) {
@@ -148,6 +153,8 @@ func NewServer(s *store.Store, projectRoot string) *Server {
 		erlangRuntimeCache: make(map[string]*erlangRuntimeCache),
 		usingCache:         make(map[string]*usingCacheEntry),
 		depsCache:          make(map[string]bool),
+		ready:              make(chan struct{}),
+		gitHeadStop:        make(chan struct{}),
 		// What every client sends when the server declares no encoding, which
 		// Dexter does not.
 		positionEncoding: EncodingUTF16,
@@ -160,24 +167,6 @@ type stdinoutCloser struct {
 }
 
 func (s stdinoutCloser) Close() error { return nil }
-
-// Serve starts the LSP server on the given reader/writer (typically stdin/stdout).
-func Serve(in io.Reader, out io.Writer, s *store.Store, projectRoot string) error {
-	server := NewServer(s, projectRoot)
-
-	logger, _ := zap.NewProduction()
-	stream := jsonrpc2.NewStream(stdinoutCloser{in, out})
-	conn := jsonrpc2.NewConn(stream)
-	server.client = protocol.ClientDispatcher(conn, logger)
-	server.conn = conn
-
-	handler := server.renameHandler(protocol.ServerHandler(server, nil))
-	ctx := context.Background()
-
-	conn.Go(ctx, handler)
-	<-conn.Done()
-	return conn.Err()
-}
 
 // warmUsingCache parses every module's defmacro __using__ body ahead of the
 // first request that needs one.
@@ -361,147 +350,161 @@ func (s *Server) backgroundReindex() {
 			return
 		}
 		defer s.reindexing.Unlock()
+		s.reindexWorkspace()
+	}()
+}
 
-		start := time.Now()
-		reindexed := 0
-		coldStart := s.store.IsEmpty()
-		fullBuilt := false
+// ReindexWorkspace runs the same full-or-incremental reindex as
+// backgroundReindex, but blocks until it completes.
+func (s *Server) ReindexWorkspace() (int, time.Duration) {
+	s.reindexing.Lock()
+	defer s.reindexing.Unlock()
+	return s.reindexWorkspace()
+}
 
-		if coldStart {
-			log.Printf("No index found, building from scratch...")
-			if s.client != nil {
-				if err := s.client.ShowMessage(context.Background(), &protocol.ShowMessageParams{
-					Type:    protocol.MessageTypeInfo,
-					Message: "Dexter: building index for the first time, go-to-definition will be available shortly...",
-				}); err != nil {
-					log.Printf("ShowMessage: %v", err)
-				}
-			}
+func (s *Server) reindexWorkspace() (int, time.Duration) {
+	start := time.Now()
+	reindexed := 0
+	coldStart := s.store.IsEmpty()
+	fullBuilt := false
 
-			stats, ran, err := s.fullBuild()
-			switch {
-			case errors.Is(err, indexer.ErrUnindexed):
-				// The SQL indexes did not come back after the bulk load committed
-				// or rolled back, so every query is a full table scan. Falling back
-				// to the incremental walk would be far worse than doing nothing:
-				// each per-file write issues a DELETE by file_id against definitions
-				// and refs tables, once per file on disk. FullBuild leaves the
-				// index version unset, so the next editor start rebuilds from
-				// scratch through cmdInit — in a process with no live readers,
-				// where deleting the database is safe.
-				log.Printf("Error: SQL indexes could not be restored after the bulk build: %v", err)
-				s.showError("Dexter: the index could not be completed. Run `dexter init --force` in your project root and restart your editor. If it happens again, please report it.")
-				// Collapse any committed data in the WAL rather than leaving it at
-				// its high-water mark for the rest of the process.
-				if err := s.store.Checkpoint(); err != nil {
-					log.Printf("Warning: WAL checkpoint: %v", err)
-				}
-				return
-			case err != nil:
-				// The incremental walk below needs nothing to be true of the
-				// database, so it is the safe thing to fall back to. It is
-				// slower, not wrong.
-				log.Printf("Warning: full index build failed, falling back to incremental: %v", err)
-			case !ran:
-				// Something wrote to the index between the check above and the
-				// build's lock. Nothing was built, and the incremental path
-				// below covers whatever is there.
-				log.Printf("Index was no longer empty at build time, using incremental reindex")
-			default:
-				fullBuilt = true
-				reindexed = stats.Files
-			}
-		}
-
-		// Re-read rather than reusing coldStart. A full build, a failed build
-		// and a concurrent write all change the answer, and reading a stale
-		// true here would skip the mtime short-circuit for every file.
-		isEmpty := s.store.IsEmpty()
-
-		seen := make(map[string]struct{})
-		walkAndIndex := func(root string, indexRefs bool) {
-			_ = parser.WalkElixirFiles(root, func(path string, d fs.DirEntry) error {
-				seen[path] = struct{}{}
-
-				if !isEmpty {
-					info, err := d.Info()
-					if err != nil {
-						return nil
-					}
-					storedMtime, found := s.store.GetFileMtime(path)
-					currentMtime := info.ModTime().UnixNano()
-					if found && storedMtime == currentMtime {
-						return nil
-					}
-				}
-
-				defs, refs, err := parser.ParseFile(path)
-				if err != nil {
-					return nil
-				}
-				if !indexRefs {
-					refs = nil
-				}
-				if err := s.store.IndexFileWithRefs(path, defs, refs); err != nil {
-					log.Printf("Warning: reindex %s: %v", path, err)
-				}
-				reindexed++
-				return nil
-			})
-		}
-
-		// A full build already indexed every file on disk from the traversal
-		// this walk would repeat, so skipping it saves a second traversal and a
-		// stored-mtime query per file. The prune lives in the same branch and
-		// so cannot run without the walk that fills `seen`.
-		if !fullBuilt {
-			// The walk writes, so it takes indexWrites for reading, the same as
-			// every other single-file write. That is what keeps it from
-			// overlapping a cold build.
-			s.indexWrites.RLock()
-			if s.indexUnavailable {
-				s.indexWrites.RUnlock()
-				return
-			}
-			// Index stdlib first (definitions only).
-			if s.stdlibRoot != "" {
-				walkAndIndex(s.stdlibRoot, false)
-			}
-
-			walkAndIndex(s.projectRoot, true)
-			s.indexWrites.RUnlock()
-
-			s.pruneMissingFiles(seen)
-		}
-
-		// Collapse the WAL back to disk now that the (potentially large) reindex
-		// is complete, so the -wal file does not stay parked at its high-water
-		// mark for the lifetime of the LSP process.
-		if err := s.store.Checkpoint(); err != nil {
-			log.Printf("Warning: WAL checkpoint after reindex: %v", err)
-		}
-
-		// The index is in place now, so fill the __using__ cache before a user
-		// asks for it. See warmUsingCache.
-		s.warmUsingCache()
-
-		elapsed := time.Since(start).Round(time.Millisecond)
-		log.Printf("Background reindex: %d files updated (%s)", reindexed, elapsed)
-
-		if coldStart && s.client != nil {
+	if coldStart {
+		log.Printf("No index found, building from scratch...")
+		if s.client != nil {
 			if err := s.client.ShowMessage(context.Background(), &protocol.ShowMessageParams{
 				Type:    protocol.MessageTypeInfo,
-				Message: fmt.Sprintf("Dexter: index built (%d files in %s)", reindexed, elapsed),
+				Message: "Dexter: building index for the first time, go-to-definition will be available shortly...",
 			}); err != nil {
 				log.Printf("ShowMessage: %v", err)
 			}
 		}
-	}()
+
+		stats, ran, err := s.fullBuild()
+		switch {
+		case errors.Is(err, indexer.ErrUnindexed):
+			// The SQL indexes did not come back after the bulk load committed
+			// or rolled back, so every query is a full table scan. Falling back
+			// to the incremental walk would be far worse than doing nothing:
+			// each per-file write issues a DELETE by file_id against definitions
+			// and refs tables, once per file on disk. FullBuild leaves the
+			// index version unset, so the next editor start rebuilds from
+			// scratch through cmdInit — in a process with no live readers,
+			// where deleting the database is safe.
+			log.Printf("Error: SQL indexes could not be restored after the bulk build: %v", err)
+			s.showError("Dexter: the index could not be completed. Run `dexter init --force` in your project root and restart your editor. If it happens again, please report it.")
+			// Collapse any committed data in the WAL rather than leaving it at
+			// its high-water mark for the rest of the process.
+			if err := s.store.Checkpoint(); err != nil {
+				log.Printf("Warning: WAL checkpoint: %v", err)
+			}
+			return reindexed, time.Since(start).Round(time.Millisecond)
+		case err != nil:
+			// The incremental walk below needs nothing to be true of the
+			// database, so it is the safe thing to fall back to. It is
+			// slower, not wrong.
+			log.Printf("Warning: full index build failed, falling back to incremental: %v", err)
+		case !ran:
+			// Something wrote to the index between the check above and the
+			// build's lock. Nothing was built, and the incremental path
+			// below covers whatever is there.
+			log.Printf("Index was no longer empty at build time, using incremental reindex")
+		default:
+			fullBuilt = true
+			reindexed = stats.Files
+		}
+	}
+
+	// Re-read rather than reusing coldStart. A full build, a failed build
+	// and a concurrent write all change the answer, and reading a stale
+	// true here would skip the mtime short-circuit for every file.
+	isEmpty := s.store.IsEmpty()
+
+	seen := make(map[string]struct{})
+	walkAndIndex := func(root string, indexRefs bool) {
+		_ = parser.WalkElixirFiles(root, func(path string, d fs.DirEntry) error {
+			seen[path] = struct{}{}
+
+			if !isEmpty {
+				info, err := d.Info()
+				if err != nil {
+					return nil
+				}
+				storedMtime, found := s.store.GetFileMtime(path)
+				currentMtime := info.ModTime().UnixNano()
+				if found && storedMtime == currentMtime {
+					return nil
+				}
+			}
+
+			defs, refs, err := parser.ParseFile(path)
+			if err != nil {
+				return nil
+			}
+			if !indexRefs {
+				refs = nil
+			}
+			if err := s.store.IndexFileWithRefs(path, defs, refs); err != nil {
+				log.Printf("Warning: reindex %s: %v", path, err)
+			}
+			reindexed++
+			return nil
+		})
+	}
+
+	// A full build already indexed every file on disk from the traversal
+	// this walk would repeat, so skipping it saves a second traversal and a
+	// stored-mtime query per file. The prune lives in the same branch and
+	// so cannot run without the walk that fills `seen`.
+	if !fullBuilt {
+		// The walk writes, so it takes indexWrites for reading, the same as
+		// every other single-file write. That is what keeps it from
+		// overlapping a cold build.
+		s.indexWrites.RLock()
+		if s.indexUnavailable {
+			s.indexWrites.RUnlock()
+			return reindexed, time.Since(start).Round(time.Millisecond)
+		}
+		// Index stdlib first (definitions only).
+		if s.stdlibRoot != "" {
+			walkAndIndex(s.stdlibRoot, false)
+		}
+
+		walkAndIndex(s.projectRoot, true)
+		s.indexWrites.RUnlock()
+
+		s.pruneMissingFiles(seen)
+	}
+
+	// Collapse the WAL back to disk now that the (potentially large) reindex
+	// is complete, so the -wal file does not stay parked at its high-water
+	// mark for the lifetime of the LSP process.
+	if err := s.store.Checkpoint(); err != nil {
+		log.Printf("Warning: WAL checkpoint after reindex: %v", err)
+	}
+
+	// The index is in place now, so fill the __using__ cache before a user
+	// asks for it. See warmUsingCache.
+	s.warmUsingCache()
+
+	elapsed := time.Since(start).Round(time.Millisecond)
+	log.Printf("Background reindex: %d files updated (%s)", reindexed, elapsed)
+
+	if coldStart && s.client != nil {
+		if err := s.client.ShowMessage(context.Background(), &protocol.ShowMessageParams{
+			Type:    protocol.MessageTypeInfo,
+			Message: fmt.Sprintf("Dexter: index built (%d files in %s)", reindexed, elapsed),
+		}); err != nil {
+			log.Printf("ShowMessage: %v", err)
+		}
+	}
+	return reindexed, elapsed
 }
 
-// watchGitHead polls .git/HEAD mtime and triggers reindex on branch switches.
-func (s *Server) watchGitHead() {
+// WatchGitHead polls .git/HEAD mtime and triggers reindex on branch switches.
+func (s *Server) WatchGitHead() {
+	s.gitHeadWG.Add(1)
 	go func() {
+		defer s.gitHeadWG.Done()
 		headPath := filepath.Join(s.projectRoot, ".git", "HEAD")
 		var lastMtime int64
 
@@ -514,7 +517,12 @@ func (s *Server) watchGitHead() {
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
 
-		for range ticker.C {
+		for {
+			select {
+			case <-s.gitHeadStop:
+				return
+			case <-ticker.C:
+			}
 			info, err := os.Stat(headPath)
 			if err != nil {
 				continue
@@ -523,7 +531,7 @@ func (s *Server) watchGitHead() {
 			if currentMtime != lastMtime {
 				lastMtime = currentMtime
 				log.Printf("Git HEAD changed, reindexing...")
-				s.backgroundReindex()
+				s.ReindexWorkspace()
 			}
 		}
 	}()
@@ -642,7 +650,7 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 	if !s.initialized {
 		s.initialized = true
 		s.backgroundReindex()
-		s.watchGitHead()
+		s.WatchGitHead()
 	}
 
 	if params.Capabilities.Window != nil && params.Capabilities.Window.ShowDocument != nil {
@@ -703,6 +711,7 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 		},
 	}
 	s.debugf("Initialize: capabilities: %+v", result.Capabilities)
+	s.readyOnce.Do(func() { close(s.ready) })
 	return result, nil
 }
 
@@ -5370,7 +5379,8 @@ func (s *Server) RenameEdit(ctx context.Context, params *protocol.RenameParams) 
 				if existing, err := s.store.LookupFunction(fullModule, params.NewName); err == nil && len(existing) > 0 {
 					return nil, fmt.Errorf("function %s.%s already exists", fullModule, params.NewName)
 				}
-				return s.renameFunctionEdits(fullModule, functionName, params.NewName)
+				edit, _, err := s.renameFunctionEdits(fullModule, functionName, params.NewName, false)
+				return edit, err
 			}
 		} else if moduleRef != "" {
 			fullModule := resolveModule(moduleRef, aliases)
@@ -5384,7 +5394,8 @@ func (s *Server) RenameEdit(ctx context.Context, params *protocol.RenameParams) 
 				if !isValidModuleName(newModule) {
 					return nil, fmt.Errorf("invalid module name %q: must be CamelCase segments separated by dots", params.NewName)
 				}
-				return s.renameModuleEdits(fullModule, newModule)
+				edit, _, _, err := s.renameModuleEdits(fullModule, newModule, false)
+				return edit, err
 			}
 		}
 	}
@@ -5394,7 +5405,7 @@ func (s *Server) RenameEdit(ctx context.Context, params *protocol.RenameParams) 
 
 // renameFunctionEdits builds a WorkspaceEdit renaming all occurrences of
 // module.functionName to newName across the codebase.
-func (s *Server) renameFunctionEdits(module, functionName, newName string) (*WorkspaceEdit, error) {
+func (s *Server) renameFunctionEdits(module, functionName, newName string, deliverAll bool) (*WorkspaceEdit, []string, error) {
 	// Collect all (filePath, lineNumber) pairs — definitions + references
 	type siteKey struct {
 		filePath string
@@ -5423,7 +5434,7 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*Wor
 	// Definition sites
 	defResults, err := s.store.LookupFunction(module, functionName)
 	if err != nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	for _, r := range defResults {
 		addSite(r.FilePath, r.Line)
@@ -5432,7 +5443,7 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*Wor
 	// Direct reference sites (calls, imports — skip alias/use which are module-level)
 	refResults, err := s.store.LookupReferences(module, functionName)
 	if err != nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	for _, r := range refResults {
 		if r.Kind == "alias" || r.Kind == "use" {
@@ -5518,7 +5529,11 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*Wor
 		}
 	}
 
-	edit := s.buildTextEdits(sites, functionName, newName)
+	edit := s.buildTextEdits(sites, functionName, newName, deliverAll)
+	changedFiles := make(map[string]bool, len(sites))
+	for _, site := range sites {
+		changedFiles[site.filePath] = true
+	}
 
 	// Update defdelegate lines that forward to this function: add or update
 	// the `as:` option so the facade keeps working after the rename.
@@ -5556,9 +5571,10 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*Wor
 				if !changed {
 					continue
 				}
+				changedFiles[del.FilePath] = true
 
 				fileURI := protocol.DocumentURI(uri.File(del.FilePath))
-				if open {
+				if open || deliverAll {
 					if edit.Changes == nil {
 						edit.Changes = make(map[protocol.DocumentURI][]protocol.TextEdit)
 					}
@@ -5581,7 +5597,12 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*Wor
 		}
 	}
 
-	return edit, nil
+	files := make([]string, 0, len(changedFiles))
+	for filePath := range changedFiles {
+		files = append(files, filePath)
+	}
+	sort.Strings(files)
+	return edit, files, nil
 }
 
 // renameModuleEdits builds a WorkspaceEdit renaming oldModule to newModule,
@@ -5592,28 +5613,42 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*Wor
 // WorkspaceEdit, keeping the response small and avoiding editor freezes.
 // Files following the naming convention are also renamed/moved: closed ones
 // by the server, open ones by the client through rename operations.
-func (s *Server) renameModuleEdits(oldModule, newModule string) (*WorkspaceEdit, error) {
+func (s *Server) renameModuleEdits(oldModule, newModule string, deliverAll bool) (*WorkspaceEdit, map[string]string, []string, error) {
 	mr := s.buildModuleRename(oldModule, newModule)
 
 	// Check for collisions: verify that none of the target module names
 	// (including submodules) already exist, and that no destination file
 	// paths are occupied.
 	if err := mr.checkCollisions(); err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 
 	mr.collectSites()
 
 	fileCache := mr.readFiles()
 
-	movedFiles, clientRenames := mr.moveConventionalFiles(fileCache)
-	openChanges := mr.applyEdits(fileCache, movedFiles)
-	mr.reindex(fileCache, movedFiles, clientRenames)
+	movedFiles, clientRenames := mr.moveConventionalFiles(fileCache, deliverAll)
+	openChanges := mr.applyEdits(fileCache, movedFiles, deliverAll)
+	if !deliverAll {
+		mr.reindex(fileCache, movedFiles, clientRenames)
+	}
+	moved := make(map[string]string, len(movedFiles)+len(clientRenames))
+	for from, to := range movedFiles {
+		moved[from] = to
+	}
+	for from, to := range clientRenames {
+		moved[from] = to
+	}
+	files := make([]string, 0, len(mr.sitesByFile))
+	for filePath := range mr.sitesByFile {
+		files = append(files, filePath)
+	}
+	sort.Strings(files)
 
 	if len(clientRenames) == 0 {
-		return &WorkspaceEdit{Changes: openChanges}, nil
+		return &WorkspaceEdit{Changes: openChanges}, moved, files, nil
 	}
-	return renamesToDocumentChanges(openChanges, clientRenames), nil
+	return renamesToDocumentChanges(openChanges, clientRenames), moved, files, nil
 }
 
 // renamesToDocumentChanges folds the open buffers' text edits and the file
@@ -6031,7 +6066,7 @@ func (mr *moduleRename) conventionalNewPath(r store.LookupResult) (string, bool)
 // Returns the files moved on disk, the moves left to the client, the open
 // files moved on disk anyway (fallback clients, which need showDocument and a
 // deferred delete), and the path to show for the trigger file.
-func (mr *moduleRename) moveConventionalFiles(fileCache map[string]moduleFileInfo) (movedFiles, clientRenames map[string]string) {
+func (mr *moduleRename) moveConventionalFiles(fileCache map[string]moduleFileInfo, deliverAll bool) (movedFiles, clientRenames map[string]string) {
 	movedFiles = make(map[string]string)
 	clientRenames = make(map[string]string)
 	for _, r := range mr.allModuleDefs {
@@ -6044,6 +6079,15 @@ func (mr *moduleRename) moveConventionalFiles(fileCache map[string]moduleFileInf
 		}
 		fi, hasContent := fileCache[r.FilePath]
 		if !hasContent {
+			continue
+		}
+		if deliverAll {
+			// Headless callers encode moves in the edit and deliverEdits applies
+			// them on disk. Attached callers can forward them only when the live
+			// editor supports rename resource operations.
+			if mr.server.conn == nil || mr.server.renameFileOpsSupported {
+				clientRenames[r.FilePath] = newPath
+			}
 			continue
 		}
 
@@ -6101,7 +6145,7 @@ func (mr *moduleRename) moveConventionalFiles(fileCache map[string]moduleFileInf
 
 // applyEdits applies text edits to all non-moved files: open buffers get
 // TextEdits in the WorkspaceEdit, closed files are written directly to disk.
-func (mr *moduleRename) applyEdits(fileCache map[string]moduleFileInfo, movedFiles map[string]string) map[protocol.DocumentURI][]protocol.TextEdit {
+func (mr *moduleRename) applyEdits(fileCache map[string]moduleFileInfo, movedFiles map[string]string, deliverAll bool) map[protocol.DocumentURI][]protocol.TextEdit {
 	openChanges := make(map[protocol.DocumentURI][]protocol.TextEdit)
 	var wg sync.WaitGroup
 
@@ -6113,7 +6157,7 @@ func (mr *moduleRename) applyEdits(fileCache map[string]moduleFileInfo, movedFil
 		if !ok {
 			continue
 		}
-		if fi.open {
+		if fi.open || deliverAll {
 			fileURI := protocol.DocumentURI(uri.File(fp))
 			// Each site is matched against the original line, so two sites can
 			// resolve to the same span — `alias Old.{A, B}` is one reference
@@ -6238,7 +6282,7 @@ type textReindex struct {
 // buildTextEdits creates a WorkspaceEdit replacing all whole-token occurrences
 // of oldToken with newToken. Open buffers are returned in the WorkspaceEdit;
 // closed files are written directly to disk in parallel goroutines.
-func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string) *WorkspaceEdit {
+func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string, deliverAll bool) *WorkspaceEdit {
 	// Group sites by file
 	sitesByFile := make(map[string][]renameSite, len(sites))
 	for _, site := range sites {
@@ -6313,7 +6357,7 @@ func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string) *
 		// Compute edits once for both TextEdits and reindexing
 		updatedLines := applyTokenEdits(fi.lines, fileSites)
 
-		if fi.open {
+		if fi.open || deliverAll {
 			// Open buffer: build TextEdits for the editor AND capture updated
 			// text for reindexing (computed once, used for both purposes).
 			fileURI := protocol.DocumentURI(uri.File(fp))
@@ -6338,7 +6382,9 @@ func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string) *
 					})
 				}
 			}
-			openReindexes = append(openReindexes, textReindex{fp, strings.Join(updatedLines, "\n")})
+			if !deliverAll {
+				openReindexes = append(openReindexes, textReindex{fp, strings.Join(updatedLines, "\n")})
+			}
 		} else {
 			// Closed file: write to disk in parallel
 			wg.Add(1)
@@ -6353,7 +6399,9 @@ func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string) *
 	}
 	wg.Wait()
 
-	s.reindexAfterRename(nil, reindexPaths, openReindexes)
+	if !deliverAll {
+		s.reindexAfterRename(nil, reindexPaths, openReindexes)
+	}
 
 	return &WorkspaceEdit{Changes: openChanges}
 }
@@ -6452,6 +6500,11 @@ func (s *Server) readFileText(filePath string) (text string, open bool, ok bool)
 	return "", false, false
 }
 
+// ReadFileText returns a file's current text, preferring an editor-owned buffer.
+func (s *Server) ReadFileText(filePath string) (text string, open bool, ok bool) {
+	return s.readFileText(filePath)
+}
+
 // getFileLine returns the text of line lineNum (1-based) from the file at
 // filePath, preferring the in-memory document store for editor-owned
 // buffers. Transient entries loaded via GetOrLoad fall through to the
@@ -6482,6 +6535,11 @@ func (s *Server) getFileLine(filePath string, lineNum int) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// FileLine returns one 1-based line, preferring an editor-owned buffer.
+func (s *Server) FileLine(filePath string, lineNum int) (string, bool) {
+	return s.getFileLine(filePath, lineNum)
 }
 
 // findBareCallRefs scans definition files for bare intra-module calls to
