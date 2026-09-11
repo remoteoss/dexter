@@ -6047,6 +6047,19 @@ func (mr *moduleRename) moveConventionalFiles(fileCache map[string]moduleFileInf
 			continue
 		}
 
+		// The conventional path is the module's last segment inside the
+		// directory the file already sits in, so a rename that leaves that
+		// segment's snake_case form alone leaves the path alone: a
+		// namespace-only move (MyApp.Accounts.User → MyApp.Billing.User), or
+		// two names that snake_case alike (ABTest → AbTest). There is nothing
+		// to move. Writing the file and then removing the old path would
+		// remove the file just written, and handing the client a rename
+		// operation from a path to itself is no better. Fall through to
+		// applyEdits, which rewrites the contents where they are.
+		if newPath == r.FilePath {
+			continue
+		}
+
 		if fi.open {
 			// Client applies rename operations: leave both paths untouched.
 			// applyEdits still emits TextEdits for the old URI, and the rename

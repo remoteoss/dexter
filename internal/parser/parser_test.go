@@ -3369,3 +3369,57 @@ end
 		}
 	}
 }
+
+// TestHeredocLineContinuationClosesHeredoc covers a backslash line
+// continuation inside a heredoc. The backslash removes the newline from the
+// heredoc's content, but the line it ends is still a line: a closing """ on
+// the next line closes the heredoc as usual.
+//
+// The scanner used to consume the escaped newline and carry straight on
+// without testing the next line for the delimiter, so the heredoc never
+// closed and the rest of the file was scanned as string content. Every
+// definition and reference below it was silently missing from the index —
+// the same failure as the `#{flag?}` and comment-in-interpolation bugs, with
+// a different trigger.
+func TestHeredocLineContinuationClosesHeredoc(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"continuation with interpolation", "    moved from #{a} to #{b} \\\n    and the #{b} update follows.\\\n"},
+		{"continuation without interpolation", "    moved from a to b \\\n    and the update follows.\\\n"},
+		{"continuation on the last content line", "    one line only \\\n"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			content := "defmodule MyApp.Worker do\n" +
+				"  def run do\n" +
+				"    log(\"\"\"\n" + tt.body + "    \"\"\")\n" +
+				"  end\n\n" +
+				"  defp helper, do: :ok\n" +
+				"  defp other_helper, do: :ok\n" +
+				"end\n"
+
+			dir := t.TempDir()
+			path := filepath.Join(dir, "worker.ex")
+			if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+				t.Fatal(err)
+			}
+			defs, _, err := ParseFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			found := make(map[string]bool, len(defs))
+			for _, d := range defs {
+				found[d.Function] = true
+			}
+			for _, want := range []string{"run", "helper", "other_helper"} {
+				if !found[want] {
+					t.Errorf("%s missing from the index — the heredoc swallowed the rest of the file (got %v)", want, found)
+				}
+			}
+		})
+	}
+}
