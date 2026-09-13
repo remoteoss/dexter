@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- **Completion and hover for macro-generated functions** — Dexter now reads compiled BEAM exports and documentation to surface public functions and macros that do not exist in source. This includes generated functions and macros in application modules, entirely generated application modules such as Phoenix route helpers (including `alias ..., as: Routes`), Oban constructors hidden from generated documentation, exported introspection APIs such as `__schema__`, and generated dependency DSLs. Source indexing remains authoritative and compilation remains optional: stale BEAMs can contribute genuinely generated names, while an absent BEAM leaves the existing source-only behavior unchanged. Generated Spark/Ash DSL macros are resolved from persisted extension attributes and narrowed to the entity modules in scope at the cursor's nested block path. Both the OTP 24–27 and OTP 28+ atom-table layouts are supported
+
+### Fixed
+
+- **Bare calls jumped to private functions in other modules** — imported modules and the implicit Kernel fallback could claim a bare name using `defp`, `defmacrop`, or `defguardp`; in particular, Ash's `define` DSL call jumped to Kernel's private `define/4`. Cross-module bare-name resolution now uses a strict public-kind allowlist while same-module private functions and private helpers injected by `__using__` remain resolvable
+- **Use-injected overrides leaked unrelated references** — references requested from an explicit consumer override could expand through its `use` provider and include same-named calls from every other consumer. Explicit definitions now retain their source provenance, and multiple matching `use` declarations consistently give precedence to the later declaration across resolution, completion, and references
+- **Signature help exposed private cross-module functions** — bare imported names and the implicit Kernel fallback now use the same strict public-kind allowlist as definition, hover, and references. Private functions injected inline into the consumer module remain available there
+
 ## [0.7.2] - 2026-09-11
 
 ### Changed
