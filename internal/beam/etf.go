@@ -396,13 +396,16 @@ func (r *etfReader) skip() error {
 		}
 		return r.skipBytes(n - 4)
 	case tagExport:
+		// An external fun, `fun M:F/A`. Unlike NEW_FUN_EXT, whose Arity is a bare
+		// byte, this one encodes the arity as an integer term, so skipping a fixed
+		// byte would misalign every term that follows it.
 		if _, err := r.readAtom(); err != nil {
 			return err
 		}
 		if _, err := r.readAtom(); err != nil {
 			return err
 		}
-		return r.skipBytes(1) // arity is a raw byte, not a tagged term
+		return r.skip()
 	default:
 		return fmt.Errorf("%w: %d", errUnsupportedTag, tag)
 	}

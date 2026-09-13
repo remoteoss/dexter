@@ -487,6 +487,20 @@ type docEntry struct {
 	signature string
 	doc       string // "none", "hidden", or the documentation prose
 	defaults  int
+
+	// extraMetadata writes additional pairs into the entry's metadata map, the
+	// way a framework's `@doc spark_opts` lands alongside `defaults`.
+	extraMetadata      func(*etfTestWriter)
+	extraMetadataPairs int
+}
+
+// export emits an EXPORT_EXT term, the encoding of a captured remote function
+// such as &DateTime.utc_now/0.
+func (w *etfTestWriter) export(module, function string, arity int) {
+	w.byte(tagExport)
+	w.atom(module)
+	w.atom(function)
+	w.smallInt(arity)
 }
 
 // buildDocsTerm encodes a docs_v1 term, mirroring what the Elixir compiler
@@ -526,12 +540,17 @@ func buildDocsTerm(entries ...docEntry) []byte {
 			w.binary(entry.doc)
 		}
 
+		pairs := entry.extraMetadataPairs
 		if entry.defaults > 0 {
-			w.mapHeader(1)
+			pairs++
+		}
+		w.mapHeader(pairs)
+		if entry.defaults > 0 {
 			w.atom("defaults")
 			w.smallInt(entry.defaults)
-		} else {
-			w.mapHeader(0)
+		}
+		if entry.extraMetadata != nil {
+			entry.extraMetadata(&w)
 		}
 	}
 	w.nil()
@@ -600,4 +619,49 @@ func (w *etfTestWriter) be32(value uint32) {
 	var field [4]byte
 	binary.BigEndian.PutUint32(field[:], value)
 	w.buf = append(w.buf, field[:]...)
+}
+
+// Framework metadata can carry a captured remote function. Spark's
+// `@doc spark_opts` schemas hold option defaults such as `&DateTime.utc_now/0`,
+// which encode as EXPORT_EXT with the arity as an integer term. Skipping that
+// arity as a raw byte desynchronises the reader: the entry after it decodes as
+// garbage and the whole chunk is lost, so the module reports no generated
+// functions at all.
+func TestParseDocsMetadataWithCapturedFunction(t *testing.T) {
+	const prose = "Creates a worker."
+	beamPath := filepath.Join(t.TempDir(), "Elixir.Example.beam")
+	writeTestBEAM(t, beamPath, buildDocsTerm(
+		docEntry{
+			kind: "function", name: "create", arity: 1, signature: "create(attrs)", doc: prose,
+			extraMetadataPairs: 1,
+			extraMetadata: func(w *etfTestWriter) {
+				// spark_opts: [{1, [default: &DateTime.utc_now/0]}]
+				w.atom("spark_opts")
+				w.listHeader(1)
+				w.smallTuple(2)
+				w.smallInt(1)
+				w.listHeader(1)
+				w.smallTuple(2)
+				w.atom("default")
+				w.export("Elixir.DateTime", "utc_now", 0)
+				w.nil()
+				w.nil()
+			},
+		},
+		docEntry{kind: "function", name: "list", arity: 0, signature: "list()", doc: "Lists workers."},
+	))
+
+	got, err := ReadDocumentedFunctions(beamPath)
+	if err != nil {
+		t.Fatalf("ReadDocumentedFunctions: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected both entries, got %v", got)
+	}
+	if got[0].Name != "create" || got[0].Arity != 1 || got[0].DocLen != len(prose) {
+		t.Errorf("first entry = %+v, want create/1 with %d bytes of prose", got[0], len(prose))
+	}
+	if got[1].Name != "list" || got[1].Arity != 0 {
+		t.Errorf("entry after the captured function = %+v, want list/0", got[1])
+	}
 }
