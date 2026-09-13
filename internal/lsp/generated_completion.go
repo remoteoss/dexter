@@ -41,12 +41,45 @@ type generatedFunctionCacheEntry struct {
 	providers         []string
 	providersResolved bool
 
-	// docs memoizes rendered documentation for functions a hover has asked about,
-	// so sweeping the mouse does not re-inflate the Docs chunk each time. It lives
-	// on the entry, so it is invalidated when the BEAM changes.
-	docs map[string]string
+	// docs memoizes rendered documentation prose for functions a hover has asked
+	// about, so sweeping the mouse does not re-inflate the Docs chunk each time.
+	// It is a pointer because get hands out a copy of the entry: the copy has to
+	// share the memo with the cache instead of forking it. put replaces it with a
+	// new entry, which is what invalidates it when the BEAM changes.
+	docs *docMemo
 
 	retryAfter time.Time
+}
+
+// docMemo is the documentation cache of one generatedFunctionCacheEntry. Its own
+// lock guards the map because hovers run concurrently on copies of the entry,
+// outside the cache's mutex; an unguarded map there is a fatal concurrent map
+// write that kills the server rather than failing one request.
+type docMemo struct {
+	mu   sync.Mutex
+	body map[string]string
+}
+
+func (m *docMemo) get(key string) (string, bool) {
+	if m == nil {
+		return "", false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	body, ok := m.body[key]
+	return body, ok
+}
+
+func (m *docMemo) set(key, body string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.body == nil {
+		m.body = make(map[string]string)
+	}
+	m.body[key] = body
 }
 
 type generatedFunctionCache struct {
@@ -89,6 +122,12 @@ func (c *generatedFunctionCache) get(module string) (generatedFunctionCacheEntry
 func (c *generatedFunctionCache) put(module string, entry generatedFunctionCacheEntry) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if entry.docs == nil && entry.beamPath != "" {
+		// A freshly loaded entry gets a fresh memo, which is how the prose of an
+		// older BEAM is dropped; one written back from a copy keeps the memo it
+		// already shares with the cache. An entry with no BEAM never reads docs.
+		entry.docs = &docMemo{}
+	}
 	if element, ok := c.entries[module]; ok {
 		item := element.Value.(*generatedCacheItem)
 		item.entry = entry
@@ -450,7 +489,7 @@ func (s *Server) hoverFromGenerated(module, beamPath, functionName string) *prot
 	}
 
 	entry, _ := s.generatedCache.get(module)
-	doc := s.generatedFunctionDoc(module, &entry, functions, docIndex)
+	doc := generatedFunctionDoc(&entry, functions, docIndex)
 
 	content := formatHoverContent(doc, "", strings.Join(signatures, "\n"))
 	if content == "" {
@@ -498,24 +537,26 @@ func (s *Server) hoverFromGeneratedModules(module string, blockPath func() []str
 // generatedFunctionDoc returns the documentation prose for one generated
 // function, re-inflating the Docs chunk only on the first hover for it. docIndex
 // is -1 when no arity carried prose.
-func (s *Server) generatedFunctionDoc(module string, entry *generatedFunctionCacheEntry, functions []beam.Function, docIndex int) string {
+//
+// The memo is written through the pointer the entry shares with the cache instead
+// of put back with the whole entry. Concurrent hovers are then safe, and a hover
+// holding an entry that a newer BEAM has since replaced leaves the cache alone.
+func generatedFunctionDoc(entry *generatedFunctionCacheEntry, functions []beam.Function, docIndex int) string {
 	if docIndex < 0 || entry.beamPath == "" {
 		return ""
 	}
 	function := functions[docIndex]
 	key := funcKey(function.Name, function.Arity)
-	if body, cached := entry.docs[key]; cached {
+	if body, cached := entry.docs.get(key); cached {
 		return body
 	}
 	body := ""
 	if text, err := beam.ReadDocBody(entry.beamPath, function.DocOffset, function.DocLen); err == nil {
 		body = text
 	}
-	if entry.docs == nil {
-		entry.docs = make(map[string]string)
-	}
-	entry.docs[key] = body
-	s.generatedCache.put(module, *entry)
+	// A failed read is cached as empty too: this BEAM is not going to grow prose
+	// for this function, and re-reading it on every hover sweep is pure waste.
+	entry.docs.set(key, body)
 	return body
 }
 

@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -168,5 +169,69 @@ func TestDslProvidersInScopeSkipsTreeWalkWithoutExtensions(t *testing.T) {
 	}
 	if walked {
 		t.Error("the syntax tree must not be walked for a module with no DSL extensions")
+	}
+}
+
+// Spark names the module that holds a block's macros after the block path, which
+// language forms are not part of. A `for` or `if` inside a DSL section used to
+// stay on every suffix of the path, match nothing, and drop the section's entity
+// macros for the rest of its body.
+func TestDslScopeIgnoresLanguageFormsInsideBlocks(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	const extension = "Fake.Dsl"
+	writeTestModuleBEAM(t, server, extension, "deps/fake/lib/fake/dsl.ex", beamExport{"code_interface", 1})
+
+	// The entity and option modules are generated at compile time, so they have
+	// no source; only their BEAMs exist.
+	ebin := filepath.Join(server.projectRoot, "_build", "dev", "lib", "my_app", "ebin")
+	for _, module := range []string{
+		"Fake.Dsl.CodeInterface",
+		"Fake.Dsl.CodeInterface.Define",
+		"Fake.Dsl.CodeInterface.Define.Options",
+		"Fake.Dsl.CodeInterface.Options",
+		"Fake.Dsl.Attributes",
+		"Fake.Dsl.Attributes.Attribute",
+		"Fake.Dsl.Attributes.Attribute.Options",
+	} {
+		path := filepath.Join(ebin, "Elixir."+module+".beam")
+		if err := os.WriteFile(path, minimalBeam(), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bumpDirMtime(t, ebin)
+
+	tests := []struct {
+		name      string
+		blockPath []string
+		want      []string
+	}{
+		{"section body", []string{"defmodule", "code_interface"},
+			[]string{"Fake.Dsl.CodeInterface.Define", "Fake.Dsl.CodeInterface.Options"}},
+		{"language form inside a section body", []string{"defmodule", "code_interface", "for"},
+			[]string{"Fake.Dsl.CodeInterface.Define", "Fake.Dsl.CodeInterface.Options"}},
+		{"language form inside an entity body", []string{"defmodule", "attributes", "attribute", "if"},
+			[]string{"Fake.Dsl.Attributes.Attribute.Options"}},
+		{"language form between sections", []string{"defmodule", "case", "attributes"},
+			[]string{"Fake.Dsl.Attributes.Attribute"}},
+		{"entity body", []string{"defmodule", "code_interface", "define"},
+			[]string{"Fake.Dsl.CodeInterface.Define.Options"}},
+		{"module level", []string{"defmodule"}, nil},
+		{"no dsl blocks at all", []string{"defmodule", "def", "with"}, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var names []string
+			for _, provider := range server.dslScopeModules([]string{extension}, tt.blockPath) {
+				names = append(names, provider.module)
+				if provider.beamPath != filepath.Join(ebin, "Elixir."+provider.module+".beam") {
+					t.Errorf("provider %s has beam path %s", provider.module, provider.beamPath)
+				}
+			}
+			if strings.Join(names, ",") != strings.Join(tt.want, ",") {
+				t.Errorf("dslScopeModules(%v) = %v, want %v", tt.blockPath, names, tt.want)
+			}
+		})
 	}
 }

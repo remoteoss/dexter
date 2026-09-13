@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -255,5 +256,74 @@ end
 	items := completionAt(t, server, docURI, 3, uint32(len("  def run, do: Routes.gen")))
 	if !hasCompletionItem(items, "generated_path/2") {
 		t.Errorf("expected a function from the generated aliased module, got %#v", items)
+	}
+}
+
+// Hover requests are served concurrently and each one works on its own copy of
+// the module's cache entry. Those copies share a single documentation memo, so
+// writing it without a lock of its own is a concurrent map write: Go raises a
+// fatal error and takes the whole server down instead of failing one request.
+func TestHoverGeneratedDocsConcurrently(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	const module = "MyApp.Accounts.User"
+	const helpers = 32
+
+	exports := make([]beamExport, 0, helpers)
+	functions := make([]beam.Function, 0, helpers)
+	var payload strings.Builder
+	for i := range helpers {
+		name := fmt.Sprintf("generated_helper_%02d", i)
+		arity := i % 3
+		prose := fmt.Sprintf("Documentation for %s.", name)
+		exports = append(exports, beamExport{name, arity})
+		functions = append(functions, beam.Function{
+			Name:      name,
+			Arity:     arity,
+			Kind:      "def",
+			Params:    "attrs",
+			DocOffset: payload.Len(),
+			DocLen:    len(prose),
+		})
+		payload.WriteString(prose)
+	}
+
+	beamPath := filepath.Join(t.TempDir(), "Elixir."+module+".beam")
+	if err := os.WriteFile(beamPath, minimalBeamWithDocs(payload.String(), exports...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Seeding the cache stands in for the Docs walk that fills DocOffset and
+	// DocLen in the real path, and starts every round with a cold memo.
+	seed := func() {
+		server.generatedCache.put(module, generatedFunctionCacheEntry{
+			beamPath:  beamPath,
+			beamStamp: statFileStamp(beamPath),
+			functions: functions,
+		})
+	}
+
+	const readers = 8
+	for range 4 {
+		seed()
+		var start, done sync.WaitGroup
+		start.Add(1)
+		for range readers {
+			done.Add(1)
+			go func() {
+				defer done.Done()
+				start.Wait()
+				for _, function := range functions {
+					want := "Documentation for " + function.Name
+					hover := server.hoverFromGenerated(module, "", function.Name)
+					if hover == nil || !strings.Contains(hover.Contents.Value, want) {
+						t.Errorf("hover for %s lost %q", function.Name, want)
+						return
+					}
+				}
+			}()
+		}
+		start.Done()
+		done.Wait()
 	}
 }

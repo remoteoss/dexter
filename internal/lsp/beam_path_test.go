@@ -144,6 +144,13 @@ type beamExport struct {
 // table, which is all ReadExports needs. Atom lengths use the pre-OTP 28
 // one-byte form; the OTP 28+ varint form has its own test in internal/beam.
 func minimalBeam(exports ...beamExport) []byte {
+	return minimalBeamWithDocs("", exports...)
+}
+
+// minimalBeamWithDocs is minimalBeam plus a Docs chunk whose inflated payload is
+// docs. ReadDocBody inflates that payload and slices it, so a test can put one
+// function's prose at a known offset without encoding a real docs_v1 term.
+func minimalBeamWithDocs(docs string, exports ...beamExport) []byte {
 	names := make([]string, 0, len(exports)+1)
 	names = append(names, "Elixir.Minimal")
 	for _, export := range exports {
@@ -168,6 +175,9 @@ func minimalBeam(exports ...beamExport) []byte {
 	var chunks bytes.Buffer
 	writeBeamChunk(&chunks, "AtU8", atoms.Bytes())
 	writeBeamChunk(&chunks, "ExpT", table.Bytes())
+	if docs != "" {
+		writeBeamChunk(&chunks, "Docs", docsChunk(docs))
+	}
 
 	var file bytes.Buffer
 	file.WriteString("FOR1")
@@ -175,6 +185,14 @@ func minimalBeam(exports ...beamExport) []byte {
 	file.WriteString("BEAM")
 	file.Write(chunks.Bytes())
 	return file.Bytes()
+}
+
+// docsChunk wraps docs in the uncompressed ETF form, which inflateDocsTerm
+// returns verbatim, so a Function's DocOffset is a plain index into docs.
+func docsChunk(docs string) []byte {
+	chunk := make([]byte, 0, len(docs)+1)
+	chunk = append(chunk, 131) // ETF version byte; 80 would mean COMPRESSED
+	return append(chunk, docs...)
 }
 
 func writeBeamChunk(chunks *bytes.Buffer, name string, data []byte) {

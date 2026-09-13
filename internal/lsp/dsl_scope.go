@@ -77,7 +77,10 @@ func (s *Server) modulesUnder(dir, prefix string) []dslProvider {
 	if idx == nil {
 		return nil
 	}
-	start := sort.SearchStrings(idx.modules, prefix)
+	start := idx.firstWithPrefix(prefix)
+	if start < 0 {
+		return nil
+	}
 	var out []dslProvider
 	for i := start; i < len(idx.modules) && strings.HasPrefix(idx.modules[i], prefix); i++ {
 		name := idx.modules[i]
@@ -101,6 +104,17 @@ func (s *Server) ebinIndex(dir string) *ebinModuleIndex {
 	fresh := buildEbinModuleIndex(dir)
 	s.ebinIndexes.put(dir, fresh)
 	return fresh
+}
+
+// firstWithPrefix returns the index of the first module starting with prefix, or
+// -1 when the listing holds none. The listing is sorted, so this is one binary
+// search and no allocation — cheap enough to call per block segment per keystroke.
+func (i *ebinModuleIndex) firstWithPrefix(prefix string) int {
+	start := sort.SearchStrings(i.modules, prefix)
+	if start == len(i.modules) || !strings.HasPrefix(i.modules[start], prefix) {
+		return -1
+	}
+	return start
 }
 
 // valid reports whether the listing still describes dir. A directory's mtime
@@ -142,35 +156,58 @@ func buildEbinModuleIndex(dir string) *ebinModuleIndex {
 // candidate is confirmed against the compiled artifacts, so a framework that
 // names things differently simply yields nothing rather than wrong suggestions.
 //
-// Suffixes are tried longest first so that the innermost enclosing DSL block
-// wins, and so that language forms (defmodule, def, if) fall away on their own
-// instead of needing a skip list kept in step with the grammar.
+// Segments are consumed in order and a segment is kept only when it extends a
+// prefix that really has compiled modules under it. The innermost matched block
+// therefore wins, and language forms (defmodule, def, if, for) fall away wherever
+// they sit in the chain, because none of them derives to a module. A skip list
+// kept in step with the grammar would be both slower and wrong the day Elixir
+// grows a form.
 func (s *Server) dslScopeModules(extensions []string, blockPath []string) []dslProvider {
 	if len(extensions) == 0 || len(blockPath) == 0 {
 		return nil
 	}
-	for start := 0; start < len(blockPath); start++ {
-		suffix := blockPath[start:]
-		camelized := make([]string, len(suffix))
-		for i, segment := range suffix {
-			camelized[i] = camelize(segment)
+	var found []dslProvider
+	for _, extension := range extensions {
+		dir := s.ebinDirForExtension(extension)
+		if dir == "" {
+			continue
 		}
-		joined := strings.Join(camelized, ".")
-
-		var found []dslProvider
-		for _, extension := range extensions {
-			dir := s.ebinDirForExtension(extension)
-			if dir == "" {
-				continue
+		// Deepest first: that is the block the cursor is inside. Shallower prefixes
+		// are the fallback for a block whose own level carries no modules.
+		prefixes := s.dslPrefixesFor(dir, extension, blockPath)
+		for i := len(prefixes) - 1; i >= 0; i-- {
+			if candidates := s.modulesUnder(dir, prefixes[i]); len(candidates) > 0 {
+				found = append(found, candidates...)
+				break
 			}
-			found = append(found, s.modulesUnder(dir, extension+"."+joined+".")...)
-		}
-		if len(found) > 0 {
-			sort.Slice(found, func(i, j int) bool { return found[i].module < found[j].module })
-			return found
 		}
 	}
-	return nil
+	if len(found) == 0 {
+		return nil
+	}
+	sort.Slice(found, func(i, j int) bool { return found[i].module < found[j].module })
+	return found
+}
+
+// dslPrefixesFor derives the DSL module prefixes the enclosing block names
+// produce, shallowest first, confirming each one against the compiled listing so
+// a segment that names no module never becomes part of a later prefix.
+func (s *Server) dslPrefixesFor(dir, extension string, blockPath []string) []string {
+	idx := s.ebinIndex(dir)
+	if idx == nil {
+		return nil
+	}
+	var prefixes []string
+	prefix := extension + "."
+	for _, segment := range blockPath {
+		candidate := prefix + camelize(segment) + "."
+		if idx.firstWithPrefix(candidate) < 0 {
+			continue
+		}
+		prefixes = append(prefixes, candidate)
+		prefix = candidate
+	}
+	return prefixes
 }
 
 // dslProvidersInScope returns the modules whose generated macros are in scope at
