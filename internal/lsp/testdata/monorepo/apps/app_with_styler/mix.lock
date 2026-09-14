@@ -1,3 +1,0 @@
-%{
-  "styler": {:git, "https://github.com/remoteoss/elixir-styler", "463bcb55479826a03b22ef9d44a1754718082d67", []},
-}

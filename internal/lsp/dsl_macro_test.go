@@ -3,6 +3,7 @@ package lsp
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -10,63 +11,64 @@ import (
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
 
+	"github.com/remoteoss/dexter/internal/fixture"
 	"github.com/remoteoss/dexter/internal/parser"
 	"github.com/remoteoss/dexter/internal/store"
 )
 
 // ashFixture returns a server whose index holds the Ash fixture's resource, its
 // domain, and the two Spark extension modules that supply their DSL macros.
-// Those extension sources must be indexed for the extensions to resolve, which
-// mirrors a real project: Dexter indexes deps/ as well as lib/.
-func ashFixture(t *testing.T, files ...string) (*Server, string) {
+// ashFixture returns a server whose index holds the Ash fixture's resource, its
+// domain, and the Spark extension modules that supply their DSL macros.
+func ashFixture(t *testing.T) (*Server, string) {
 	t.Helper()
-	root := os.Getenv("DEXTER_ASH_FIXTURE")
-	if root == "" {
-		root = filepath.Join("testdata", "ash_generated_functions")
-		for _, required := range []string{
-			filepath.Join("_build", "dev", "lib", "ash", "ebin", "Elixir.Ash.Resource.Dsl.beam"),
-			filepath.Join("_build", "dev", "lib", "ash", "ebin", "Elixir.Ash.Resource.Dsl.CodeInterface.Define.beam"),
-		} {
-			if _, err := os.Stat(filepath.Join(root, required)); err != nil {
-				t.Skip("compile testdata/ash_generated_functions or set DEXTER_ASH_FIXTURE")
-			}
+	return ashFixtureWith(t,
+		fixture.Source(t, fixture.AppAshDSL, "lib/dexter_ash_beam_fixture/accounts/user.ex"),
+		fixture.Source(t, fixture.AppAshDSL, "lib/dexter_ash_beam_fixture/accounts.ex"),
+		fixture.DepSource(t, "ash", "lib/ash/resource/dsl.ex"),
+		fixture.DepSource(t, "ash", "lib/ash/domain/dsl.ex"),
+	)
+}
+
+// ashFixtureWith indexes exactly the given files. Paths come from fixture.Source or
+// fixture.DepSource, because the umbrella keeps scenario sources and dependency
+// sources in different directories and a bare relative path would be ambiguous.
+//
+// The extension sources have to be indexed for the extensions to resolve, which
+// mirrors a real project: Dexter indexes deps/ as well as lib/.
+func ashFixtureWith(t *testing.T, paths ...string) (*Server, string) {
+	t.Helper()
+	// The server is rooted at the umbrella, not at the scenario app: that is how a
+	// real umbrella or monorepo checkout is opened, and it is what lets the build
+	// root search reach the shared _build.
+	server := newFixtureServer(t)
+	for _, path := range paths {
+		defs, refs, err := parser.ParseFile(path)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		if err := server.store.IndexFileWithRefs(path, defs, refs); err != nil {
+			t.Fatal(err)
 		}
 	}
-	// The store keys rows by path and the LSP resolves URIs to absolute ones, so
-	// the fixture root has to be absolute too or nothing matches.
-	abs, err := filepath.Abs(root)
-	if err != nil {
-		t.Fatal(err)
-	}
+	return server, fixture.App(t, fixture.AppAshDSL)
+}
 
+// newFixtureServer returns a server over a throwaway store, rooted at the compiled
+// umbrella fixture.
+func newFixtureServer(t *testing.T) *Server {
+	t.Helper()
 	s, err := store.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	server := NewServer(s, abs)
+	server := NewServer(s, fixture.Root(t))
 	server.snippetSupport = true
-
-	defaults := []string{
-		"lib/dexter_ash_beam_fixture/accounts/user.ex",
-		"lib/dexter_ash_beam_fixture/accounts.ex",
-		"deps/ash/lib/ash/resource/dsl.ex",
-		"deps/ash/lib/ash/domain/dsl.ex",
+	if p, err := exec.LookPath("mix"); err == nil {
+		server.mixBin = p
 	}
-	if len(files) > 0 {
-		defaults = files
-	}
-	for _, rel := range defaults {
-		path := filepath.Join(abs, rel)
-		defs, refs, err := parser.ParseFile(path)
-		if err != nil {
-			t.Fatalf("parse %s: %v", rel, err)
-		}
-		if err := s.IndexFileWithRefs(path, defs, refs); err != nil {
-			t.Fatal(err)
-		}
-	}
-	return server, abs
+	return server
 }
 
 // openFixtureFile puts a fixture file in the document store and returns its URI
@@ -89,9 +91,9 @@ func openFixtureFile(t *testing.T, server *Server, root, rel string) (string, []
 // the use chain that injects them is itself generated code. The compiled module's
 // `extensions` attribute is the only record of which module provides them.
 func TestSparkDSLMacroCompletionAndHover(t *testing.T) {
-	server, root := ashFixture(t,
-		"lib/dexter_ash_beam_fixture/accounts.ex",
-		"deps/ash/lib/ash/domain/dsl.ex",
+	server, root := ashFixtureWith(t,
+		fixture.Source(t, fixture.AppAshDSL, "lib/dexter_ash_beam_fixture/accounts.ex"),
+		fixture.DepSource(t, "ash", "lib/ash/domain/dsl.ex"),
 	)
 	domainURI, _ := openFixtureFile(t, server, root, "lib/dexter_ash_beam_fixture/accounts.ex")
 
@@ -239,7 +241,7 @@ func TestDslScopeResolvesInnermostBlock(t *testing.T) {
 // Hovering a generated code-interface function must render the documentation
 // prose recorded in the BEAM, which is what the doc offsets exist for.
 func TestHoverGeneratedFunctionDocs(t *testing.T) {
-	server, _ := ashFixture(t, "lib/dexter_ash_beam_fixture/accounts/user.ex")
+	server, _ := ashFixtureWith(t, fixture.Source(t, fixture.AppAshDSL, "lib/dexter_ash_beam_fixture/accounts/user.ex"))
 
 	// Ash generates get_by_id/1..3 with documentation; the source has no such def.
 	hover := server.hoverFromGenerated("DexterAshBeamFixture.Accounts.User", "", "get_by_id")

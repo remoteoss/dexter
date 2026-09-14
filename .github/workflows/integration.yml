@@ -1,0 +1,73 @@
+name: Integration
+
+# Compiles the single integration fixture (one Mix umbrella, one lock, one
+# _build shared by every scenario) and runs the whole suite against it. Called
+# twice: pinned to the toolchain we support, and on a schedule against the newest
+# stable one so a BEAM format change surfaces before it reaches users.
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: Elixir container image to compile and test against
+        required: true
+        type: string
+      cache-suffix:
+        description: Keeps build artifacts from one toolchain out of another's cache
+        required: true
+        type: string
+
+env:
+  CGO_ENABLED: "1"
+  # A fixture that did not compile must fail here rather than skip, which is how
+  # the Ash scenario's coverage silently disappeared before.
+  DEXTER_REQUIRE_FIXTURE: "1"
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    container: ${{ inputs.image }}
+    env:
+      GOMODCACHE: ${{ github.workspace }}/.gomod
+      MIX_HOME: ${{ github.workspace }}/.mix
+      HEX_HOME: ${{ github.workspace }}/.hex
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: .go/
+          key: go-install-${{ hashFiles('go.sum') }}
+          restore-keys: go-install-
+      - uses: actions/cache@v5
+        with:
+          path: .gomod/
+          key: go-mod-integration-${{ hashFiles('go.sum') }}
+          restore-keys: go-mod-integration-
+      - uses: actions/cache@v5
+        with:
+          path: |
+            .mix/
+            .hex/
+            internal/lsp/testdata/integration/deps/
+            internal/lsp/testdata/integration/_build/
+          key: elixir-fixture-${{ inputs.cache-suffix }}-${{ hashFiles('internal/lsp/testdata/integration/mix.lock') }}
+          restore-keys: elixir-fixture-${{ inputs.cache-suffix }}-
+      - name: Install Go
+        run: |
+          if [ ! -f .go/bin/go ]; then
+            mkdir -p .go
+            curl -fsSL https://go.dev/dl/go1.26.1.linux-amd64.tar.gz | tar -C .go --strip-components=1 -xz
+          fi
+          echo "$GITHUB_WORKSPACE/.go/bin" >> "$GITHUB_PATH"
+      # A cold compile of the whole umbrella measures ~30s; with _build restored
+      # from cache this step is a no-op.
+      - name: Compile the integration fixture
+        run: |
+          mix local.hex --force && mix local.rebar --force
+          cd internal/lsp/testdata/integration
+          mix deps.get
+          mix compile
+      # The whole suite runs rather than a -run filter: this is the only job with
+      # Elixir on PATH, so it is where the fixture-backed tests actually execute,
+      # and a hand-maintained filter silently stops covering new tests.
+      - name: Run the test suite
+        run: go test ./... -timeout 900s
