@@ -1,10 +1,11 @@
 package beam
 
 import (
-	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
+
+	"github.com/remoteoss/dexter/internal/fixture"
 )
 
 func TestReadModuleAttributes(t *testing.T) {
@@ -150,10 +151,7 @@ func buildAttrTerm(fixtures ...attrFixture) []byte {
 }
 
 func TestReadModuleAttributesFromAshFixture(t *testing.T) {
-	path := os.Getenv("DEXTER_ASH_BEAM")
-	if path == "" {
-		t.Skip("set DEXTER_ASH_BEAM to run against a compiled Ash resource")
-	}
+	path := fixture.Beam(t, fixture.AppAshDSL, "DexterAshBeamFixture.Accounts.User")
 	attrs, err := ReadModuleAttributes(path)
 	if err != nil {
 		t.Fatal(err)

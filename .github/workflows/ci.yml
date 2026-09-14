@@ -4,6 +4,12 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Weekly run of the same integration job against the newest stable Elixir and
+  # OTP. The BEAM readers decode whatever the current toolchain produces, so a
+  # format change has to be caught by a schedule rather than by a user report.
+  # Scheduled only: no pull request waits on a toolchain nobody has installed.
+  schedule:
+    - cron: "24 3 * * 1"
 
 permissions:
   contents: read
@@ -31,54 +37,18 @@ jobs:
       - run: go test -race ./...
 
   test-integration:
-    runs-on: ubuntu-latest
-    container: elixir:1.20.4-otp-29
-    env:
-      GOMODCACHE: ${{ github.workspace }}/.gomod
-      MIX_HOME: ${{ github.workspace }}/.mix
-      HEX_HOME: ${{ github.workspace }}/.hex
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/cache@v5
-        with:
-          path: .go/
-          key: go-install-${{ hashFiles('go.sum') }}
-          restore-keys: go-install-
-      - uses: actions/cache@v5
-        with:
-          path: .gomod/
-          key: go-mod-integration-${{ hashFiles('go.sum') }}
-          restore-keys: go-mod-integration-
-      - uses: actions/cache@v5
-        with:
-          path: |
-            .mix/
-            .hex/
-            internal/lsp/testdata/monorepo/apps/app_with_styler/deps/
-            internal/lsp/testdata/monorepo/apps/app_with_styler/_build/
-            internal/lsp/testdata/monorepo/apps/app_with_ecto_migration/deps/
-            internal/lsp/testdata/monorepo/apps/app_with_ecto_migration/_build/
-          key: elixir-deps-${{ hashFiles('internal/lsp/testdata/monorepo/apps/app_with_styler/mix.lock', 'internal/lsp/testdata/monorepo/apps/app_with_ecto_migration/mix.lock') }}
-          restore-keys: elixir-deps-
-      - name: Install Go
-        run: |
-          if [ ! -f .go/bin/go ]; then
-            mkdir -p .go
-            curl -fsSL https://go.dev/dl/go1.26.1.linux-amd64.tar.gz | tar -C .go --strip-components=1 -xz
-          fi
-          echo "$GITHUB_WORKSPACE/.go/bin" >> "$GITHUB_PATH"
-      - name: Install Elixir dependencies
-        run: |
-          mix local.hex --force && mix local.rebar --force
-          cd internal/lsp/testdata/monorepo/apps/app_with_styler && mix deps.get && mix deps.compile && cd -
-          cd internal/lsp/testdata/monorepo/apps/app_with_ecto_migration && mix deps.get && mix deps.compile && cd -
-          cd internal/lsp/testdata/monorepo/apps/app_basic && mix deps.get && cd -
-      # Every formatter test and the generated-BEAM completion test need mix on
-      # PATH and skip themselves without it, so this job is the only place they
-      # run — the test/test-race jobs have no Elixir. Match the formatter family
-      # and explicitly include the self-contained BEAM regression fixture.
-      - name: Run integration tests
-        run: go test ./internal/lsp/ -run 'TestFormatter|TestDidSave_Formatter|TestCompletion_GeneratedFunctionsFromConsumerBEAM' -v -timeout 600s
+    if: github.event_name != 'schedule'
+    uses: ./.github/workflows/integration.yml
+    with:
+      image: elixir:1.20.4-otp-29
+      cache-suffix: otp-29
+
+  integration-next:
+    if: github.event_name == 'schedule'
+    uses: ./.github/workflows/integration.yml
+    with:
+      image: elixir:latest
+      cache-suffix: latest
 
   lint:
     runs-on: ubuntu-latest

@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/remoteoss/dexter/internal/fixture"
 )
 
 func TestReadDocumentedFunctions(t *testing.T) {
@@ -235,11 +237,11 @@ func TestReadExportsLongAtomTable(t *testing.T) {
 	}
 }
 
+// The fixture's Ash resource is the real-artifact check for the Docs walk: Ash
+// generates its code interface with default arguments, hidden internals and
+// documentation prose that only a compiled BEAM contains.
 func TestReadDocumentedFunctionsFromAshFixture(t *testing.T) {
-	path := os.Getenv("DEXTER_ASH_BEAM")
-	if path == "" {
-		t.Skip("set DEXTER_ASH_BEAM to run against a compiled Ash resource")
-	}
+	path := fixture.Beam(t, fixture.AppAshDSL, "DexterAshBeamFixture.Accounts.User")
 	functions, err := ReadDocumentedFunctions(path)
 	if err != nil {
 		t.Fatal(err)
@@ -267,10 +269,7 @@ func TestReadDocumentedFunctionsFromAshFixture(t *testing.T) {
 }
 
 func BenchmarkReadDocumentedFunctionsFromAshFixture(b *testing.B) {
-	path := os.Getenv("DEXTER_ASH_BEAM")
-	if path == "" {
-		b.Skip("set DEXTER_ASH_BEAM to benchmark a compiled Ash resource")
-	}
+	path := fixture.Beam(b, fixture.AppAshDSL, "DexterAshBeamFixture.Accounts.User")
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {

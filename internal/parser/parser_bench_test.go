@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/remoteoss/dexter/internal/fixture"
 )
 
 var benchFiles []struct {
@@ -16,13 +18,18 @@ func loadBenchFiles(b *testing.B) {
 	if benchFiles != nil {
 		return
 	}
-	testdata := filepath.Join("..", "lsp", "testdata", "monorepo", "apps", "app_with_ecto_migration", "deps")
+	// The integration fixture's shared deps are the corpus: real dependency
+	// sources, macro-heavy and hand-written alike. Missing files are skipped, so
+	// the benchmark degrades instead of failing when a dep is not fetched.
 	candidates := []string{
-		filepath.Join(testdata, "ecto", "lib", "ecto", "changeset.ex"),
-		filepath.Join(testdata, "db_connection", "lib", "db_connection.ex"),
-		filepath.Join(testdata, "ecto", "lib", "ecto", "repo.ex"),
-		filepath.Join(testdata, "ecto", "lib", "ecto", "query.ex"),
-		filepath.Join(testdata, "ecto_sql", "lib", "ecto", "adapters", "sql.ex"),
+		fixture.DepSource(b, "ecto", "lib/ecto/changeset.ex"),
+		fixture.DepSource(b, "db_connection", "lib/db_connection.ex"),
+		fixture.DepSource(b, "ecto", "lib/ecto/repo.ex"),
+		fixture.DepSource(b, "ecto", "lib/ecto/query.ex"),
+		fixture.DepSource(b, "ecto_sql", "lib/ecto/adapters/sql.ex"),
+		fixture.DepSource(b, "ash", "lib/ash/resource.ex"),
+		fixture.DepSource(b, "phoenix", "lib/phoenix/router.ex"),
+		fixture.DepSource(b, "reactor", "lib/reactor.ex"),
 	}
 	for _, path := range candidates {
 		data, err := os.ReadFile(path)

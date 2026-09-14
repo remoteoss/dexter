@@ -13,6 +13,7 @@ import (
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
 
+	"github.com/remoteoss/dexter/internal/fixture"
 	"github.com/remoteoss/dexter/internal/parser"
 	"github.com/remoteoss/dexter/internal/stdlib"
 	"github.com/remoteoss/dexter/internal/store"
@@ -460,37 +461,27 @@ end
 	}
 }
 
+// The Ash scenario is the compiled-artifact check for generated functions: the
+// code interface's create/get_by_id/list arities exist only in the BEAM, and the
+// source index holds the resource's file. Both have to be true at once for the
+// delta to be exactly the generated set.
 func TestCompletion_AshGeneratedFunctionsIntegration(t *testing.T) {
-	root := os.Getenv("DEXTER_ASH_FIXTURE")
-	if root == "" {
-		root = filepath.Join("testdata", "ash_generated_functions")
-		beamPath := filepath.Join(root, "_build", "dev", "lib", "dexter_ash_beam_fixture",
-			"ebin", "Elixir.DexterAshBeamFixture.Accounts.User.beam")
-		if _, err := os.Stat(beamPath); err != nil {
-			t.Skip("compile testdata/ash_generated_functions or set DEXTER_ASH_FIXTURE")
-		}
+	if _, err := exec.LookPath("mix"); err != nil {
+		t.Skip("mix not available")
 	}
+	server := newFixtureServer(t)
 
-	storeDir := t.TempDir()
-	s, err := store.Open(storeDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = s.Close() }()
-	server := NewServer(s, root)
-	server.snippetSupport = true
-
-	resourcePath := filepath.Join(root, "lib", "dexter_ash_beam_fixture", "accounts", "user.ex")
+	resourcePath := fixture.Source(t, fixture.AppAshDSL, "lib/dexter_ash_beam_fixture/accounts/user.ex")
 	defs, refs, err := parser.ParseFile(resourcePath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.IndexFileWithRefs(resourcePath, defs, refs); err != nil {
+	if err := server.store.IndexFileWithRefs(resourcePath, defs, refs); err != nil {
 		t.Fatal(err)
 	}
 
 	caller := "DexterAshBeamFixture.Accounts.User."
-	callerURI := string(uri.File(filepath.Join(root, "lib", "completion_probe.ex")))
+	callerURI := string(uri.File(fixture.Source(t, fixture.AppAshDSL, "lib/completion_probe.ex")))
 	server.docs.Set(callerURI, caller)
 	items := completionAt(t, server, callerURI, 0, uint32(len(caller)))
 	for _, label := range []string{"create!/1", "create!/4", "get_by_id/1", "list!/0"} {
@@ -500,24 +491,27 @@ func TestCompletion_AshGeneratedFunctionsIntegration(t *testing.T) {
 	}
 }
 
-func BenchmarkGeneratedFunctionsForModuleCached(b *testing.B) {
-	root := os.Getenv("DEXTER_ASH_FIXTURE")
-	if root == "" {
-		b.Skip("set DEXTER_ASH_FIXTURE to a compiled Ash fixture app")
-	}
-
+// fixtureServerForBench is newFixtureServer for a benchmark: the fixture skips
+// itself when it has not been compiled, so a benchmark run without Elixir stays
+// usable.
+func fixtureServerForBench(b *testing.B) *Server {
+	b.Helper()
 	s, err := store.Open(b.TempDir())
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer func() { _ = s.Close() }()
-	server := NewServer(s, root)
-	resourcePath := filepath.Join(root, "lib", "dexter_ash_beam_fixture", "accounts", "user.ex")
+	b.Cleanup(func() { _ = s.Close() })
+	return NewServer(s, fixture.Root(b))
+}
+
+func BenchmarkGeneratedFunctionsForModuleCached(b *testing.B) {
+	server := fixtureServerForBench(b)
+	resourcePath := fixture.Source(b, fixture.AppAshDSL, "lib/dexter_ash_beam_fixture/accounts/user.ex")
 	defs, refs, err := parser.ParseFile(resourcePath)
 	if err != nil {
 		b.Fatal(err)
 	}
-	if err := s.IndexFileWithRefs(resourcePath, defs, refs); err != nil {
+	if err := server.store.IndexFileWithRefs(resourcePath, defs, refs); err != nil {
 		b.Fatal(err)
 	}
 	if functions := server.generatedFunctionsForModule("DexterAshBeamFixture.Accounts.User"); len(functions) == 0 {

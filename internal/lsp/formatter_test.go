@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -17,36 +16,9 @@ import (
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
 
+	"github.com/remoteoss/dexter/internal/fixture"
 	"github.com/remoteoss/dexter/internal/store"
 )
-
-func fixtureMonorepoPath(t *testing.T) string {
-	t.Helper()
-	_, file, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("could not determine test file path")
-	}
-	return filepath.Join(filepath.Dir(file), "testdata", "monorepo")
-}
-
-func ensureFixtureDeps(t *testing.T, mixRoot string) {
-	t.Helper()
-	buildDir := filepath.Join(mixRoot, "_build")
-	if _, err := os.Stat(buildDir); err == nil {
-		return
-	}
-	t.Logf("compiling fixture deps in %s (first run only)", mixRoot)
-	cmd := exec.Command("mix", "deps.get")
-	cmd.Dir = mixRoot
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Skipf("could not fetch deps for fixture %s: %v\n%s", mixRoot, err, out)
-	}
-	cmd = exec.Command("mix", "deps.compile")
-	cmd.Dir = mixRoot
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Skipf("could not compile deps for fixture %s: %v\n%s", mixRoot, err, out)
-	}
-}
 
 func createHEEXFormatterFixture(t *testing.T) string {
 	t.Helper()
@@ -116,14 +88,17 @@ end
 	return mixRoot
 }
 
-func setupTestServerForFixture(t *testing.T, mixRoot string) (*Server, func()) {
+// setupTestServerForFixture serves the umbrella fixture root, the way a real
+// umbrella or monorepo checkout is opened: the index and the build-root search
+// both start above the child applications.
+func setupTestServerForFixture(t *testing.T) (*Server, func()) {
 	t.Helper()
 	dir := t.TempDir()
 	s, err := store.Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := NewServer(s, filepath.Dir(filepath.Dir(mixRoot)))
+	server := NewServer(s, fixture.Root(t))
 	if p, err := exec.LookPath("mix"); err == nil {
 		server.mixBin = p
 	}
@@ -201,11 +176,8 @@ func TestFormatterServer_WithStylerPlugin(t *testing.T) {
 		t.Skip("mix not available in PATH")
 	}
 
-	monorepo := fixtureMonorepoPath(t)
-	mixRoot := filepath.Join(monorepo, "apps", "app_with_styler")
-	ensureFixtureDeps(t, mixRoot)
-
-	server, cleanup := setupTestServerForFixture(t, mixRoot)
+	mixRoot := fixture.App(t, fixture.AppStyler)
+	server, cleanup := setupTestServerForFixture(t)
 	defer cleanup()
 
 	unformatted := "defmodule Test do\n  def hello(x) do\n    x |> to_string()\n  end\nend\n"
@@ -518,11 +490,8 @@ func TestFormatterServer_BasicProject(t *testing.T) {
 		t.Skip("mix not available in PATH")
 	}
 
-	monorepo := fixtureMonorepoPath(t)
-	mixRoot := filepath.Join(monorepo, "apps", "app_basic")
-	ensureFixtureDeps(t, mixRoot)
-
-	server, cleanup := setupTestServerForFixture(t, mixRoot)
+	mixRoot := fixture.App(t, fixture.AppBasic)
+	server, cleanup := setupTestServerForFixture(t)
 	defer cleanup()
 
 	unformatted := "defmodule Test do\n  def hello(x) do\n    x |> to_string()\n  end\nend\n"
@@ -548,11 +517,8 @@ func TestFormatterServer_BadIndentation(t *testing.T) {
 		t.Skip("mix not available in PATH")
 	}
 
-	monorepo := fixtureMonorepoPath(t)
-	mixRoot := filepath.Join(monorepo, "apps", "app_basic")
-	ensureFixtureDeps(t, mixRoot)
-
-	server, cleanup := setupTestServerForFixture(t, mixRoot)
+	mixRoot := fixture.App(t, fixture.AppBasic)
+	server, cleanup := setupTestServerForFixture(t)
 	defer cleanup()
 
 	unformatted := "defmodule   Test   do\ndef   hello(   ), do:    :world\nend\n"
@@ -579,13 +545,9 @@ func TestFormatterServer_DifferentProjectsDifferentResults(t *testing.T) {
 		t.Skip("mix not available in PATH")
 	}
 
-	monorepo := fixtureMonorepoPath(t)
-	stylerRoot := filepath.Join(monorepo, "apps", "app_with_styler")
-	basicRoot := filepath.Join(monorepo, "apps", "app_basic")
-	ensureFixtureDeps(t, stylerRoot)
-	ensureFixtureDeps(t, basicRoot)
-
-	server, cleanup := setupTestServerForFixture(t, stylerRoot)
+	stylerRoot := fixture.App(t, fixture.AppStyler)
+	basicRoot := fixture.App(t, fixture.AppBasic)
+	server, cleanup := setupTestServerForFixture(t)
 	defer cleanup()
 
 	input := "defmodule Test do\n  def hello(x) do\n    x |> to_string()\n  end\nend\n"
@@ -641,11 +603,8 @@ func TestFormatterServer_MigrationDSL(t *testing.T) {
 		t.Skip("mix not available in PATH")
 	}
 
-	monorepo := fixtureMonorepoPath(t)
-	mixRoot := filepath.Join(monorepo, "apps", "app_with_ecto_migration")
-	ensureFixtureDeps(t, mixRoot)
-
-	server, cleanup := setupTestServerForFixture(t, mixRoot)
+	mixRoot := fixture.App(t, fixture.AppEctoMigration)
+	server, cleanup := setupTestServerForFixture(t)
 	defer cleanup()
 
 	// Migration DSL functions (add, create) are in locals_without_parens via
@@ -688,64 +647,30 @@ end
 	}
 }
 
-func TestFormatterServer_UmbrellaStylerPlugin(t *testing.T) {
+// The umbrella fixture is the real shape: _build only at the root, with the child
+// app carrying its own .formatter.exs. Build-root resolution has to climb from a
+// child's lib directory up to that root for the sidecar to load the compiled
+// Styler plugin, while the formatter config stays the child's own. This used to be
+// faked with a symlinked _build and a hand-written child app.
+func TestFormatterServer_UmbrellaChildApp(t *testing.T) {
 	if _, err := exec.LookPath("mix"); err != nil {
 		t.Skip("mix not available in PATH")
 	}
 
-	// Ensure the Styler fixture is compiled so we have beam files to reuse
-	monorepo := fixtureMonorepoPath(t)
-	stylerFixture := filepath.Join(monorepo, "apps", "app_with_styler")
-	ensureFixtureDeps(t, stylerFixture)
+	root := fixture.Root(t)
+	stylerApp := fixture.App(t, fixture.AppStyler)
+	server, cleanup := setupTestServerForFixture(t)
+	defer cleanup()
 
-	// Create an umbrella-like temp directory where _build is only at the
-	// root, not in the child app — this is how real umbrella apps work.
-	umbrellaRoot := t.TempDir()
-	childApp := filepath.Join(umbrellaRoot, "apps", "child_app")
-	if err := os.MkdirAll(filepath.Join(childApp, "lib"), 0755); err != nil {
-		t.Fatal(err)
+	if got := server.findBuildRoot(filepath.Join(stylerApp, "lib")); got != root {
+		t.Errorf("findBuildRoot from an umbrella child = %s, want the umbrella root %s", got, root)
 	}
-
-	// Symlink _build from the existing fixture to the umbrella root
-	if err := os.Symlink(
-		filepath.Join(stylerFixture, "_build"),
-		filepath.Join(umbrellaRoot, "_build"),
-	); err != nil {
-		t.Fatal(err)
-	}
-
-	// Write a minimal mix.exs so findMixRoot stops at the child app
-	if err := os.WriteFile(
-		filepath.Join(childApp, "mix.exs"),
-		[]byte("defmodule ChildApp.MixProject do\n  use Mix.Project\n  def project, do: [app: :child_app, version: \"0.1.0\"]\nend\n"),
-		0644,
-	); err != nil {
-		t.Fatal(err)
-	}
-
-	// Write .formatter.exs with Styler plugin
-	if err := os.WriteFile(
-		filepath.Join(childApp, ".formatter.exs"),
-		[]byte("[plugins: [Styler], inputs: [\"{lib,test}/**/*.{ex,exs}\"]]\n"),
-		0644,
-	); err != nil {
-		t.Fatal(err)
-	}
-
-	// Set up server with the umbrella root as projectRoot
-	storeDir := t.TempDir()
-	s, err := store.Open(storeDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = s.Close() }()
-	server := NewServer(s, umbrellaRoot)
-	if p, err := exec.LookPath("mix"); err == nil {
-		server.mixBin = p
+	filePath := filepath.Join(stylerApp, "lib", "test.ex")
+	if got, want := findFormatterConfig(filePath, root), filepath.Join(stylerApp, ".formatter.exs"); got != want {
+		t.Errorf("formatter config = %s, want the child app's own %s", got, want)
 	}
 
 	unformatted := "defmodule Test do\n  def hello(x) do\n    x |> to_string()\n  end\nend\n"
-	filePath := filepath.Join(childApp, "lib", "test.ex")
 	docURI := string(uri.File(filePath))
 	server.docs.Set(docURI, unformatted)
 
@@ -756,7 +681,7 @@ func TestFormatterServer_UmbrellaStylerPlugin(t *testing.T) {
 		t.Fatal(err)
 	}
 	if edits == nil {
-		t.Fatal("expected formatting edits from Styler in umbrella child app, got nil")
+		t.Fatal("expected formatting edits from Styler in an umbrella child app, got nil")
 	}
 	if !strings.Contains(edits[0].NewText, "to_string(x)") {
 		t.Errorf("expected Styler to rewrite pipe in umbrella child app, got:\n%s", edits[0].NewText)
