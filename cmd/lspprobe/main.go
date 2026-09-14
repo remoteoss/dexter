@@ -13,6 +13,7 @@
 //	lspprobe -root ~/code/my_app lib/my_app/accounts.ex:42:9
 //	lspprobe -root ~/code/my_app 'lib/my_app/accounts.ex#get_user'
 //	lspprobe -root ~/code/my_app -method references -json probes.txt
+//	lspprobe -root ~/code/my_app -method completion -v lib/my_app/router.ex:24:18
 //
 // Compare two builds on the same project:
 //
@@ -42,20 +43,21 @@ type probe struct {
 }
 
 type result struct {
-	Probe      string   `json:"probe"`
-	References []string `json:"references,omitempty"`
-	RefCount   int      `json:"reference_count"`
-	Definition []string `json:"definition,omitempty"`
-	Hover      string   `json:"hover,omitempty"`
-	Error      string   `json:"error,omitempty"`
-	ElapsedMS  int64    `json:"elapsed_ms,omitempty"`
+	Probe       string   `json:"probe"`
+	References  []string `json:"references,omitempty"`
+	RefCount    int      `json:"reference_count"`
+	Definition  []string `json:"definition,omitempty"`
+	Hover       string   `json:"hover,omitempty"`
+	Completions []string `json:"completions,omitempty"`
+	Error       string   `json:"error,omitempty"`
+	ElapsedMS   int64    `json:"elapsed_ms,omitempty"`
 }
 
 func main() {
 	var (
 		binary  = flag.String("binary", "dexter", "dexter binary to drive")
 		root    = flag.String("root", ".", "project root the server indexes")
-		method  = flag.String("method", "all", "references, definition, hover, or all")
+		method  = flag.String("method", "all", "references, definition, hover, completion, or all")
 		asJSON  = flag.Bool("json", false, "emit JSON (stable ordering, for diffing two builds)")
 		counts  = flag.Bool("counts", false, "print only how many locations each probe returned")
 		timeout = flag.Duration("timeout", 60*time.Second, "per-request timeout")
@@ -131,12 +133,22 @@ func main() {
 				r.Hover = text
 			}
 		}
+		if want("completion") && r.Error == "" {
+			items, err := client.Completion(p.Path, p.Line, p.Column)
+			if err != nil {
+				r.Error = err.Error()
+			} else {
+				for _, item := range items {
+					r.Completions = append(r.Completions, item.Label)
+				}
+			}
+		}
 		r.ElapsedMS = time.Since(start).Milliseconds()
 
 		// Counts mode keeps output small enough to diff across thousands of
 		// probes; the full location lists can run to tens of thousands of lines.
 		if *counts {
-			r.References, r.Definition, r.Hover = nil, nil, ""
+			r.References, r.Definition, r.Hover, r.Completions = nil, nil, "", nil
 		}
 		results = append(results, r)
 	}
@@ -173,6 +185,12 @@ func main() {
 		}
 		if want("hover") && r.Hover != "" {
 			fmt.Printf("  hover: %s\n", strings.ReplaceAll(strings.TrimSpace(r.Hover), "\n", "\n         "))
+		}
+		if want("completion") {
+			fmt.Printf("  completions: %d\n", len(r.Completions))
+			for _, label := range capped(r.Completions) {
+				fmt.Printf("    %s\n", label)
+			}
 		}
 	}
 }

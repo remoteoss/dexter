@@ -947,6 +947,46 @@ func (s *Store) ListModuleFunctions(module string, publicOnly bool) ([]Completio
 	return results, rows.Err()
 }
 
+// FunctionKey identifies a function by name and arity.
+type FunctionKey struct {
+	Name  string
+	Arity int
+}
+
+// ModuleFunctionKeys returns every public function, macro, guard, delegate and
+// type the index knows for a module.
+//
+// It is the unbounded counterpart to ListModuleFunctions, which caps at 100 rows
+// and joins in file paths and params because it feeds completion. Anything
+// diffing the index against another source of truth must use this instead: a
+// truncated set makes the rows past the cap look unindexed, and whatever is
+// derived from that is wrong. The predicate matches ListModuleFunctions with
+// publicOnly so the two agree on what counts as public.
+//
+// Only the two columns needed are selected and no join is performed, so despite
+// being unbounded this is cheaper than the completion query. It is covered by
+// idx_definitions_module_function.
+func (s *Store) ModuleFunctionKeys(module string) ([]FunctionKey, error) {
+	rows, err := s.db.Query(
+		"SELECT DISTINCT function, arity FROM definitions WHERE module = ? AND function != '' AND kind IN ('def', 'defmacro', 'defguard', 'defdelegate', 'type', 'opaque')",
+		module,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var keys []FunctionKey
+	for rows.Next() {
+		var key FunctionKey
+		if err := rows.Scan(&key.Name, &key.Arity); err != nil {
+			return nil, err
+		}
+		keys = append(keys, key)
+	}
+	return keys, rows.Err()
+}
+
 type LookupResult struct {
 	Module     string // populated by bulk queries; empty for single-module lookups
 	FilePath   string
@@ -1019,6 +1059,16 @@ func (s *Store) LookupFunctionInFile(filePath, function string, nearLine int) (s
 func (s *Store) LookupFunction(module, function string) ([]LookupResult, error) {
 	return s.queryLookup(
 		"SELECT f.path, d.line, d.kind, d.arity, d.delegate_to, d.delegate_as FROM definitions d JOIN files f ON f.id = d.file_id WHERE d.module = ? AND d.function = ? AND d.kind NOT IN ('module', 'defprotocol', 'defimpl', 'callback', 'macrocallback') ORDER BY CASE WHEN d.kind IN ('type', 'opaque') THEN 1 ELSE 0 END, d.line",
+		module, function,
+	)
+}
+
+// LookupPublicFunction returns callable definitions that can be referenced
+// outside module. Keep this as an allowlist: a newly indexed private kind must
+// not silently become visible through imports, use chains, or Kernel fallback.
+func (s *Store) LookupPublicFunction(module, function string) ([]LookupResult, error) {
+	return s.queryLookup(
+		"SELECT f.path, d.line, d.kind, d.arity, d.delegate_to, d.delegate_as FROM definitions d JOIN files f ON f.id = d.file_id WHERE d.module = ? AND d.function = ? AND d.kind IN ('def', 'defmacro', 'defguard', 'defdelegate', 'type', 'opaque') ORDER BY CASE WHEN d.kind IN ('type', 'opaque') THEN 1 ELSE 0 END, d.line",
 		module, function,
 	)
 }
