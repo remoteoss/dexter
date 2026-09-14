@@ -147,10 +147,27 @@ func minimalBeam(exports ...beamExport) []byte {
 	return minimalBeamWithDocs("", exports...)
 }
 
+// testAttr is one attribute persisted in a synthetic Attr chunk.
+type testAttr struct {
+	name   string
+	values []string // encoded as atoms, as the compiler persists module names
+}
+
+// minimalBeamWithAttrs adds an Attr chunk to minimalBeamWithDocs. It is how a test
+// makes a compiled module record facts its source does not state, which is the
+// only way a framework's macro provider can be discovered.
+func minimalBeamWithAttrs(attrs []testAttr, docs string, exports ...beamExport) []byte {
+	return buildTestBeam(attrs, docs, exports...)
+}
+
 // minimalBeamWithDocs is minimalBeam plus a Docs chunk whose inflated payload is
 // docs. ReadDocBody inflates that payload and slices it, so a test can put one
 // function's prose at a known offset without encoding a real docs_v1 term.
 func minimalBeamWithDocs(docs string, exports ...beamExport) []byte {
+	return buildTestBeam(nil, docs, exports...)
+}
+
+func buildTestBeam(attrs []testAttr, docs string, exports ...beamExport) []byte {
 	names := make([]string, 0, len(exports)+1)
 	names = append(names, "Elixir.Minimal")
 	for _, export := range exports {
@@ -178,6 +195,9 @@ func minimalBeamWithDocs(docs string, exports ...beamExport) []byte {
 	if docs != "" {
 		writeBeamChunk(&chunks, "Docs", docsChunk(docs))
 	}
+	if len(attrs) > 0 {
+		writeBeamChunk(&chunks, "Attr", attrChunk(attrs))
+	}
 
 	var file bytes.Buffer
 	file.WriteString("FOR1")
@@ -193,6 +213,40 @@ func docsChunk(docs string) []byte {
 	chunk := make([]byte, 0, len(docs)+1)
 	chunk = append(chunk, 131) // ETF version byte; 80 would mean COMPRESSED
 	return append(chunk, docs...)
+}
+
+// attrChunk encodes the Attr chunk ReadModuleAttributes reads: an ETF list of
+// {name, [values]} pairs, with the values as atoms because that is how the
+// compiler persists module names.
+func attrChunk(attrs []testAttr) []byte {
+	var out []byte
+	out = append(out, 131) // ETF version byte
+	out = append(out, etfListHeader(len(attrs))...)
+	for _, attr := range attrs {
+		out = append(out, 104, 2) // small tuple of arity 2
+		out = append(out, etfAtom(attr.name)...)
+		out = append(out, etfListHeader(len(attr.values))...)
+		for _, value := range attr.values {
+			out = append(out, etfAtom(value)...)
+		}
+		out = append(out, 106) // NIL, the list tail
+	}
+	out = append(out, 106)
+	return out
+}
+
+func etfListHeader(count int) []byte {
+	header := []byte{108} // LIST_EXT
+	var field [4]byte
+	binary.BigEndian.PutUint32(field[:], uint32(count))
+	return append(header, field[:]...)
+}
+
+func etfAtom(name string) []byte {
+	if len(name) > 255 {
+		panic("test atom too long for the one-byte length form")
+	}
+	return append([]byte{119, byte(len(name))}, name...) // SMALL_ATOM_UTF8_EXT
 }
 
 func writeBeamChunk(chunks *bytes.Buffer, name string, data []byte) {

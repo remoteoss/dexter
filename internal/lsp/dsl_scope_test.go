@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"go.lsp.dev/uri"
+
 	"github.com/remoteoss/dexter/internal/store"
 )
 
@@ -233,5 +235,149 @@ func TestDslScopeIgnoresLanguageFormsInsideBlocks(t *testing.T) {
 				t.Errorf("dslScopeModules(%v) = %v, want %v", tt.blockPath, names, tt.want)
 			}
 		})
+	}
+}
+
+// A framework's DSL macros are discoverable from compiled artifacts alone: a
+// consumer whose Attr chunk names its extension, plus source-less generated
+// modules for each nesting level. Spark's generated layout exports the section
+// macro from `<Extension>`, the entity macro from `<Extension>.<Section>.<Entity>`,
+// and an entity's option macros from `.Options`, so every level has its own
+// provider and no level leaks into another.
+//
+// This is the self-contained form of the Ash fixture tests, which skip unless
+// testdata/ash_generated_functions has been compiled, so CI has no coverage of
+// the DSL path without it.
+func TestNestedDslMacrosFromSyntheticBeams(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	const consumer = "MyApp.Post"
+	const extension = "Fake.Dsl"
+	const source = `defmodule MyApp.Post do
+  use Fake.Resource
+
+  code_interface do
+    def
+    define :get_post do
+      cust
+      get
+      not_
+      if true do
+        get
+      end
+    end
+  end
+
+  code_int
+end
+`
+	indexAndCompile(t, server, consumer, "lib/my_app/post.ex", source)
+	ebin := filepath.Join(server.projectRoot, "_build", "dev", "lib", "my_app", "ebin")
+	write := func(module string, data []byte) {
+		t.Helper()
+		path := filepath.Join(ebin, "Elixir."+module+".beam")
+		if err := os.WriteFile(path, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The macros have no defmacro in any source file, so the compiled attribute is
+	// the only record of who provides them.
+	write(consumer, minimalBeamWithAttrs(
+		[]testAttr{{name: "extensions", values: []string{"Elixir." + extension}}},
+		"", beamExport{"source_function", 0}))
+	write(extension, minimalBeam(beamExport{"MACRO-code_interface", 1}, beamExport{"MACRO-attributes", 1}))
+	write(extension+".CodeInterface.Define", minimalBeam(beamExport{"MACRO-define", 2}))
+	write(extension+".CodeInterface.Define.CustomInput", minimalBeam(beamExport{"MACRO-custom_input", 2}))
+	write(extension+".CodeInterface.Define.Options", minimalBeam(
+		beamExport{"MACRO-get_by", 2},
+		beamExport{"MACRO-get?", 2},
+		beamExport{"MACRO-not_found_error?", 2},
+	))
+	bumpDirMtime(t, ebin)
+
+	docURI := string(uri.File(filepath.Join(server.projectRoot, "lib", "my_app", "post.ex")))
+	server.docs.Set(docURI, source)
+
+	// Generated items are labelled "name/arity" where the arity is the compiled
+	// macro arity minus the caller environment the compiler prepends. Asserting
+	// that label rather than the bare name matters here: the buffer scanner also
+	// offers the `define :get_post do` call it sees in this file, as define/0.
+	tests := []struct {
+		name      string
+		line, col int
+		present   []string
+		absent    []string
+	}{
+		{
+			name:    "module level offers the section macro",
+			line:    15,
+			col:     len("  code_int"),
+			present: []string{"code_interface/0"},
+			absent:  []string{"define/1", "get_by/1"},
+		},
+		{
+			name:    "section body offers its entity macro",
+			line:    4,
+			col:     len("    def"),
+			present: []string{"define/1"},
+			absent:  []string{"code_interface/0", "get_by/1", "custom_input/1"},
+		},
+		{
+			name:    "entity body offers a nested entity",
+			line:    6,
+			col:     len("      cust"),
+			present: []string{"custom_input/1"},
+			absent:  []string{"define/1", "code_interface/0"},
+		},
+		{
+			// A language form is not part of Spark's module naming, so it must not
+			// hide the block it sits in.
+			name:    "option macros survive a language form in the block path",
+			line:    10,
+			col:     len("        get"),
+			present: []string{"get_by/1", "get?/1"},
+			absent:  []string{"define/1", "code_interface/0"},
+		},
+		{
+			name:    "entity body offers its option macros",
+			line:    7,
+			col:     len("      get"),
+			present: []string{"get_by/1", "get?/1"},
+			absent:  []string{"define/1", "custom_input/1"},
+		},
+		{
+			name:    "every option of an entity is reachable",
+			line:    8,
+			col:     len("      not_"),
+			present: []string{"not_found_error?/1"},
+			absent:  []string{"define/1"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			items := completionAt(t, server, docURI, uint32(tt.line), uint32(tt.col))
+			for _, label := range tt.present {
+				if !hasCompletionItem(items, label) {
+					t.Errorf("missing %s in %v", label, labelsOf(items))
+				}
+			}
+			for _, label := range tt.absent {
+				if hasCompletionItem(items, label) {
+					t.Errorf("%s leaked outside its own block: %v", label, labelsOf(items))
+				}
+			}
+		})
+	}
+
+	// Hover reaches the same providers, so an option macro renders a signature
+	// even though no source definition of it exists anywhere.
+	blockPath := func() []string { return server.enclosingBlockPath(docURI, 7, len("      get")) }
+	hover := server.hoverFromGeneratedModules(consumer, blockPath, "get_by")
+	if hover == nil {
+		t.Fatal("expected a hover for the generated option macro")
+	}
+	if !strings.Contains(hover.Contents.Value, "defmacro get_by(") {
+		t.Errorf("hover = %q", hover.Contents.Value)
 	}
 }

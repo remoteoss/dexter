@@ -1,2 +1,3 @@
 apps/*/deps/
 apps/*/_build/
+erl_crash.dump
