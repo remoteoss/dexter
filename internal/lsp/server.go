@@ -4210,11 +4210,10 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 			kind := tokText(tok)
 			lineIdx := tok.Line - 1
 
-			j := nextSig(i + 1)
-			if j >= n || tokens[j].Kind != parser.TokIdent {
+			funcName, j, ok := parser.StaticDeclarationName(source, tokens, n, i)
+			if !ok {
 				continue
 			}
-			funcName := tokText(tokens[j])
 			nameCol := tokCol(tokens[j])
 			j = nextSig(j + 1)
 			arity, _, _, _ := parser.CollectParams(source, tokens, n, j)
@@ -4330,11 +4329,10 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 			}
 			lineIdx := tok.Line - 1
 
-			j := nextSig(i + 1)
-			if j >= n || tokens[j].Kind != parser.TokIdent {
+			name, j, ok := parser.StaticDeclarationName(source, tokens, n, i)
+			if !ok {
 				continue
 			}
-			name := tokText(tokens[j])
 			nameCol := tokCol(tokens[j])
 			j = nextSig(j + 1)
 			arity, _, _, _ := parser.CollectParams(source, tokens, n, j)
@@ -4378,11 +4376,10 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 			}
 			lineIdx := tok.Line - 1
 
-			j := nextSig(i + 1)
-			if j >= n || tokens[j].Kind != parser.TokIdent {
+			name, j, ok := parser.StaticDeclarationName(source, tokens, n, i)
+			if !ok {
 				continue
 			}
-			name := tokText(tokens[j])
 			nameCol := tokCol(tokens[j])
 			j = nextSig(j + 1)
 			arity, _, _, _ := parser.CollectParams(source, tokens, n, j)

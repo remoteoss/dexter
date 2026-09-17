@@ -465,3 +465,30 @@ func TestTokenWalker_IsModuleDefiningToken(t *testing.T) {
 		}
 	}
 }
+
+func TestStaticDeclarationName(t *testing.T) {
+	tests := []struct {
+		source string
+		want   string
+		ok     bool
+	}{
+		{"def ordinary(arg), do: arg", "ordinary", true},
+		{"defmacro defstruct(fields), do: fields", "defstruct", true},
+		{"@type ordinary() :: term()", "ordinary", true},
+		{"@callback ordinary(term()) :: term()", "ordinary", true},
+		{"def unquote(name)(), do: :ok", "", false},
+		{"@type unquote(name)() :: term()", "", false},
+		{"@callback unquote_splicing(callbacks)", "", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.source, func(t *testing.T) {
+			source := []byte(tt.source)
+			tokens := Tokenize(source)
+			got, _, ok := StaticDeclarationName(source, tokens, len(tokens), 0)
+			if got != tt.want || ok != tt.ok {
+				t.Fatalf("StaticDeclarationName() = (%q, %v), want (%q, %v)", got, ok, tt.want, tt.ok)
+			}
+		})
+	}
+}

@@ -4613,6 +4613,31 @@ end
 	}
 }
 
+func TestDocumentSymbol_IgnoresGeneratedDeclarationNames(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule Generated do
+  quote do
+    def unquote(function_name)(), do: :ok
+    @type unquote(type_name)() :: term()
+    @callback unquote(callback_name)(term()) :: term()
+  end
+
+  def ordinary, do: :ok
+end`
+	docURI := "file:///test/generated.ex"
+	server.docs.Set(docURI, content)
+
+	symbols := documentSymbols(t, server, docURI)
+	if symbol := findSymbol(symbols, "unquote/1"); symbol != nil {
+		t.Fatalf("generated declaration appeared as document symbol: %+v", symbol)
+	}
+	if symbol := findSymbol(symbols, "ordinary/0"); symbol == nil {
+		t.Fatal("ordinary declaration missing from document symbols")
+	}
+}
+
 func TestDocumentSymbol_NestedModules(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()

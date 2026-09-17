@@ -133,11 +133,11 @@ func (tf *TokenizedFile) findDefinition(functionName string, preferType bool) (i
 			if funcLine != 0 {
 				continue
 			}
-			j := tokNextSig(tf.tokens, tf.n, i+1)
-			if j >= tf.n || tf.tokens[j].Kind != parser.TokIdent {
+			name, _, ok := parser.StaticDeclarationName(tf.source, tf.tokens, tf.n, i)
+			if !ok {
 				continue
 			}
-			if parser.TokenText(tf.source, tf.tokens[j]) == functionName {
+			if name == functionName {
 				funcLine = tok.Line
 				if !preferType {
 					return funcLine, true
@@ -148,11 +148,11 @@ func (tf *TokenizedFile) findDefinition(functionName string, preferType bool) (i
 			if typeLine != 0 {
 				continue
 			}
-			j := tokNextSig(tf.tokens, tf.n, i+1)
-			if j >= tf.n || tf.tokens[j].Kind != parser.TokIdent {
+			name, _, ok := parser.StaticDeclarationName(tf.source, tf.tokens, tf.n, i)
+			if !ok {
 				continue
 			}
-			if parser.TokenText(tf.source, tf.tokens[j]) == functionName {
+			if name == functionName {
 				typeLine = tok.Line
 				if preferType {
 					return typeLine, true
@@ -945,11 +945,10 @@ func findBufferFunctionsFromTokens(source []byte, tokens []parser.Token) []Buffe
 		case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
 			parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate:
 			kind := parser.TokenText(source, tok)
-			j := tokNextSig(tokens, n, i+1)
-			if j >= n || tokens[j].Kind != parser.TokIdent {
+			name, j, ok := parser.StaticDeclarationName(source, tokens, n, i)
+			if !ok {
 				continue
 			}
-			name := parser.TokenText(source, tokens[j])
 			j++
 			pj := tokNextSig(tokens, n, j)
 			maxArity := 0
@@ -983,11 +982,10 @@ func findBufferFunctionsFromTokens(source []byte, tokens []parser.Token) []Buffe
 			case "@typep":
 				kind = "typep"
 			}
-			j := tokNextSig(tokens, n, i+1)
-			if j >= n || tokens[j].Kind != parser.TokIdent {
+			name, j, ok := parser.StaticDeclarationName(source, tokens, n, i)
+			if !ok {
 				continue
 			}
-			name := parser.TokenText(source, tokens[j])
 			arity := 0
 			pj := tokNextSig(tokens, n, j+1)
 			if pj < n && tokens[pj].Kind == parser.TokOpenParen {
@@ -1343,8 +1341,8 @@ func parseHelperQuoteBlockDetailed(lines []string, helperName string, fileAliase
 		if tokens[i].Kind != parser.TokDef && tokens[i].Kind != parser.TokDefp {
 			continue
 		}
-		j := tokNextSig(tokens, n, i+1)
-		if j < n && tokens[j].Kind == parser.TokIdent && string(source[tokens[j].Start:tokens[j].End]) == helperName {
+		name, j, ok := parser.StaticDeclarationName(source, tokens, n, i)
+		if ok && name == helperName {
 			// Find the TokDo that opens this function. Don't stop at TokEOL
 			// because Elixir allows `do` on the next line after multi-line params.
 			if _, nextPos, hasDo := parser.ScanForwardToBlockDo(tokens, n, j+1); hasDo {
@@ -1464,11 +1462,10 @@ func parseHelperQuoteBlockDetailed(lines []string, helperName string, fileAliase
 			parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate:
 			kind := string(source[tok.Start:tok.End])
 			defLine := tok.Line
-			j := tokNextSig(tokens, n, i+1)
-			if j >= n || tokens[j].Kind != parser.TokIdent {
+			funcName, j, ok := parser.StaticDeclarationName(source, tokens, n, i)
+			if !ok {
 				continue
 			}
-			funcName := string(source[tokens[j].Start:tokens[j].End])
 			j++
 			pj := tokNextSig(tokens, n, j)
 			nextPos := pj
@@ -1765,8 +1762,8 @@ func usingDispatchParam(source []byte, tokens []parser.Token) string {
 		if tokens[i].Kind != parser.TokDefmacro {
 			continue
 		}
-		j := tokNextSig(tokens, n, i+1)
-		if j >= n || tokens[j].Kind != parser.TokIdent || parser.TokenText(source, tokens[j]) != "__using__" {
+		name, j, ok := parser.StaticDeclarationName(source, tokens, n, i)
+		if !ok || name != "__using__" {
 			continue
 		}
 		param, after := usingClauseParam(source, tokens, n, j+1)
@@ -1902,11 +1899,10 @@ func parseDispatchBodies(text string) map[string]*usingBody {
 		if tokens[i].Kind != parser.TokDef {
 			continue
 		}
-		j := tokNextSig(tokens, n, i+1)
-		if j >= n || tokens[j].Kind != parser.TokIdent {
+		name, _, ok := parser.StaticDeclarationName(source, tokens, n, i)
+		if !ok {
 			continue
 		}
-		name := parser.TokenText(source, tokens[j])
 		if name == "" || seen[name] {
 			continue
 		}
@@ -1987,8 +1983,8 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 	for i := 0; i < n; i++ {
 		tok := tokens[i]
 		if tok.Kind == parser.TokDefmacro {
-			j := nextSig(i + 1)
-			if j < n && tokens[j].Kind == parser.TokIdent && string(source[tokens[j].Start:tokens[j].End]) == "__using__" {
+			name, j, ok := parser.StaticDeclarationName(source, tokens, n, i)
+			if ok && name == "__using__" {
 				// Scan forward to find TokDo; Elixir allows split-line heads.
 				if _, nextPos, hasDo := parser.ScanForwardToBlockDo(tokens, n, j+1); hasDo {
 					usingBodyStart = nextPos
@@ -2243,13 +2239,11 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 			parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate:
 			kind := string(source[tok.Start:tok.End])
 			defLine := tok.Line
-			i++
-			j := nextSig(i)
-			if j >= n || tokens[j].Kind != parser.TokIdent {
+			funcName, j, ok := parser.StaticDeclarationName(source, tokens, n, i)
+			if !ok {
 				i = j
 				continue
 			}
-			funcName := string(source[tokens[j].Start:tokens[j].End])
 			j++
 			pj := nextSig(j)
 			nextPos := pj
@@ -2483,19 +2477,15 @@ func FindBareFunctionCalls(text string, functionName string) []int {
 		switch tok.Kind {
 		case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
 			parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate:
-			j := tokNextSig(tokens, n, i+1)
-			if j < n && tokens[j].Kind == parser.TokIdent {
-				if parser.TokenText(source, tokens[j]) == functionName {
-					defLines[tok.Line] = true
-				}
+			name, _, ok := parser.StaticDeclarationName(source, tokens, n, i)
+			if ok && name == functionName {
+				defLines[tok.Line] = true
 			}
 		case parser.TokAttrSpec, parser.TokAttrCallback:
 			// Skip @spec and @callback lines that define this function
-			j := tokNextSig(tokens, n, i+1)
-			if j < n && tokens[j].Kind == parser.TokIdent {
-				if parser.TokenText(source, tokens[j]) == functionName {
-					defLines[tok.Line] = true
-				}
+			name, _, ok := parser.StaticDeclarationName(source, tokens, n, i)
+			if ok && name == functionName {
+				defLines[tok.Line] = true
 			}
 		}
 	}
@@ -2792,8 +2782,8 @@ func extractParamNames(lines []string, defIdx int) []string {
 		switch tok.Kind {
 		case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
 			parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate:
-			j := tokNextSig(tokens, n, i+1)
-			if j >= n || tokens[j].Kind != parser.TokIdent {
+			_, j, ok := parser.StaticDeclarationName(source, tokens, n, i)
+			if !ok {
 				return nil
 			}
 			j++
