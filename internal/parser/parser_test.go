@@ -238,9 +238,13 @@ func TestParseFile_DoesNotIndexUnquoteFragmentsAsDefinitions(t *testing.T) {
     def unquote(name)(), do: :ok
   end
 
-  quote do
-    def unquote_splicing(definitions)
-  end
+	quote do
+		def unquote_splicing(definitions)
+		@type unquote(type_name)() :: term()
+		@opaque unquote_splicing(types) :: term()
+		@callback unquote(callback_name)(term()) :: term()
+		@macrocallback unquote_splicing(callbacks) :: Macro.t()
+	end
 
   def source_function, do: :ok
 end
@@ -260,7 +264,7 @@ end
 		t.Error("unquote fragment must not be indexed as a literal function definition")
 	}
 	if functions["unquote_splicing"] {
-		t.Error("unquote_splicing fragment must not be indexed as a literal function definition")
+		t.Error("unquote_splicing fragment must not be indexed as a literal definition")
 	}
 	if !functions["source_function"] {
 		t.Error("ordinary definitions after unquote fragments must still be indexed")

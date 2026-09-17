@@ -297,7 +297,7 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 				// indexing the special form itself invents an unquote function that
 				// the module does not define. Compiled-function discovery recovers
 				// the concrete exported names when a BEAM is available.
-				if funcName == "unquote" || funcName == "unquote_splicing" {
+				if isUnquoteFragment(funcName) {
 					i = j + 1
 					goto extractRefsForLine
 				}
@@ -490,6 +490,10 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 				j := nextSig(i)
 				if j < n && tokens[j].Kind == TokIdent {
 					name := tokenText(tokens[j])
+					if isUnquoteFragment(name) {
+						i = j + 1
+						goto extractRefsForLine
+					}
 					arity := 0
 					pj := nextSig(j + 1)
 					if pj < n && tokens[pj].Kind == TokOpenParen {
@@ -544,6 +548,10 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 				j := nextSig(i)
 				if j < n && tokens[j].Kind == TokIdent {
 					name := tokenText(tokens[j])
+					if isUnquoteFragment(name) {
+						i = j + 1
+						goto extractRefsForLine
+					}
 					arity := 0
 					pj := nextSig(j + 1)
 					if pj < n && tokens[pj].Kind == TokOpenParen {
@@ -741,6 +749,10 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 	}
 
 	return defs, dedupeRefs(refs), nil
+}
+
+func isUnquoteFragment(name string) bool {
+	return name == "unquote" || name == "unquote_splicing"
 }
 
 // callRefKind is the kind every interpolated reference carries: a typespec
