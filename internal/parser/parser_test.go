@@ -232,6 +232,41 @@ end
 	}
 }
 
+func TestParseFile_DoesNotIndexUnquoteFragmentsAsDefinitions(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.Generated do
+  for name <- [:foo, :bar] do
+    def unquote(name)(), do: :ok
+  end
+
+  quote do
+    def unquote_splicing(definitions)
+  end
+
+  def source_function, do: :ok
+end
+`)
+
+	defs, _, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	functions := map[string]bool{}
+	for _, def := range defs {
+		functions[def.Function] = true
+	}
+
+	if functions["unquote"] {
+		t.Error("unquote fragment must not be indexed as a literal function definition")
+	}
+	if functions["unquote_splicing"] {
+		t.Error("unquote_splicing fragment must not be indexed as a literal function definition")
+	}
+	if !functions["source_function"] {
+		t.Error("ordinary definitions after unquote fragments must still be indexed")
+	}
+}
+
 func TestParseFile_FunctionWithQuestionMark(t *testing.T) {
 	path := writeTempFile(t, `defmodule MyApp.Guards do
   def valid?(thing) do

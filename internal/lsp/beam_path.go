@@ -76,6 +76,7 @@ func (s *Server) libIndex(buildRoot string) *beamLibIndex {
 	}
 
 	fresh := buildBeamLibIndex(buildRoot)
+	s.debugf("Generated BEAM applications: build_root=%s lib=%s apps=%d root_app=%s loaded=%t", buildRoot, fresh.libDir, len(fresh.apps), fresh.rootApp, fresh.loaded)
 	s.beamLibs.mu.Lock()
 	s.beamLibs.roots[buildRoot] = fresh
 	s.beamLibs.mu.Unlock()
@@ -154,10 +155,12 @@ func (s *Server) locateModuleBEAM(buildRoot, module, sourcePath string) beamLoca
 	// dependency to double-check.
 	if app := appForSource(idx.buildRoot, sourcePath); app != "" {
 		if loc, ok := beamInApp(idx.libDir, app, fileName); ok {
+			s.debugf("Generated BEAM locate: module=%s strategy=source-app app=%s beam=%s", module, app, loc.beamPath)
 			return loc
 		}
 	} else if idx.rootApp != "" {
 		if loc, ok := beamInApp(idx.libDir, idx.rootApp, fileName); ok {
+			s.debugf("Generated BEAM locate: module=%s strategy=root-app app=%s beam=%s", module, idx.rootApp, loc.beamPath)
 			return loc
 		}
 	}
@@ -169,6 +172,7 @@ func (s *Server) locateModuleBEAM(buildRoot, module, sourcePath string) beamLoca
 		ebin := filepath.Join(idx.libDir, app, "ebin")
 		beam := filepath.Join(ebin, fileName)
 		if stamp := statFileStamp(beam); stamp.exists {
+			s.debugf("Generated BEAM locate: module=%s strategy=application-scan app=%s beam=%s", module, app, beam)
 			return beamLocation{
 				beamPath:   beam,
 				beamStamp:  stamp,
@@ -181,8 +185,10 @@ func (s *Server) locateModuleBEAM(buildRoot, module, sourcePath string) beamLoca
 	// Nothing is compiled for this module. Watch the lib directory itself when
 	// there is no ebin to watch, so the answer is revisited once a build exists.
 	if idx.loaded && idx.libStamp.exists {
+		s.debugf("Generated BEAM locate: module=%s strategy=application-scan result=missing watch=%s", module, idx.libDir)
 		return beamLocation{watchDir: idx.libDir, watchStamp: idx.libStamp}
 	}
+	s.debugf("Generated BEAM locate: module=%s strategy=application-scan result=unavailable watch=%s", module, idx.libDir)
 	return beamLocation{watchDir: idx.libDir}
 }
 

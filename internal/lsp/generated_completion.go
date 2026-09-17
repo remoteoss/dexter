@@ -200,12 +200,14 @@ func (s *Server) generatedFunctionsFor(module, knownBeam string) []beam.Function
 	}
 
 	if knownBeam != "" {
+		s.debugf("Generated BEAM resolve: module=%s strategy=known-beam beam=%s", module, knownBeam)
 		return s.loadAndCacheGenerated(module, knownBeam, "", fileStamp{}, "")
 	}
 
 	if sourcePath == "" {
 		moduleResults, err := s.store.LookupModule(module)
 		if err != nil {
+			s.debugf("Generated BEAM resolve: module=%s source lookup failed: %v", module, err)
 			s.cacheGeneratedMiss(module)
 			return nil
 		}
@@ -216,19 +218,23 @@ func (s *Server) generatedFunctionsFor(module, knownBeam string) []beam.Function
 			// locateModuleBEAM checks the root application first and caches the
 			// application listing, so this is one stat on the warm path.
 			buildRoot = s.findBuildRoot(s.projectRoot)
+			s.debugf("Generated BEAM resolve: module=%s source=generated build_root=%s", module, buildRoot)
 		} else {
 			sourcePath = moduleResults[0].FilePath
 			sourceStamp = statFileStamp(sourcePath)
 			if !sourceStamp.exists {
+				s.debugf("Generated BEAM resolve: module=%s indexed source missing path=%s", module, sourcePath)
 				s.cacheGeneratedMiss(module)
 				return nil
 			}
 			buildRoot = s.findBuildRoot(filepath.Dir(sourcePath))
+			s.debugf("Generated BEAM resolve: module=%s source=%s build_root=%s", module, sourcePath, buildRoot)
 		}
 	}
 
 	loc := s.locateModuleBEAM(buildRoot, module, sourcePath)
 	if loc.beamPath == "" {
+		s.debugf("Generated BEAM resolve: module=%s no compiled BEAM watch=%s", module, loc.watchDir)
 		negative := generatedFunctionCacheEntry{
 			sourcePath:  sourcePath,
 			sourceStamp: sourceStamp,
@@ -246,6 +252,7 @@ func (s *Server) generatedFunctionsFor(module, knownBeam string) []beam.Function
 		s.generatedCache.put(module, negative)
 		return nil
 	}
+	s.debugf("Generated BEAM resolve: module=%s beam=%s", module, loc.beamPath)
 	return s.loadAndCacheGenerated(module, loc.beamPath, sourcePath, sourceStamp, buildRoot)
 }
 
@@ -490,6 +497,7 @@ func (s *Server) hoverFromGenerated(module, beamPath, functionName string) *prot
 
 	entry, _ := s.generatedCache.get(module)
 	doc := generatedFunctionDoc(&entry, functions, docIndex)
+	s.debugf("Hover: generated function module=%s function=%s signatures=%d beam=%s docs=%t", module, functionName, len(signatures), entry.beamPath, doc != "")
 
 	content := formatHoverContent(doc, "", strings.Join(signatures, "\n"))
 	if content == "" {
@@ -578,6 +586,7 @@ func (s *Server) addGeneratedFunctionCompletions(module, beamPath, prefix string
 	if len(functions) == 0 {
 		return
 	}
+	before := len(*items)
 	start := sort.Search(len(functions), func(i int) bool { return functions[i].Name >= prefix })
 	for _, function := range functions[start:] {
 		if !strings.HasPrefix(function.Name, prefix) {
@@ -603,6 +612,10 @@ func (s *Server) addGeneratedFunctionCompletions(module, beamPath, prefix string
 			}
 		}
 		*items = append(*items, item)
+	}
+	if added := len(*items) - before; added > 0 {
+		entry, _ := s.generatedCache.get(module)
+		s.debugf("Completion: generated functions module=%s prefix=%q matches=%d beam=%s", module, prefix, added, entry.beamPath)
 	}
 }
 

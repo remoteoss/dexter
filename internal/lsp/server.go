@@ -1011,14 +1011,20 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 			s.debugf("Definition: found %d result(s) via use chain of %s for %s", len(results), fullModule, functionName)
 			return storeResultsToLocations(results), nil
 		}
-		s.debugf("Definition: no result for %s.%s", fullModule, functionName)
+		s.debugf("Definition: no indexed or use-chain definition for %s.%s; falling back to module source", fullModule, functionName)
 	}
 
 	// Fall back to module (fullModule already resolved via nesting above)
 	results, err := s.store.LookupModule(fullModule)
-	if err != nil || len(results) == 0 {
+	if err != nil {
+		s.debugf("Definition: module fallback lookup failed for %s: %v", fullModule, err)
 		return nil, nil
 	}
+	if len(results) == 0 {
+		s.debugf("Definition: module fallback found no source for %s", fullModule)
+		return nil, nil
+	}
+	s.debugf("Definition: module fallback for %s.%s -> %s:%d (%d result(s))", fullModule, functionName, results[0].FilePath, results[0].Line, len(results))
 	return storeResultsToLocations(results), nil
 }
 

@@ -293,6 +293,14 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 			}
 			{
 				funcName := tokenText(tokens[j])
+				// An unquote fragment computes the definition name at compile time;
+				// indexing the special form itself invents an unquote function that
+				// the module does not define. Compiled-function discovery recovers
+				// the concrete exported names when a BEAM is available.
+				if funcName == "unquote" || funcName == "unquote_splicing" {
+					i = j + 1
+					goto extractRefsForLine
+				}
 				j++
 
 				pj := nextSig(j)
