@@ -1464,6 +1464,7 @@ func parseHelperQuoteBlockDetailed(lines []string, helperName string, fileAliase
 			defLine := tok.Line
 			funcName, j, ok := parser.StaticDeclarationName(source, tokens, n, i)
 			if !ok {
+				i = skipToEndOfStatement(tokens, n, j) - 1
 				continue
 			}
 			j++
@@ -2257,7 +2258,7 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 			defLine := tok.Line
 			funcName, j, ok := parser.StaticDeclarationName(source, tokens, n, i)
 			if !ok {
-				i = j
+				i = skipToEndOfStatement(tokens, n, j)
 				continue
 			}
 			j++

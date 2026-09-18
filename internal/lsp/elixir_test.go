@@ -1,6 +1,7 @@
 package lsp
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -1600,6 +1601,41 @@ end`
 	}
 }
 
+func TestParseUsingBody_IgnoresGeneratedDefBodies(t *testing.T) {
+	text := `defmodule MyLib do
+  def hidden_helpers do
+    quote do
+      import SharedLib.HiddenHelper
+    end
+  end
+
+  defmacro __using__(_opts) do
+    quote do
+      def unquote(generated_name)() do
+        import SharedLib.HiddenImport
+        use SharedLib.HiddenUse
+        unquote(hidden_helpers())
+      end
+
+      import SharedLib.Visible
+    end
+  end
+end`
+
+	imports, _, uses, _, _ := parseUsingBody(text)
+	if !slices.Contains(imports, "SharedLib.Visible") {
+		t.Fatalf("visible quote import missing: %v", imports)
+	}
+	for _, hidden := range []string{"SharedLib.HiddenImport", "SharedLib.HiddenHelper"} {
+		if slices.Contains(imports, hidden) {
+			t.Errorf("generated def body leaked import %s: %v", hidden, imports)
+		}
+	}
+	if slices.Contains(uses, "SharedLib.HiddenUse") {
+		t.Errorf("generated def body leaked use: %v", uses)
+	}
+}
+
 func TestParseUsingBody_InlineDefArity(t *testing.T) {
 	text := `defmodule MyLib do
   defmacro __using__(_opts) do
@@ -2140,6 +2176,33 @@ end`
 	imported, _, _, _, _ := parseHelperQuoteBlock(lines, "helper_name", nil)
 	if len(imported) != 0 {
 		t.Fatalf("expected no imports from inside inline def body, got %v", imported)
+	}
+}
+
+func TestParseHelperQuoteBlock_IgnoresGeneratedDefBodies(t *testing.T) {
+	text := `defmodule MyLib do
+  def build_helpers(_opts) do
+    quote do
+      def unquote(generated_name)() do
+        import SharedLib.Hidden
+        use SharedLib.HiddenUse
+      end
+
+      import SharedLib.Visible
+    end
+  end
+end`
+
+	lines := strings.Split(text, "\n")
+	imports, _, uses, _, _ := parseHelperQuoteBlock(lines, "build_helpers", nil)
+	if !slices.Contains(imports, "SharedLib.Visible") {
+		t.Fatalf("visible helper import missing: %v", imports)
+	}
+	if slices.Contains(imports, "SharedLib.Hidden") {
+		t.Errorf("generated def body leaked import: %v", imports)
+	}
+	if slices.Contains(uses, "SharedLib.HiddenUse") {
+		t.Errorf("generated def body leaked use: %v", uses)
 	}
 }
 

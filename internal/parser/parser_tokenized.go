@@ -286,7 +286,6 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 			kind := tokenText(tok)
 			defLine := tok.Line
 			declarationIdx := i
-			i++
 			funcName, j, ok := StaticDeclarationName(source, tokens, n, declarationIdx)
 			if !ok {
 				i = j
@@ -479,7 +478,6 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 					i++
 					goto extractRefsForLine
 				}
-				i++
 				name, j, ok := StaticDeclarationName(source, tokens, n, declarationIdx)
 				if ok {
 					arity := 0
@@ -533,7 +531,6 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 				if attrText == "@macrocallback" {
 					kind = "macrocallback"
 				}
-				i++
 				name, j, ok := StaticDeclarationName(source, tokens, n, declarationIdx)
 				if ok {
 					arity := 0
