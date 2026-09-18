@@ -139,6 +139,17 @@ defmodule Dexter.Formatter do
     |> Path.wildcard()
     |> Enum.each(&Code.prepend_path/1)
 
+    # Match `mix format` by loading the project before evaluating formatter
+    # files. Keep this lazy: the shared BEAM also serves docs and completion,
+    # which should not evaluate mix.exs unless formatting is requested.
+    if Mix.Project.get() == nil do
+      mix_exs = Path.join(project_root, "mix.exs")
+
+      if File.regular?(mix_exs) do
+        Code.eval_file(mix_exs)
+      end
+    end
+
     raw_opts =
       if File.regular?(formatter_exs_path) do
         {result, _} = Code.eval_file(formatter_exs_path)

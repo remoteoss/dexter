@@ -429,6 +429,9 @@ func createMixConfigFormatterFixture(t *testing.T) string {
 	if err := os.MkdirAll(filepath.Join(mixRoot, "lib"), 0755); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.MkdirAll(filepath.Join(mixRoot, "deps", "fake_dep"), 0755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(
 		filepath.Join(mixRoot, "mix.exs"),
 		[]byte(`defmodule MixConfigFormatter.MixProject do
@@ -449,7 +452,17 @@ end
 	}
 	if err := os.WriteFile(
 		filepath.Join(mixRoot, ".formatter.exs"),
-		[]byte("[plugins: [Dexter.MixConfigFormatter], inputs: [\"{lib,test}/**/*.{ex,exs}\"]]\n"),
+		[]byte("[import_deps: [:fake_dep], plugins: [Dexter.MixConfigFormatter], inputs: [\"{lib,test}/**/*.{ex,exs}\"]]\n"),
+		0644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(mixRoot, "deps", "fake_dep", ".formatter.exs"),
+		[]byte(`requirement = Mix.Project.config()[:elixir]
+[minor | _] = Regex.run(~r/([\d\.]+)/, requirement)
+[export: [locals_without_parens: [from_dep: 1]], fixture_minor: minor]
+`),
 		0644,
 	); err != nil {
 		t.Fatal(err)
