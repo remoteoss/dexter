@@ -245,9 +245,9 @@ func TestDslScopeIgnoresLanguageFormsInsideBlocks(t *testing.T) {
 // and an entity's option macros from `.Options`, so every level has its own
 // provider and no level leaks into another.
 //
-// This is the self-contained form of the Ash fixture tests, which skip unless
-// testdata/ash_generated_functions has been compiled, so CI has no coverage of
-// the DSL path without it.
+// This is the self-contained form of the Ash scenario in
+// testdata/integration: it runs without a compiled fixture, so the DSL chain
+// stays covered even when the umbrella is not built.
 func TestNestedDslMacrosFromSyntheticBeams(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()

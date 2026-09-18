@@ -15,6 +15,14 @@ Install `golangci-lint` if needed:
 go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.4
 ```
 
+Tests that need compiled Elixir run against one shared fixture, a Mix umbrella:
+
+```sh
+cd internal/lsp/testdata/integration && mix deps.get && mix compile  # ~30s cold
+```
+
+They skip without it, so `make test` stays usable on a Go-only checkout. Reach the fixture through `internal/fixture` instead of building paths, and set `DEXTER_REQUIRE_FIXTURE=1` to make an uncompiled fixture fail rather than skip, the way CI does. Read its README before adding a scenario: one file that fails to compile blocks every scenario, so deliberately broken Elixir belongs in a test's synthetic builders.
+
 ## Conventions
 
 - Our guiding principles for all code written are: We want maximum performance and speed, but without sacrificing
