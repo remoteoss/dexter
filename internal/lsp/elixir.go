@@ -133,11 +133,11 @@ func (tf *TokenizedFile) findDefinition(functionName string, preferType bool) (i
 			if funcLine != 0 {
 				continue
 			}
-			j := tokNextSig(tf.tokens, tf.n, i+1)
-			if j >= tf.n || tf.tokens[j].Kind != parser.TokIdent {
+			name, _, ok := parser.StaticDeclarationName(tf.source, tf.tokens, tf.n, i)
+			if !ok {
 				continue
 			}
-			if parser.TokenText(tf.source, tf.tokens[j]) == functionName {
+			if name == functionName {
 				funcLine = tok.Line
 				if !preferType {
 					return funcLine, true
@@ -148,11 +148,11 @@ func (tf *TokenizedFile) findDefinition(functionName string, preferType bool) (i
 			if typeLine != 0 {
 				continue
 			}
-			j := tokNextSig(tf.tokens, tf.n, i+1)
-			if j >= tf.n || tf.tokens[j].Kind != parser.TokIdent {
+			name, _, ok := parser.StaticDeclarationName(tf.source, tf.tokens, tf.n, i)
+			if !ok {
 				continue
 			}
-			if parser.TokenText(tf.source, tf.tokens[j]) == functionName {
+			if name == functionName {
 				typeLine = tok.Line
 				if preferType {
 					return typeLine, true
@@ -945,11 +945,10 @@ func findBufferFunctionsFromTokens(source []byte, tokens []parser.Token) []Buffe
 		case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
 			parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate:
 			kind := parser.TokenText(source, tok)
-			j := tokNextSig(tokens, n, i+1)
-			if j >= n || tokens[j].Kind != parser.TokIdent {
+			name, j, ok := parser.StaticDeclarationName(source, tokens, n, i)
+			if !ok {
 				continue
 			}
-			name := parser.TokenText(source, tokens[j])
 			j++
 			pj := tokNextSig(tokens, n, j)
 			maxArity := 0
@@ -983,11 +982,10 @@ func findBufferFunctionsFromTokens(source []byte, tokens []parser.Token) []Buffe
 			case "@typep":
 				kind = "typep"
 			}
-			j := tokNextSig(tokens, n, i+1)
-			if j >= n || tokens[j].Kind != parser.TokIdent {
+			name, j, ok := parser.StaticDeclarationName(source, tokens, n, i)
+			if !ok {
 				continue
 			}
-			name := parser.TokenText(source, tokens[j])
 			arity := 0
 			pj := tokNextSig(tokens, n, j+1)
 			if pj < n && tokens[pj].Kind == parser.TokOpenParen {
@@ -1343,8 +1341,8 @@ func parseHelperQuoteBlockDetailed(lines []string, helperName string, fileAliase
 		if tokens[i].Kind != parser.TokDef && tokens[i].Kind != parser.TokDefp {
 			continue
 		}
-		j := tokNextSig(tokens, n, i+1)
-		if j < n && tokens[j].Kind == parser.TokIdent && string(source[tokens[j].Start:tokens[j].End]) == helperName {
+		name, j, ok := parser.StaticDeclarationName(source, tokens, n, i)
+		if ok && name == helperName {
 			// Find the TokDo that opens this function. Don't stop at TokEOL
 			// because Elixir allows `do` on the next line after multi-line params.
 			if _, nextPos, hasDo := parser.ScanForwardToBlockDo(tokens, n, j+1); hasDo {
@@ -1464,11 +1462,11 @@ func parseHelperQuoteBlockDetailed(lines []string, helperName string, fileAliase
 			parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate:
 			kind := string(source[tok.Start:tok.End])
 			defLine := tok.Line
-			j := tokNextSig(tokens, n, i+1)
-			if j >= n || tokens[j].Kind != parser.TokIdent {
+			funcName, j, ok := parser.StaticDeclarationName(source, tokens, n, i)
+			if !ok {
+				i = skipToEndOfStatement(tokens, n, j) - 1
 				continue
 			}
-			funcName := string(source[tokens[j].Start:tokens[j].End])
 			j++
 			pj := tokNextSig(tokens, n, j)
 			nextPos := pj
@@ -1765,8 +1763,8 @@ func usingDispatchParam(source []byte, tokens []parser.Token) string {
 		if tokens[i].Kind != parser.TokDefmacro {
 			continue
 		}
-		j := tokNextSig(tokens, n, i+1)
-		if j >= n || tokens[j].Kind != parser.TokIdent || parser.TokenText(source, tokens[j]) != "__using__" {
+		name, j, ok := parser.StaticDeclarationName(source, tokens, n, i)
+		if !ok || name != "__using__" {
 			continue
 		}
 		param, after := usingClauseParam(source, tokens, n, j+1)
@@ -1902,11 +1900,10 @@ func parseDispatchBodies(text string) map[string]*usingBody {
 		if tokens[i].Kind != parser.TokDef {
 			continue
 		}
-		j := tokNextSig(tokens, n, i+1)
-		if j >= n || tokens[j].Kind != parser.TokIdent {
+		name, _, ok := parser.StaticDeclarationName(source, tokens, n, i)
+		if !ok {
 			continue
 		}
-		name := parser.TokenText(source, tokens[j])
 		if name == "" || seen[name] {
 			continue
 		}
@@ -1987,8 +1984,8 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 	for i := 0; i < n; i++ {
 		tok := tokens[i]
 		if tok.Kind == parser.TokDefmacro {
-			j := nextSig(i + 1)
-			if j < n && tokens[j].Kind == parser.TokIdent && string(source[tokens[j].Start:tokens[j].End]) == "__using__" {
+			name, j, ok := parser.StaticDeclarationName(source, tokens, n, i)
+			if ok && name == "__using__" {
 				// Scan forward to find TokDo; Elixir allows split-line heads.
 				if _, nextPos, hasDo := parser.ScanForwardToBlockDo(tokens, n, j+1); hasDo {
 					usingBodyStart = nextPos
@@ -2033,6 +2030,22 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 		defaultMod string
 	}
 	varToOpt := make(map[string]varBinding)
+	mergeHelperQuote := func(helperName string) {
+		helperImported, helperDefs, helperTransUses, helperCalls, helperBindings, helperAliases := parseHelperQuoteBlockDetailed(lines, helperName, fileAliases, make(map[string]bool))
+		imported = append(imported, helperImported...)
+		for name, defs := range helperDefs {
+			inlineDefs[name] = append(inlineDefs[name], defs...)
+		}
+		transUses = append(transUses, helperTransUses...)
+		transCalls = append(transCalls, helperCalls...)
+		optBindings = append(optBindings, helperBindings...)
+		for short, full := range helperAliases {
+			if aliases == nil {
+				aliases = make(map[string]string)
+			}
+			aliases[short] = full
+		}
+	}
 
 	// scanKeywordCall checks if tokens starting at i match:
 	//   Keyword.{get|pop|put|put_new|fetch|fetch!|pop!|pop_lazy}(ident, :key [, Default])
@@ -2243,13 +2256,11 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 			parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate:
 			kind := string(source[tok.Start:tok.End])
 			defLine := tok.Line
-			i++
-			j := nextSig(i)
-			if j >= n || tokens[j].Kind != parser.TokIdent {
-				i = j
+			funcName, j, ok := parser.StaticDeclarationName(source, tokens, n, i)
+			if !ok {
+				i = skipToEndOfStatement(tokens, n, j)
 				continue
 			}
-			funcName := string(source[tokens[j].Start:tokens[j].End])
 			j++
 			pj := nextSig(j)
 			nextPos := pj
@@ -2303,6 +2314,21 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 			isStmtStart := i == 0 || tokens[i-1].Kind == parser.TokEOL || tokens[i-1].Kind == parser.TokComment
 			j := nextSig(i + 1)
 
+			// Phoenix-style __using__ bodies commonly inject a helper's quote with
+			// `unquote(prelude(opts))`. Follow that helper just as helper quote
+			// parsing follows nested unquotes.
+			if identName == "unquote" && j < n && tokens[j].Kind == parser.TokOpenParen {
+				helper := nextSig(j + 1)
+				if helper < n && tokens[helper].Kind == parser.TokIdent {
+					afterHelper := nextSig(helper + 1)
+					if afterHelper < n && tokens[afterHelper].Kind == parser.TokOpenParen {
+						mergeHelperQuote(string(source[tokens[helper].Start:tokens[helper].End]))
+						i = skipToEndOfStatement(tokens, n, i)
+						continue
+					}
+				}
+			}
+
 			// Check for var = Keyword.{get,pop,put,put_new,...}(opts, :key, Default)
 			// or var = ModuleName
 			if isStmtStart && j < n && tokens[j].Kind == parser.TokOther && string(source[tokens[j].Start:tokens[j].End]) == "=" {
@@ -2344,22 +2370,7 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 			// helper_name(opts) where helper_name is a def/defp in the same file.
 			// Only at statement start to avoid matching function calls inside expressions.
 			if isStmtStart && j < n && tokens[j].Kind == parser.TokOpenParen && !parser.IsElixirKeyword(identName) {
-				helperImported, helperDefs, helperTransUses, helperCalls, helperBindings, helperAliases := parseHelperQuoteBlockDetailed(lines, identName, fileAliases, make(map[string]bool))
-				if helperImported != nil {
-					imported = append(imported, helperImported...)
-					for hk, hv := range helperDefs {
-						inlineDefs[hk] = append(inlineDefs[hk], hv...)
-					}
-					transUses = append(transUses, helperTransUses...)
-					transCalls = append(transCalls, helperCalls...)
-					optBindings = append(optBindings, helperBindings...)
-				}
-				for hk, hv := range helperAliases {
-					if aliases == nil {
-						aliases = make(map[string]string)
-					}
-					aliases[hk] = hv
-				}
+				mergeHelperQuote(identName)
 				i = skipToEndOfStatement(tokens, n, i)
 				continue
 			}
@@ -2483,19 +2494,15 @@ func FindBareFunctionCalls(text string, functionName string) []int {
 		switch tok.Kind {
 		case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
 			parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate:
-			j := tokNextSig(tokens, n, i+1)
-			if j < n && tokens[j].Kind == parser.TokIdent {
-				if parser.TokenText(source, tokens[j]) == functionName {
-					defLines[tok.Line] = true
-				}
+			name, _, ok := parser.StaticDeclarationName(source, tokens, n, i)
+			if ok && name == functionName {
+				defLines[tok.Line] = true
 			}
 		case parser.TokAttrSpec, parser.TokAttrCallback:
 			// Skip @spec and @callback lines that define this function
-			j := tokNextSig(tokens, n, i+1)
-			if j < n && tokens[j].Kind == parser.TokIdent {
-				if parser.TokenText(source, tokens[j]) == functionName {
-					defLines[tok.Line] = true
-				}
+			name, _, ok := parser.StaticDeclarationName(source, tokens, n, i)
+			if ok && name == functionName {
+				defLines[tok.Line] = true
 			}
 		}
 	}
@@ -2792,8 +2799,8 @@ func extractParamNames(lines []string, defIdx int) []string {
 		switch tok.Kind {
 		case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
 			parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate:
-			j := tokNextSig(tokens, n, i+1)
-			if j >= n || tokens[j].Kind != parser.TokIdent {
+			_, j, ok := parser.StaticDeclarationName(source, tokens, n, i)
+			if !ok {
 				return nil
 			}
 			j++

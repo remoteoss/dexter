@@ -1,6 +1,7 @@
 package lsp
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -1106,6 +1107,36 @@ end`
 	}
 }
 
+func TestLiveDeclarationReadersIgnoreGeneratedNames(t *testing.T) {
+	text := `defmodule Generated do
+  quote do
+    def unquote(function_name)(), do: :ok
+    def unquote_splicing(functions)
+    @type unquote(type_name)() :: term()
+    @opaque unquote_splicing(types) :: term()
+  end
+
+  def ordinary, do: :ok
+end`
+
+	tf := NewTokenizedFile(text)
+	for _, name := range []string{"unquote", "unquote_splicing"} {
+		if line, found := tf.FindFunctionDefinition(name); found {
+			t.Errorf("FindFunctionDefinition(%q) returned generated name at line %d", name, line)
+		}
+		if line, found := tf.FindTypeDefinition(name); found {
+			t.Errorf("FindTypeDefinition(%q) returned generated name at line %d", name, line)
+		}
+	}
+
+	functions := tf.FindBufferFunctions()
+	for _, function := range functions {
+		if function.Name == "unquote" || function.Name == "unquote_splicing" {
+			t.Errorf("FindBufferFunctions returned generated declaration: %+v", function)
+		}
+	}
+}
+
 func TestFindFunctionDefinition_Guards(t *testing.T) {
 	text := `defmodule Foo do
   defguard is_admin(user) when user.role == :admin
@@ -1539,6 +1570,70 @@ end`
 			t.Errorf("expected empty, got %v", lineNums)
 		}
 	})
+}
+
+func TestUsingInlineDefsIgnoreGeneratedNames(t *testing.T) {
+	text := `defmodule MyLib do
+  def helper_defs do
+    quote do
+      def unquote(helper_name)(), do: :ok
+    end
+  end
+
+  defmacro __using__(_opts) do
+    quote do
+      def unquote(direct_name)(), do: :ok
+      def unquote_splicing(definitions)
+      unquote(helper_defs())
+      def ordinary, do: :ok
+    end
+  end
+end`
+
+	_, inlineDefs, _, _, _ := parseUsingBody(text)
+	for _, name := range []string{"unquote", "unquote_splicing"} {
+		if defs := inlineDefs[name]; len(defs) != 0 {
+			t.Errorf("generated name %q returned as inline definitions: %+v", name, defs)
+		}
+	}
+	if len(inlineDefs["ordinary"]) != 1 {
+		t.Errorf("ordinary inline definition missing: %+v", inlineDefs)
+	}
+}
+
+func TestParseUsingBody_IgnoresGeneratedDefBodies(t *testing.T) {
+	text := `defmodule MyLib do
+  def hidden_helpers do
+    quote do
+      import SharedLib.HiddenHelper
+    end
+  end
+
+  defmacro __using__(_opts) do
+    quote do
+      def unquote(generated_name)() do
+        import SharedLib.HiddenImport
+        use SharedLib.HiddenUse
+        unquote(hidden_helpers())
+      end
+
+      import SharedLib.Visible
+    end
+  end
+end`
+
+	imports, _, uses, _, _ := parseUsingBody(text)
+	if !slices.Contains(imports, "SharedLib.Visible") {
+		t.Fatalf("visible quote import missing: %v", imports)
+	}
+	for _, hidden := range []string{"SharedLib.HiddenImport", "SharedLib.HiddenHelper"} {
+		if slices.Contains(imports, hidden) {
+			t.Errorf("generated def body leaked import %s: %v", hidden, imports)
+		}
+	}
+	if slices.Contains(uses, "SharedLib.HiddenUse") {
+		t.Errorf("generated def body leaked use: %v", uses)
+	}
 }
 
 func TestParseUsingBody_InlineDefArity(t *testing.T) {
@@ -2081,6 +2176,33 @@ end`
 	imported, _, _, _, _ := parseHelperQuoteBlock(lines, "helper_name", nil)
 	if len(imported) != 0 {
 		t.Fatalf("expected no imports from inside inline def body, got %v", imported)
+	}
+}
+
+func TestParseHelperQuoteBlock_IgnoresGeneratedDefBodies(t *testing.T) {
+	text := `defmodule MyLib do
+  def build_helpers(_opts) do
+    quote do
+      def unquote(generated_name)() do
+        import SharedLib.Hidden
+        use SharedLib.HiddenUse
+      end
+
+      import SharedLib.Visible
+    end
+  end
+end`
+
+	lines := strings.Split(text, "\n")
+	imports, _, uses, _, _ := parseHelperQuoteBlock(lines, "build_helpers", nil)
+	if !slices.Contains(imports, "SharedLib.Visible") {
+		t.Fatalf("visible helper import missing: %v", imports)
+	}
+	if slices.Contains(imports, "SharedLib.Hidden") {
+		t.Errorf("generated def body leaked import: %v", imports)
+	}
+	if slices.Contains(uses, "SharedLib.HiddenUse") {
+		t.Errorf("generated def body leaked use: %v", uses)
 	}
 }
 

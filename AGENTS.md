@@ -28,14 +28,16 @@ go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.4
   Indexing must be kept fast no matter what.
 - Keep the CLI commands (`init`, `reindex`, `lookup`) working independently of the LSP server
 - Parser tests should cover real-world Elixir patterns from large codebases
-- Version strings (`Version` and `IndexVersion`) live in `internal/version/version.go`
+- Version strings (`Version` and `IndexVersion`) live in `internal/version/version.go`. Do not bump them in feature PRs;
+  version bumps are made together in a separate release PR.
 
-## When to bump IndexVersion
+## When a release PR should bump IndexVersion
 
-Bump `IndexVersion` (alongside `Version`) whenever a parser change or schema change would make existing indexes produce
-wrong results. The LSP server checks this on startup and, on a mismatch, triggers a forced rebuild of a **populated**
-index. An empty index is left to the background full build, which stamps the current version itself — so a bump is not a
-way to force anything to happen on a store that has no rows.
+Do not change `Version` or `IndexVersion` in a feature PR. Note when a parser or schema change makes existing indexes
+produce wrong results so the separate release PR can bump `IndexVersion` alongside `Version`. The LSP server checks this
+on startup and, on a mismatch, triggers a forced rebuild of a **populated** index. An empty index is left to the
+background full build, which stamps the current version itself — so a bump is not a way to force anything to happen on
+a store that has no rows.
 
 ## What to check when making changes
 
@@ -48,6 +50,7 @@ way to force anything to happen on a store that has no rows.
 | Tokenizer string/heredoc/sigil scanning | `TokenResult.Interp` (the `#{}` token stream), `flushInterpRefs`, `TokenizedFile.ExpressionAtCursor` |
 | `ExtractAliases` | LSP handlers use `ExtractAliasesInScope(text, lineNum)` — scope-aware. Only `Completion` and `CodeAction` use the unscoped `ExtractAliases` intentionally |
 | Any new store query | Add an index if the query will run on hot paths (definition, hover, references) |
+| `internal/beam` ETF tag handling | The ERTS external term format spec. One wrong field width desynchronises every later term in the chunk (`EXPORT_EXT` carries its arity as an integer term, `NEW_FUN_EXT` as a raw byte) |
 
 ## Token walking
 

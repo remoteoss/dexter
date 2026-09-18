@@ -285,14 +285,13 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 			}
 			kind := tokenText(tok)
 			defLine := tok.Line
-			i++
-			j := nextSig(i)
-			if j >= n || !isValidFuncNameToken(tokens[j].Kind) {
+			declarationIdx := i
+			funcName, j, ok := StaticDeclarationName(source, tokens, n, declarationIdx)
+			if !ok {
 				i = j
 				goto extractRefsForLine
 			}
 			{
-				funcName := tokenText(tokens[j])
 				j++
 
 				pj := nextSig(j)
@@ -464,6 +463,7 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 			continue
 
 		case TokAttrType:
+			declarationIdx := i
 			typespecStart = i
 			typespecEnd = ScanTypespecEnd(source, tokens, n, i)
 			cm := currentModule()
@@ -478,10 +478,8 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 					i++
 					goto extractRefsForLine
 				}
-				i++
-				j := nextSig(i)
-				if j < n && tokens[j].Kind == TokIdent {
-					name := tokenText(tokens[j])
+				name, j, ok := StaticDeclarationName(source, tokens, n, declarationIdx)
+				if ok {
 					arity := 0
 					pj := nextSig(j + 1)
 					if pj < n && tokens[pj].Kind == TokOpenParen {
@@ -522,6 +520,7 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 			goto extractRefsForLine
 
 		case TokAttrCallback:
+			declarationIdx := i
 			typespecStart = i
 			typespecEnd = ScanTypespecEnd(source, tokens, n, i)
 			cm := currentModule()
@@ -532,10 +531,8 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 				if attrText == "@macrocallback" {
 					kind = "macrocallback"
 				}
-				i++
-				j := nextSig(i)
-				if j < n && tokens[j].Kind == TokIdent {
-					name := tokenText(tokens[j])
+				name, j, ok := StaticDeclarationName(source, tokens, n, declarationIdx)
+				if ok {
 					arity := 0
 					pj := nextSig(j + 1)
 					if pj < n && tokens[pj].Kind == TokOpenParen {
@@ -669,6 +666,18 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 								// arguments, respecting bracket depth and statement boundaries.
 								_, _, hasDo := ScanForwardToMacroCallBlockDo(tokens, n, j)
 								emit = hasDo
+								if !emit && isStatementStart {
+									// Injected DSL calls commonly omit both parentheses and a do
+									// block (`authorize_if always()`). At statement start, an
+									// argument-shaped next token distinguishes those calls from
+									// assignments and operators such as `value = 1`.
+									switch tokens[j].Kind {
+									case TokIdent, TokModule, TokString, TokHeredoc, TokSigil,
+										TokCharLiteral, TokNumber, TokOpenBracket, TokOpenBrace,
+										TokPercent:
+										emit = true
+									}
+								}
 							}
 						}
 						if emit {

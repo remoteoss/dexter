@@ -53,6 +53,13 @@ type Location struct {
 	Range Range  `json:"range"`
 }
 
+// CompletionItem is the stable subset of an LSP completion item that probes
+// and end-to-end tests need.
+type CompletionItem struct {
+	Label  string `json:"label"`
+	Detail string `json:"detail,omitempty"`
+}
+
 // Path returns the location's filesystem path, with the file:// scheme removed.
 func (l Location) Path() string {
 	trimmed := strings.TrimPrefix(l.URI, "file://")
@@ -366,6 +373,34 @@ func (c *Client) Hover(path string, line, char int) (string, error) {
 		return plain, nil
 	}
 	return string(hover.Contents), nil
+}
+
+// Completion returns textDocument/completion items at a zero-based position.
+// Dexter answers with CompletionList, but accepting a bare item array keeps the
+// probe useful with alternate LSP builds too.
+func (c *Client) Completion(path string, line, char int) ([]CompletionItem, error) {
+	params, err := c.position(path, line, char)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := c.Request("textDocument/completion", params)
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
+	}
+	var list struct {
+		Items []CompletionItem `json:"items"`
+	}
+	if err := json.Unmarshal(raw, &list); err == nil && list.Items != nil {
+		return list.Items, nil
+	}
+	var items []CompletionItem
+	if err := json.Unmarshal(raw, &items); err == nil {
+		return items, nil
+	}
+	return nil, fmt.Errorf("completion: cannot decode result %s", truncate(string(raw)))
 }
 
 func decodeLocations(raw json.RawMessage) ([]Location, error) {

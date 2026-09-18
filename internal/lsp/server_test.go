@@ -373,6 +373,164 @@ end
 	}
 }
 
+func TestCompletion_GeneratedFunctionsFromConsumerBEAM(t *testing.T) {
+	if _, err := exec.LookPath("mix"); err != nil {
+		t.Skip("mix not available")
+	}
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	mixExs := `defmodule GeneratedCompletion.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :generated_completion, version: "0.1.0", elixir: "~> 1.18"]
+  end
+end
+`
+	if err := os.WriteFile(filepath.Join(server.projectRoot, "mix.exs"), []byte(mixExs), 0644); err != nil {
+		t.Fatal(err)
+	}
+	indexFile(t, server.store, server.projectRoot, "lib/shared_lib/generator.ex", `defmodule SharedLib.Generator do
+  defmacro __using__(_opts) do
+    quote generated: true, location: :keep do
+      @doc "Runs the generated action."
+      def generated_action(value, opts \\ []), do: {value, opts}
+
+      @doc "Expands an application-local generated macro."
+      defmacro generated_macro(value), do: value
+
+      @doc false
+      def generated_hidden(value), do: value
+    end
+  end
+end
+`)
+	indexFile(t, server.store, server.projectRoot, "lib/shared_lib/resource.ex", `defmodule SharedLib.Resource do
+  use SharedLib.Generator
+
+  def source_action(value), do: value
+end
+`)
+
+	cmd := exec.Command("mix", "compile")
+	cmd.Dir = server.projectRoot
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("compile generated-function fixture: %v\n%s", err, output)
+	}
+	caller := "SharedLib.Resource.gen"
+	callerPath := filepath.Join(server.projectRoot, "lib", "caller.ex")
+	callerURI := string(uri.File(callerPath))
+	server.docs.Set(callerURI, caller)
+	items := completionAt(t, server, callerURI, 0, uint32(len(caller)))
+
+	for _, label := range []string{"generated_action/1", "generated_action/2", "generated_macro/1"} {
+		if !hasCompletionItem(items, label) {
+			t.Errorf("expected %s from consumer BEAM, got %#v", label, items)
+		}
+	}
+	// @doc false controls documentation, not visibility. Oban marks its generated
+	// new/1 and new/2 constructors hidden, but they remain public API called by
+	// application code and must be completable just like source-defined @doc false.
+	if !hasCompletionItem(items, "generated_hidden/1") {
+		t.Error("public @doc false generated function should still be offered")
+	}
+
+	hoverText := "SharedLib.Resource.generated_hidden(value)"
+	hoverPath := filepath.Join(server.projectRoot, "lib", "hover_caller.ex")
+	hoverURI := string(uri.File(hoverPath))
+	server.docs.Set(hoverURI, hoverText)
+	hover, err := server.Hover(context.Background(), &protocol.HoverParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(hoverURI)},
+			Position: protocol.Position{
+				Line:      0,
+				Character: uint32(strings.Index(hoverText, "generated_hidden") + 1),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hover == nil || !strings.Contains(hover.Contents.Value, "def generated_hidden(value)") {
+		t.Fatalf("public @doc false generated function should hover by signature, got %#v", hover)
+	}
+	if strings.Contains(hover.Contents.Value, "defmodule SharedLib.Resource") {
+		t.Fatalf("function hover must not fall through to the module, got %q", hover.Contents.Value)
+	}
+}
+
+func TestCompletion_AshGeneratedFunctionsIntegration(t *testing.T) {
+	root := os.Getenv("DEXTER_ASH_FIXTURE")
+	if root == "" {
+		root = filepath.Join("testdata", "ash_generated_functions")
+		beamPath := filepath.Join(root, "_build", "dev", "lib", "dexter_ash_beam_fixture",
+			"ebin", "Elixir.DexterAshBeamFixture.Accounts.User.beam")
+		if _, err := os.Stat(beamPath); err != nil {
+			t.Skip("compile testdata/ash_generated_functions or set DEXTER_ASH_FIXTURE")
+		}
+	}
+
+	storeDir := t.TempDir()
+	s, err := store.Open(storeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	server := NewServer(s, root)
+	server.snippetSupport = true
+
+	resourcePath := filepath.Join(root, "lib", "dexter_ash_beam_fixture", "accounts", "user.ex")
+	defs, refs, err := parser.ParseFile(resourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IndexFileWithRefs(resourcePath, defs, refs); err != nil {
+		t.Fatal(err)
+	}
+
+	caller := "DexterAshBeamFixture.Accounts.User."
+	callerURI := string(uri.File(filepath.Join(root, "lib", "completion_probe.ex")))
+	server.docs.Set(callerURI, caller)
+	items := completionAt(t, server, callerURI, 0, uint32(len(caller)))
+	for _, label := range []string{"create!/1", "create!/4", "get_by_id/1", "list!/0"} {
+		if !hasCompletionItem(items, label) {
+			t.Errorf("expected Ash generated completion %s", label)
+		}
+	}
+}
+
+func BenchmarkGeneratedFunctionsForModuleCached(b *testing.B) {
+	root := os.Getenv("DEXTER_ASH_FIXTURE")
+	if root == "" {
+		b.Skip("set DEXTER_ASH_FIXTURE to a compiled Ash fixture app")
+	}
+
+	s, err := store.Open(b.TempDir())
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	server := NewServer(s, root)
+	resourcePath := filepath.Join(root, "lib", "dexter_ash_beam_fixture", "accounts", "user.ex")
+	defs, refs, err := parser.ParseFile(resourcePath)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := s.IndexFileWithRefs(resourcePath, defs, refs); err != nil {
+		b.Fatal(err)
+	}
+	if functions := server.generatedFunctionsForModule("DexterAshBeamFixture.Accounts.User"); len(functions) == 0 {
+		b.Fatal("fixture exposed no generated functions")
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		server.generatedFunctionsForModule("DexterAshBeamFixture.Accounts.User")
+	}
+}
+
 func TestCompletion_SubModuleAfterDot(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
@@ -2881,6 +3039,138 @@ end
 	}
 }
 
+// A consumer may override a function injected by __using__. References to that
+// explicit consumer definition must not expand through the injector to bare
+// calls in every other consumer: each consumer owns a distinct generated
+// function. Oban.Worker.new/1 is a real-world instance of this pattern.
+func TestReferences_ExplicitOverrideExcludesOtherUseConsumers(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	injectorSrc := `defmodule SharedLib.Worker do
+  defmacro __using__(_opts) do
+    quote do
+      def generated_action(arg), do: arg
+      defoverridable generated_action: 1
+    end
+  end
+end
+`
+	overrideSrc := `defmodule MyApp.SpecialWorker do
+  use SharedLib.Worker
+
+  def generated_action(arg), do: super(arg)
+end
+`
+	otherSrc := `defmodule MyApp.OtherWorker do
+  use SharedLib.Worker
+
+  def run(arg) do
+    generated_action(arg)
+  end
+end
+`
+	callerSrc := `defmodule MyApp.Caller do
+  def run(arg), do: MyApp.SpecialWorker.generated_action(arg)
+end
+`
+
+	indexFile(t, server.store, server.projectRoot, "lib/shared_lib/worker.ex", injectorSrc)
+	overridePath := filepath.Join(server.projectRoot, "lib/my_app/special_worker.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/special_worker.ex", overrideSrc)
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/other_worker.ex", otherSrc)
+	callerPath := filepath.Join(server.projectRoot, "lib/my_app/caller.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/caller.ex", callerSrc)
+
+	overrideURI := string(uri.File(overridePath))
+	server.docs.Set(overrideURI, overrideSrc)
+	locs := referencesAt(t, server, overrideURI, 3, 6)
+
+	if len(locs) != 1 || uriToPath(locs[0].URI) != callerPath {
+		t.Fatalf("expected only the qualified call to the explicit override, got %v", locs)
+	}
+}
+
+// Later use declarations win when multiple macros inject the same overridable
+// name. Resolution and references must choose the same injector rather than
+// merging calls from unrelated consumers of both providers.
+func TestReferences_LaterUseShadowsEarlierInjector(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	firstSrc := `defmodule SharedLib.FirstWorker do
+  defmacro __using__(_opts) do
+    quote do
+      def injected_action(arg), do: {:first, arg}
+      defoverridable injected_action: 1
+    end
+  end
+end
+`
+	secondSrc := `defmodule SharedLib.SecondWorker do
+  defmacro __using__(_opts) do
+    quote do
+      def injected_action(arg), do: {:second, arg}
+    end
+  end
+end
+`
+	bothSrc := `defmodule MyApp.CombinedWorker do
+  use SharedLib.FirstWorker
+  use SharedLib.SecondWorker
+
+  def run(arg) do
+    injected_action(arg)
+  end
+end
+`
+	firstCallerSrc := `defmodule MyApp.FirstCaller do
+  use SharedLib.FirstWorker
+
+  def run(arg) do
+    injected_action(arg)
+  end
+end
+`
+	secondCallerSrc := `defmodule MyApp.SecondCaller do
+  use SharedLib.SecondWorker
+
+  def run(arg) do
+    injected_action(arg)
+  end
+end
+`
+
+	indexFile(t, server.store, server.projectRoot, "lib/shared_lib/first_worker.ex", firstSrc)
+	indexFile(t, server.store, server.projectRoot, "lib/shared_lib/second_worker.ex", secondSrc)
+	bothPath := filepath.Join(server.projectRoot, "lib/my_app/combined_worker.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/combined_worker.ex", bothSrc)
+	firstCallerPath := filepath.Join(server.projectRoot, "lib/my_app/first_caller.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/first_caller.ex", firstCallerSrc)
+	secondCallerPath := filepath.Join(server.projectRoot, "lib/my_app/second_caller.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/second_caller.ex", secondCallerSrc)
+
+	bothURI := string(uri.File(bothPath))
+	server.docs.Set(bothURI, bothSrc)
+	tf := NewTokenizedFile(bothSrc)
+	aliases := tf.ExtractAliasesInScope(5)
+	if got := server.resolveBareFunctionModule(bothPath, bothSrc, tf, 5, "injected_action", aliases); got != "SharedLib.SecondWorker" {
+		t.Fatalf("later use should win resolution: got %q", got)
+	}
+
+	locs := referencesAt(t, server, bothURI, 5, 6)
+	seen := make(map[string]bool, len(locs))
+	for _, loc := range locs {
+		seen[uriToPath(loc.URI)] = true
+	}
+	if !seen[bothPath] || !seen[secondCallerPath] {
+		t.Fatalf("expected combined and second-provider calls, got %v", locs)
+	}
+	if seen[firstCallerPath] {
+		t.Fatalf("earlier shadowed injector leaked an unrelated call: %v", locs)
+	}
+}
+
 func TestReferences_TransitiveUseChain(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
@@ -4323,6 +4613,31 @@ end
 	}
 }
 
+func TestDocumentSymbol_IgnoresGeneratedDeclarationNames(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule Generated do
+  quote do
+    def unquote(function_name)(), do: :ok
+    @type unquote(type_name)() :: term()
+    @callback unquote(callback_name)(term()) :: term()
+  end
+
+  def ordinary, do: :ok
+end`
+	docURI := "file:///test/generated.ex"
+	server.docs.Set(docURI, content)
+
+	symbols := documentSymbols(t, server, docURI)
+	if symbol := findSymbol(symbols, "unquote/1"); symbol != nil {
+		t.Fatalf("generated declaration appeared as document symbol: %+v", symbol)
+	}
+	if symbol := findSymbol(symbols, "ordinary/0"); symbol == nil {
+		t.Fatal("ordinary declaration missing from document symbols")
+	}
+}
+
 func TestDocumentSymbol_NestedModules(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
@@ -5380,6 +5695,73 @@ end`)
 	}
 	if result.ActiveParameter != 0 {
 		t.Errorf("expected active parameter 0, got %d", result.ActiveParameter)
+	}
+}
+
+func TestSignatureHelp_BareNameIgnoresCrossModulePrivateFunctions(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/shared_lib/worker.ex", `defmodule SharedLib.Worker do
+  def visible(value), do: value
+  defp concealed(value), do: value
+end
+`)
+	indexFile(t, server.store, server.projectRoot, "lib/kernel.ex", `defmodule Kernel do
+  defp kernel_secret(value), do: value
+end
+`)
+
+	signatureFor := func(source, function string) *protocol.SignatureHelp {
+		t.Helper()
+		docURI := "file:///" + function + "_caller.ex"
+		server.docs.Set(docURI, source)
+		lines := strings.Split(source, "\n")
+		line := -1
+		col := -1
+		for i, text := range lines {
+			if start := strings.Index(text, function+"("); start >= 0 {
+				line = i
+				col = start + len(function) + 1
+				break
+			}
+		}
+		if line < 0 {
+			t.Fatalf("fixture has no call to %s", function)
+		}
+		result, err := server.SignatureHelp(context.Background(), &protocol.SignatureHelpParams{
+			TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+				TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(docURI)},
+				Position:     protocol.Position{Line: uint32(line), Character: uint32(col)},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+
+	if got := signatureFor(`defmodule MyApp.PublicCaller do
+  import SharedLib.Worker
+  def run, do: visible(value)
+end
+`, "visible"); got == nil {
+		t.Fatal("public imported function should provide signature help")
+	}
+
+	if got := signatureFor(`defmodule MyApp.PrivateCaller do
+  import SharedLib.Worker
+  def run, do: concealed(value)
+end
+`, "concealed"); got != nil {
+		t.Fatalf("private imported function leaked into signature help: %#v", got)
+	}
+
+	if got := signatureFor(`defmodule MyApp.KernelCaller do
+  def run, do: kernel_secret(value)
+end
+`, "kernel_secret"); got != nil {
+		t.Fatalf("private Kernel function leaked into signature help: %#v", got)
 	}
 }
 

@@ -62,6 +62,16 @@ func (x *T) Hover(path string, line, char int) string {
 	return text
 }
 
+// Completion returns completion items at a zero-based position.
+func (x *T) Completion(path string, line, char int) []CompletionItem {
+	x.t.Helper()
+	items, err := x.Client.Completion(path, line, char)
+	if err != nil {
+		x.t.Fatalf("lsptest: %v", err)
+	}
+	return items
+}
+
 // RefLines is References rendered through Lines, the form assertions compare.
 func (x *T) RefLines(path string, line, char int, includeDeclaration bool) []string {
 	x.t.Helper()

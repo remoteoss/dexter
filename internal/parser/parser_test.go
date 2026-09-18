@@ -232,6 +232,45 @@ end
 	}
 }
 
+func TestParseFile_DoesNotIndexUnquoteFragmentsAsDefinitions(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.Generated do
+  for name <- [:foo, :bar] do
+    def unquote(name)(), do: :ok
+  end
+
+	quote do
+		def unquote_splicing(definitions)
+		@type unquote(type_name)() :: term()
+		@opaque unquote_splicing(types) :: term()
+		@callback unquote(callback_name)(term()) :: term()
+		@macrocallback unquote_splicing(callbacks) :: Macro.t()
+	end
+
+  def source_function, do: :ok
+end
+`)
+
+	defs, _, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	functions := map[string]bool{}
+	for _, def := range defs {
+		functions[def.Function] = true
+	}
+
+	if functions["unquote"] {
+		t.Error("unquote fragment must not be indexed as a literal function definition")
+	}
+	if functions["unquote_splicing"] {
+		t.Error("unquote_splicing fragment must not be indexed as a literal definition")
+	}
+	if !functions["source_function"] {
+		t.Error("ordinary definitions after unquote fragments must still be indexed")
+	}
+}
+
 func TestParseFile_FunctionWithQuestionMark(t *testing.T) {
 	path := writeTempFile(t, `defmodule MyApp.Guards do
   def valid?(thing) do
@@ -1884,6 +1923,27 @@ end
 			t.Errorf("should not capture Elixir keyword %q as bare macro call", r.Function)
 		}
 	}
+}
+
+func TestParseFileReferences_BareInjectedCallWithoutParensOrBlock(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.Policy do
+  use SharedLib.Policy
+
+  authorize_if always()
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, r := range refs {
+		if r.Kind == "call" && r.Module == "SharedLib.Policy" && r.Function == "authorize_if" {
+			return
+		}
+	}
+	t.Fatalf("expected authorize_if to be attributed to SharedLib.Policy, got %+v", refs)
 }
 
 func TestParseFileReferences_BareMacroNotWithoutInjector(t *testing.T) {

@@ -28,6 +28,7 @@ import (
 	"go.lsp.dev/uri"
 	"go.uber.org/zap"
 
+	"github.com/remoteoss/dexter/internal/beam"
 	"github.com/remoteoss/dexter/internal/indexer"
 	"github.com/remoteoss/dexter/internal/parser"
 	"github.com/remoteoss/dexter/internal/stdlib"
@@ -93,8 +94,11 @@ type Server struct {
 	erlangRuntimeCache map[string]*erlangRuntimeCache   // runtime key → cached OTP modules/exports
 	erlangRuntimeMu    sync.Mutex
 
-	usingCache   map[string]*usingCacheEntry // module name → parsed __using__ result
-	usingCacheMu sync.RWMutex
+	usingCache     map[string]*usingCacheEntry // module name → parsed __using__ result
+	usingCacheMu   sync.RWMutex
+	generatedCache *generatedFunctionCache
+	beamLibs       *beamLibIndexCache // build root → compiled application directories
+	ebinIndexes    *ebinIndexCache    // ebin dir → modules compiled into it
 
 	depsCache   map[string]bool // dir → whether files in that dir are deps
 	depsCacheMu sync.RWMutex
@@ -147,6 +151,9 @@ func NewServer(s *store.Store, projectRoot string) *Server {
 		erlangBuildRoots:   make(map[string]*erlangBuildRootState),
 		erlangRuntimeCache: make(map[string]*erlangRuntimeCache),
 		usingCache:         make(map[string]*usingCacheEntry),
+		generatedCache:     newGeneratedFunctionCache(),
+		beamLibs:           newBeamLibIndexCache(),
+		ebinIndexes:        newEbinIndexCache(),
 		depsCache:          make(map[string]bool),
 		// What every client sends when the server declares no encoding, which
 		// Dexter does not.
@@ -751,10 +758,12 @@ func (s *Server) DidOpen(ctx context.Context, params *protocol.DidOpenTextDocume
 	// Skip deps and stdlib files — we don't format those.
 	if path != "" && isFormattableFile(path) && s.isProjectFile(path) && !s.isDepsFile(path) {
 		buildRoot := s.findBuildRoot(filepath.Dir(path))
-		go func(path, buildRoot string) {
+		text := params.TextDocument.Text
+		go func(path, buildRoot, text string) {
+			s.prewarmGeneratedFunctions(path, text)
 			_ = s.getBeamProcess(context.Background(), buildRoot)
 			s.startErlangModuleLoad(path)
-		}(path, buildRoot)
+		}(path, buildRoot, text)
 	}
 
 	return nil
@@ -920,6 +929,15 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		fullModule := s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, tf, lineNum, functionName, aliases)
 		s.debugf("Definition: resolved bare %q -> %q", functionName, fullModule)
 		if fullModule == "" {
+			currentModule := s.store.LookupEnclosingModule(uriToPath(protocol.DocumentURI(docURI)), lineNum+1)
+			if provider, _, found := s.generatedSymbolInScope(currentModule, func() []string {
+				return s.enclosingBlockPath(docURI, lineNum, col)
+			}, functionName); found {
+				if results := s.generatedDefinitionResults(provider.module); len(results) > 0 {
+					s.debugf("Definition: generated bare %q provider=%s", functionName, provider.module)
+					return storeResultsToLocations(results), nil
+				}
+			}
 			s.debugf("Definition: could not resolve bare function %q", functionName)
 			return nil, nil
 		}
@@ -971,6 +989,16 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 			return storeResultsToLocations(byKindForContext(tf, lineNum, results)), nil
 		}
 
+		currentModule = s.store.LookupEnclosingModule(uriToPath(protocol.DocumentURI(docURI)), lineNum+1)
+		if provider, _, found := s.generatedSymbolInScope(currentModule, func() []string {
+			return s.enclosingBlockPath(docURI, lineNum, col)
+		}, functionName); found {
+			if results := s.generatedDefinitionResults(provider.module); len(results) > 0 {
+				s.debugf("Definition: generated fallback for bare %q provider=%s", functionName, provider.module)
+				return storeResultsToLocations(results), nil
+			}
+		}
+
 		s.debugf("Definition: no result found for bare function %q in module %q", functionName, fullModule)
 
 		return nil, nil
@@ -1003,14 +1031,20 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 			s.debugf("Definition: found %d result(s) via use chain of %s for %s", len(results), fullModule, functionName)
 			return storeResultsToLocations(results), nil
 		}
-		s.debugf("Definition: no result for %s.%s", fullModule, functionName)
+		s.debugf("Definition: no indexed or use-chain definition for %s.%s; falling back to module source", fullModule, functionName)
 	}
 
 	// Fall back to module (fullModule already resolved via nesting above)
 	results, err := s.store.LookupModule(fullModule)
-	if err != nil || len(results) == 0 {
+	if err != nil {
+		s.debugf("Definition: module fallback lookup failed for %s: %v", fullModule, err)
 		return nil, nil
 	}
+	if len(results) == 0 {
+		s.debugf("Definition: module fallback found no source for %s", fullModule)
+		return nil, nil
+	}
+	s.debugf("Definition: module fallback for %s.%s -> %s:%d (%d result(s))", fullModule, functionName, results[0].FilePath, results[0].Line, len(results))
 	return storeResultsToLocations(results), nil
 }
 
@@ -1039,6 +1073,20 @@ var typeKinds = map[string]bool{"type": true, "typep": true, "opaque": true}
 
 // privateKinds are definitions that only the defining module can call.
 var privateKinds = map[string]bool{"defp": true, "defmacrop": true, "defguardp": true}
+
+// publicOnly applies the same strict visibility rule as
+// store.LookupPublicFunction after a delegate lookup has followed the public
+// defdelegate to its final definition.
+func publicOnly(results []store.LookupResult) []store.LookupResult {
+	public := results[:0]
+	for _, r := range results {
+		switch r.Kind {
+		case "def", "defmacro", "defguard", "defdelegate", "type", "opaque":
+			public = append(public, r)
+		}
+	}
+	return public
+}
 
 // filterOutPrivate drops private definitions from a lookup whose call site is
 // outside the defining module. A module can export a public def and keep a
@@ -1743,9 +1791,20 @@ func (s *Server) CodeLensResolve(ctx context.Context, params *protocol.CodeLens)
 func (s *Server) ColorPresentation(ctx context.Context, params *protocol.ColorPresentationParams) ([]protocol.ColorPresentation, error) {
 	return nil, nil
 }
-func (s *Server) Completion(ctx context.Context, params *protocol.CompletionParams) (*protocol.CompletionList, error) {
+func (s *Server) Completion(ctx context.Context, params *protocol.CompletionParams) (result *protocol.CompletionList, err error) {
 	docURI := string(params.TextDocument.URI)
 	filePath := uriToPath(params.TextDocument.URI)
+	if s.debug {
+		started := time.Now()
+		s.debugf("Completion request: uri=%s line=%d col=%d", docURI, params.Position.Line, params.Position.Character)
+		defer func() {
+			items := 0
+			if result != nil {
+				items = len(result.Items)
+			}
+			s.debugf("Completion: total %s (%d items)", time.Since(started).Round(time.Microsecond), items)
+		}()
+	}
 
 	text, ok := s.docs.GetOrLoad(docURI)
 	if !ok {
@@ -1898,10 +1957,12 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 		if err != nil {
 			return nil, nil
 		}
+		seen := make(map[string]bool, len(results))
 		for _, r := range results {
 			if funcPrefix != "" && !strings.HasPrefix(r.Function, funcPrefix) {
 				continue
 			}
+			seen[funcKey(r.Function, r.Arity)] = true
 			item := protocol.CompletionItem{
 				Label:  r.Function,
 				Kind:   kindToCompletionItemKind(r.Kind),
@@ -1914,6 +1975,8 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 			applySnippet(&item, r.Function, r.Arity, r.Params, r.Kind, inPipe, s.snippetSupport)
 			items = append(items, item)
 		}
+
+		s.addGeneratedFunctionCompletions(resolved, "", funcPrefix, seen, &items, inPipe, s.snippetSupport)
 
 		if afterDot {
 			segments, err := s.store.SearchSubmoduleSegments(resolved, funcPrefix)
@@ -1989,6 +2052,8 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 		}
 	} else if funcPrefix != "" {
 		seen := make(map[string]bool)
+		aliases := tf.ExtractAliases()
+		s.mergeAliasesFromUseTokenized(tf, aliases)
 
 		for _, bf := range tf.FindBufferFunctions() {
 			key := funcKey(bf.Name, bf.Arity)
@@ -2007,6 +2072,7 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 		imports := tf.ExtractImports()
 		imports = append(imports, "Kernel")
 		for _, mod := range imports {
+			mod = resolveModule(mod, aliases)
 			results, err := s.store.ListModuleFunctions(mod, true)
 			if err != nil {
 				continue
@@ -2031,13 +2097,26 @@ func (s *Server) Completion(ctx context.Context, params *protocol.CompletionPara
 					items = append(items, item)
 				}
 			}
+			s.addGeneratedFunctionCompletions(mod, "", funcPrefix, seen, &items, inPipe, s.snippetSupport)
+		}
+		if currentModule := s.store.LookupEnclosingModule(filePath, lineNum+1); currentModule != "" {
+			s.addGeneratedFunctionCompletions(currentModule, "", funcPrefix, seen, &items, inPipe, s.snippetSupport)
+			// DSL macros are injected by provider modules that only the compiled
+			// attributes name, so static use-chain resolution never reaches them.
+			// Which ones are in scope depends on the do block the cursor sits in;
+			// the walk is deferred because most modules have no DSL extensions.
+			for _, provider := range s.dslProvidersInScope(currentModule, func() []string {
+				return s.enclosingBlockPath(docURI, lineNum, col)
+			}) {
+				s.addGeneratedFunctionCompletions(provider.module, provider.beamPath, funcPrefix, seen, &items, inPipe, s.snippetSupport)
+			}
 		}
 
 		// Check use-injected imports and inline defs (including transitive use chains)
-		aliases := tf.ExtractAliases()
-		s.mergeAliasesFromUseTokenized(tf, aliases)
 		visitedCompletion := make(map[string]bool)
-		for _, useCall := range tf.ExtractUsesWithOpts(aliases) {
+		useCalls := tf.ExtractUsesWithOpts(aliases)
+		for i := len(useCalls) - 1; i >= 0; i-- {
+			useCall := useCalls[i]
 			s.addCompletionsFromUsingFor(useCall.Module, useCall.dispatchAtom(), useCall.Opts, funcPrefix, seen, &items, visitedCompletion, inPipe, s.snippetSupport)
 		}
 
@@ -2286,8 +2365,9 @@ func (s *Server) lookupInUsingEntryFor(moduleName, functionName, which string, c
 		var err error
 		if s.followDelegates {
 			results, err = s.store.LookupFollowDelegate(body.imports[j], functionName)
+			results = publicOnly(results)
 		} else {
-			results, err = s.store.LookupFunction(body.imports[j], functionName)
+			results, err = s.store.LookupPublicFunction(body.imports[j], functionName)
 		}
 		if err != nil || len(results) == 0 {
 			continue
@@ -2310,8 +2390,9 @@ func (s *Server) lookupInUsingEntryFor(moduleName, functionName, which string, c
 			var err error
 			if s.followDelegates {
 				results, err = s.store.LookupFollowDelegate(mod, functionName)
+				results = publicOnly(results)
 			} else {
-				results, err = s.store.LookupFunction(mod, functionName)
+				results, err = s.store.LookupPublicFunction(mod, functionName)
 			}
 			if err == nil && len(results) > 0 {
 				return results
@@ -2374,7 +2455,7 @@ func (s *Server) resolveModuleViaUseChainFor(moduleName, functionName, which str
 	}
 
 	for j := len(body.imports) - 1; j >= 0; j-- {
-		if results, err := s.store.LookupFunction(body.imports[j], functionName); err == nil && len(results) > 0 {
+		if results, err := s.store.LookupPublicFunction(body.imports[j], functionName); err == nil && len(results) > 0 {
 			return body.imports[j]
 		}
 	}
@@ -2389,7 +2470,7 @@ func (s *Server) resolveModuleViaUseChainFor(moduleName, functionName, which str
 		}
 		switch b.kind {
 		case "import":
-			if results, err := s.store.LookupFunction(mod, functionName); err == nil && len(results) > 0 {
+			if results, err := s.store.LookupPublicFunction(mod, functionName); err == nil && len(results) > 0 {
 				return mod
 			}
 		case "use":
@@ -3223,6 +3304,7 @@ func (s *Server) addCompletionsFromUsingFor(moduleName, which string, consumerOp
 				*items = append(*items, item)
 			}
 		}
+		s.addGeneratedFunctionCompletions(mod, "", funcPrefix, seen, items, inPipe, useSnippets)
 	}
 	for _, mod := range body.imports {
 		addModule(mod)
@@ -3258,10 +3340,20 @@ func (s *Server) addCompletionsFromUsingFor(moduleName, which string, consumerOp
 // Mirrors the go-to-definition priority: current file modules → imports → use chains → Kernel.
 // Callers should pass pre-computed aliases to avoid redundant ExtractAliases scans.
 func (s *Server) resolveBareFunctionModule(filePath, text string, tf *TokenizedFile, lineNum int, functionName string, aliases map[string]string) string {
+	module, _ := s.resolveBareFunctionModuleWithOrigin(filePath, text, tf, lineNum, functionName, aliases)
+	return module
+}
+
+// resolveBareFunctionModuleWithOrigin also reports whether the winner is an
+// explicit definition in the cursor file. References uses that provenance to
+// distinguish a consumer override from a function supplied by its use chain:
+// both resolve to the consumer module, but only the latter should expand across
+// other consumers of the injector.
+func (s *Server) resolveBareFunctionModuleWithOrigin(filePath, text string, tf *TokenizedFile, lineNum int, functionName string, aliases map[string]string) (module string, definedInFile bool) {
 	// Check all modules in the current file with a single query, preferring
 	// the one closest to the cursor line (handles sibling nested modules).
 	if mod, ok := s.store.LookupFunctionInFile(filePath, functionName, lineNum+1); ok {
-		return mod
+		return mod, true
 	}
 
 	if tf == nil {
@@ -3271,33 +3363,35 @@ func (s *Server) resolveBareFunctionModule(filePath, text string, tf *TokenizedF
 	// Explicit imports (direct definitions only — fast store lookup)
 	imports := tf.ExtractImports()
 	for _, mod := range imports {
-		if results, err := s.store.LookupFunction(mod, functionName); err == nil && len(results) > 0 {
-			return mod
+		if results, err := s.store.LookupPublicFunction(mod, functionName); err == nil && len(results) > 0 {
+			return mod, false
 		}
 	}
 
 	// Use chains — use opts-aware resolution so `import unquote(mod)` patterns
 	// resolve to the consumer-provided module rather than always using the default.
-	for _, uc := range tf.ExtractUsesWithOpts(aliases) {
+	useCalls := tf.ExtractUsesWithOpts(aliases)
+	for i := len(useCalls) - 1; i >= 0; i-- {
+		uc := useCalls[i]
 		if mod := s.resolveModuleViaUseChainFor(uc.Module, functionName, uc.dispatchAtom(), uc.Opts, map[string]bool{}); mod != "" {
-			return mod
+			return mod, false
 		}
 	}
 
 	// Kernel is always in scope
-	if results, err := s.store.LookupFunction("Kernel", functionName); err == nil && len(results) > 0 {
-		return "Kernel"
+	if results, err := s.store.LookupPublicFunction("Kernel", functionName); err == nil && len(results) > 0 {
+		return "Kernel", false
 	}
 
 	// Slow fallback: function may be injected into an imported module via its
 	// own use chain (e.g. MyApp.Factory uses ExMachina, which injects `insert`).
 	for _, mod := range imports {
 		if results := s.lookupThroughUseOf(mod, functionName); len(results) > 0 {
-			return mod
+			return mod, false
 		}
 	}
 
-	return ""
+	return "", false
 }
 
 func resolveModule(moduleRef string, aliases map[string]string) string {
@@ -3598,10 +3692,21 @@ func (s *Server) CompletionResolve(ctx context.Context, params *protocol.Complet
 	}
 
 	var data struct {
-		FilePath string `json:"filePath"`
-		Line     int    `json:"line"`
+		FilePath          string `json:"filePath"`
+		Line              int    `json:"line"`
+		GeneratedModule   string `json:"generatedModule"`
+		GeneratedFunction string `json:"generatedFunction"`
 	}
-	if err := json.Unmarshal(raw, &data); err != nil || data.FilePath == "" {
+	if err := json.Unmarshal(raw, &data); err != nil {
+		return params, nil
+	}
+	if data.GeneratedModule != "" && data.GeneratedFunction != "" {
+		if hover := s.hoverFromGenerated(data.GeneratedModule, "", data.GeneratedFunction); hover != nil {
+			params.Documentation = hover.Contents
+		}
+		return params, nil
+	}
+	if data.FilePath == "" {
 		return params, nil
 	}
 
@@ -4136,11 +4241,10 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 			kind := tokText(tok)
 			lineIdx := tok.Line - 1
 
-			j := nextSig(i + 1)
-			if j >= n || tokens[j].Kind != parser.TokIdent {
+			funcName, j, ok := parser.StaticDeclarationName(source, tokens, n, i)
+			if !ok {
 				continue
 			}
-			funcName := tokText(tokens[j])
 			nameCol := tokCol(tokens[j])
 			j = nextSig(j + 1)
 			arity, _, _, _ := parser.CollectParams(source, tokens, n, j)
@@ -4256,11 +4360,10 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 			}
 			lineIdx := tok.Line - 1
 
-			j := nextSig(i + 1)
-			if j >= n || tokens[j].Kind != parser.TokIdent {
+			name, j, ok := parser.StaticDeclarationName(source, tokens, n, i)
+			if !ok {
 				continue
 			}
-			name := tokText(tokens[j])
 			nameCol := tokCol(tokens[j])
 			j = nextSig(j + 1)
 			arity, _, _, _ := parser.CollectParams(source, tokens, n, j)
@@ -4304,11 +4407,10 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 			}
 			lineIdx := tok.Line - 1
 
-			j := nextSig(i + 1)
-			if j >= n || tokens[j].Kind != parser.TokIdent {
+			name, j, ok := parser.StaticDeclarationName(source, tokens, n, i)
+			if !ok {
 				continue
 			}
-			name := tokText(tokens[j])
 			nameCol := tokCol(tokens[j])
 			j = nextSig(j + 1)
 			arity, _, _, _ := parser.CollectParams(source, tokens, n, j)
@@ -4682,6 +4784,19 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 			return s.hoverFromFile(functionName, results[0])
 		}
 
+		// Generated functions have no source definition to hover: a macro emitted
+		// them into the compiled module. Look in the enclosing module and in the
+		// modules whose DSL macros it pulls in.
+		enclosing := s.store.LookupEnclosingModule(uriToPath(protocol.DocumentURI(docURI)), lineNum+1)
+		if enclosing == "" {
+			enclosing = currentModule
+		}
+		if hover := s.hoverFromGeneratedModules(enclosing, func() []string {
+			return s.enclosingBlockPath(docURI, lineNum, col)
+		}, functionName); hover != nil {
+			return hover, nil
+		}
+
 		// Fallback: bare identifier might be an Erlang built-in type or function
 		// (e.g. pos_integer, binary, term, length, is_atom)
 		if hover, _ := s.erlangHover(ctx, uriToPath(protocol.DocumentURI(docURI)), "erlang", functionName); hover != nil {
@@ -4704,6 +4819,10 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 		if err == nil && len(results) > 0 {
 			hits := byKindForContext(tf, lineNum, results)
 			return s.hoverFromFile(functionName, hits[0])
+		}
+		// Nothing in the index: the function may exist only in the compiled module.
+		if hover := s.hoverFromGenerated(fullModule, "", functionName); hover != nil {
+			return hover, nil
 		}
 	}
 
@@ -4997,6 +5116,9 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 	s.debugf("References: expr=%q module=%q function=%q", expr, moduleRef, functionName)
 
 	var fullModule string
+	var definedInCursorFile bool
+	var generatedInjectors []string
+	var generatedProvider string
 	// Same-file occurrences of a name written in a typespec — see the note
 	// below. They carry the bare type uses (`@type t :: schema | embedded`)
 	// that the call-shaped scan cannot see.
@@ -5044,8 +5166,21 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 		}
 
 		// Bare function — resolve to its defining module
-		fullModule = s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, tf, lineNum, functionName, aliases)
+		fullModule, definedInCursorFile = s.resolveBareFunctionModuleWithOrigin(uriToPath(protocol.DocumentURI(docURI)), text, tf, lineNum, functionName, aliases)
 		s.debugf("References: resolved bare %q -> %q", functionName, fullModule)
+		if fullModule == "" {
+			currentModule := s.store.LookupEnclosingModule(uriToPath(protocol.DocumentURI(docURI)), lineNum+1)
+			if provider, _, found := s.generatedSymbolInScope(currentModule, func() []string {
+				return s.enclosingBlockPath(docURI, lineNum, col)
+			}, functionName); found {
+				fullModule = provider.module
+				generatedProvider = provider.module
+				for _, useCall := range tf.ExtractUsesWithOpts(aliases) {
+					generatedInjectors = append(generatedInjectors, useCall.Module)
+				}
+				s.debugf("References: generated bare %q provider=%s injectors=%v", functionName, fullModule, generatedInjectors)
+			}
+		}
 		if fullModule == "" {
 			s.debugf("References: could not resolve bare function %q", functionName)
 			if typespecOccurrences != nil {
@@ -5076,14 +5211,15 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 	// fast (cache reads only) and catches dynamic opt-binding injectors like
 	// `import unquote(mod)`. If we find injectors here we can skip the expensive
 	// findModulesWhoseUsingImports scan entirely.
-	var injectors []string
-	if functionName != "" && moduleRef == "" {
+	injectors := generatedInjectors
+	if functionName != "" && moduleRef == "" && !definedInCursorFile && len(injectors) == 0 {
 		useCalls := tf.ExtractUsesWithOpts(aliases)
-		visited := make(map[string]bool)
-		for _, uc := range useCalls {
-			if s.lookupInUsingEntryFor(uc.Module, functionName, uc.dispatchAtom(), uc.Opts, visited) != nil {
+		for i := len(useCalls) - 1; i >= 0; i-- {
+			uc := useCalls[i]
+			if s.lookupInUsingEntryFor(uc.Module, functionName, uc.dispatchAtom(), uc.Opts, map[string]bool{}) != nil {
 				injectors = append(injectors, uc.Module)
 				s.debugf("References: opt-binding injector for %s: %s", functionName, uc.Module)
+				break
 			}
 		}
 	}
@@ -5144,6 +5280,9 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 	for _, mod := range injectors {
 		transitive, err := s.store.LookupReferences(mod, functionName)
 		if err == nil {
+			if generatedProvider != "" {
+				transitive = s.filterGeneratedProviderReferences(generatedProvider, functionName, transitive)
+			}
 			refResults = append(refResults, transitive...)
 			s.debugf("References: transitive via %s: +%d results", mod, len(transitive))
 		}
@@ -5241,6 +5380,10 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 	// Include declaration if requested
 	if params.Context.IncludeDeclaration {
 		defResults, err := s.store.LookupFunction(fullModule, functionName)
+		if (err != nil || len(defResults) == 0) && len(generatedInjectors) > 0 {
+			defResults = s.generatedDefinitionResults(fullModule)
+			err = nil
+		}
 		if err == nil {
 			defResults = byKindForContext(tf, lineNum, defResults)
 			for _, r := range defResults {
@@ -6557,10 +6700,14 @@ func (s *Server) SignatureHelp(ctx context.Context, params *protocol.SignatureHe
 
 	// Resolve the function to a store lookup result
 	var result *store.LookupResult
+	var generatedModule string
+	var generatedFunctions []beam.Function
 	if moduleRef != "" {
 		fullModule := resolveModule(moduleRef, aliases)
 		if results, err := s.store.LookupFunction(fullModule, functionName); err == nil && len(results) > 0 {
 			result = &results[0]
+		} else if functions, found := s.generatedSymbol(fullModule, "", functionName); found {
+			generatedModule, generatedFunctions = fullModule, functions
 		}
 	} else {
 		// Bare function — check buffer, imports, use chains, Kernel
@@ -6579,7 +6726,8 @@ func (s *Server) SignatureHelp(ctx context.Context, params *protocol.SignatureHe
 		}
 
 		for _, mod := range tf.ExtractImports() {
-			if results, err := s.store.LookupFunction(mod, functionName); err == nil && len(results) > 0 {
+			mod = resolveModule(mod, aliases)
+			if results, err := s.store.LookupPublicFunction(mod, functionName); err == nil && len(results) > 0 {
 				result = &results[0]
 				break
 			}
@@ -6593,11 +6741,25 @@ func (s *Server) SignatureHelp(ctx context.Context, params *protocol.SignatureHe
 
 		if result == nil {
 			if results, err := s.store.LookupFollowDelegate("Kernel", functionName); err == nil && len(results) > 0 {
-				result = &results[0]
+				if results = publicOnly(results); len(results) > 0 {
+					result = &results[0]
+				}
+			}
+		}
+
+		if result == nil {
+			currentModule := s.store.LookupEnclosingModule(uriToPath(protocol.DocumentURI(docURI)), lineNum+1)
+			if provider, functions, found := s.generatedSymbolInScope(currentModule, func() []string {
+				return s.enclosingBlockPath(docURI, lineNum, col)
+			}, functionName); found {
+				generatedModule, generatedFunctions = provider.module, functions
 			}
 		}
 	}
 
+	if len(generatedFunctions) > 0 {
+		return s.generatedSignature(generatedFunctions, generatedModule, argIndex), nil
+	}
 	if result == nil {
 		return nil, nil
 	}
@@ -6797,16 +6959,37 @@ func (s *Server) PrepareCallHierarchy(ctx context.Context, params *protocol.Call
 	} else {
 		fullModule = s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, tf, lineNum, functionName, aliases)
 	}
+	var generatedFunctions []beam.Function
 	if fullModule == "" {
-		return nil, nil
+		currentModule := s.store.LookupEnclosingModule(uriToPath(protocol.DocumentURI(docURI)), lineNum+1)
+		if provider, functions, found := s.generatedSymbolInScope(currentModule, func() []string {
+			return s.enclosingBlockPath(docURI, lineNum, col)
+		}, functionName); found {
+			fullModule, generatedFunctions = provider.module, functions
+		} else {
+			return nil, nil
+		}
 	}
 
 	defResults, err := s.store.LookupFunction(fullModule, functionName)
 	if err != nil || len(defResults) == 0 {
-		return nil, nil
+		if len(generatedFunctions) == 0 {
+			generatedFunctions, _ = s.generatedSymbol(fullModule, "", functionName)
+		}
+		if len(generatedFunctions) == 0 {
+			return nil, nil
+		}
+		defResults = s.generatedDefinitionResults(fullModule)
+		if len(defResults) == 0 {
+			return nil, nil
+		}
 	}
 
 	r := defResults[0]
+	if len(generatedFunctions) > 0 {
+		r.Arity = generatedFunctions[0].Arity
+		r.Kind = generatedFunctions[0].Kind
+	}
 	nameCol := 0
 	defLine, _ := s.getFileLine(r.FilePath, r.Line)
 	if col := findTokenColumn(defLine, functionName); col >= 0 {

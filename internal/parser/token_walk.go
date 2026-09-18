@@ -2,6 +2,40 @@ package parser
 
 import "strings"
 
+// StaticDeclarationName returns the literal name declared by a function,
+// type, spec, or callback token. Macro-generated declaration heads use
+// unquote/unquote_splicing as placeholders rather than literal names; those
+// return ok=false so every token-based consumer treats them consistently.
+func StaticDeclarationName(source []byte, tokens []Token, n, declarationIdx int) (name string, nameIdx int, ok bool) {
+	if declarationIdx < 0 || declarationIdx >= n {
+		return "", n, false
+	}
+
+	nameIdx = NextSigToken(tokens, n, declarationIdx+1)
+	if nameIdx >= n {
+		return "", nameIdx, false
+	}
+
+	switch tokens[declarationIdx].Kind {
+	case TokDef, TokDefp, TokDefmacro, TokDefmacrop, TokDefguard, TokDefguardp, TokDefdelegate:
+		if !isValidFuncNameToken(tokens[nameIdx].Kind) {
+			return "", nameIdx, false
+		}
+	case TokAttrType, TokAttrSpec, TokAttrCallback:
+		if tokens[nameIdx].Kind != TokIdent {
+			return "", nameIdx, false
+		}
+	default:
+		return "", nameIdx, false
+	}
+
+	name = TokenText(source, tokens[nameIdx])
+	if name == "unquote" || name == "unquote_splicing" {
+		return "", nameIdx, false
+	}
+	return name, nameIdx, true
+}
+
 // IsStatementBoundaryToken reports whether kind starts a new statement or closes
 // the current one, so forward scans should stop before consuming later syntax.
 func IsStatementBoundaryToken(kind TokenKind) bool {
