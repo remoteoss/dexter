@@ -687,6 +687,15 @@ func (s *Server) filterGeneratedProviderReferences(providerModule, functionName 
 		if currentModule == "" {
 			continue
 		}
+		// A generated consumer function is owned by the enclosing module itself.
+		// Its bare calls are conservatively indexed under the module's use
+		// injector, but no DSL extension should be involved in validating them.
+		if currentModule == providerModule {
+			if _, found := s.generatedSymbol(currentModule, "", functionName); found {
+				kept = append(kept, ref)
+			}
+			continue
+		}
 		providerPossible := false
 		for _, extension := range s.macroProvidersForModule(currentModule) {
 			if providerModule == extension || strings.HasPrefix(providerModule, extension+".") {

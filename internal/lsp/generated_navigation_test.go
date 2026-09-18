@@ -348,3 +348,38 @@ end
 		t.Fatalf("reference from a different generated provider leaked in: %#v", locations)
 	}
 }
+
+func TestReferencesBareGeneratedConsumerFunctionThroughInjector(t *testing.T) {
+	f := newGeneratedNavigationFixture(t)
+	const source = `defmodule MyApp.Article do
+  use SharedLib.Resource
+
+  def run do
+    generated_lookup(:id)
+  end
+end
+`
+	indexFile(t, f.server.store, f.server.projectRoot, "lib/my_app/article.ex", source)
+	f.server.docs.Set(f.consumerURI, source)
+	indexed, err := f.server.store.LookupReferences("SharedLib.Resource", "generated_lookup")
+	if err != nil || len(indexed) != 1 {
+		t.Fatalf("test setup expected one injector reference, got %v, %v", indexed, err)
+	}
+	provider, _, found := f.server.generatedSymbolInScope(f.consumer, func() []string { return []string{"defmodule", "def"} }, "generated_lookup")
+	if !found || provider.module != f.consumer {
+		t.Fatalf("test setup expected generated consumer provider, got %#v, %v", provider, found)
+	}
+
+	locations, err := f.server.References(context.Background(), &protocol.ReferenceParams{
+		TextDocumentPositionParams: protocol.TextDocumentPositionParams{
+			TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(f.consumerURI)},
+			Position:     protocol.Position{Line: 4, Character: 12},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(locations) != 1 || uriToPath(locations[0].URI) != uriToPath(protocol.DocumentURI(f.consumerURI)) || locations[0].Range.Start.Line != 4 {
+		t.Fatalf("expected the bare generated consumer call, got %#v", locations)
+	}
+}
