@@ -133,6 +133,10 @@ At a cursor inside block path `P`, `dslScopeModules` derives candidates using Sp
 
 The block walk is passed as a thunk and runs only after the compiled consumer reports extension providers. Ordinary modules therefore pay no tree-walk cost. If no scoped entity provider exists, completion falls back to the extension modules themselves for top-level section macros.
 
+Generated-symbol resolution is shared by completion, hover, definition, signature help, references, and call-hierarchy preparation. Definition and call hierarchy cannot point at a source definition for a source-less provider, so they walk the provider's lexical module parents and use the closest module that has an indexed source location. Completion resolve and signature help read the same lazily cached BEAM documentation used by hover.
+
+For references, the parser records bare injected calls under the direct `use` module because the generated provider is unavailable while source is indexed. At lookup time, generated-symbol resolution queries those injector rows and validates every candidate against the compiled provider active at that candidate's block path. This keeps same-named macros from another DSL or another section out of the result. Statement-level injected calls with arguments are indexed even when they omit both parentheses and a `do` block, as in `authorize_if always()`.
+
 ## References — injector scan
 
 References for use-injected functions use two paths, preferring the fast one:

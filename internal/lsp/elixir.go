@@ -2029,6 +2029,22 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 		defaultMod string
 	}
 	varToOpt := make(map[string]varBinding)
+	mergeHelperQuote := func(helperName string) {
+		helperImported, helperDefs, helperTransUses, helperCalls, helperBindings, helperAliases := parseHelperQuoteBlockDetailed(lines, helperName, fileAliases, make(map[string]bool))
+		imported = append(imported, helperImported...)
+		for name, defs := range helperDefs {
+			inlineDefs[name] = append(inlineDefs[name], defs...)
+		}
+		transUses = append(transUses, helperTransUses...)
+		transCalls = append(transCalls, helperCalls...)
+		optBindings = append(optBindings, helperBindings...)
+		for short, full := range helperAliases {
+			if aliases == nil {
+				aliases = make(map[string]string)
+			}
+			aliases[short] = full
+		}
+	}
 
 	// scanKeywordCall checks if tokens starting at i match:
 	//   Keyword.{get|pop|put|put_new|fetch|fetch!|pop!|pop_lazy}(ident, :key [, Default])
@@ -2297,6 +2313,21 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 			isStmtStart := i == 0 || tokens[i-1].Kind == parser.TokEOL || tokens[i-1].Kind == parser.TokComment
 			j := nextSig(i + 1)
 
+			// Phoenix-style __using__ bodies commonly inject a helper's quote with
+			// `unquote(prelude(opts))`. Follow that helper just as helper quote
+			// parsing follows nested unquotes.
+			if identName == "unquote" && j < n && tokens[j].Kind == parser.TokOpenParen {
+				helper := nextSig(j + 1)
+				if helper < n && tokens[helper].Kind == parser.TokIdent {
+					afterHelper := nextSig(helper + 1)
+					if afterHelper < n && tokens[afterHelper].Kind == parser.TokOpenParen {
+						mergeHelperQuote(string(source[tokens[helper].Start:tokens[helper].End]))
+						i = skipToEndOfStatement(tokens, n, i)
+						continue
+					}
+				}
+			}
+
 			// Check for var = Keyword.{get,pop,put,put_new,...}(opts, :key, Default)
 			// or var = ModuleName
 			if isStmtStart && j < n && tokens[j].Kind == parser.TokOther && string(source[tokens[j].Start:tokens[j].End]) == "=" {
@@ -2338,22 +2369,7 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 			// helper_name(opts) where helper_name is a def/defp in the same file.
 			// Only at statement start to avoid matching function calls inside expressions.
 			if isStmtStart && j < n && tokens[j].Kind == parser.TokOpenParen && !parser.IsElixirKeyword(identName) {
-				helperImported, helperDefs, helperTransUses, helperCalls, helperBindings, helperAliases := parseHelperQuoteBlockDetailed(lines, identName, fileAliases, make(map[string]bool))
-				if helperImported != nil {
-					imported = append(imported, helperImported...)
-					for hk, hv := range helperDefs {
-						inlineDefs[hk] = append(inlineDefs[hk], hv...)
-					}
-					transUses = append(transUses, helperTransUses...)
-					transCalls = append(transCalls, helperCalls...)
-					optBindings = append(optBindings, helperBindings...)
-				}
-				for hk, hv := range helperAliases {
-					if aliases == nil {
-						aliases = make(map[string]string)
-					}
-					aliases[hk] = hv
-				}
+				mergeHelperQuote(identName)
 				i = skipToEndOfStatement(tokens, n, i)
 				continue
 			}

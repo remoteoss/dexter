@@ -1925,6 +1925,27 @@ end
 	}
 }
 
+func TestParseFileReferences_BareInjectedCallWithoutParensOrBlock(t *testing.T) {
+	path := writeTempFile(t, `defmodule MyApp.Policy do
+  use SharedLib.Policy
+
+  authorize_if always()
+end
+`)
+
+	_, refs, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, r := range refs {
+		if r.Kind == "call" && r.Module == "SharedLib.Policy" && r.Function == "authorize_if" {
+			return
+		}
+	}
+	t.Fatalf("expected authorize_if to be attributed to SharedLib.Policy, got %+v", refs)
+}
+
 func TestParseFileReferences_BareMacroNotWithoutInjector(t *testing.T) {
 	// Bare calls without a preceding use/import should not be captured
 	path := writeTempFile(t, `defmodule MyApp.NoUse do

@@ -669,6 +669,18 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 								// arguments, respecting bracket depth and statement boundaries.
 								_, _, hasDo := ScanForwardToMacroCallBlockDo(tokens, n, j)
 								emit = hasDo
+								if !emit && isStatementStart {
+									// Injected DSL calls commonly omit both parentheses and a do
+									// block (`authorize_if always()`). At statement start, an
+									// argument-shaped next token distinguishes those calls from
+									// assignments and operators such as `value = 1`.
+									switch tokens[j].Kind {
+									case TokIdent, TokModule, TokString, TokHeredoc, TokSigil,
+										TokCharLiteral, TokNumber, TokOpenBracket, TokOpenBrace,
+										TokPercent:
+										emit = true
+									}
+								}
 							}
 						}
 						if emit {

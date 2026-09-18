@@ -9,8 +9,10 @@ import (
 	"time"
 
 	"github.com/remoteoss/dexter/internal/beam"
+	"github.com/remoteoss/dexter/internal/store"
 	"github.com/remoteoss/dexter/internal/treesitter"
 	"go.lsp.dev/protocol"
+	"go.lsp.dev/uri"
 )
 
 const maxGeneratedFunctionCacheEntries = 1024
@@ -601,6 +603,10 @@ func (s *Server) addGeneratedFunctionCompletions(module, beamPath, prefix string
 			Label:  function.Name,
 			Kind:   kindToCompletionItemKind(function.Kind),
 			Detail: module + " (compiled function)",
+			Data: map[string]interface{}{
+				"generatedModule":   module,
+				"generatedFunction": function.Name,
+			},
 		}
 		applySnippet(&item, function.Name, function.Arity, function.Params, function.Kind, inPipe, useSnippets)
 		// A curated template still wins; it may carry argument placeholders we
@@ -616,6 +622,142 @@ func (s *Server) addGeneratedFunctionCompletions(module, beamPath, prefix string
 	if added := len(*items) - before; added > 0 {
 		entry, _ := s.generatedCache.get(module)
 		s.debugf("Completion: generated functions module=%s prefix=%q matches=%d beam=%s", module, prefix, added, entry.beamPath)
+	}
+}
+
+// generatedSymbolInScope resolves a bare compiled callable against the current
+// module and then against the generated DSL providers active at the cursor. It
+// is shared by navigation features so completion, hover, definition, references,
+// signature help, and call hierarchy agree on what the symbol means.
+func (s *Server) generatedSymbolInScope(module string, blockPath func() []string, functionName string) (dslProvider, []beam.Function, bool) {
+	if functions := generatedFunctionsNamed(s.generatedFunctionsForModule(module), functionName); len(functions) > 0 {
+		return dslProvider{module: module}, functions, true
+	}
+	for _, provider := range s.dslProvidersInScope(module, blockPath) {
+		if functions := generatedFunctionsNamed(s.generatedFunctionsFor(provider.module, provider.beamPath), functionName); len(functions) > 0 {
+			return provider, functions, true
+		}
+	}
+	return dslProvider{}, nil, false
+}
+
+func (s *Server) generatedSymbol(module, beamPath, functionName string) ([]beam.Function, bool) {
+	functions := generatedFunctionsNamed(s.generatedFunctionsFor(module, beamPath), functionName)
+	return functions, len(functions) > 0
+}
+
+func generatedFunctionsNamed(functions []beam.Function, name string) []beam.Function {
+	start := sort.Search(len(functions), func(i int) bool { return functions[i].Name >= name })
+	end := start
+	for end < len(functions) && functions[end].Name == name {
+		end++
+	}
+	if start == end {
+		return nil
+	}
+	return functions[start:end]
+}
+
+// generatedDefinitionResults returns the closest source-backed module for a
+// generated provider. Generated nested modules have no source row, so walking
+// their lexical parents yields a stable artifact-level destination without
+// knowing which framework created them.
+func (s *Server) generatedDefinitionResults(module string) []store.LookupResult {
+	for candidate := module; candidate != ""; {
+		if results, err := s.store.LookupModule(candidate); err == nil && len(results) > 0 {
+			return results
+		}
+		dot := strings.LastIndexByte(candidate, '.')
+		if dot < 0 {
+			break
+		}
+		candidate = candidate[:dot]
+	}
+	return nil
+}
+
+// filterGeneratedProviderReferences removes the conservative false positives
+// produced by bare-call indexing. The parser attributes an injected call to
+// every use module in the file because source alone cannot know which macro won;
+// compiled provider scope can make that decision at lookup time.
+func (s *Server) filterGeneratedProviderReferences(providerModule, functionName string, refs []store.ReferenceResult) []store.ReferenceResult {
+	kept := refs[:0]
+	for _, ref := range refs {
+		currentModule := s.store.LookupEnclosingModule(ref.FilePath, ref.Line)
+		if currentModule == "" {
+			continue
+		}
+		providerPossible := false
+		for _, extension := range s.macroProvidersForModule(currentModule) {
+			if providerModule == extension || strings.HasPrefix(providerModule, extension+".") {
+				providerPossible = true
+				break
+			}
+		}
+		if !providerPossible {
+			continue
+		}
+		docURI := string(uri.File(ref.FilePath))
+		text, ok := s.docs.GetOrLoad(docURI)
+		if !ok {
+			continue
+		}
+		lines := strings.Split(text, "\n")
+		lineNum := ref.Line - 1
+		if lineNum < 0 || lineNum >= len(lines) {
+			continue
+		}
+		col := findTokenColumn(lines[lineNum], functionName)
+		if col < 0 {
+			continue
+		}
+		providers := s.dslProvidersInScope(currentModule, func() []string {
+			return s.enclosingBlockPath(docURI, lineNum, col)
+		})
+		for _, provider := range providers {
+			if provider.module != providerModule {
+				continue
+			}
+			if _, found := s.generatedSymbol(provider.module, provider.beamPath, functionName); found {
+				kept = append(kept, ref)
+				break
+			}
+		}
+	}
+	return kept
+}
+
+func (s *Server) generatedSignature(functions []beam.Function, module string, argIndex int) *protocol.SignatureHelp {
+	if len(functions) == 0 {
+		return nil
+	}
+	active := len(functions) - 1
+	for i, function := range functions {
+		if argIndex < function.Arity {
+			active = i
+			break
+		}
+	}
+	signatures := make([]protocol.SignatureInformation, 0, len(functions))
+	entry, _ := s.generatedCache.get(module)
+	for i, function := range functions {
+		params := strings.Split(function.Params, ",")
+		if function.Params == "" {
+			params = nil
+		}
+		info := protocol.SignatureInformation{Label: function.Name + "(" + strings.Join(params, ", ") + ")"}
+		for _, param := range params {
+			info.Parameters = append(info.Parameters, protocol.ParameterInformation{Label: param})
+		}
+		if doc := generatedFunctionDoc(&entry, functions, i); doc != "" {
+			info.Documentation = protocol.MarkupContent{Kind: protocol.Markdown, Value: doc}
+		}
+		signatures = append(signatures, info)
+	}
+	return &protocol.SignatureHelp{
+		Signatures:      signatures,
+		ActiveSignature: uint32(active),
+		ActiveParameter: uint32(argIndex),
 	}
 }
 

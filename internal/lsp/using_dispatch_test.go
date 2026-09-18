@@ -318,6 +318,54 @@ end`)
 	}
 }
 
+func TestDispatch_CompletionFollowsUnquotedHelperInTransitiveUse(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/shared_lib/router.ex", `defmodule SharedLib.Router do
+  defmacro __using__(opts) do
+    quote do
+      unquote(prelude(opts))
+    end
+  end
+
+  defp prelude(_opts) do
+    quote do
+      import SharedLib.Router
+    end
+  end
+
+  defmacro pipeline(name, do: block), do: {name, block}
+  defmacro plug(name, opts \\ []), do: {name, opts}
+end
+`)
+	indexFile(t, server.store, server.projectRoot, "lib/my_app_web.ex", `defmodule MyAppWeb do
+  def router do
+    quote do
+      use SharedLib.Router, helpers: false
+    end
+  end
+
+  defmacro __using__(which) when is_atom(which), do: apply(__MODULE__, which, [])
+end
+`)
+
+	uri := "file://" + filepath.Join(server.projectRoot, "lib/router.ex")
+	server.docs.Set(uri, `defmodule MyApp.Router do
+  use MyAppWeb, :router
+
+  pipe
+  plu
+end`)
+
+	if items := completionAt(t, server, uri, 3, 6); !hasCompletionItem(items, "pipeline") {
+		t.Fatal("expected pipeline completion imported by the unquoted helper")
+	}
+	if items := completionAt(t, server, uri, 4, 5); !hasCompletionItem(items, "plug") {
+		t.Fatal("expected plug completion imported by the unquoted helper")
+	}
+}
+
 func TestDispatch_MergesAliasesFromSelectedBody(t *testing.T) {
 	server, cleanup := setupDispatchServer(t)
 	defer cleanup()

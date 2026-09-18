@@ -28,6 +28,7 @@ import (
 	"go.lsp.dev/uri"
 	"go.uber.org/zap"
 
+	"github.com/remoteoss/dexter/internal/beam"
 	"github.com/remoteoss/dexter/internal/indexer"
 	"github.com/remoteoss/dexter/internal/parser"
 	"github.com/remoteoss/dexter/internal/stdlib"
@@ -928,6 +929,15 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		fullModule := s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, tf, lineNum, functionName, aliases)
 		s.debugf("Definition: resolved bare %q -> %q", functionName, fullModule)
 		if fullModule == "" {
+			currentModule := s.store.LookupEnclosingModule(uriToPath(protocol.DocumentURI(docURI)), lineNum+1)
+			if provider, _, found := s.generatedSymbolInScope(currentModule, func() []string {
+				return s.enclosingBlockPath(docURI, lineNum, col)
+			}, functionName); found {
+				if results := s.generatedDefinitionResults(provider.module); len(results) > 0 {
+					s.debugf("Definition: generated bare %q provider=%s", functionName, provider.module)
+					return storeResultsToLocations(results), nil
+				}
+			}
 			s.debugf("Definition: could not resolve bare function %q", functionName)
 			return nil, nil
 		}
@@ -977,6 +987,16 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		if results := s.lookupThroughUse(text, functionName, aliases); len(results) > 0 {
 			s.debugf("Definition: found %d result(s) via current file use chain for %s", len(results), functionName)
 			return storeResultsToLocations(byKindForContext(tf, lineNum, results)), nil
+		}
+
+		currentModule = s.store.LookupEnclosingModule(uriToPath(protocol.DocumentURI(docURI)), lineNum+1)
+		if provider, _, found := s.generatedSymbolInScope(currentModule, func() []string {
+			return s.enclosingBlockPath(docURI, lineNum, col)
+		}, functionName); found {
+			if results := s.generatedDefinitionResults(provider.module); len(results) > 0 {
+				s.debugf("Definition: generated fallback for bare %q provider=%s", functionName, provider.module)
+				return storeResultsToLocations(results), nil
+			}
 		}
 
 		s.debugf("Definition: no result found for bare function %q in module %q", functionName, fullModule)
@@ -3672,10 +3692,21 @@ func (s *Server) CompletionResolve(ctx context.Context, params *protocol.Complet
 	}
 
 	var data struct {
-		FilePath string `json:"filePath"`
-		Line     int    `json:"line"`
+		FilePath          string `json:"filePath"`
+		Line              int    `json:"line"`
+		GeneratedModule   string `json:"generatedModule"`
+		GeneratedFunction string `json:"generatedFunction"`
 	}
-	if err := json.Unmarshal(raw, &data); err != nil || data.FilePath == "" {
+	if err := json.Unmarshal(raw, &data); err != nil {
+		return params, nil
+	}
+	if data.GeneratedModule != "" && data.GeneratedFunction != "" {
+		if hover := s.hoverFromGenerated(data.GeneratedModule, "", data.GeneratedFunction); hover != nil {
+			params.Documentation = hover.Contents
+		}
+		return params, nil
+	}
+	if data.FilePath == "" {
 		return params, nil
 	}
 
@@ -5086,6 +5117,8 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 
 	var fullModule string
 	var definedInCursorFile bool
+	var generatedInjectors []string
+	var generatedProvider string
 	// Same-file occurrences of a name written in a typespec — see the note
 	// below. They carry the bare type uses (`@type t :: schema | embedded`)
 	// that the call-shaped scan cannot see.
@@ -5136,6 +5169,19 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 		fullModule, definedInCursorFile = s.resolveBareFunctionModuleWithOrigin(uriToPath(protocol.DocumentURI(docURI)), text, tf, lineNum, functionName, aliases)
 		s.debugf("References: resolved bare %q -> %q", functionName, fullModule)
 		if fullModule == "" {
+			currentModule := s.store.LookupEnclosingModule(uriToPath(protocol.DocumentURI(docURI)), lineNum+1)
+			if provider, _, found := s.generatedSymbolInScope(currentModule, func() []string {
+				return s.enclosingBlockPath(docURI, lineNum, col)
+			}, functionName); found {
+				fullModule = provider.module
+				generatedProvider = provider.module
+				for _, useCall := range tf.ExtractUsesWithOpts(aliases) {
+					generatedInjectors = append(generatedInjectors, useCall.Module)
+				}
+				s.debugf("References: generated bare %q provider=%s injectors=%v", functionName, fullModule, generatedInjectors)
+			}
+		}
+		if fullModule == "" {
 			s.debugf("References: could not resolve bare function %q", functionName)
 			if typespecOccurrences != nil {
 				s.debugf("References: returning %d typespec occurrences", len(typespecOccurrences))
@@ -5165,8 +5211,8 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 	// fast (cache reads only) and catches dynamic opt-binding injectors like
 	// `import unquote(mod)`. If we find injectors here we can skip the expensive
 	// findModulesWhoseUsingImports scan entirely.
-	var injectors []string
-	if functionName != "" && moduleRef == "" && !definedInCursorFile {
+	injectors := generatedInjectors
+	if functionName != "" && moduleRef == "" && !definedInCursorFile && len(injectors) == 0 {
 		useCalls := tf.ExtractUsesWithOpts(aliases)
 		for i := len(useCalls) - 1; i >= 0; i-- {
 			uc := useCalls[i]
@@ -5234,6 +5280,9 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 	for _, mod := range injectors {
 		transitive, err := s.store.LookupReferences(mod, functionName)
 		if err == nil {
+			if generatedProvider != "" {
+				transitive = s.filterGeneratedProviderReferences(generatedProvider, functionName, transitive)
+			}
 			refResults = append(refResults, transitive...)
 			s.debugf("References: transitive via %s: +%d results", mod, len(transitive))
 		}
@@ -5331,6 +5380,10 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 	// Include declaration if requested
 	if params.Context.IncludeDeclaration {
 		defResults, err := s.store.LookupFunction(fullModule, functionName)
+		if (err != nil || len(defResults) == 0) && len(generatedInjectors) > 0 {
+			defResults = s.generatedDefinitionResults(fullModule)
+			err = nil
+		}
 		if err == nil {
 			defResults = byKindForContext(tf, lineNum, defResults)
 			for _, r := range defResults {
@@ -6647,10 +6700,14 @@ func (s *Server) SignatureHelp(ctx context.Context, params *protocol.SignatureHe
 
 	// Resolve the function to a store lookup result
 	var result *store.LookupResult
+	var generatedModule string
+	var generatedFunctions []beam.Function
 	if moduleRef != "" {
 		fullModule := resolveModule(moduleRef, aliases)
 		if results, err := s.store.LookupFunction(fullModule, functionName); err == nil && len(results) > 0 {
 			result = &results[0]
+		} else if functions, found := s.generatedSymbol(fullModule, "", functionName); found {
+			generatedModule, generatedFunctions = fullModule, functions
 		}
 	} else {
 		// Bare function — check buffer, imports, use chains, Kernel
@@ -6689,8 +6746,20 @@ func (s *Server) SignatureHelp(ctx context.Context, params *protocol.SignatureHe
 				}
 			}
 		}
+
+		if result == nil {
+			currentModule := s.store.LookupEnclosingModule(uriToPath(protocol.DocumentURI(docURI)), lineNum+1)
+			if provider, functions, found := s.generatedSymbolInScope(currentModule, func() []string {
+				return s.enclosingBlockPath(docURI, lineNum, col)
+			}, functionName); found {
+				generatedModule, generatedFunctions = provider.module, functions
+			}
+		}
 	}
 
+	if len(generatedFunctions) > 0 {
+		return s.generatedSignature(generatedFunctions, generatedModule, argIndex), nil
+	}
 	if result == nil {
 		return nil, nil
 	}
@@ -6890,16 +6959,37 @@ func (s *Server) PrepareCallHierarchy(ctx context.Context, params *protocol.Call
 	} else {
 		fullModule = s.resolveBareFunctionModule(uriToPath(protocol.DocumentURI(docURI)), text, tf, lineNum, functionName, aliases)
 	}
+	var generatedFunctions []beam.Function
 	if fullModule == "" {
-		return nil, nil
+		currentModule := s.store.LookupEnclosingModule(uriToPath(protocol.DocumentURI(docURI)), lineNum+1)
+		if provider, functions, found := s.generatedSymbolInScope(currentModule, func() []string {
+			return s.enclosingBlockPath(docURI, lineNum, col)
+		}, functionName); found {
+			fullModule, generatedFunctions = provider.module, functions
+		} else {
+			return nil, nil
+		}
 	}
 
 	defResults, err := s.store.LookupFunction(fullModule, functionName)
 	if err != nil || len(defResults) == 0 {
-		return nil, nil
+		if len(generatedFunctions) == 0 {
+			generatedFunctions, _ = s.generatedSymbol(fullModule, "", functionName)
+		}
+		if len(generatedFunctions) == 0 {
+			return nil, nil
+		}
+		defResults = s.generatedDefinitionResults(fullModule)
+		if len(defResults) == 0 {
+			return nil, nil
+		}
 	}
 
 	r := defResults[0]
+	if len(generatedFunctions) > 0 {
+		r.Arity = generatedFunctions[0].Arity
+		r.Kind = generatedFunctions[0].Kind
+	}
 	nameCol := 0
 	defLine, _ := s.getFileLine(r.FilePath, r.Line)
 	if col := findTokenColumn(defLine, functionName); col >= 0 {
