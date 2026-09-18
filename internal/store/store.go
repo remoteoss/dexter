@@ -947,6 +947,54 @@ func (s *Store) ListModuleFunctions(module string, publicOnly bool) ([]Completio
 	return results, rows.Err()
 }
 
+// ListModuleCallbacks returns the @callback and @macrocallback definitions of
+// the given behaviour module (these are excluded from ListModuleFunctions).
+func (s *Store) ListModuleCallbacks(module string) ([]CompletionResult, error) {
+	rows, err := s.db.Query(
+		"SELECT d.module, d.function, d.arity, d.kind, f.path, d.line, d.params FROM definitions d JOIN files f ON f.id = d.file_id WHERE d.module = ? AND d.kind IN ('callback', 'macrocallback') GROUP BY d.function, d.arity ORDER BY d.function, d.arity LIMIT 100",
+		module,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var results []CompletionResult
+	for rows.Next() {
+		var r CompletionResult
+		if err := rows.Scan(&r.Module, &r.Function, &r.Arity, &r.Kind, &r.FilePath, &r.Line, &r.Params); err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	return results, rows.Err()
+}
+
+// IndexStats summarizes the size of the index.
+type IndexStats struct {
+	Files       int
+	Definitions int
+	References  int
+}
+
+// Stats returns row counts for the files, definitions, and refs tables.
+func (s *Store) Stats() (IndexStats, error) {
+	var st IndexStats
+	for _, q := range []struct {
+		query string
+		dst   *int
+	}{
+		{"SELECT COUNT(*) FROM files", &st.Files},
+		{"SELECT COUNT(*) FROM definitions", &st.Definitions},
+		{"SELECT COUNT(*) FROM refs", &st.References},
+	} {
+		if err := s.db.QueryRow(q.query).Scan(q.dst); err != nil {
+			return IndexStats{}, err
+		}
+	}
+	return st, nil
+}
+
 type LookupResult struct {
 	Module     string // populated by bulk queries; empty for single-module lookups
 	FilePath   string

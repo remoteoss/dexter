@@ -1796,3 +1796,70 @@ func TestSetBulkPragmas_AppliesWhenExclusive(t *testing.T) {
 		t.Errorf("journal_mode = %q, want memory", mode)
 	}
 }
+
+func TestListModuleCallbacks(t *testing.T) {
+	s, dir := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	path := writeElixirFile(t, dir, "lib/notifier.ex", `defmodule MyApp.Notifier do
+  @callback deliver(map()) :: :ok | {:error, term()}
+  @callback name() :: String.t()
+  @macrocallback render(term()) :: Macro.t()
+  def dispatch(msg), do: msg
+end
+`)
+	defs, _, err := parser.ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IndexFile(path, defs); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := s.ListModuleCallbacks("MyApp.Notifier")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("callbacks = %d, want 3: %+v", len(results), results)
+	}
+	kinds := make(map[string]string, len(results))
+	for _, result := range results {
+		kinds[result.Function] = result.Kind
+	}
+	if kinds["deliver"] != "callback" || kinds["render"] != "macrocallback" {
+		t.Errorf("callback kinds = %v", kinds)
+	}
+}
+
+func TestStats(t *testing.T) {
+	s, dir := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	stats, err := s.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Files != 0 || stats.Definitions != 0 || stats.References != 0 {
+		t.Errorf("empty store stats = %+v, want zeros", stats)
+	}
+
+	path := writeElixirFile(t, dir, "lib/worker.ex", `defmodule SharedLib.Worker do
+  def run, do: MyApp.Accounts.fetch_user(1)
+end
+`)
+	defs, refs, err := parser.ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IndexFileWithRefs(path, defs, refs); err != nil {
+		t.Fatal(err)
+	}
+	stats, err = s.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Files != 1 || stats.Definitions < 2 || stats.References < 1 {
+		t.Errorf("populated store stats = %+v", stats)
+	}
+}
