@@ -29,6 +29,18 @@ type Function struct {
 	Kind   string
 	Hidden bool
 
+	// Line is the source annotation the compiler recorded for this callable, as
+	// emitted in the Docs chunk. It is zero when the callable came from the export
+	// table alone, which has no annotation.
+	//
+	// The annotation names the site the code was created at, not the module it
+	// ended up in: a symbol created while expanding `use X` is attributed to the
+	// `use` line, while one created by a transformer or a `@before_compile` hook is
+	// attributed to the module line. Combined with the owning module's source file
+	// (see ReadSourcePath) that is a usable definition target for code that exists
+	// only in compiled form.
+	Line int
+
 	// DocOffset and DocLen locate the documentation prose inside the inflated
 	// Docs chunk, so a hover can read one function's docs without decoding the
 	// chunk again. They are zero when the function has no prose. zlib output is
@@ -456,7 +468,8 @@ func parseDocsEntry(r *etfReader) ([]Function, bool, error) {
 		return nil, false, err
 	}
 
-	if err := r.skip(); err != nil { // anno
+	line, err := readAnnoLine(r)
+	if err != nil {
 		return nil, false, err
 	}
 	params, err := readSignatureParams(r)
@@ -502,11 +515,28 @@ func parseDocsEntry(r *etfReader) ([]Function, bool, error) {
 			Params:    strings.Join(callParams, ","),
 			Kind:      definitionKind,
 			Hidden:    hidden,
+			Line:      line,
 			DocOffset: docOffset,
 			DocLen:    docLen,
 		})
 	}
 	return out, true, nil
+}
+
+// readAnnoLine reads the per-entry source annotation. Elixir writes it as a bare
+// line number, but the field is an erl_anno and may hold other shapes (a tuple,
+// or `none`), so anything that is not an integer is consumed and reported as line
+// 0 rather than failing the whole entry. A dropped annotation must never cost the
+// module its generated functions.
+func readAnnoLine(r *etfReader) (int, error) {
+	tag, err := r.peekTag()
+	if err != nil {
+		return 0, err
+	}
+	if tag == tagSmallInteger || tag == tagInteger {
+		return r.readInt()
+	}
+	return 0, r.skip()
 }
 
 // readSignatureParams consumes the signature list and parses the first signature

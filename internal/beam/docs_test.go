@@ -488,6 +488,10 @@ type docEntry struct {
 	doc       string // "none", "hidden", or the documentation prose
 	defaults  int
 
+	// anno is the source annotation the compiler records for the entry: the line
+	// the code was created at. Zero means the usual module line.
+	anno int
+
 	// extraMetadata writes additional pairs into the entry's metadata map, the
 	// way a framework's `@doc spark_opts` lands alongside `defaults`.
 	extraMetadata      func(*etfTestWriter)
@@ -523,7 +527,11 @@ func buildDocsTerm(entries ...docEntry) []byte {
 		w.atom(entry.name)
 		w.smallInt(entry.arity)
 
-		w.smallInt(1) // anno
+		anno := entry.anno
+		if anno == 0 {
+			anno = 1
+		}
+		w.smallInt(anno)
 
 		w.listHeader(1)
 		w.binary(entry.signature)
@@ -599,6 +607,14 @@ func (w *etfTestWriter) binary(text string) {
 	w.buf = append(w.buf, text...)
 }
 
+// string writes a STRING_EXT term, the compact encoding Erlang uses for the
+// printable charlists it records in compile info.
+func (w *etfTestWriter) string(text string) {
+	w.byte(tagString)
+	w.be16(uint16(len(text)))
+	w.buf = append(w.buf, text...)
+}
+
 func (w *etfTestWriter) smallInt(value int) {
 	if value >= 0 && value < 256 {
 		w.byte(tagSmallInteger)
@@ -663,5 +679,80 @@ func TestParseDocsMetadataWithCapturedFunction(t *testing.T) {
 	}
 	if got[1].Name != "list" || got[1].Arity != 0 {
 		t.Errorf("entry after the captured function = %+v, want list/0", got[1])
+	}
+}
+
+// The compile-time annotation is what makes a generated callable navigable: it
+// names the line the code was created at, which for a macro-emitted symbol is a
+// specific site rather than the module the symbol ended up in.
+func TestReadDocumentedFunctionsRecordsSourceLine(t *testing.T) {
+	docs := buildDocsTerm(
+		docEntry{kind: "macro", name: "code_interface", arity: 1, signature: "code_interface(body)", doc: "none", anno: 1811},
+		docEntry{kind: "function", name: "generated_at_module_line", arity: 0, signature: "generated_at_module_line()", doc: "none", anno: 1},
+		docEntry{kind: "function", name: "no_anno", arity: 0, signature: "no_anno()", doc: "none", anno: 1},
+	)
+	path := filepath.Join(t.TempDir(), "Elixir.LibFixture.beam")
+	writeTestBEAM(t, path, docs)
+
+	functions, err := ReadDocumentedFunctions(path)
+	if err != nil {
+		t.Fatalf("ReadDocumentedFunctions: %v", err)
+	}
+
+	got := make(map[string]int, len(functions))
+	for _, f := range functions {
+		got[f.Name] = f.Line
+	}
+	for name, want := range map[string]int{
+		"code_interface":           1811,
+		"generated_at_module_line": 1,
+		"no_anno":                  1,
+	} {
+		if got[name] != want {
+			t.Errorf("%s: Line = %d, want %d", name, got[name], want)
+		}
+	}
+}
+
+// An annotation the reader does not understand must cost only the line, never
+// the entry: dropping the whole Docs chunk would take every generated function
+// with it.
+func TestReadDocumentedFunctionsToleratesNonIntegerAnno(t *testing.T) {
+	// writeTestBEAM prepends the ETF version byte, so the payload starts at the
+	// term itself — same as buildDocsTerm.
+	var w etfTestWriter
+	w.smallTuple(7)
+	w.atom("docs_v1")
+	w.smallInt(1)
+	w.atom("elixir")
+	w.binary("text/markdown")
+	w.atom("none")
+	w.mapHeader(0)
+	w.listHeader(1)
+	w.smallTuple(5)
+	w.smallTuple(3)
+	w.atom("function")
+	w.atom("kept")
+	w.smallInt(0)
+	w.atom("none") // anno as an atom instead of a line
+	w.listHeader(1)
+	w.binary("kept()")
+	w.nil()
+	w.atom("none")
+	w.mapHeader(0)
+	w.nil()
+
+	path := filepath.Join(t.TempDir(), "Elixir.LibFixture.beam")
+	writeTestBEAM(t, path, w.buf)
+
+	functions, err := ReadDocumentedFunctions(path)
+	if err != nil {
+		t.Fatalf("ReadDocumentedFunctions: %v", err)
+	}
+	if len(functions) != 1 || functions[0].Name != "kept" {
+		t.Fatalf("functions = %+v, want the single kept/0 entry", functions)
+	}
+	if functions[0].Line != 0 {
+		t.Errorf("Line = %d, want 0 for an unreadable anno", functions[0].Line)
 	}
 }
