@@ -130,6 +130,48 @@ end
 	}
 }
 
+func TestLookupPublicFunctionUsesAllowlist(t *testing.T) {
+	s, dir := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	path := makeFile(t, dir, "visibility.ex")
+	defs := []parser.Definition{
+		{Module: "SharedLib.Visibility", Function: "public_fun", Arity: 0, Kind: "def", Line: 1, FilePath: path},
+		{Module: "SharedLib.Visibility", Function: "public_macro", Arity: 0, Kind: "defmacro", Line: 2, FilePath: path},
+		{Module: "SharedLib.Visibility", Function: "public_guard", Arity: 1, Kind: "defguard", Line: 3, FilePath: path},
+		{Module: "SharedLib.Visibility", Function: "public_delegate", Arity: 1, Kind: "defdelegate", Line: 4, FilePath: path},
+		{Module: "SharedLib.Visibility", Function: "public_type", Arity: 0, Kind: "type", Line: 5, FilePath: path},
+		{Module: "SharedLib.Visibility", Function: "public_opaque", Arity: 0, Kind: "opaque", Line: 6, FilePath: path},
+		{Module: "SharedLib.Visibility", Function: "private_fun", Arity: 0, Kind: "defp", Line: 7, FilePath: path},
+		{Module: "SharedLib.Visibility", Function: "private_macro", Arity: 0, Kind: "defmacrop", Line: 8, FilePath: path},
+		{Module: "SharedLib.Visibility", Function: "private_guard", Arity: 1, Kind: "defguardp", Line: 9, FilePath: path},
+		{Module: "SharedLib.Visibility", Function: "future_private", Arity: 0, Kind: "future_private", Line: 10, FilePath: path},
+	}
+	if err := s.IndexFile(path, defs); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, name := range []string{"public_fun", "public_macro", "public_guard", "public_delegate", "public_type", "public_opaque"} {
+		results, err := s.LookupPublicFunction("SharedLib.Visibility", name)
+		if err != nil {
+			t.Fatalf("LookupPublicFunction(%q): %v", name, err)
+		}
+		if len(results) != 1 {
+			t.Errorf("LookupPublicFunction(%q) returned %d results, want 1", name, len(results))
+		}
+	}
+
+	for _, name := range []string{"private_fun", "private_macro", "private_guard", "future_private"} {
+		results, err := s.LookupPublicFunction("SharedLib.Visibility", name)
+		if err != nil {
+			t.Fatalf("LookupPublicFunction(%q): %v", name, err)
+		}
+		if len(results) != 0 {
+			t.Errorf("LookupPublicFunction(%q) returned private results: %+v", name, results)
+		}
+	}
+}
+
 func TestLookupFunctionOrdersFunctionsBeforeTypes(t *testing.T) {
 	s, dir := setupTestStore(t)
 	defer func() { _ = s.Close() }()
@@ -1483,6 +1525,98 @@ func TestLookupByPrefixRange(t *testing.T) {
 	}
 }
 
+func TestLookupCaseTemplateModulesReturnsOnlyEnclosingModule(t *testing.T) {
+	s, dir := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	path := writeElixirFile(t, dir, "test/support/templates.ex", `defmodule MyApp.DataCase do
+  use ExUnit.CaseTemplate
+end
+
+defmodule MyApp.Sibling do
+  def helper, do: :ok
+end
+`)
+	defs, refs, err := parser.ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IndexFileWithRefs(path, defs, refs); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.LookupCaseTemplateModules()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Module != "MyApp.DataCase" || got[0].FilePath != path {
+		t.Fatalf("LookupCaseTemplateModules() = %+v, want only MyApp.DataCase", got)
+	}
+}
+
+func TestLookupCaseTemplateModulesIncludesOuterAfterNestedModule(t *testing.T) {
+	s, dir := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	path := writeElixirFile(t, dir, "test/support/outer_case.ex", `defmodule MyApp.OuterCase do
+  defmodule Helper do
+    def value, do: :ok
+  end
+
+  use ExUnit.CaseTemplate
+end
+`)
+	defs, refs, err := parser.ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IndexFileWithRefs(path, defs, refs); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.LookupCaseTemplateModules()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, result := range got {
+		if result.Module == "MyApp.OuterCase" {
+			return
+		}
+	}
+	t.Fatalf("LookupCaseTemplateModules() = %+v, missing outer module after nested module", got)
+}
+
+func TestLookupCaseTemplateModulesUsesHotPathIndexes(t *testing.T) {
+	s, _ := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	rows, err := s.db.Query("EXPLAIN QUERY PLAN " + lookupCaseTemplateModulesQuery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var plan strings.Builder
+	for rows.Next() {
+		var id, parent, notUsed int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notUsed, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan.WriteString(detail)
+		plan.WriteByte('\n')
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	detail := plan.String()
+	for _, index := range []string{"idx_refs_module_function", "idx_definitions_file_id_line"} {
+		if !strings.Contains(detail, index) {
+			t.Errorf("query plan does not use %s:\n%s", index, detail)
+		}
+	}
+}
+
 // TestReferencesUsesCoveringIndex pins the plan for the References hot path.
 // idx_refs_module_function spans (module, function, file_id, line, kind) so the
 // query is answered from the index alone. Before that, every hit cost a random
@@ -1769,5 +1903,102 @@ end
 	}
 	if stats.Files != 1 || stats.Definitions < 2 || stats.References < 1 {
 		t.Errorf("populated store stats = %+v", stats)
+	}
+}
+
+// ModuleFunctionKeys must return the complete set. Callers diff it against
+// another source of truth, so the 100-row cap ListModuleFunctions applies for
+// completion would silently make every function past the cap look unindexed.
+func TestModuleFunctionKeysIsUnbounded(t *testing.T) {
+	s, dir := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	const total = 150
+	var source strings.Builder
+	source.WriteString("defmodule MyApp.Big do\n")
+	for i := range total {
+		source.WriteString("  def fn_" + strconv.Itoa(i) + "(value), do: value\n")
+	}
+	source.WriteString("end\n")
+
+	path := writeElixirFile(t, dir, "lib/big.ex", source.String())
+	defs, _, err := parser.ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IndexFile(path, defs); err != nil {
+		t.Fatal(err)
+	}
+
+	keys, err := s.ModuleFunctionKeys("MyApp.Big")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != total {
+		t.Fatalf("ModuleFunctionKeys returned %d keys, want %d", len(keys), total)
+	}
+	capped, err := s.ListModuleFunctions("MyApp.Big", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(capped) >= total {
+		t.Fatalf("expected ListModuleFunctions to stay capped below %d, got %d", total, len(capped))
+	}
+}
+
+// The predicate must match ListModuleFunctions(publicOnly) so the two never
+// disagree about what is public, or a diff between them reports phantom
+// generated functions.
+func TestModuleFunctionKeysMatchesPublicOnlyKinds(t *testing.T) {
+	s, dir := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	path := writeElixirFile(t, dir, "lib/kinds.ex", `defmodule MyApp.Kinds do
+  def public_fn(value), do: value
+  defp private_fn(value), do: value
+  defmacro a_macro(value), do: value
+  defguard is_thing(value) when is_atom(value)
+  @type t :: atom
+  @callback behaviour_cb() :: :ok
+end
+`)
+	defs, _, err := parser.ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IndexFile(path, defs); err != nil {
+		t.Fatal(err)
+	}
+
+	keys, err := s.ModuleFunctionKeys("MyApp.Kinds")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make(map[string]bool, len(keys))
+	for _, key := range keys {
+		got[key.Name] = true
+	}
+	for _, want := range []string{"public_fn", "a_macro", "is_thing", "t"} {
+		if !got[want] {
+			t.Errorf("expected %s in %v", want, keys)
+		}
+	}
+	for _, unwanted := range []string{"private_fn", "behaviour_cb"} {
+		if got[unwanted] {
+			t.Errorf("%s must not be reported as public: %v", unwanted, keys)
+		}
+	}
+}
+
+func TestModuleFunctionKeysUnknownModule(t *testing.T) {
+	s, _ := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	keys, err := s.ModuleFunctionKeys("MyApp.Absent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 0 {
+		t.Fatalf("expected no keys for an unknown module, got %v", keys)
 	}
 }

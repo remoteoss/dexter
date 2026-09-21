@@ -32,7 +32,7 @@ jobs:
 
   test-integration:
     runs-on: ubuntu-latest
-    container: elixir:1.19
+    container: elixir:1.20.4-otp-29
     env:
       GOMODCACHE: ${{ github.workspace }}/.gomod
       MIX_HOME: ${{ github.workspace }}/.mix
@@ -73,13 +73,12 @@ jobs:
           cd internal/lsp/testdata/monorepo/apps/app_with_styler && mix deps.get && mix deps.compile && cd -
           cd internal/lsp/testdata/monorepo/apps/app_with_ecto_migration && mix deps.get && mix deps.compile && cd -
           cd internal/lsp/testdata/monorepo/apps/app_basic && mix deps.get && cd -
-      # Every formatter test needs mix on PATH and skips itself without it, so
-      # this job is the only place they run — the test/test-race jobs have no
-      # Elixir. Match the whole family rather than naming tests one by one: a
-      # hand-maintained list silently stops covering each new test that is
-      # added outside it.
+      # Every formatter test and the generated-BEAM completion test need mix on
+      # PATH and skip themselves without it, so this job is the only place they
+      # run — the test/test-race jobs have no Elixir. Match the formatter family
+      # and explicitly include the self-contained BEAM regression fixture.
       - name: Run integration tests
-        run: go test ./internal/lsp/ -run 'TestFormatter|TestDidSave_Formatter' -v -timeout 600s
+        run: go test ./internal/lsp/ -run 'TestFormatter|TestDidSave_Formatter|TestCompletion_GeneratedFunctionsFromConsumerBEAM' -v -timeout 600s
 
   lint:
     runs-on: ubuntu-latest

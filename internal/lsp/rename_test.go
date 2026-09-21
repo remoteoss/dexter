@@ -3204,3 +3204,366 @@ end
 		t.Errorf("expected 'alias CoreLib.{Config, Job, Worker}', got:\n%s", got)
 	}
 }
+
+// A module renamed while its short name reaches call sites only through an
+// alias injected by its own `__using__` block. The call sites carry no alias
+// line of their own, so the index has them under the bare short name and the
+// rename used to leave them behind.
+func TestRenameModuleUpdatesUseInjectedAliasCallSites(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	repoContent := `defmodule MyApp.Repo do
+  defmacro __using__(_) do
+    quote do
+      alias MyApp.Repo
+    end
+  end
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/repo.ex", repoContent)
+
+	accountsContent := `defmodule MyApp.Accounts do
+  use MyApp.Repo
+
+  def list_users do
+    Repo.all(User)
+  end
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/accounts.ex", accountsContent)
+
+	repoPath := filepath.Join(server.projectRoot, "lib/my_app/repo.ex")
+	accountsPath := filepath.Join(server.projectRoot, "lib/my_app/accounts.ex")
+	repoURI := "file://" + repoPath
+	server.docs.Set(repoURI, repoContent)
+
+	if edit := renameAt(t, server, repoURI, 0, 16, "Database"); edit == nil {
+		t.Fatal("expected non-nil edit")
+	}
+
+	// accounts.ex is not open, so the server writes it rather than returning
+	// edits for the editor to apply.
+	got, err := os.ReadFile(accountsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "Database.all(User)") {
+		t.Errorf("expected the bare call site to become Database.all(User), got:\n%s", got)
+	}
+	if strings.Contains(string(got), "Repo.") {
+		t.Errorf("no Repo. call site should be left behind, got:\n%s", got)
+	}
+}
+
+// An injected alias is lexically scoped like a written one, so a module
+// nested inside the module that `use`s the injector sees it too. Missing the
+// call site there leaves a rename half-applied and the file broken.
+func TestRenameModuleUpdatesInjectedAliasCallSiteInNestedModule(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	repoContent := `defmodule MyApp.Repo do
+  defmacro __using__(_) do
+    quote do
+      alias MyApp.Repo
+    end
+  end
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/repo.ex", repoContent)
+
+	accountsContent := `defmodule MyApp.Accounts do
+  use MyApp.Repo
+
+  defmodule Inner do
+    def list_users do
+      Repo.all(User)
+    end
+  end
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/accounts.ex", accountsContent)
+
+	repoPath := filepath.Join(server.projectRoot, "lib/my_app/repo.ex")
+	accountsPath := filepath.Join(server.projectRoot, "lib/my_app/accounts.ex")
+	repoURI := "file://" + repoPath
+	server.docs.Set(repoURI, repoContent)
+
+	if edit := renameAt(t, server, repoURI, 0, 16, "Database"); edit == nil {
+		t.Fatal("expected non-nil edit")
+	}
+
+	// accounts.ex is not open, so the server writes it rather than returning
+	// edits for the editor to apply.
+	got, err := os.ReadFile(accountsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "Database.all(User)") {
+		t.Errorf("expected the bare call site to become Database.all(User), got:\n%s", got)
+	}
+	if strings.Contains(string(got), "Repo.") {
+		t.Errorf("no Repo. call site should be left behind, got:\n%s", got)
+	}
+}
+
+// A sibling module in the same file does not `use` the injector, so the same
+// short name there is a different module and must not be rewritten.
+func TestRenameModuleLeavesInjectedAliasSpellingInSiblingModule(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	repoContent := `defmodule MyApp.Repo do
+  defmacro __using__(_) do
+    quote do
+      alias MyApp.Repo
+    end
+  end
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/repo.ex", repoContent)
+
+	accountsContent := `defmodule MyApp.Accounts do
+  use MyApp.Repo
+
+  def list_users do
+    Repo.all(User)
+  end
+end
+
+defmodule MyApp.Other do
+  def nope, do: Repo.all(User)
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/accounts.ex", accountsContent)
+
+	repoPath := filepath.Join(server.projectRoot, "lib/my_app/repo.ex")
+	accountsPath := filepath.Join(server.projectRoot, "lib/my_app/accounts.ex")
+	repoURI := "file://" + repoPath
+	server.docs.Set(repoURI, repoContent)
+
+	if edit := renameAt(t, server, repoURI, 0, 16, "Database"); edit == nil {
+		t.Fatal("expected non-nil edit")
+	}
+
+	// accounts.ex is not open, so the server writes it rather than returning
+	// edits for the editor to apply.
+	got, err := os.ReadFile(accountsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "Database.all(User)") {
+		t.Errorf("expected the bare call site to become Database.all(User), got:\n%s", got)
+	}
+	if strings.Count(string(got), "Repo.all") != 1 {
+		t.Errorf("the sibling module does not use MyApp.Repo; its Repo.all must be untouched, got:\n%s", got)
+	}
+}
+
+// A call site that is reached through a `use`-injected alias AND written
+// inside a #{} interpolation needs both paths at once: the index holds it
+// under the bare short name, and the main token stream keeps the whole string
+// as one token, so the columns come from the interpolation stream.
+func TestRenameModuleUpdatesInjectedAliasCallSiteInsideInterpolation(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	repoContent := `defmodule MyApp.Repo do
+  defmacro __using__(_) do
+    quote do
+      alias MyApp.Repo
+    end
+  end
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/repo.ex", repoContent)
+
+	accountsContent := `defmodule MyApp.Accounts do
+  use MyApp.Repo
+
+  def describe(user) do
+    "count: #{Repo.aggregate(user)}"
+  end
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/accounts.ex", accountsContent)
+
+	repoPath := filepath.Join(server.projectRoot, "lib/my_app/repo.ex")
+	accountsPath := filepath.Join(server.projectRoot, "lib/my_app/accounts.ex")
+	repoURI := "file://" + repoPath
+	server.docs.Set(repoURI, repoContent)
+
+	if edit := renameAt(t, server, repoURI, 0, 16, "Database"); edit == nil {
+		t.Fatal("expected non-nil edit")
+	}
+
+	// accounts.ex is not open, so the server writes it rather than returning
+	// edits for the editor to apply.
+	got, err := os.ReadFile(accountsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "Database.aggregate(user)") {
+		t.Errorf("expected the interpolated call site to become Database.aggregate(user), got:\n%s", got)
+	}
+	if strings.Contains(string(got), "Repo.") {
+		t.Errorf("no Repo. call site should be left behind, got:\n%s", got)
+	}
+}
+
+// A rename that stops at the quote leaves broken code behind: the call inside
+// the interpolation still names the old module.
+func TestRenameModule_UpdatesInterpolationSite(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/config.ex", `defmodule SharedLib.Config do
+  def admin_url(slug), do: slug
+end`)
+	notifier := `defmodule MyApp.Notifier do
+  alias SharedLib.Config
+
+  def line(slug) do
+    "<#{Config.admin_url(slug)}|#{slug}>"
+  end
+end`
+	indexFile(t, server.store, server.projectRoot, "lib/notifier.ex", notifier)
+	configURI := "file://" + filepath.Join(server.projectRoot, "lib/config.ex")
+	server.docs.Set(configURI, `defmodule SharedLib.Config do
+  def admin_url(slug), do: slug
+end`)
+
+	// cursor on Config in `defmodule SharedLib.Config`
+	edit := renameAt(t, server, configURI, 0, 20, "Settings")
+	if edit == nil {
+		t.Fatal("expected rename edits")
+	}
+	// notifier.ex is not open, so the server writes it rather than returning
+	// edits for the editor to apply.
+	got, err := os.ReadFile(filepath.Join(server.projectRoot, "lib/notifier.ex"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), `"<#{Settings.admin_url(slug)}|#{slug}>"`) {
+		t.Errorf("interpolation site not renamed:\n%s", got)
+	}
+}
+
+func TestRenameFunction_UpdatesInterpolationSite(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	config := `defmodule SharedLib.Config do
+  def admin_url(slug), do: slug
+end`
+	indexFile(t, server.store, server.projectRoot, "lib/config.ex", config)
+	notifier := `defmodule MyApp.Notifier do
+  alias SharedLib.Config
+
+  def line(slug) do
+    "<#{Config.admin_url(slug)}|#{slug}>"
+  end
+end`
+	indexFile(t, server.store, server.projectRoot, "lib/notifier.ex", notifier)
+	configURI := "file://" + filepath.Join(server.projectRoot, "lib/config.ex")
+	server.docs.Set(configURI, config)
+
+	// cursor on admin_url in its definition
+	edit := renameAt(t, server, configURI, 1, 7, "admin_link")
+	if edit == nil {
+		t.Fatal("expected rename edits")
+	}
+	got, err := os.ReadFile(filepath.Join(server.projectRoot, "lib/notifier.ex"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), `"<#{Config.admin_link(slug)}|#{slug}>"`) {
+		t.Errorf("interpolation site not renamed:\n%s", got)
+	}
+}
+
+// TestRename_Module_ConventionalPathUnchanged covers a rename whose new module
+// maps to the file path it already has. The conventional path is the module's
+// last segment, snake_cased, inside the directory the file already sits in, and
+// camelToSnake folds an acronym and its capitalised form together: ABTest and
+// AbTest are both ab_test. Normalising that casing is an ordinary rename, and
+// the editor sends the bare new segment for it.
+//
+// A closed file used to be written to its "new" path and then removed from its
+// old one — the same path — which deleted the module outright.
+func TestRename_Module_ConventionalPathUnchanged(t *testing.T) {
+	cases := []struct {
+		name   string
+		oldSeg string
+		newSeg string
+		base   string
+	}{
+		{"acronym casing", "ABTest", "AbTest", "ab_test"},
+		{"acronym casing longer", "HTTPClient", "HttpClient", "http_client"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server, cleanup := setupTestServer(t)
+			defer cleanup()
+
+			relPath := "lib/my_app/" + tc.base + ".ex"
+			defContent := "defmodule MyApp." + tc.oldSeg + " do\n  def run, do: :ok\nend\n"
+			callerContent := "defmodule MyApp.Caller do\n  alias MyApp." + tc.oldSeg +
+				"\n\n  def go, do: " + tc.oldSeg + ".run()\nend\n"
+
+			defPath := filepath.Join(server.projectRoot, filepath.FromSlash(relPath))
+			callerPath := filepath.Join(server.projectRoot, "lib", "caller.ex")
+			indexFile(t, server.store, server.projectRoot, relPath, defContent)
+			indexFile(t, server.store, server.projectRoot, "lib/caller.ex", callerContent)
+
+			// The def file stays closed, so the server owns the move.
+			callerURI := "file://" + callerPath
+			server.docs.Set(callerURI, callerContent)
+
+			aliasLine := strings.Split(callerContent, "\n")[1]
+			col := uint32(strings.Index(aliasLine, tc.oldSeg))
+			edit := renameAt(t, server, callerURI, 1, col, tc.newSeg)
+			server.backgroundWork.Wait()
+
+			if _, err := os.Stat(defPath); err != nil {
+				t.Fatalf("%s was deleted by the rename: %v", relPath, err)
+			}
+			if !fileContains(defPath, "defmodule MyApp."+tc.newSeg) {
+				data, _ := os.ReadFile(defPath)
+				t.Errorf("expected %q in %s, got:\n%s", "defmodule MyApp."+tc.newSeg, relPath, string(data))
+			}
+			// Nothing moved, so the reply must not ask the client to move it.
+			if op := renameOp(edit, defPath); op != nil {
+				t.Errorf("unexpected rename operation %s -> %s", op.OldURI, op.NewURI)
+			}
+		})
+	}
+}
+
+// TestRename_Module_ConventionalPathUnchangedOpenFile is the same situation
+// with the defining file open: the client must not be handed a rename
+// operation whose old and new URI are the same path.
+func TestRename_Module_ConventionalPathUnchangedOpenFile(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+	server.renameFileOpsSupported = true
+
+	defContent := "defmodule MyApp.ABTest do\n  def run, do: :ok\nend\n"
+	defPath := filepath.Join(server.projectRoot, "lib", "my_app", "ab_test.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/ab_test.ex", defContent)
+
+	defURI := "file://" + defPath
+	server.docs.Set(defURI, defContent)
+
+	edit := renameAt(t, server, defURI, 0, uint32(strings.Index(defContent, "ABTest")), "AbTest")
+	server.backgroundWork.Wait()
+
+	if op := renameOp(edit, defPath); op != nil {
+		t.Errorf("rename op emitted for an unchanged path: %s -> %s", op.OldURI, op.NewURI)
+	}
+	if got := bufferAfterEdits(t, edit, defPath, defContent); !strings.Contains(got, "defmodule MyApp.AbTest") {
+		t.Errorf("expected 'defmodule MyApp.AbTest', got:\n%s", got)
+	}
+}

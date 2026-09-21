@@ -472,15 +472,21 @@ func cursorNeedsWithScope(callNode, prev, cursor *tree_sitter.Node, src []byte, 
 	for _, clause := range clauses {
 		lhs := clause.Child(0)
 		rhs := clause.Child(2)
-		// Cursor on lhs = new binding → with is the scope
+		binds := subtreeContainsUnpinnedIdentifier(lhs, src, varName)
 		if lhs.StartByte() <= cursor.StartByte() && cursor.EndByte() <= lhs.EndByte() {
-			return true
+			// Cursor on a pattern that binds the name → with is the scope. A
+			// pin in the pattern binds nothing, so it names whatever was bound
+			// before it, exactly like the expression side below.
+			if binds || bound {
+				return true
+			}
+			return false
 		}
 		// Cursor on rhs of a clause where a previous lhs bound varName → with is the scope
 		if bound && rhs.StartByte() <= cursor.StartByte() && cursor.EndByte() <= rhs.EndByte() {
 			return true
 		}
-		if subtreeContainsUnpinnedIdentifier(lhs, src, varName) {
+		if binds {
 			bound = true
 		}
 	}
@@ -909,47 +915,76 @@ func collectWithOccurrences(callNode, cursor *tree_sitter.Node, src []byte, varN
 				lastBindingIdx = i
 			}
 		}
-		if lastBindingIdx >= 0 {
-			collectVariableOccurrences(clauses[lastBindingIdx].Child(0), src, varName, out, false)
-			for i := lastBindingIdx + 1; i < len(clauses); i++ {
-				collectVariableOccurrences(clauses[i].Child(2), src, varName, out, false)
-				if subtreeContainsUnpinnedIdentifier(clauses[i].Child(0), src, varName) {
-					return
-				}
+		if lastBindingIdx < 0 {
+			if doBlock != nil {
+				collectVariableOccurrences(doBlock, src, varName, out, false)
 			}
+			return
 		}
-		if doBlock != nil {
-			collectVariableOccurrences(doBlock, src, varName, out, false)
-		}
+		collectFromClauseBinding(clauses, lastBindingIdx, doBlock, src, varName, out)
 		return
 	}
 
-	if cursorOnLhs {
-		// Cursor on lhs of clause N: collect lhs N, then rhs of N+1..., until rebind
-		collectVariableOccurrences(clauses[cursorIdx].Child(0), src, varName, out, false)
-		for i := cursorIdx + 1; i < len(clauses); i++ {
-			collectVariableOccurrences(clauses[i].Child(2), src, varName, out, false)
+	bindingIdx := -1
+	if cursorOnLhs && subtreeContainsUnpinnedIdentifier(clauses[cursorIdx].Child(0), src, varName) {
+		// Cursor on a pattern that binds the name: that pattern is the binding.
+		bindingIdx = cursorIdx
+	} else {
+		// Cursor on a clause's expression side, or on a pin in its pattern.
+		// Both are evaluated before that pattern binds, so the name is the one
+		// an earlier clause bound — not the one appearing to its left on the
+		// same line.
+		for i := cursorIdx - 1; i >= 0; i-- {
 			if subtreeContainsUnpinnedIdentifier(clauses[i].Child(0), src, varName) {
-				return
+				bindingIdx = i
+				break
 			}
 		}
-		if doBlock != nil {
-			collectVariableOccurrences(doBlock, src, varName, out, false)
-		}
+	}
+	if bindingIdx < 0 {
+		// Nothing in the clause list bound it; the name belongs to an outer
+		// scope, which this call is not the boundary for.
 		return
 	}
+	collectFromClauseBinding(clauses, bindingIdx, doBlock, src, varName, out)
+}
 
-	// Cursor on rhs of clause N>0: references lhs of clause N-1
-	collectVariableOccurrences(clauses[cursorIdx-1].Child(0), src, varName, out, false) // lhs N-1
-	collectVariableOccurrences(clauses[cursorIdx].Child(2), src, varName, out, false)   // rhs N
-	for i := cursorIdx + 1; i < len(clauses); i++ {
+// collectFromClauseBinding collects the occurrences of the binding that
+// clauses[bindingIdx]'s pattern creates: the pattern itself, then each
+// following clause's expression side and any pin in its pattern — both still
+// name this binding. It stops at the first following clause whose pattern
+// binds the name anew, because everything from that pattern onward, the
+// do_block included, belongs to the new binding.
+func collectFromClauseBinding(clauses []*tree_sitter.Node, bindingIdx int, doBlock *tree_sitter.Node, src []byte, varName string, out *[]VariableOccurrence) {
+	collectVariableOccurrences(clauses[bindingIdx].Child(0), src, varName, out, false)
+	for i := bindingIdx + 1; i < len(clauses); i++ {
+		lhs := clauses[i].Child(0)
+		// Pins come before the expression in source order; keep the output
+		// ordered so edits line up with the file.
+		collectPinnedOccurrences(lhs, src, varName, out)
 		collectVariableOccurrences(clauses[i].Child(2), src, varName, out, false)
-		if subtreeContainsUnpinnedIdentifier(clauses[i].Child(0), src, varName) {
+		if subtreeContainsUnpinnedIdentifier(lhs, src, varName) {
 			return
 		}
 	}
 	if doBlock != nil {
 		collectVariableOccurrences(doBlock, src, varName, out, false)
+	}
+}
+
+// collectPinnedOccurrences collects identifiers matching varName that appear
+// as the operand of a pin (^varName). A pin matches against a value already
+// bound, so it is a reference to the existing binding rather than a new one.
+func collectPinnedOccurrences(node *tree_sitter.Node, src []byte, varName string, out *[]VariableOccurrence) {
+	if node == nil {
+		return
+	}
+	if isPinOperator(node, src) {
+		collectVariableOccurrences(node, src, varName, out, true)
+		return
+	}
+	for i := uint(0); i < uint(node.ChildCount()); i++ {
+		collectPinnedOccurrences(node.Child(i), src, varName, out)
 	}
 }
 

@@ -64,8 +64,8 @@ func ParseFile(path string) ([]Definition, []Reference, error) {
 // The path is used to populate FilePath fields but the text is not read from disk.
 func ParseText(path, text string) ([]Definition, []Reference, error) {
 	source := []byte(text)
-	tokens := Tokenize(source)
-	return parseTextFromTokens(path, source, tokens)
+	result := TokenizeFull(source)
+	return parseTextFromTokens(path, source, result.Tokens, result.Interp)
 }
 
 // ScanFuncName reads a function/type name ([a-z_][a-z0-9_?!]*) from the start of s.
@@ -106,18 +106,29 @@ func resolveModule(s, currentModule string) string {
 	return s
 }
 
+// ExpandAliasPrefix rewrites the leading segment of a module reference using
+// the aliases in scope: after `alias SharedLib.Accounts`, the reference
+// `Accounts.Users` becomes `SharedLib.Accounts.Users`. It leaves __MODULE__
+// alone — see resolveModule for that.
+func ExpandAliasPrefix(modRef string, aliases map[string]string) string {
+	if len(aliases) == 0 {
+		return modRef
+	}
+	if full, ok := aliases[modRef]; ok {
+		return full
+	}
+	if dot := strings.IndexByte(modRef, '.'); dot > 0 {
+		if full, ok := aliases[modRef[:dot]]; ok {
+			return full + modRef[dot:]
+		}
+	}
+	return modRef
+}
+
 // ResolveModuleRef resolves a module reference through aliases and __MODULE__.
 // Returns "" if the reference contains unresolvable __MODULE__.
 func ResolveModuleRef(modRef string, aliases map[string]string, currentModule string) string {
-	resolved := modRef
-	if full, ok := aliases[modRef]; ok {
-		resolved = full
-	} else if parts := strings.SplitN(modRef, ".", 2); len(parts) == 2 {
-		if full, ok := aliases[parts[0]]; ok {
-			resolved = full + "." + parts[1]
-		}
-	}
-	resolved = resolveModule(resolved, currentModule)
+	resolved := resolveModule(ExpandAliasPrefix(modRef, aliases), currentModule)
 	if strings.Contains(resolved, "__MODULE__") {
 		return ""
 	}

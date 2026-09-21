@@ -1557,3 +1557,163 @@ config :app, value: some_helper()
 		t.Errorf("expected nil for bare top-level call, got %d occurrences: %+v", len(occs), occs)
 	}
 }
+
+// The argument on the right of a `with` clause is evaluated before that
+// clause's own pattern binds, so it refers to the binding the previous clause
+// made — not to the one being introduced on the same line.
+//
+//	with {:ok, site} <- normalize(site),   # binding A
+//	     {:ok, site} <- authorize(site) do # A on the right, B on the left
+//
+// Renaming the `site` inside `authorize(...)` must reach binding A and that
+// argument, and must leave the second pattern, the later pin, and the body
+// alone — those all belong to binding B.
+func TestFindVariableOccurrences_WithClauseRHSRefersToPreviousBinding(t *testing.T) {
+	src := []byte(`defmodule MyApp.Scopes do
+  def run(site, sites) do
+    with {:ok, site} <- normalize(site),
+         {:ok, site} <- authorize(site) do
+      Enum.each(sites, fn
+        ^site -> IO.inspect(site, label: "pinned")
+      end)
+
+      IO.inspect(site, label: "authorized")
+    end
+
+    IO.inspect(site, label: "function argument")
+  end
+end`)
+
+	// Cursor on the `site` inside `authorize(site)` — line 3, col 32.
+	occs := FindVariableOccurrences(src, 3, 34)
+	lines := make(map[uint]bool)
+	for _, occ := range occs {
+		lines[occ.Line] = true
+	}
+
+	if !lines[2] {
+		t.Error("expected binding A, the first clause's pattern (line 2)")
+	}
+	if !lines[3] {
+		t.Error("expected the `authorize(site)` argument itself (line 3)")
+	}
+	for _, l := range []uint{5, 8} {
+		if lines[l] {
+			t.Errorf("line %d belongs to binding B and should NOT be included", l)
+		}
+	}
+	if lines[11] {
+		t.Error("the function argument (line 11) is shadowed by binding A and should NOT be included")
+	}
+	for _, occ := range occs {
+		if occ.Line == 3 && occ.StartCol < 20 {
+			t.Errorf("the second clause's own pattern should NOT be included, got col %d", occ.StartCol)
+		}
+	}
+}
+
+// The pattern of the clause the cursor's expression sits in decides where that
+// binding ends. Pinned, it binds nothing, so the pin and the body still name
+// the earlier binding.
+func TestFindVariableOccurrences_WithClausePinnedPatternDoesNotRebind(t *testing.T) {
+	src := []byte(`defmodule MyApp.Scopes do
+  def run(site) do
+    with {:ok, site} <- normalize(site),
+         {:ok, ^site} <- authorize(site) do
+      IO.inspect(site, label: "authorized")
+    end
+  end
+end`)
+
+	// Cursor on the `site` inside `authorize(site)` — line 3, col 34.
+	for _, tc := range []struct {
+		name string
+		col  uint
+	}{
+		{"expression side", 35},
+		{"pin", 16},
+	} {
+		occs := FindVariableOccurrences(src, 3, tc.col)
+		lines := make(map[uint]bool)
+		for _, occ := range occs {
+			lines[occ.Line] = true
+		}
+		if !lines[2] {
+			t.Errorf("%s: expected the binding pattern (line 2)", tc.name)
+		}
+		if !lines[3] {
+			t.Errorf("%s: expected the pin and the argument (line 3)", tc.name)
+		}
+		if !lines[4] {
+			t.Errorf("%s: a pinned pattern binds nothing, so the body (line 4) still names this binding", tc.name)
+		}
+	}
+}
+
+// The other direction of the same `with`: renaming the binding a clause's
+// pattern does create reaches the later pin and the body, and stops short of
+// the earlier clause.
+func TestFindVariableOccurrences_WithClauseLHSKeepsItsOwnBinding(t *testing.T) {
+	src := []byte(`defmodule MyApp.Scopes do
+  def run(site, sites) do
+    with {:ok, site} <- normalize(site),
+         {:ok, site} <- authorize(site) do
+      Enum.each(sites, fn
+        ^site -> IO.inspect(site, label: "pinned")
+      end)
+
+      IO.inspect(site, label: "authorized")
+    end
+  end
+end`)
+
+	// Cursor on the second clause's pattern — line 3, col 15.
+	occs := FindVariableOccurrences(src, 3, 15)
+	lines := make(map[uint]bool)
+	for _, occ := range occs {
+		lines[occ.Line] = true
+	}
+	for _, l := range []uint{3, 5, 8} {
+		if !lines[l] {
+			t.Errorf("expected line %d to belong to this binding", l)
+		}
+	}
+	if lines[2] {
+		t.Error("the first clause's pattern (line 2) is a different binding and should NOT be included")
+	}
+	for _, occ := range occs {
+		if occ.Line == 3 && occ.StartCol > 20 {
+			t.Errorf("the `authorize(site)` argument names the earlier binding and should NOT be included, got col %d", occ.StartCol)
+		}
+	}
+}
+
+// A pin in the first clause's pattern has no earlier clause to name, so it
+// names the outer binding — the `with` is not the boundary for it.
+func TestFindVariableOccurrences_WithFirstClausePinNamesOuterBinding(t *testing.T) {
+	src := []byte(`defmodule MyApp.Scopes do
+  def run(site) do
+    with {:ok, ^site} <- normalize(site) do
+      :ok
+    end
+
+    IO.inspect(site, label: "function argument")
+  end
+end`)
+
+	// Cursor on the pin `^site` — line 2, col 16.
+	occs := FindVariableOccurrences(src, 2, 16)
+	lines := make(map[uint]bool)
+	for _, occ := range occs {
+		lines[occ.Line] = true
+	}
+	if !lines[1] {
+		t.Error("expected the function argument binding (line 1)")
+	}
+	if !lines[2] {
+		t.Error("expected the pin and the argument (line 2)")
+	}
+	if !lines[6] {
+		t.Error("expected the use after the with (line 6)")
+	}
+}

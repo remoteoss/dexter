@@ -6,11 +6,36 @@ Dexter is a fast Elixir LSP server. It indexes module and function definitions f
 
 - `cmd/main.go` — CLI entrypoint: `init`, `reindex`, `lookup`, `lsp` subcommands
 - `internal/indexer/` — the cold build: walk and stat on all cores, parse on all cores, then one bulk transaction with the indexes dropped. `dexter init` and the LSP server (when it finds an empty index) both call `FullBuild`. `Options.InProcess` marks the server, which shares the database with live readers and so cannot use the connection-wide bulk pragmas.
-- `internal/parser/` — Elixir parser backed by a hand-rolled tokenizer (`tokenizer.go`). The tokenizer produces a flat token stream (handling heredocs, sigils, strings, comments as opaque tokens) and `parser_tokenized.go` walks it to extract defmodule, def, defp, defmacro, defdelegate, defguard, defprotocol, defimpl, @type, @callback, alias, import, use, and Module.function references. Handles module nesting, alias resolution for defdelegate targets, and multi-line expressions natively via bracket depth tracking.
+- `internal/parser/` — Elixir parser backed by a hand-rolled tokenizer (`tokenizer.go`). The tokenizer produces a flat token stream (handling heredocs, sigils, strings, comments as opaque tokens; the code inside a `#{}` interpolation is tokenized as well, into the separate `TokenResult.Interp` stream — see below) and `parser_tokenized.go` walks it to extract defmodule, def, defp, defmacro, defdelegate, defguard, defprotocol, defimpl, @type, @callback, alias, import, use, and Module.function references. Handles module nesting, alias resolution for defdelegate targets, and multi-line expressions natively via bracket depth tracking.
+- `internal/beam/` — bounded, bounds-checked readers for the BEAM container, export table, Elixir Docs chunk, and persisted module attributes. These readers extract generated callables and DSL-provider metadata without starting the Erlang VM.
 - `internal/store/` — SQLite layer. Tables: `files` (path + mtime), `definitions` (module, function, kind, line, file_path, delegate_to, delegate_as), `refs` (module, function, line, file_path, kind).
 - `internal/lsp/` — LSP server. `server.go` handles all LSP methods. `elixir.go` contains pure functions for cursor expression extraction, alias/import/use extraction (tokenizer-based), and use-chain parsing. `rename.go` has rename helpers. `hover.go` has hover formatting. `documents.go` is an in-memory open-buffer store.
 - `internal/treesitter/` — Tree-sitter integration for scope-aware variable rename and go-to-references.
 - `internal/mcp/` — Model Context Protocol server (`dexter mcp`). One file per tool, gopls-style; tools are name-based (module/function, not file+position) and call the store plus the exported facade in `internal/lsp/api.go`.
+
+
+## String interpolation (`TokenResult.Interp`)
+
+A string literal stays one token in the main stream, because `@doc` extraction
+reads the token text whole and the block-depth tracker must never see a `do` or
+an `end` that belongs to an interpolation. The code inside `#{}` is real code
+all the same, so the tokenizer records it in a second, byte-ordered stream:
+`TokenResult.Interp`, holding only `TokModule`, `TokIdent`, `TokDot` and
+`TokAttr` (keywords are dropped on purpose). Nesting recurses, which Elixir
+allows: `"outer #{"inner #{x}"}"`. Interpolating (lowercase) sigils are covered;
+uppercase sigils are raw text and are not.
+
+Two consumers read it:
+
+- `parseTextFromTokens` drains it in byte order as the main walker passes each
+  token (`flushInterpRefs`), so an interpolated reference is resolved with the
+  aliases and the enclosing module in force at that point in the file. Both
+  streams go through the same `collectModuleRefs`.
+- `TokenizedFile.ExpressionAtCursor` (and `FullExpressionAtCursor`) fall back to
+  it when the main-stream lookup finds nothing, which is what gives
+  go-to-definition, hover and document highlight inside an interpolation. The
+  fallback costs one binary search, and only when the cursor is not on an
+  expression in the main stream.
 
 ## LSP feature map
 
@@ -75,6 +100,44 @@ The token walker cannot evaluate conditionals, so a `use` nested in a compile-ti
 
 `lookupInUsingEntry(moduleName, fn, consumerOpts, visited)` is the recursive lookup. `lookupThroughUse` calls it with full consumer opts from `ExtractUsesWithOpts`. `ParseKeywordModuleOpts` parses `key: Module` pairs from use call opts strings, with alias resolution.
 
+## Generated functions from BEAM files
+
+Some macros create public functions that have no source definition for Dexter to index. Completion and hover recover those functions from the compiled consumer module while keeping compilation optional:
+
+1. `generatedFunctionsForModule` resolves source-backed modules through the store, derives their Mix build root and application, and stats the expected `Elixir.<Module>.beam` path. When the module itself is generated and therefore absent from the store (for example, Phoenix route helpers), it probes the root application's cached ebin index. It does not glob every dependency ebin directory on the hot path.
+2. `loadCompiledFunctionDelta` reads the cheap `AtU8` and `ExpT` chunks first, then subtracts the complete, unbounded set returned by `ModuleFunctionKeys`. The source index wins every conflict, including against a stale BEAM.
+3. Only when exports remain does it inflate the `Docs` chunk. The hand-written ETF walker extracts signatures, default-argument arities, hidden flags, and offsets into documentation prose without materialising the full term. Completion reuses the metadata; hover re-inflates lazily for the one requested doc body and memoizes it under the cache entry's own lock, because concurrent hovers each work on a struct copy that still shares that memo and the cache's mutex.
+4. The resulting sorted slice is searched by binary search for each completion prefix.
+
+The BEAM readers support both `AtU8` layouts covered by Dexter's OTP 24+ floor: OTP 27 and earlier use one-byte atom lengths, while OTP 28+ negates the atom count and encodes lengths as ERTS tagged integers.
+
+Compilation is never required and source-vs-BEAM mtime is deliberately not a validity gate. A stale compiled module can still describe generated functions absent from the index; if no BEAM exists, the ordinary source-index behavior remains unchanged.
+
+### Cache invalidation
+
+The generated-function cache is a 1,024-entry LRU keyed by module. Invalidation is event-driven wherever a filesystem object exists:
+
+- A compiled result is reused while its BEAM stamp is unchanged.
+- A source-backed negative result watches the target ebin directory, whose mtime changes when the BEAM is first compiled.
+- Build application names are cached against the `_build/<profile>/lib` directory stamp.
+- A store miss also watches the root application's ebin directory for an entirely generated module. It uses a one-second retry TTL as well because a newly indexed source file does not move that directory's mtime.
+
+`DidOpen` prewarms project modules in the background. The completion path remains authoritative and performs the same cached lookup if prewarming has not finished.
+
+With `DEXTER_DEBUG=true`, every completion request logs its total duration and item count. A cold or invalidated compiled-module lookup additionally logs the module, whether it was source-backed, the generated-function count, and its load duration. `cmd/lspprobe -method completion -v` drives that same LSP path repeatedly against a real project, making cold and warm behavior visible without editor-side timestamp inference.
+
+### Generated DSL macros and scope
+
+Spark-generated DSL macros (including Ash sections and entities) neither exist in source nor remain in the consumer's export/import tables after expansion. The consumer BEAM's persisted `extensions` attribute is the record of their providers. `macroProviderAttributes` is the single framework-specific seam for this mapping.
+
+At a cursor inside block path `P`, `dslScopeModules` derives candidates using Spark's naming convention: `<Extension>.<Camel(P)>.<one child segment>`. The prefix is grown one path segment at a time and each step is verified against the provider application's ebin directory, so a segment that derives to no module — a language form such as `defmodule`, `if`, or `for`, wherever it sits in the path — is skipped rather than breaking the chain, and the deepest verified prefix wins. A wrong derivation therefore produces no result rather than an incorrect completion. `treesitter.EnclosingBlockPathWithTree` supplies the lexical block path, and the ebin module listing is cached against the directory mtime so newly compiled entity modules appear without a timer. The cache is capped at 128 directories; it uses arbitrary one-at-a-time eviction at capacity so ordinary reads retain the cheaper read lock instead of mutating an LRU.
+
+The block walk is passed as a thunk and runs only after the compiled consumer reports extension providers. Ordinary modules therefore pay no tree-walk cost. If no scoped entity provider exists, completion falls back to the extension modules themselves for top-level section macros.
+
+Generated-symbol resolution is shared by completion, hover, definition, signature help, references, and call-hierarchy preparation. Definition and call hierarchy cannot point at a source definition for a source-less provider, so they walk the provider's lexical module parents and use the closest module that has an indexed source location. Completion resolve and signature help read the same lazily cached BEAM documentation used by hover.
+
+For references, the parser records bare injected calls under the direct `use` module because the generated provider is unavailable while source is indexed. At lookup time, generated-symbol resolution queries those injector rows and validates every candidate against the compiled provider active at that candidate's block path. This keeps same-named macros from another DSL or another section out of the result. Statement-level injected calls with arguments are indexed even when they omit both parentheses and a `do` block, as in `authorize_if always()`.
+
 ## References — injector scan
 
 References for use-injected functions use two paths, preferring the fast one:
@@ -83,6 +146,8 @@ References for use-injected functions use two paths, preferring the fast one:
 2. **Slow path** — `findModulesWhoseUsingImports` scans all `__using__` cache entries codebase-wide for modules that statically import `targetModule`. Expensive (~30-65ms). Used for functions from statically-imported modules (e.g. `Ecto.Query` functions).
 
 Call sites are attributed to the **injecting module** in the store (not the defining module), so `LookupReferences(injectorMod, fn)` finds the actual call locations.
+
+An explicit definition in the consumer shadows a same-named injected function. `resolveBareFunctionModuleWithOrigin` preserves whether the winning definition came from the cursor file, preventing the fast path from widening an override to unrelated consumers. When multiple `use` declarations can inject the name, they are checked in reverse source order—the later declaration wins, matching `lookupThroughUse` and completion precedence.
 
 ## Variable scoping (tree-sitter)
 
