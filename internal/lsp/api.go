@@ -336,15 +336,12 @@ func (s *Server) prepareDeliveredEdit(edit *WorkspaceEdit) ([]deliveredFile, err
 
 // recordDeliveredEdit makes MCP reads and index queries reflect an accepted
 // editor edit immediately, without waiting for subsequent didChange events.
-// It holds the reindex lock so a concurrent workspace reindex's
-// walk-and-prune cannot drop rows written after its walk passed.
+// WithReindexLock supplies both locks the writes need: the reindex lock so a
+// concurrent workspace reindex's walk-and-prune cannot drop rows written
+// after its walk passed, and the indexWrites read lock (not retaken here,
+// RWMutex is not reentrant).
 func (s *Server) recordDeliveredEdit(files []deliveredFile) {
 	s.WithReindexLock(func() {
-		s.indexWrites.RLock()
-		defer s.indexWrites.RUnlock()
-		if s.indexUnavailable {
-			return
-		}
 		for _, file := range files {
 			if file.oldPath != file.newPath {
 				_ = s.store.RemoveFile(file.oldPath)
@@ -396,8 +393,10 @@ func (s *Server) applyTextEdits(text string, edits []protocol.TextEdit) string {
 	return strings.Join(lines, "\n")
 }
 
+// reindexPaths must run inside WithReindexLock, which already holds the
+// indexWrites read lock indexOneFile would retake (RWMutex is not reentrant).
 func (s *Server) reindexPaths(paths []string) {
 	for _, path := range paths {
-		s.indexOneFile(path)
+		s.indexOneFileLocked(path)
 	}
 }
