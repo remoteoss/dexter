@@ -111,3 +111,56 @@ func (s *Server) renameHandler(next jsonrpc2.Handler) jsonrpc2.Handler {
 		return reply(ctx, edit, nil)
 	}
 }
+
+// applyWorkspaceEditParams mirrors protocol.ApplyWorkspaceEditParams with our
+// own edit type, for the same reason WorkspaceEdit itself exists: the protocol
+// package's edit has nowhere to put resource operations.
+type applyWorkspaceEditParams struct {
+	Label string         `json:"label,omitempty"`
+	Edit  *WorkspaceEdit `json:"edit"`
+}
+
+// applyEdit asks the editor to apply edit, reporting whether it did. It goes
+// out over the raw connection rather than protocol.Client.ApplyEdit, whose
+// typed params would drop every file move.
+func (s *Server) applyEdit(ctx context.Context, label string, edit *WorkspaceEdit) (bool, error) {
+	var result protocol.ApplyWorkspaceEditResponse
+	params := &applyWorkspaceEditParams{Label: label, Edit: edit}
+	if err := protocol.Call(ctx, s.conn, protocol.MethodWorkspaceApplyEdit, params, &result); err != nil {
+		return false, err
+	}
+	return result.Applied, nil
+}
+
+// empty reports whether the edit asks for nothing at all.
+func (e *WorkspaceEdit) empty() bool {
+	return e == nil || (len(e.Changes) == 0 && len(e.DocumentChanges) == 0)
+}
+
+// textEditsByPath returns the edit's text edits keyed by file path, from
+// whichever of the two fields carries them.
+func (e *WorkspaceEdit) textEditsByPath() map[string][]protocol.TextEdit {
+	out := make(map[string][]protocol.TextEdit, len(e.Changes)+len(e.DocumentChanges))
+	for docURI, edits := range e.Changes {
+		path := uriToPath(docURI)
+		out[path] = append(out[path], edits...)
+	}
+	for _, change := range e.DocumentChanges {
+		if tde, ok := change.(TextDocumentEdit); ok {
+			path := uriToPath(tde.TextDocument.URI)
+			out[path] = append(out[path], tde.Edits...)
+		}
+	}
+	return out
+}
+
+// fileRenames returns the moves the edit asks for, old path → new path.
+func (e *WorkspaceEdit) fileRenames() map[string]string {
+	out := make(map[string]string, len(e.DocumentChanges))
+	for _, change := range e.DocumentChanges {
+		if rf, ok := change.(RenameFile); ok {
+			out[uriToPath(rf.OldURI)] = uriToPath(rf.NewURI)
+		}
+	}
+	return out
+}
