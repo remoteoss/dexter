@@ -73,6 +73,19 @@ func (s *Server) CollectReferences(module, function string) []store.ReferenceRes
 		return nil
 	}
 
+	// Sites written through an alias that a __using__ block injects. The file
+	// holding them declares no alias of its own, so the index has them under
+	// the bare short name and the direct lookup cannot see them.
+	moduleKindRefs := refResults
+	if function != "" {
+		if refs, err := s.store.LookupReferences(module, ""); err == nil {
+			moduleKindRefs = refs
+		} else {
+			moduleKindRefs = nil
+		}
+	}
+	refResults = append(refResults, s.injectedAliasReferences(module, function, moduleKindRefs)...)
+
 	if function != "" {
 		// Transitive refs via static __using__ import chains. Call sites of
 		// use-injected functions are attributed to the injecting module in the
@@ -276,7 +289,9 @@ func (s *Server) deliverEdits(edit *WorkspaceEdit) error {
 		}
 	}
 	if len(paths) > 0 {
-		s.reindexPaths(paths)
+		// Under the reindex lock so a concurrent workspace reindex's
+		// walk-and-prune cannot drop rows written after its walk passed.
+		s.WithReindexLock(func() { s.reindexPaths(paths) })
 	}
 	return nil
 }
@@ -321,27 +336,31 @@ func (s *Server) prepareDeliveredEdit(edit *WorkspaceEdit) ([]deliveredFile, err
 
 // recordDeliveredEdit makes MCP reads and index queries reflect an accepted
 // editor edit immediately, without waiting for subsequent didChange events.
+// It holds the reindex lock so a concurrent workspace reindex's
+// walk-and-prune cannot drop rows written after its walk passed.
 func (s *Server) recordDeliveredEdit(files []deliveredFile) {
-	s.indexWrites.RLock()
-	defer s.indexWrites.RUnlock()
-	if s.indexUnavailable {
-		return
-	}
-	for _, file := range files {
-		if file.oldPath != file.newPath {
-			_ = s.store.RemoveFile(file.oldPath)
+	s.WithReindexLock(func() {
+		s.indexWrites.RLock()
+		defer s.indexWrites.RUnlock()
+		if s.indexUnavailable {
+			return
 		}
-		defs, refs, err := parser.ParseText(file.newPath, file.text)
-		if err == nil {
-			_ = s.store.IndexFileWithRefs(file.newPath, defs, refs)
-		}
-		if file.open {
+		for _, file := range files {
 			if file.oldPath != file.newPath {
-				s.docs.Close(string(uri.File(file.oldPath)))
+				_ = s.store.RemoveFile(file.oldPath)
 			}
-			s.docs.Set(string(uri.File(file.newPath)), file.text)
+			defs, refs, err := parser.ParseText(file.newPath, file.text)
+			if err == nil {
+				_ = s.store.IndexFileWithRefs(file.newPath, defs, refs)
+			}
+			if file.open {
+				if file.oldPath != file.newPath {
+					s.docs.Close(string(uri.File(file.oldPath)))
+				}
+				s.docs.Set(string(uri.File(file.newPath)), file.text)
+			}
 		}
-	}
+	})
 }
 
 // applyTextEdits applies non-overlapping TextEdits to text. The rename

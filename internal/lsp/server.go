@@ -6224,15 +6224,6 @@ func (mr *moduleRename) moveConventionalFiles(fileCache map[string]moduleFileInf
 		if !hasContent {
 			continue
 		}
-		if deliverAll {
-			// Headless callers encode moves in the edit and deliverEdits applies
-			// them on disk. Attached callers can forward them only when the live
-			// editor supports rename resource operations.
-			if mr.server.conn == nil || mr.server.renameFileOpsSupported {
-				clientRenames[r.FilePath] = newPath
-			}
-			continue
-		}
 
 		// The conventional path is the module's last segment inside the
 		// directory the file already sits in, so a rename that leaves that
@@ -6244,6 +6235,16 @@ func (mr *moduleRename) moveConventionalFiles(fileCache map[string]moduleFileInf
 		// operation from a path to itself is no better. Fall through to
 		// applyEdits, which rewrites the contents where they are.
 		if newPath == r.FilePath {
+			continue
+		}
+
+		if deliverAll {
+			// Headless callers encode moves in the edit and deliverEdits applies
+			// them on disk. Attached callers can forward them only when the live
+			// editor supports rename resource operations.
+			if mr.server.conn == nil || mr.server.renameFileOpsSupported {
+				clientRenames[r.FilePath] = newPath
+			}
 			continue
 		}
 

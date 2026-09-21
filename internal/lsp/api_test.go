@@ -444,3 +444,80 @@ func TestStopGitHeadWatch(t *testing.T) {
 		t.Fatal("StopGitHeadWatch did not return")
 	}
 }
+
+// CollectReferences must mirror the References handler's collection: call
+// sites written through a __using__-injected alias are indexed under the bare
+// short name and only reachable through injectedAliasReferences.
+func TestCollectReferences_ViaUseInjectedAlias(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/repo.ex", `defmodule MyApp.Repo do
+  defmacro __using__(_) do
+    quote do
+      alias MyApp.Repo
+    end
+  end
+
+  def all(queryable), do: queryable
+end
+`)
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/accounts.ex", `defmodule MyApp.Accounts do
+  use MyApp.Repo
+
+  def list_users do
+    Repo.all(User)
+  end
+end
+`)
+	// Same short name, no `use` — a different module entirely.
+	indexFile(t, server.store, server.projectRoot, "lib/my_app/unrelated.ex", `defmodule MyApp.Unrelated do
+  def count do
+    Repo.aggregate(:count)
+  end
+end
+`)
+
+	refs := server.CollectReferences("MyApp.Repo", "all")
+	accountsPath := filepath.Join(server.projectRoot, "lib/my_app/accounts.ex")
+	unrelatedPath := filepath.Join(server.projectRoot, "lib/my_app/unrelated.ex")
+	found := make(map[string]bool, len(refs))
+	for _, r := range refs {
+		found[r.FilePath] = true
+	}
+	if !found[accountsPath] {
+		t.Errorf("Repo.all call through the injected alias not collected: %+v", refs)
+	}
+	if found[unrelatedPath] {
+		t.Errorf("bare Repo. in a file that does not use MyApp.Repo was collected: %+v", refs)
+	}
+}
+
+// A namespace-only module rename keeps the conventional file path, so the
+// edit must carry no rename operation: moving a path onto itself would fail
+// after the text edits are already prepared.
+func TestRenameModule_NamespaceOnlyKeepsPath(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	path := filepath.Join(server.projectRoot, "lib", "user.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/user.ex", `defmodule MyApp.Accounts.User do
+  def name(u), do: u.name
+end
+`)
+
+	summary, err := server.RenameModule("MyApp.Accounts.User", "MyApp.Billing.User")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summary.FilesMoved) != 0 {
+		t.Errorf("namespace-only rename reported moves: %v", summary.FilesMoved)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("file left its conventional path: %v", err)
+	}
+	if !strings.Contains(string(data), "defmodule MyApp.Billing.User") {
+		t.Errorf("module not renamed in place:\n%s", data)
+	}
+}
