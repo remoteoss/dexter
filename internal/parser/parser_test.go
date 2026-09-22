@@ -2814,6 +2814,308 @@ end
 	}
 }
 
+func TestParseCallEdges(t *testing.T) {
+	src := `defmodule MyApp.Worker do
+  alias SharedLib.Service, as: Service
+
+  def run(value), do: Service.fetch(value)
+
+  def normalize(value, opts \\ []) do
+    value
+    |> String.trim()
+    |> finish(opts)
+  end
+
+  defp finish(value, _opts), do: value
+  def capture, do: &Service.fetch/1
+end
+`
+
+	_, _, edges, err := ParseTextWithCalls("lib/my_app/worker.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := map[CallEdge]bool{
+		{Caller: FunctionID{Module: "MyApp.Worker", Function: "run", Arity: 1}, Callee: FunctionID{Module: "SharedLib.Service", Function: "fetch", Arity: 1}, Kind: "call"}:         true,
+		{Caller: FunctionID{Module: "MyApp.Worker", Function: "normalize", Arity: 2}, Callee: FunctionID{Module: "String", Function: "trim", Arity: 1}, Kind: "call"}:               true,
+		{Caller: FunctionID{Module: "MyApp.Worker", Function: "normalize", Arity: 2}, Callee: FunctionID{Module: "MyApp.Worker", Function: "finish", Arity: 2}, Kind: "call"}:       true,
+		{Caller: FunctionID{Module: "MyApp.Worker", Function: "normalize", Arity: 1}, Callee: FunctionID{Module: "MyApp.Worker", Function: "normalize", Arity: 2}, Kind: "default"}: true,
+		{Caller: FunctionID{Module: "MyApp.Worker", Function: "capture", Arity: 0}, Callee: FunctionID{Module: "SharedLib.Service", Function: "fetch", Arity: 1}, Kind: "capture"}:  true,
+	}
+
+	if len(edges) != len(want) {
+		t.Fatalf("edges = %+v, want exactly %+v", edges, want)
+	}
+	for _, edge := range edges {
+		if !want[edge] {
+			t.Errorf("unexpected edge: %+v", edge)
+		}
+	}
+}
+
+func TestParseCallEdgesScopesAndDeduplicates(t *testing.T) {
+	src := `defmodule MyApp.Outer do
+  def repeated(value) do
+    SharedLib.Worker.perform(value)
+    SharedLib.Worker.perform(value)
+  end
+
+  SharedLib.Worker.outside()
+
+  defmodule Inner do
+    def nested(value), do: SharedLib.Worker.perform(value, nested(value))
+  end
+end
+`
+
+	_, _, edges, err := ParseTextWithCalls("lib/my_app/outer.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := map[CallEdge]bool{
+		{Caller: FunctionID{Module: "MyApp.Outer", Function: "repeated", Arity: 1}, Callee: FunctionID{Module: "SharedLib.Worker", Function: "perform", Arity: 1}, Kind: "call"}:     true,
+		{Caller: FunctionID{Module: "MyApp.Outer.Inner", Function: "nested", Arity: 1}, Callee: FunctionID{Module: "SharedLib.Worker", Function: "perform", Arity: 2}, Kind: "call"}: true,
+		{Caller: FunctionID{Module: "MyApp.Outer.Inner", Function: "nested", Arity: 1}, Callee: FunctionID{Module: "MyApp.Outer.Inner", Function: "nested", Arity: 1}, Kind: "call"}: true,
+	}
+
+	if len(edges) != len(want) {
+		t.Fatalf("edges = %+v, want exactly %+v", edges, want)
+	}
+	for _, edge := range edges {
+		if !want[edge] {
+			t.Errorf("unexpected edge: %+v", edge)
+		}
+	}
+}
+
+func TestParseCallEdgesMarksAmbiguousArity(t *testing.T) {
+	src := `defmodule MyApp.Worker do
+  def run(value) do
+    SharedLib.Service.fetch value
+  end
+end
+`
+
+	_, _, edges, err := ParseTextWithCalls("lib/my_app/worker.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := CallEdge{
+		Caller: FunctionID{Module: "MyApp.Worker", Function: "run", Arity: 1},
+		Callee: FunctionID{Module: "SharedLib.Service", Function: "fetch", Arity: UnknownArity},
+		Kind:   "call",
+	}
+	if len(edges) != 1 || edges[0] != want {
+		t.Fatalf("edges = %+v, want [%+v]", edges, want)
+	}
+}
+
+func TestParseCallEdgesBareDefinitionArity(t *testing.T) {
+	src := `defmodule MyApp.Worker do
+  def run value, opts \\ [] when is_list(opts) do
+    SharedLib.Service.fetch(value, opts)
+  end
+end
+`
+
+	defs, _, edges, err := ParseTextWithCalls("lib/my_app/worker.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var arities []int
+	for _, def := range defs {
+		if def.Function == "run" {
+			arities = append(arities, def.Arity)
+		}
+	}
+	if !reflect.DeepEqual(arities, []int{1, 2}) {
+		t.Fatalf("run arities = %v, want [1 2]", arities)
+	}
+	want := map[CallEdge]bool{
+		{Caller: FunctionID{Module: "MyApp.Worker", Function: "run", Arity: 1}, Callee: FunctionID{Module: "MyApp.Worker", Function: "run", Arity: 2}, Kind: "default"}:     true,
+		{Caller: FunctionID{Module: "MyApp.Worker", Function: "run", Arity: 2}, Callee: FunctionID{Module: "SharedLib.Service", Function: "fetch", Arity: 2}, Kind: "call"}: true,
+	}
+	if len(edges) != len(want) {
+		t.Fatalf("edges = %+v, want exactly %+v", edges, want)
+	}
+	for _, edge := range edges {
+		if !want[edge] {
+			t.Errorf("unexpected edge: %+v", edge)
+		}
+	}
+}
+
+func TestParseCallEdgesDelegate(t *testing.T) {
+	src := `defmodule MyApp.Worker do
+  defdelegate run(value), to: SharedLib.Worker, as: :perform
+end
+`
+
+	_, _, edges, err := ParseTextWithCalls("lib/my_app/worker.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := CallEdge{
+		Caller: FunctionID{Module: "MyApp.Worker", Function: "run", Arity: 1},
+		Callee: FunctionID{Module: "SharedLib.Worker", Function: "perform", Arity: 1},
+		Kind:   "delegate",
+	}
+	if len(edges) != 1 || edges[0] != want {
+		t.Fatalf("edges = %+v, want [%+v]", edges, want)
+	}
+}
+
+func TestParseCallEdgesSplitKeywordBody(t *testing.T) {
+	src := `defmodule MyApp.Worker do
+  def run(value),
+    do:
+      value
+      |> SharedLib.Service.fetch()
+
+  SharedLib.Service.outside()
+end
+`
+
+	_, _, edges, err := ParseTextWithCalls("lib/my_app/worker.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := CallEdge{
+		Caller: FunctionID{Module: "MyApp.Worker", Function: "run", Arity: 1},
+		Callee: FunctionID{Module: "SharedLib.Service", Function: "fetch", Arity: 1},
+		Kind:   "call",
+	}
+	if len(edges) != 1 || edges[0] != want {
+		t.Fatalf("edges = %+v, want [%+v]", edges, want)
+	}
+}
+
+func TestParseCallEdgesLocalPrecedenceDoesNotGuessImports(t *testing.T) {
+	src := `defmodule MyApp.Worker do
+  import SharedLib.Worker
+
+  def imported(value), do: perform(value)
+  def local(value), do: perform(value)
+  defp perform(value), do: value
+end
+`
+
+	_, _, edges, err := ParseTextWithCalls("lib/my_app/worker.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[CallEdge]bool{
+		{Caller: FunctionID{Module: "MyApp.Worker", Function: "imported", Arity: 1}, Callee: FunctionID{Module: "MyApp.Worker", Function: "perform", Arity: 1}, Kind: "call"}: true,
+		{Caller: FunctionID{Module: "MyApp.Worker", Function: "local", Arity: 1}, Callee: FunctionID{Module: "MyApp.Worker", Function: "perform", Arity: 1}, Kind: "call"}:    true,
+	}
+	if len(edges) != len(want) {
+		t.Fatalf("edges = %+v, want exactly %+v", edges, want)
+	}
+	for _, edge := range edges {
+		if !want[edge] {
+			t.Errorf("unexpected edge: %+v", edge)
+		}
+	}
+
+	withoutLocal := strings.Replace(src, "  defp perform(value), do: value\n", "  def dsl(value) do\n    perform value\n  end\n", 1)
+	_, _, edges, err = ParseTextWithCalls("lib/my_app/worker.ex", withoutLocal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(edges) != 0 {
+		t.Fatalf("ambiguous imported calls were stored as concrete edges: %+v", edges)
+	}
+}
+
+func TestParseCallEdgesInterpolation(t *testing.T) {
+	src := `defmodule MyApp.Worker do
+  def render(value), do: "result: #{SharedLib.Service.fetch(value)}"
+end
+`
+
+	_, _, edges, err := ParseTextWithCalls("lib/my_app/worker.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := CallEdge{
+		Caller: FunctionID{Module: "MyApp.Worker", Function: "render", Arity: 1},
+		Callee: FunctionID{Module: "SharedLib.Service", Function: "fetch", Arity: UnknownArity},
+		Kind:   "call",
+	}
+	if len(edges) != 1 || edges[0] != want {
+		t.Fatalf("edges = %+v, want [%+v]", edges, want)
+	}
+}
+
+func TestParseCallEdgesDoesNotTreatMultilineHeadAsInjectedCalls(t *testing.T) {
+	src := `defmodule MyApp.Worker do
+  import GenServer
+
+  def run(
+        value
+      )
+      when is_integer(value) do
+    value
+  end
+end
+`
+
+	_, refs, edges, err := ParseTextWithCalls("lib/my_app/worker.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ref := range refs {
+		if ref.Module == "GenServer" && ref.Function == "is_integer" {
+			t.Fatalf("guard was attributed to an unrelated import: %+v", ref)
+		}
+	}
+	if len(edges) != 0 {
+		t.Fatalf("function head produced call edges: %+v", edges)
+	}
+}
+
+func TestParseCallEdgesDoesNotMisattributeDefaultExpression(t *testing.T) {
+	src := `defmodule MyApp.Worker do
+  def run(value \\ SharedLib.Defaults.value()), do: value
+end
+`
+
+	_, _, edges, err := ParseTextWithCalls("lib/my_app/worker.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := CallEdge{
+		Caller: FunctionID{Module: "MyApp.Worker", Function: "run", Arity: 0},
+		Callee: FunctionID{Module: "MyApp.Worker", Function: "run", Arity: 1},
+		Kind:   "default",
+	}
+	if len(edges) != 1 || edges[0] != want {
+		t.Fatalf("edges = %+v, want only [%+v]", edges, want)
+	}
+}
+
+func TestParseCallEdgesInlineBodyStopsAtSemicolon(t *testing.T) {
+	src := `defmodule MyApp.Worker do
+  def run, do: SharedLib.Service.inside(); SharedLib.Service.outside()
+end
+`
+
+	_, _, edges, err := ParseTextWithCalls("lib/my_app/worker.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := CallEdge{
+		Caller: FunctionID{Module: "MyApp.Worker", Function: "run", Arity: 0},
+		Callee: FunctionID{Module: "SharedLib.Service", Function: "inside", Arity: 0},
+		Kind:   "call",
+	}
+	if len(edges) != 1 || edges[0] != want {
+		t.Fatalf("edges = %+v, want only [%+v]", edges, want)
+	}
+}
+
 // TestCollectElixirFilesParallelMatchesWalk asserts that the parallel collector
 // finds exactly the same files as the sequential walk, including the directory
 // exclusions, so swapping it into the indexer cannot change what gets indexed.

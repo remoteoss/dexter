@@ -2,6 +2,177 @@ package parser
 
 import "strings"
 
+// QualifiedCall is the syntactic part of a Module.function call. Module is not
+// alias-resolved; callers apply the scope that is active at the token position.
+type QualifiedCall struct {
+	Module   string
+	Function string
+	Arity    int
+	NameEnd  int
+}
+
+// QualifiedCallAt recognizes the same qualified expression used by reference
+// extraction and call-graph extraction. Calls without parentheses retain an
+// unknown arity instead of guessing from expression boundaries.
+func QualifiedCallAt(source []byte, tokens []Token, n, pos int) (QualifiedCall, bool) {
+	if pos < 0 || pos >= n || tokens[pos].Kind != TokModule || !isUserModule(source, tokens[pos]) {
+		return QualifiedCall{}, false
+	}
+	module, k := CollectModuleName(source, tokens, n, pos)
+	if k+1 >= n || tokens[k].Kind != TokDot || tokens[k+1].Kind != TokIdent {
+		return QualifiedCall{}, false
+	}
+	call := QualifiedCall{
+		Module:   module,
+		Function: TokenText(source, tokens[k+1]),
+		Arity:    UnknownArity,
+		NameEnd:  k + 2,
+	}
+	if call.NameEnd < n && tokens[call.NameEnd].Kind == TokOpenParen {
+		arity, ok := ParenthesizedCallArity(tokens, n, call.NameEnd)
+		if !ok {
+			return QualifiedCall{}, false
+		}
+		call.Arity = arity
+	}
+	return call, true
+}
+
+// ParenthesizedCallArity counts top-level arguments without evaluating them.
+func ParenthesizedCallArity(tokens []Token, n, open int) (int, bool) {
+	if open < 0 || open >= n || tokens[open].Kind != TokOpenParen {
+		return 0, false
+	}
+	brackets := 1
+	blocks := 0
+	args := 0
+	hasValue := false
+	for i := open + 1; i < n; i++ {
+		switch tokens[i].Kind {
+		case TokOpenParen, TokOpenBracket, TokOpenBrace, TokOpenAngle:
+			brackets++
+			hasValue = true
+		case TokCloseParen:
+			brackets--
+			if brackets == 0 {
+				if hasValue {
+					args++
+				}
+				return args, true
+			}
+		case TokCloseBracket, TokCloseBrace, TokCloseAngle:
+			if brackets > 1 {
+				brackets--
+			}
+		case TokDo, TokFn:
+			blocks++
+			hasValue = true
+		case TokEnd:
+			if blocks > 0 {
+				blocks--
+			}
+		case TokComma:
+			if brackets == 1 && blocks == 0 {
+				args++
+				hasValue = false
+			}
+		case TokEOL, TokComment:
+		default:
+			hasValue = true
+		}
+	}
+	return 0, false
+}
+
+// ScanKeywordDoBody finds a `do:` body in a definition head and returns the
+// token range of its expression. It does not treat physical lines as scopes;
+// bracketed, block, and piped expressions can continue across lines.
+func ScanKeywordDoBody(source []byte, tokens []Token, n, from int) (start, end int, ok bool) {
+	doPos := -1
+	for i := from; i+1 < n; i++ {
+		if IsStatementBoundaryToken(tokens[i].Kind) {
+			return 0, 0, false
+		}
+		if tokens[i].Kind == TokIdent && TokenText(source, tokens[i]) == "do" && tokens[i+1].Kind == TokColon {
+			doPos = i
+			break
+		}
+	}
+	if doPos < 0 {
+		return 0, 0, false
+	}
+	start = doPos + 2
+	depth := 0
+	blocks := 0
+	seen := false
+	lastSig := -1
+	for i := start; i < n; i++ {
+		tok := tokens[i]
+		switch tok.Kind {
+		case TokOpenParen, TokOpenBracket, TokOpenBrace, TokOpenAngle:
+			depth++
+			seen = true
+			lastSig = i
+		case TokCloseParen, TokCloseBracket, TokCloseBrace, TokCloseAngle:
+			if depth > 0 {
+				depth--
+			}
+			seen = true
+			lastSig = i
+		case TokDo, TokFn:
+			blocks++
+			seen = true
+			lastSig = i
+		case TokEnd:
+			if blocks > 0 {
+				blocks--
+				seen = true
+				lastSig = i
+				continue
+			}
+			if depth == 0 {
+				return start, i, seen
+			}
+		case TokEOL:
+			if !seen || depth > 0 || blocks > 0 {
+				continue
+			}
+			next := NextSigToken(tokens, n, i+1)
+			if (next < n && (tokens[next].Kind == TokPipe || tokens[next].Kind == TokDot)) || expressionContinuesAfter(source, tokens, lastSig) {
+				continue
+			}
+			return start, i, true
+		case TokComment:
+			continue
+		case TokEOF:
+			return start, i, seen
+		case TokOther:
+			if depth == 0 && blocks == 0 && TokenText(source, tok) == ";" {
+				return start, i, seen
+			}
+			seen = true
+			lastSig = i
+		default:
+			seen = true
+			lastSig = i
+		}
+	}
+	return start, n, seen
+}
+
+func expressionContinuesAfter(source []byte, tokens []Token, pos int) bool {
+	if pos < 0 || pos >= len(tokens) {
+		return false
+	}
+	switch tokens[pos].Kind {
+	case TokComma, TokPipe, TokDot, TokBackslash, TokRightArrow, TokLeftArrow, TokAssoc:
+		return true
+	case TokOther:
+		return TokenText(source, tokens[pos]) != ";"
+	}
+	return false
+}
+
 // StaticDeclarationName returns the literal name declared by a function,
 // type, spec, or callback token. Macro-generated declaration heads use
 // unquote/unquote_splicing as placeholders rather than literal names; those
@@ -34,6 +205,80 @@ func StaticDeclarationName(source []byte, tokens []Token, n, declarationIdx int)
 		return "", nameIdx, false
 	}
 	return name, nameIdx, true
+}
+
+// CollectBareParams reads a function head whose parameters are not wrapped in
+// parentheses. It stops at a guard, block do, or keyword do and returns the
+// same arity information as CollectParams.
+func CollectBareParams(source []byte, tokens []Token, n, from int) (arity, defaults int, names []string, end int) {
+	depth := 0
+	hasParam := false
+	hasDefault := false
+	paramName := ""
+	finishParam := func() {
+		if !hasParam {
+			return
+		}
+		arity++
+		if hasDefault {
+			defaults++
+		}
+		names = append(names, paramName)
+		hasParam = false
+		hasDefault = false
+		paramName = ""
+	}
+
+	for i := from; i < n; i++ {
+		tok := tokens[i]
+		if depth == 0 {
+			switch tok.Kind {
+			case TokDo, TokWhen, TokEOF, TokEnd:
+				finishParam()
+				return arity, defaults, names, i
+			case TokComma:
+				finishParam()
+				continue
+			case TokIdent:
+				if i+1 < n && tokens[i+1].Kind == TokColon {
+					keyword := TokenText(source, tok)
+					if keyword == "do" || keyword == "to" || keyword == "as" {
+						finishParam()
+						return arity, defaults, names, i
+					}
+				}
+			}
+			if i > from && IsStatementBoundaryToken(tok.Kind) {
+				finishParam()
+				return arity, defaults, names, i
+			}
+		}
+
+		switch tok.Kind {
+		case TokOpenParen, TokOpenBracket, TokOpenBrace, TokOpenAngle:
+			depth++
+			hasParam = true
+		case TokCloseParen, TokCloseBracket, TokCloseBrace, TokCloseAngle:
+			if depth > 0 {
+				depth--
+			}
+			hasParam = true
+		case TokBackslash:
+			if depth == 0 {
+				hasDefault = true
+			}
+			hasParam = true
+		case TokEOL, TokComment:
+			continue
+		default:
+			if depth == 0 && paramName == "" && tok.Kind == TokIdent {
+				paramName = TokenText(source, tok)
+			}
+			hasParam = true
+		}
+	}
+	finishParam()
+	return arity, defaults, names, n
 }
 
 // IsStatementBoundaryToken reports whether kind starts a new statement or closes

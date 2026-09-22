@@ -461,12 +461,12 @@ func (s *Server) indexOneFile(path string) {
 // indexOneFileLocked is indexOneFile for callers already holding indexWrites.
 // Go's RWMutex is not reentrant, so the two must stay separate.
 func (s *Server) indexOneFileLocked(path string) {
-	defs, refs, err := parser.ParseFile(path)
+	defs, refs, calls, err := parser.ParseFileWithCalls(path)
 	if err != nil {
 		log.Printf("Error parsing %s: %v", path, err)
 		return
 	}
-	if err := s.store.IndexFileWithRefs(path, defs, refs); err != nil {
+	if err := s.store.IndexFileWithRefsAndCalls(path, defs, refs, calls); err != nil {
 		log.Printf("Error indexing %s: %v", path, err)
 	}
 }
@@ -559,14 +559,15 @@ func (s *Server) startBackgroundReindex() <-chan struct{} {
 					}
 				}
 
-				defs, refs, err := parser.ParseFile(path)
+				defs, refs, calls, err := parser.ParseFileWithCalls(path)
 				if err != nil {
 					return nil
 				}
 				if !indexRefs {
 					refs = nil
+					calls = nil
 				}
-				if err := s.store.IndexFileWithRefs(path, defs, refs); err != nil {
+				if err := s.store.IndexFileWithRefsAndCalls(path, defs, refs, calls); err != nil {
 					log.Printf("Warning: reindex %s: %v", path, err)
 				}
 				reindexed++
@@ -6743,11 +6744,11 @@ func (s *Server) reindexAfterRename(removePaths, diskPaths []string, textPaths [
 			s.indexOneFileLocked(path)
 		}
 		for _, entry := range textPaths {
-			defs, refs, err := parser.ParseText(entry.path, entry.text)
+			defs, refs, calls, err := parser.ParseTextWithCalls(entry.path, entry.text)
 			if err != nil {
 				continue
 			}
-			_ = s.store.IndexFileWithRefs(entry.path, defs, refs)
+			_ = s.store.IndexFileWithRefsAndCalls(entry.path, defs, refs, calls)
 		}
 
 		if len(diskPaths)+len(textPaths) > 0 {

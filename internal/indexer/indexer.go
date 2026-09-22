@@ -76,6 +76,7 @@ type Stats struct {
 	Files       int
 	Definitions int
 	References  int
+	CallEdges   int
 	Workers     int
 
 	Walk          time.Duration
@@ -187,13 +188,13 @@ func FullBuild(s *store.Store, projectRoot string, opts Options) (Stats, error) 
 			defer wg.Done()
 			for f := range fileCh {
 				t0 := time.Now()
-				defs, refs, err := parser.ParseFile(f.path)
+				defs, refs, calls, err := parser.ParseFileWithCalls(f.path)
 				if err != nil {
 					warn("%s: %v", f.path, err)
 					continue
 				}
 				parseNanos.Add(int64(time.Since(t0)))
-				resultCh <- parseResult{path: f.path, mtimeNano: f.mtimeNano, defs: defs, refs: refs}
+				resultCh <- parseResult{path: f.path, mtimeNano: f.mtimeNano, defs: defs, refs: refs, calls: calls}
 			}
 		}()
 	}
@@ -243,7 +244,7 @@ func FullBuild(s *store.Store, projectRoot string, opts Options) (Stats, error) 
 	var writeNanos time.Duration
 	for res := range resultCh {
 		writeStart := time.Now()
-		err := batch.IndexFileWithMtimeAndRefs(res.path, res.mtimeNano, res.defs, res.refs)
+		err := batch.IndexFileWithMtimeRefsAndCalls(res.path, res.mtimeNano, res.defs, res.refs, res.calls)
 		writeNanos += time.Since(writeStart)
 		if err != nil {
 			return stats, abortBuild(s, batch, resultCh, fmt.Errorf("%s: %w", res.path, err))
@@ -251,6 +252,7 @@ func FullBuild(s *store.Store, projectRoot string, opts Options) (Stats, error) 
 		stats.Files++
 		stats.Definitions += len(res.defs)
 		stats.References += len(res.refs)
+		stats.CallEdges += len(res.calls)
 	}
 	stats.Write = writeNanos
 	stats.Parse = time.Duration(parseNanos.Load())
@@ -282,6 +284,7 @@ type parseResult struct {
 	mtimeNano int64
 	defs      []parser.Definition
 	refs      []parser.Reference
+	calls     []parser.CallEdge
 }
 
 type stdlibResult struct {

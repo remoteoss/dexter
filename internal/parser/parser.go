@@ -52,6 +52,24 @@ type Reference struct {
 	Kind     string // "call", "alias", "import", "use"
 }
 
+// FunctionID identifies one callable function or macro in the call graph.
+type FunctionID struct {
+	Module   string
+	Function string
+	Arity    int
+}
+
+// UnknownArity marks a call whose target is known but whose arity cannot be
+// established without evaluating Elixir syntax.
+const UnknownArity = -1
+
+// CallEdge is one deduplicated caller-to-callee relationship in a source file.
+type CallEdge struct {
+	Caller FunctionID
+	Callee FunctionID
+	Kind   string
+}
+
 func ParseFile(path string) ([]Definition, []Reference, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -60,12 +78,28 @@ func ParseFile(path string) ([]Definition, []Reference, error) {
 	return ParseText(path, string(data))
 }
 
+// ParseFileWithCalls parses definitions, references, and caller-callee edges.
+func ParseFileWithCalls(path string) ([]Definition, []Reference, []CallEdge, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return ParseTextWithCalls(path, string(data))
+}
+
 // ParseText parses Elixir source text and returns definitions and references.
 // The path is used to populate FilePath fields but the text is not read from disk.
 func ParseText(path, text string) ([]Definition, []Reference, error) {
 	source := []byte(text)
 	result := TokenizeFull(source)
 	return parseTextFromTokens(path, source, result.Tokens, result.Interp)
+}
+
+// ParseTextWithCalls parses definitions, references, and caller-callee edges.
+func ParseTextWithCalls(path, text string) ([]Definition, []Reference, []CallEdge, error) {
+	source := []byte(text)
+	result := TokenizeFull(source)
+	return parseTextFromTokensWithCalls(path, source, result.Tokens, result.Interp)
 }
 
 // ScanFuncName reads a function/type name ([a-z_][a-z0-9_?!]*) from the start of s.
