@@ -420,8 +420,8 @@ func cmdInit(projectRoot string, force bool, allowNonProject bool, profile bool)
 		fmt.Fprintf(os.Stderr, "  create indices: %s\n", stats.CreateIndexes.Round(time.Millisecond))
 	}
 
-	fmt.Fprintf(os.Stderr, "Indexed %s files (%s definitions, %s references) in %s\n",
-		formatInt(stats.Files), formatInt(stats.Definitions), formatInt(stats.References),
+	fmt.Fprintf(os.Stderr, "Indexed %s files (%s definitions, %s references, %s call edges) in %s\n",
+		formatInt(stats.Files), formatInt(stats.Definitions), formatInt(stats.References), formatInt(stats.CallEdges),
 		stats.Total.Round(time.Millisecond))
 }
 

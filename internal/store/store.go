@@ -261,6 +261,22 @@ func migrate(db *sql.DB) error {
 			-- so the cascade was never the thing keeping them consistent.
 		);
 
+		CREATE TABLE IF NOT EXISTS call_symbols (
+			id INTEGER PRIMARY KEY,
+			module TEXT NOT NULL,
+			function TEXT NOT NULL,
+			arity INTEGER NOT NULL,
+			UNIQUE (module, function, arity)
+		);
+
+		CREATE TABLE IF NOT EXISTS call_edges (
+			file_id INTEGER NOT NULL,
+			caller_id INTEGER NOT NULL,
+			callee_id INTEGER NOT NULL,
+			kind TEXT NOT NULL,
+			PRIMARY KEY (file_id, caller_id, callee_id, kind)
+		) WITHOUT ROWID;
+
 		CREATE TABLE IF NOT EXISTS metadata (
 			key   TEXT PRIMARY KEY,
 			value TEXT NOT NULL
@@ -295,6 +311,8 @@ func createIndexes(db dbExecer) error {
 		CREATE INDEX IF NOT EXISTS idx_definitions_file_id_line ON definitions(file_id, line);
 		CREATE INDEX IF NOT EXISTS idx_refs_module_function ON refs(module, function, file_id, line, kind);
 		CREATE INDEX IF NOT EXISTS idx_refs_file_id ON refs(file_id);
+		CREATE INDEX IF NOT EXISTS idx_call_edges_caller ON call_edges(caller_id, callee_id, kind);
+		CREATE INDEX IF NOT EXISTS idx_call_edges_callee ON call_edges(callee_id, caller_id, kind);
 		CREATE INDEX IF NOT EXISTS idx_definitions_delegate_to ON definitions(delegate_to);
 		-- LookupUsingModules runs on the References slow path. Without this it
 		-- scans every definition in the index (481k entries on a large monorepo)
@@ -316,6 +334,8 @@ func (s *Store) DropIndexes() error {
 		DROP INDEX IF EXISTS idx_refs_module_function;
 		DROP INDEX IF EXISTS idx_refs_file_path;
 		DROP INDEX IF EXISTS idx_refs_file_id;
+		DROP INDEX IF EXISTS idx_call_edges_caller;
+		DROP INDEX IF EXISTS idx_call_edges_callee;
 		DROP INDEX IF EXISTS idx_refs_function_kind;
 		DROP INDEX IF EXISTS idx_definitions_delegate_to;
 		DROP INDEX IF EXISTS idx_definitions_using;
@@ -412,6 +432,10 @@ func (s *Store) IndexFile(path string, defs []parser.Definition) error {
 }
 
 func (s *Store) IndexFileWithRefs(path string, defs []parser.Definition, refs []parser.Reference) error {
+	return s.IndexFileWithRefsAndCalls(path, defs, refs, nil)
+}
+
+func (s *Store) IndexFileWithRefsAndCalls(path string, defs []parser.Definition, refs []parser.Reference, calls []parser.CallEdge) error {
 	info, err := os.Stat(path)
 	if err != nil {
 		return err
@@ -427,11 +451,18 @@ func (s *Store) IndexFileWithRefs(path string, defs []parser.Definition, refs []
 	if err != nil {
 		return err
 	}
+	staleSymbols, err := callSymbolIDsForFile(tx, fileID)
+	if err != nil {
+		return err
+	}
 
 	if _, err := tx.Exec("DELETE FROM definitions WHERE file_id = ?", fileID); err != nil {
 		return err
 	}
 	if _, err := tx.Exec("DELETE FROM refs WHERE file_id = ?", fileID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM call_edges WHERE file_id = ?", fileID); err != nil {
 		return err
 	}
 
@@ -461,7 +492,81 @@ func (s *Store) IndexFileWithRefs(path string, defs []parser.Definition, refs []
 		}
 	}
 
+	if len(calls) > 0 {
+		callStmt, err := tx.Prepare("INSERT INTO call_edges (file_id, caller_id, callee_id, kind) VALUES (?, ?, ?, ?)")
+		if err != nil {
+			return err
+		}
+		defer func() { _ = callStmt.Close() }()
+
+		symbols := make(map[parser.FunctionID]int64)
+		for _, call := range calls {
+			callerID, err := internCallSymbol(tx, symbols, call.Caller)
+			if err != nil {
+				return err
+			}
+			calleeID, err := internCallSymbol(tx, symbols, call.Callee)
+			if err != nil {
+				return err
+			}
+			if _, err := callStmt.Exec(fileID, callerID, calleeID, call.Kind); err != nil {
+				return err
+			}
+		}
+	}
+	if err := cleanupCallSymbols(tx, staleSymbols); err != nil {
+		return err
+	}
+
 	return tx.Commit()
+}
+
+func internCallSymbol(tx *sql.Tx, cache map[parser.FunctionID]int64, fn parser.FunctionID) (int64, error) {
+	if id, ok := cache[fn]; ok {
+		return id, nil
+	}
+	var id int64
+	err := tx.QueryRow("SELECT id FROM call_symbols WHERE module = ? AND function = ? AND arity = ?", fn.Module, fn.Function, fn.Arity).Scan(&id)
+	if err == sql.ErrNoRows {
+		result, insertErr := tx.Exec("INSERT INTO call_symbols (module, function, arity) VALUES (?, ?, ?)", fn.Module, fn.Function, fn.Arity)
+		if insertErr != nil {
+			return 0, insertErr
+		}
+		id, err = result.LastInsertId()
+	}
+	if err != nil {
+		return 0, err
+	}
+	cache[fn] = id
+	return id, nil
+}
+
+func callSymbolIDsForFile(tx *sql.Tx, fileID int64) (map[int64]struct{}, error) {
+	rows, err := tx.Query("SELECT caller_id FROM call_edges WHERE file_id = ? UNION ALL SELECT callee_id FROM call_edges WHERE file_id = ?", fileID, fileID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	ids := make(map[int64]struct{})
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids[id] = struct{}{}
+	}
+	return ids, rows.Err()
+}
+
+func cleanupCallSymbols(tx *sql.Tx, ids map[int64]struct{}) error {
+	for id := range ids {
+		if _, err := tx.Exec(`DELETE FROM call_symbols WHERE id = ?
+			AND NOT EXISTS (SELECT 1 FROM call_edges WHERE caller_id = ? LIMIT 1)
+			AND NOT EXISTS (SELECT 1 FROM call_edges WHERE callee_id = ? LIMIT 1)`, id, id, id); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // txExecQuerier is the subset of *sql.Tx that upsertFileID needs.
@@ -487,23 +592,31 @@ func upsertFileID(tx txExecQuerier, path string, mtimeNano int64) (int64, error)
 // SQLITE_MAX_VARIABLE_NUMBER of 999, so the batch size never depends on how
 // the driver's SQLite was compiled.
 const (
-	defColumns   = 9
-	refColumns   = 5
-	maxBindVars  = 900
-	defChunkRows = maxBindVars / defColumns // 100
-	refChunkRows = maxBindVars / refColumns // 180
+	defColumns      = 9
+	refColumns      = 5
+	symbolColumns   = 4
+	callColumns     = 4
+	maxBindVars     = 900
+	defChunkRows    = maxBindVars / defColumns    // 100
+	refChunkRows    = maxBindVars / refColumns    // 180
+	symbolChunkRows = maxBindVars / symbolColumns // 225
+	callChunkRows   = maxBindVars / callColumns   // 225
 )
 
 // Batch wraps multiple IndexFile operations in a single SQLite transaction
 // with shared prepared statements.
 type Batch struct {
-	tx         *sql.Tx
-	defStmt    *sql.Stmt
-	refStmt    *sql.Stmt
-	fileStmt   *sql.Stmt
-	delDefStmt *sql.Stmt // nil in insert-only mode
-	delRefStmt *sql.Stmt // nil in insert-only mode
-	insertOnly bool
+	tx          *sql.Tx
+	defStmt     *sql.Stmt
+	refStmt     *sql.Stmt
+	symbolStmt  *sql.Stmt
+	symbolQuery *sql.Stmt
+	callStmt    *sql.Stmt
+	fileStmt    *sql.Stmt
+	delDefStmt  *sql.Stmt // nil in insert-only mode
+	delRefStmt  *sql.Stmt // nil in insert-only mode
+	delCallStmt *sql.Stmt // nil in insert-only mode
+	insertOnly  bool
 
 	// Multi-row INSERT buffers, used in insert-only mode only. A cold index
 	// writes ~4.4M rows through one connection, and the writer is the
@@ -511,15 +624,22 @@ type Batch struct {
 	// crossings into a few tens of thousands. Incremental reindexing keeps the
 	// row-at-a-time path, where a file's DELETE must stay ordered ahead of its
 	// INSERTs and the row count is far too small to matter.
-	defChunkStmt *sql.Stmt
-	refChunkStmt *sql.Stmt
-	defArgs      []interface{}
-	refArgs      []interface{}
+	defChunkStmt    *sql.Stmt
+	refChunkStmt    *sql.Stmt
+	symbolChunkStmt *sql.Stmt
+	callChunkStmt   *sql.Stmt
+	defArgs         []interface{}
+	refArgs         []interface{}
+	symbolArgs      []interface{}
+	callArgs        []interface{}
 
 	// Bulk-path file id allocation. Insert-only mode assigns ids in Go from a
 	// counter and writes files rows with an explicit id, so a cold index never
 	// pays a round trip per file to learn what id it just wrote.
-	nextFileID int64
+	nextFileID     int64
+	nextSymbolID   int64
+	symbolIDs      map[parser.FunctionID]int64
+	staleSymbolIDs map[int64]struct{}
 }
 
 // multiRowInsert builds "INSERT INTO <table> (<cols>) VALUES (?,..),(?,..)" for
@@ -570,6 +690,30 @@ func (s *Store) beginBatch(insertOnly bool) (*Batch, error) {
 		_ = tx.Rollback()
 		return nil, err
 	}
+	symbolStmt, err := tx.Prepare("INSERT INTO call_symbols (id, module, function, arity) VALUES (?, ?, ?, ?)")
+	if err != nil {
+		_ = defStmt.Close()
+		_ = refStmt.Close()
+		_ = tx.Rollback()
+		return nil, err
+	}
+	symbolQuery, err := tx.Prepare("SELECT id FROM call_symbols WHERE module = ? AND function = ? AND arity = ?")
+	if err != nil {
+		_ = defStmt.Close()
+		_ = refStmt.Close()
+		_ = symbolStmt.Close()
+		_ = tx.Rollback()
+		return nil, err
+	}
+	callStmt, err := tx.Prepare("INSERT INTO call_edges (file_id, caller_id, callee_id, kind) VALUES (?, ?, ?, ?)")
+	if err != nil {
+		_ = defStmt.Close()
+		_ = refStmt.Close()
+		_ = symbolStmt.Close()
+		_ = symbolQuery.Close()
+		_ = tx.Rollback()
+		return nil, err
+	}
 
 	fileSQL := "INSERT INTO files (path, mtime) VALUES (?, ?) ON CONFLICT(path) DO UPDATE SET mtime = excluded.mtime RETURNING id"
 	if insertOnly {
@@ -579,16 +723,29 @@ func (s *Store) beginBatch(insertOnly bool) (*Batch, error) {
 	if err != nil {
 		_ = defStmt.Close()
 		_ = refStmt.Close()
+		_ = callStmt.Close()
+		_ = symbolStmt.Close()
+		_ = symbolQuery.Close()
 		_ = tx.Rollback()
 		return nil, err
 	}
 
 	b := &Batch{
-		tx:         tx,
-		defStmt:    defStmt,
-		refStmt:    refStmt,
-		fileStmt:   fileStmt,
-		insertOnly: insertOnly,
+		tx:             tx,
+		defStmt:        defStmt,
+		refStmt:        refStmt,
+		symbolStmt:     symbolStmt,
+		symbolQuery:    symbolQuery,
+		callStmt:       callStmt,
+		fileStmt:       fileStmt,
+		insertOnly:     insertOnly,
+		symbolIDs:      make(map[parser.FunctionID]int64),
+		staleSymbolIDs: make(map[int64]struct{}),
+	}
+	if err := tx.QueryRow("SELECT COALESCE(MAX(id), 0) FROM call_symbols").Scan(&b.nextSymbolID); err != nil {
+		b.closeStmts()
+		_ = tx.Rollback()
+		return nil, err
 	}
 
 	if !insertOnly {
@@ -599,6 +756,12 @@ func (s *Store) beginBatch(insertOnly bool) (*Batch, error) {
 			return nil, err
 		}
 		b.delRefStmt, err = tx.Prepare("DELETE FROM refs WHERE file_id = ?")
+		if err != nil {
+			b.closeStmts()
+			_ = tx.Rollback()
+			return nil, err
+		}
+		b.delCallStmt, err = tx.Prepare("DELETE FROM call_edges WHERE file_id = ?")
 		if err != nil {
 			b.closeStmts()
 			_ = tx.Rollback()
@@ -621,8 +784,24 @@ func (s *Store) beginBatch(insertOnly bool) (*Batch, error) {
 			_ = tx.Rollback()
 			return nil, err
 		}
+		b.callChunkStmt, err = tx.Prepare(multiRowInsert(
+			"call_edges", "file_id, caller_id, callee_id, kind", callColumns, callChunkRows))
+		if err != nil {
+			b.closeStmts()
+			_ = tx.Rollback()
+			return nil, err
+		}
+		b.symbolChunkStmt, err = tx.Prepare(multiRowInsert(
+			"call_symbols", "id, module, function, arity", symbolColumns, symbolChunkRows))
+		if err != nil {
+			b.closeStmts()
+			_ = tx.Rollback()
+			return nil, err
+		}
 		b.defArgs = make([]interface{}, 0, defColumns*defChunkRows)
 		b.refArgs = make([]interface{}, 0, refColumns*refChunkRows)
+		b.symbolArgs = make([]interface{}, 0, symbolColumns*symbolChunkRows)
+		b.callArgs = make([]interface{}, 0, callColumns*callChunkRows)
 
 		// Bulk mode is used on a freshly created database, but seed from the
 		// table anyway so a non-empty one cannot collide on the primary key.
@@ -641,28 +820,42 @@ func (b *Batch) IndexFile(path string, defs []parser.Definition) error {
 	if err != nil {
 		return err
 	}
-	return b.indexFile(path, info.ModTime().UnixNano(), defs, nil)
+	return b.indexFile(path, info.ModTime().UnixNano(), defs, nil, nil)
 }
 
 func (b *Batch) IndexFileWithMtime(path string, mtimeNano int64, defs []parser.Definition) error {
-	return b.indexFile(path, mtimeNano, defs, nil)
+	return b.indexFile(path, mtimeNano, defs, nil, nil)
 }
 
 func (b *Batch) IndexFileWithMtimeAndRefs(path string, mtimeNano int64, defs []parser.Definition, refs []parser.Reference) error {
-	return b.indexFile(path, mtimeNano, defs, refs)
+	return b.indexFile(path, mtimeNano, defs, refs, nil)
 }
 
-func (b *Batch) indexFile(path string, mtimeNano int64, defs []parser.Definition, refs []parser.Reference) error {
+func (b *Batch) IndexFileWithMtimeRefsAndCalls(path string, mtimeNano int64, defs []parser.Definition, refs []parser.Reference, calls []parser.CallEdge) error {
+	return b.indexFile(path, mtimeNano, defs, refs, calls)
+}
+
+func (b *Batch) indexFile(path string, mtimeNano int64, defs []parser.Definition, refs []parser.Reference, calls []parser.CallEdge) error {
 	fileID, err := b.fileID(path, mtimeNano)
 	if err != nil {
 		return err
 	}
 
 	if !b.insertOnly {
+		stale, err := callSymbolIDsForFile(b.tx, fileID)
+		if err != nil {
+			return err
+		}
+		for id := range stale {
+			b.staleSymbolIDs[id] = struct{}{}
+		}
 		if _, err := b.delDefStmt.Exec(fileID); err != nil {
 			return err
 		}
 		if _, err := b.delRefStmt.Exec(fileID); err != nil {
+			return err
+		}
+		if _, err := b.delCallStmt.Exec(fileID); err != nil {
 			return err
 		}
 	}
@@ -691,6 +884,24 @@ func (b *Batch) indexFile(path string, mtimeNano int64, defs []parser.Definition
 				}
 			}
 		}
+		for _, call := range calls {
+			callerID, err := b.callSymbolID(call.Caller)
+			if err != nil {
+				return err
+			}
+			calleeID, err := b.callSymbolID(call.Callee)
+			if err != nil {
+				return err
+			}
+			b.callArgs = append(b.callArgs, fileID, callerID, calleeID, call.Kind)
+			if len(b.callArgs) == callColumns*callChunkRows {
+				_, err := b.callChunkStmt.Exec(b.callArgs...)
+				b.callArgs = b.callArgs[:0]
+				if err != nil {
+					return err
+				}
+			}
+		}
 		return nil
 	}
 
@@ -705,8 +916,57 @@ func (b *Batch) indexFile(path string, mtimeNano int64, defs []parser.Definition
 			return err
 		}
 	}
+	for _, call := range calls {
+		callerID, err := b.callSymbolID(call.Caller)
+		if err != nil {
+			return err
+		}
+		calleeID, err := b.callSymbolID(call.Callee)
+		if err != nil {
+			return err
+		}
+		if _, err := b.callStmt.Exec(fileID, callerID, calleeID, call.Kind); err != nil {
+			return err
+		}
+	}
 
 	return nil
+}
+
+func (b *Batch) callSymbolID(fn parser.FunctionID) (int64, error) {
+	if id, ok := b.symbolIDs[fn]; ok {
+		return id, nil
+	}
+	if !b.insertOnly {
+		var id int64
+		err := b.symbolQuery.QueryRow(fn.Module, fn.Function, fn.Arity).Scan(&id)
+		if err == nil {
+			b.symbolIDs[fn] = id
+			return id, nil
+		}
+		if err != sql.ErrNoRows {
+			return 0, err
+		}
+	}
+
+	b.nextSymbolID++
+	id := b.nextSymbolID
+	b.symbolIDs[fn] = id
+	if b.insertOnly {
+		b.symbolArgs = append(b.symbolArgs, id, fn.Module, fn.Function, fn.Arity)
+		if len(b.symbolArgs) == symbolColumns*symbolChunkRows {
+			_, err := b.symbolChunkStmt.Exec(b.symbolArgs...)
+			b.symbolArgs = b.symbolArgs[:0]
+			if err != nil {
+				return 0, err
+			}
+		}
+		return id, nil
+	}
+	if _, err := b.symbolStmt.Exec(id, fn.Module, fn.Function, fn.Arity); err != nil {
+		return 0, err
+	}
+	return id, nil
 }
 
 // fileID writes the files row for path and returns its id.
@@ -744,11 +1004,28 @@ func (b *Batch) flushPending() error {
 		}
 	}
 	b.refArgs = b.refArgs[:0]
+	for i := 0; i < len(b.symbolArgs); i += symbolColumns {
+		if _, err := b.symbolStmt.Exec(b.symbolArgs[i : i+symbolColumns]...); err != nil {
+			return err
+		}
+	}
+	b.symbolArgs = b.symbolArgs[:0]
+	for i := 0; i < len(b.callArgs); i += callColumns {
+		if _, err := b.callStmt.Exec(b.callArgs[i : i+callColumns]...); err != nil {
+			return err
+		}
+	}
+	b.callArgs = b.callArgs[:0]
 	return nil
 }
 
 func (b *Batch) Commit() error {
 	if err := b.flushPending(); err != nil {
+		b.closeStmts()
+		_ = b.tx.Rollback()
+		return err
+	}
+	if err := cleanupCallSymbols(b.tx, b.staleSymbolIDs); err != nil {
 		b.closeStmts()
 		_ = b.tx.Rollback()
 		return err
@@ -765,6 +1042,9 @@ func (b *Batch) Rollback() error {
 func (b *Batch) closeStmts() {
 	_ = b.defStmt.Close()
 	_ = b.refStmt.Close()
+	_ = b.symbolStmt.Close()
+	_ = b.symbolQuery.Close()
+	_ = b.callStmt.Close()
 	_ = b.fileStmt.Close()
 	if b.defChunkStmt != nil {
 		_ = b.defChunkStmt.Close()
@@ -772,11 +1052,20 @@ func (b *Batch) closeStmts() {
 	if b.refChunkStmt != nil {
 		_ = b.refChunkStmt.Close()
 	}
+	if b.symbolChunkStmt != nil {
+		_ = b.symbolChunkStmt.Close()
+	}
+	if b.callChunkStmt != nil {
+		_ = b.callChunkStmt.Close()
+	}
 	if b.delDefStmt != nil {
 		_ = b.delDefStmt.Close()
 	}
 	if b.delRefStmt != nil {
 		_ = b.delRefStmt.Close()
+	}
+	if b.delCallStmt != nil {
+		_ = b.delCallStmt.Close()
 	}
 }
 
@@ -812,16 +1101,43 @@ func (s *Store) RemoveFiles(paths []string) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	staleSymbols := make(map[int64]struct{})
 	for _, path := range paths {
+		var fileID int64
+		lookupErr := tx.QueryRow("SELECT id FROM files WHERE path = ?", path).Scan(&fileID)
+		if lookupErr != nil && lookupErr != sql.ErrNoRows {
+			return lookupErr
+		}
+		if lookupErr == nil {
+			ids, err := callSymbolIDsForFile(tx, fileID)
+			if err != nil {
+				return err
+			}
+			for id := range ids {
+				staleSymbols[id] = struct{}{}
+			}
+		}
 		if _, err = tx.Exec("DELETE FROM definitions WHERE file_id = "+fileIDSubquery, path); err != nil {
 			return err
 		}
 		if _, err = tx.Exec("DELETE FROM refs WHERE file_id = "+fileIDSubquery, path); err != nil {
 			return err
 		}
+		if _, err = tx.Exec("DELETE FROM call_edges WHERE file_id = "+fileIDSubquery, path); err != nil {
+			return err
+		}
 		if _, err = tx.Exec("DELETE FROM files WHERE path = ?", path); err != nil {
 			return err
 		}
+	}
+	if err := cleanupCallSymbols(tx, staleSymbols); err != nil {
+		return err
+	}
+	// A workspace can become empty after its last file is removed. Clear the
+	// file-independent symbol pool too, so a later insert-only cold build still
+	// starts from a genuinely empty derived index.
+	if _, err = tx.Exec("DELETE FROM call_symbols WHERE NOT EXISTS (SELECT 1 FROM files LIMIT 1)"); err != nil {
+		return err
 	}
 	return tx.Commit()
 }
@@ -952,6 +1268,7 @@ type IndexStats struct {
 	Files       int
 	Definitions int
 	References  int
+	CallEdges   int
 }
 
 // Stats returns row counts for the files, definitions, and refs tables.
@@ -964,12 +1281,98 @@ func (s *Store) Stats() (IndexStats, error) {
 		{"SELECT COUNT(*) FROM files", &st.Files},
 		{"SELECT COUNT(*) FROM definitions", &st.Definitions},
 		{"SELECT COUNT(*) FROM refs", &st.References},
+		{"SELECT COUNT(*) FROM call_edges", &st.CallEdges},
 	} {
 		if err := s.db.QueryRow(q.query).Scan(q.dst); err != nil {
 			return IndexStats{}, err
 		}
 	}
 	return st, nil
+}
+
+// CallResult is one adjacent function and the relationship that connects it.
+type CallResult struct {
+	Function parser.FunctionID
+	Kind     string
+}
+
+// LookupCallees returns the functions called by caller.
+func (s *Store) LookupCallees(caller parser.FunctionID) ([]CallResult, error) {
+	id, ok, err := s.lookupCallSymbolID(caller)
+	if err != nil || !ok {
+		return nil, err
+	}
+	return s.lookupAdjacentCalls(
+		"SELECT s.module, s.function, s.arity, e.kind FROM call_edges e JOIN call_symbols s ON s.id = e.callee_id WHERE e.caller_id = ?",
+		id,
+	)
+}
+
+// LookupCallers returns the functions that call callee.
+func (s *Store) LookupCallers(callee parser.FunctionID) ([]CallResult, error) {
+	id, ok, err := s.lookupCallSymbolID(callee)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, nil
+	}
+	return s.lookupAdjacentCalls(
+		"SELECT s.module, s.function, s.arity, e.kind FROM call_edges e JOIN call_symbols s ON s.id = e.caller_id WHERE e.callee_id = ?",
+		id,
+	)
+}
+
+func (s *Store) lookupCallSymbolID(fn parser.FunctionID) (int64, bool, error) {
+	var id int64
+	err := s.db.QueryRow("SELECT id FROM call_symbols WHERE module = ? AND function = ? AND arity = ?", fn.Module, fn.Function, fn.Arity).Scan(&id)
+	if err == sql.ErrNoRows {
+		return 0, false, nil
+	}
+	return id, err == nil, err
+}
+
+func (s *Store) lookupAdjacentCalls(query string, ids ...int64) ([]CallResult, error) {
+	args := make([]interface{}, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	seen := make(map[CallResult]struct{})
+	var results []CallResult
+	for rows.Next() {
+		var result CallResult
+		if err := rows.Scan(&result.Function.Module, &result.Function.Function, &result.Function.Arity, &result.Kind); err != nil {
+			return nil, err
+		}
+		if _, ok := seen[result]; ok {
+			continue
+		}
+		seen[result] = struct{}{}
+		results = append(results, result)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.Slice(results, func(i, j int) bool {
+		a, b := results[i], results[j]
+		if a.Function.Module != b.Function.Module {
+			return a.Function.Module < b.Function.Module
+		}
+		if a.Function.Function != b.Function.Function {
+			return a.Function.Function < b.Function.Function
+		}
+		if a.Function.Arity != b.Function.Arity {
+			return a.Function.Arity < b.Function.Arity
+		}
+		return a.Kind < b.Kind
+	})
+	return results, nil
 }
 
 // FunctionKey identifies a function by name and arity.
