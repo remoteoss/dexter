@@ -760,6 +760,61 @@ func TestIntegration_RefusesGitBackedHome(t *testing.T) {
 	}
 }
 
+func TestIntegration_FindsProjectInsideGitBackedHome(t *testing.T) {
+	binary := buildDexter(t)
+	home := t.TempDir()
+	if err := os.Mkdir(filepath.Join(home, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	project := filepath.Join(home, "project")
+	if err := os.Mkdir(project, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(project, "mix.exs"), []byte("defmodule Nested.MixProject do\nend\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(binary, "lookup", "Nested.Module")
+	cmd.Dir = project
+	cmd.Env = append(os.Environ(), "HOME="+home, "PWD="+project, "DEXTER_DAEMON_IDLE_TIMEOUT=1s")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("lookup in nested project failed: %v\n%s", err, out)
+	}
+	t.Cleanup(func() {
+		stop := exec.Command(binary, "stop", "--force", "--root", project)
+		stop.Dir = project
+		_ = stop.Run()
+	})
+	if _, err := os.Stat(filepath.Join(project, ".dexter", "dexter.db")); err != nil {
+		t.Fatalf("nested project was not indexed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".dexter")); !os.IsNotExist(err) {
+		t.Fatalf("lookup indexed the git-backed home: %v", err)
+	}
+}
+
+func TestIntegration_GitBackedHomeYesIsSticky(t *testing.T) {
+	binary := buildDexter(t)
+	home := t.TempDir()
+	if err := os.Mkdir(filepath.Join(home, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run := func(args ...string) (string, error) {
+		cmd := exec.Command(binary, args...)
+		cmd.Dir = home
+		cmd.Env = append(os.Environ(), "HOME="+home, "PWD="+home, "DEXTER_DAEMON_IDLE_TIMEOUT=1s")
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+	if out, err := run("lookup", "-y", "MyApp.Repo"); err != nil {
+		t.Fatalf("lookup -y in home failed: %v\n%s", err, out)
+	}
+	_, _ = run("stop")
+	if out, err := run("lookup", "MyApp.Repo"); err != nil {
+		t.Fatalf("lookup after home opt-in was refused: %v\n%s", err, out)
+	}
+	_, _ = run("stop")
+}
+
 // TestIntegration_LegacyMigration simulates an upgrade path: a project with
 // the pre-.dexter/ folder layout (legacy .dexter.db file and its WAL
 // siblings at the root) is migrated automatically on the next dexter

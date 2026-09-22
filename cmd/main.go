@@ -230,7 +230,26 @@ func findProjectRoot(path string) string {
 	if !info.IsDir() {
 		path = filepath.Dir(path)
 	}
-	return store.FindProjectRoot(path, "mix.exs")
+	root := store.FindProjectRoot(path, "mix.exs")
+	if home, homeErr := os.UserHomeDir(); homeErr == nil && sameDir(root, home) {
+		if mixRoot := findMarkerBefore(path, "mix.exs", home); mixRoot != "" {
+			return mixRoot
+		}
+	}
+	return root
+}
+
+func findMarkerBefore(path, marker, stop string) string {
+	for dir := path; !sameDir(dir, stop); dir = filepath.Dir(dir) {
+		if _, err := os.Stat(filepath.Join(dir, marker)); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+	}
+	return ""
 }
 
 // projectMarkers are the cheap signals that a directory is, or carries, a
@@ -239,6 +258,15 @@ func findProjectRoot(path string) string {
 // ever needed once.
 func looksLikeProjectRoot(dir string) bool {
 	for _, marker := range []string{"mix.exs", ".git", ".dexter", ".dexter.db"} {
+		if _, err := os.Stat(filepath.Join(dir, marker)); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func hasDexterMarker(dir string) bool {
+	for _, marker := range []string{".dexter", ".dexter.db"} {
 		if _, err := os.Stat(filepath.Join(dir, marker)); err == nil {
 			return true
 		}
@@ -258,6 +286,9 @@ func requireProjectRoot(dir string, allowNonProject bool) {
 		return
 	}
 	if home, err := os.UserHomeDir(); err == nil && sameDir(dir, home) {
+		if hasDexterMarker(dir) {
+			return
+		}
 		fatal(fmt.Errorf("refusing to use %s as a workspace: it is your home directory, not a project\nhint: run from a project, pass --root <path>, or pass -y/--yes if you really mean it", dir))
 	}
 	if looksLikeProjectRoot(dir) {
@@ -273,6 +304,9 @@ func requireProjectRoot(dir string, allowNonProject bool) {
 // is written to stderr, which every LSP client keeps in its server log.
 func warnProjectRoot(dir string) {
 	if home, err := os.UserHomeDir(); err == nil && sameDir(dir, home) {
+		if hasDexterMarker(dir) {
+			return
+		}
 		log.Printf("Warning: %s is your home directory, not a project; indexing it because the editor asked. Set --root <path> in the editor's dexter command if that is wrong.", dir)
 		return
 	}
