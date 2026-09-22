@@ -92,6 +92,13 @@ func findDaemonProcess(root string) (int, bool) {
 	return parseDaemonPid(string(out), root)
 }
 
+// processAlive reports whether pid names a live process. A pid this user may
+// not signal still counts as alive; only ESRCH means gone.
+func processAlive(pid int) bool {
+	err := unix.Kill(pid, 0)
+	return err == nil || errors.Is(err, unix.EPERM)
+}
+
 // killPlatformProcess is the escalation for a daemon that ignores SIGTERM. The
 // index is a derived cache, so an uncatchable kill is safe: SQLite recovers its
 // WAL on the next open, and the next daemon rebuilds anything a torn write lost.

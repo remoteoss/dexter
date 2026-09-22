@@ -84,6 +84,20 @@ func findDaemonProcess(string) (int, bool) {
 	return 0, false
 }
 
+// processAlive reports whether pid names a live process.
+func processAlive(pid int) bool {
+	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
+	if err != nil {
+		return false
+	}
+	defer windows.CloseHandle(h)
+	var code uint32
+	if err := windows.GetExitCodeProcess(h, &code); err != nil {
+		return true
+	}
+	return code == windows.STILL_ACTIVE
+}
+
 // killPlatformProcess is the escalation for a process that ignores a terminate
 // request. Windows has no softer signal, so this is the same call.
 func killPlatformProcess(pid int) error {

@@ -591,17 +591,48 @@ var signalGrace = 5 * time.Second
 var replacementGrace = 30 * time.Second
 
 func stopPid(ctx context.Context, root string, pid int, grace time.Duration) error {
+	if !processAlive(pid) {
+		return nil
+	}
 	if err := terminatePlatformProcess(pid); err != nil {
 		return fmt.Errorf("stop daemon pid %d: %w", pid, err)
 	}
-	if err := waitForWorkspaceFree(ctx, root, grace); err == nil {
+	if err := waitForProcessExit(ctx, pid, grace); err == nil {
 		return nil
 	}
 	log.Printf("Daemon pid %d did not exit after SIGTERM; killing it", pid)
 	if err := killPlatformProcess(pid); err != nil {
 		return fmt.Errorf("kill daemon pid %d: %w", pid, err)
 	}
-	return waitForWorkspaceFree(ctx, root, grace)
+	if err := waitForProcessExit(ctx, pid, grace); err == nil {
+		return nil
+	}
+	// A zombie whose parent is not reaping reports as alive but cannot hold the
+	// workspace lock, which the kernel releases at process exit.
+	if ownership, _, ownErr := AcquireOwnership(root); ownErr == nil {
+		return ownership.Release()
+	}
+	return fmt.Errorf("daemon pid %d did not exit; it may be wedged", pid)
+}
+
+// waitForProcessExit polls until the process itself is gone. The workspace lock
+// is not a substitute: a process that never held it (or whose lock file was
+// removed) would make a lock-based wait report success while the process lives.
+func waitForProcessExit(ctx context.Context, pid int, grace time.Duration) error {
+	deadline := time.Now().Add(grace)
+	for {
+		if !processAlive(pid) {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("process %d is still running", pid)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
 }
 
 // waitForWorkspaceFree waits until a compatible daemon serves the workspace or
