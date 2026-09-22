@@ -11,6 +11,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"go.lsp.dev/jsonrpc2"
@@ -75,12 +77,71 @@ type erlangRuntimeCache struct {
 	readyCh     chan struct{}
 }
 
+// WorkspaceEvents receives disk-backed workspace changes from an LSP session.
+// A daemon-backed session uses this to feed the workspace's single mutation
+// coordinator instead of writing the index independently; an embedded Server
+// that owns its store leaves it nil and writes directly.
+type WorkspaceEvents interface {
+	ReconcileFile(path string)
+	RemoveFile(path string)
+	SetStdlibRoot(ctx context.Context, path string) error
+}
+
+// IndexCoordinator contains the write-side state that must be shared by every
+// language-service session attached to one store. Session-local state (open
+// documents, client capabilities, and connections) deliberately remains on
+// Server.
+type IndexCoordinator struct {
+	reindexing sync.Mutex
+	stdlibMu   sync.RWMutex
+	stdlibRoot string
+
+	// writes is held for writing by a cold full build and for reading by every
+	// single-file write. The bulk path is insert-only and cannot overlap any
+	// incremental mutation.
+	writes      sync.RWMutex
+	unavailable bool // guarded by writes
+
+	backgroundWork sync.WaitGroup
+}
+
+func (c *IndexCoordinator) setStdlibRoot(root string) (string, bool) {
+	c.stdlibMu.Lock()
+	defer c.stdlibMu.Unlock()
+	if c.stdlibRoot == root {
+		return c.stdlibRoot, false
+	}
+	old := c.stdlibRoot
+	c.stdlibRoot = root
+	return old, true
+}
+
+func (c *IndexCoordinator) getStdlibRoot() string {
+	c.stdlibMu.RLock()
+	defer c.stdlibMu.RUnlock()
+	return c.stdlibRoot
+}
+
+// NewIndexCoordinator returns write coordination for one workspace store.
+func NewIndexCoordinator() *IndexCoordinator {
+	return &IndexCoordinator{}
+}
+
+// ServerOptions configures a Server attached to a daemon-owned workspace.
+// Embedded callers that own their store and workspace lifecycle — the
+// package's tests, for example — use NewServer instead.
+type ServerOptions struct {
+	Index             *IndexCoordinator
+	Events            WorkspaceEvents
+	ManageWorkspace   bool
+	InitialStdlibRoot string
+}
+
 type Server struct {
 	store           *store.Store
 	docs            *DocumentStore
 	projectRoot     string
 	explicitRoot    bool // true when projectRoot was provided via CLI, not inferred from Initialize
-	stdlibRoot      string
 	initialized     bool
 	client          protocol.Client
 	followDelegates bool
@@ -114,18 +175,11 @@ type Server struct {
 	// negotiation can set it without touching every call site.
 	positionEncoding PositionEncoding
 
-	reindexing sync.Mutex // serializes concurrent backgroundReindex calls
-
-	// indexWrites is held for writing by a cold full build and for reading by
-	// every single-file write. The bulk path a full build uses is insert-only:
-	// it skips the DELETE the incremental path does, and allocates file ids
-	// from a counter seeded when the batch opens. A save landing in the middle
-	// of one would duplicate rows or collide on a primary key.
-	indexWrites         sync.RWMutex
-	indexUnavailable    bool      // guarded by indexWrites; set only after index recreation exhausts its retries
+	index               *IndexCoordinator
+	workspaceEvents     WorkspaceEvents
+	manageWorkspace     bool
 	notifiedOTPMismatch sync.Once // prevents repeated OTP mismatch warnings
-
-	backgroundWork sync.WaitGroup // tracks background reindex goroutines so the store isn't closed while they're running
+	closeOnce           sync.Once
 }
 
 func (s *Server) debugf(format string, args ...interface{}) {
@@ -142,6 +196,20 @@ func (s *Server) debugNow() time.Time {
 }
 
 func NewServer(s *store.Store, projectRoot string) *Server {
+	return NewServerWithOptions(s, projectRoot, ServerOptions{ManageWorkspace: true})
+}
+
+// NewServerWithOptions constructs an LSP session over shared workspace state.
+// Daemon sessions pass one IndexCoordinator and set ManageWorkspace false so
+// only the daemon performs startup reconciliation and owns watchers.
+func NewServerWithOptions(s *store.Store, projectRoot string, opts ServerOptions) *Server {
+	index := opts.Index
+	if index == nil {
+		index = NewIndexCoordinator()
+	}
+	if opts.InitialStdlibRoot != "" {
+		_, _ = index.setStdlibRoot(opts.InitialStdlibRoot)
+	}
 	return &Server{
 		store:              s,
 		docs:               NewDocumentStore(),
@@ -155,25 +223,42 @@ func NewServer(s *store.Store, projectRoot string) *Server {
 		beamLibs:           newBeamLibIndexCache(),
 		ebinIndexes:        newEbinIndexCache(),
 		depsCache:          make(map[string]bool),
+		index:              index,
+		workspaceEvents:    opts.Events,
+		manageWorkspace:    opts.ManageWorkspace,
 		// What every client sends when the server declares no encoding, which
 		// Dexter does not.
 		positionEncoding: EncodingUTF16,
 	}
 }
 
-type stdinoutCloser struct {
-	io.Reader
-	io.Writer
+// StdlibRoot returns the workspace-wide stdlib root shared by all sessions.
+func (s *Server) StdlibRoot() string { return s.index.getStdlibRoot() }
+
+// SetStdlibRoot changes the workspace-wide stdlib root and returns its previous
+// value. Workspace runtimes use both values to reconcile the shared index.
+func (s *Server) SetStdlibRoot(root string) (string, bool) { return s.index.setStdlibRoot(root) }
+
+func (s *Server) isStdlibPath(path string) bool {
+	root := s.StdlibRoot()
+	if root == "" {
+		return false
+	}
+	rel, err := filepath.Rel(root, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
 }
 
-func (s stdinoutCloser) Close() error { return nil }
-
-// Serve starts the LSP server on the given reader/writer (typically stdin/stdout).
-func Serve(in io.Reader, out io.Writer, s *store.Store, projectRoot string) error {
-	server := NewServer(s, projectRoot)
-
+// ServeStream runs one preconstructed LSP session over a stream the session is
+// allowed to close. Workspace daemons use this so an editor's `exit`
+// notification ends that session — releasing its registration and its lease on
+// the daemon — instead of waiting for the peer to hang up. Sessions share index
+// coordination while keeping independent document overlays and client
+// capabilities.
+//
+// A closed stream is what a normal shutdown looks like, so it is reported as nil.
+func ServeStream(server *Server, rwc io.ReadWriteCloser) error {
 	logger, _ := zap.NewProduction()
-	stream := jsonrpc2.NewStream(stdinoutCloser{in, out})
+	stream := jsonrpc2.NewStream(rwc)
 	conn := jsonrpc2.NewConn(stream)
 	server.client = protocol.ClientDispatcher(conn, logger)
 	server.conn = conn
@@ -183,8 +268,36 @@ func Serve(in io.Reader, out io.Writer, s *store.Store, projectRoot string) erro
 
 	conn.Go(ctx, handler)
 	<-conn.Done()
-	return conn.Err()
+	if err := conn.Err(); err != nil && !isStreamClosed(err) {
+		return err
+	}
+	return nil
 }
+
+// isStreamClosed reports whether an error is just the stream ending: the expected
+// result of an `exit` notification or a disconnecting client, not a failure worth
+// surfacing to an editor's log.
+func isStreamClosed(err error) bool {
+	return errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, os.ErrClosed) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, syscall.EPIPE)
+}
+
+// WaitForIndexWork waits for background index writes already accepted by this
+// workspace. Callers must prevent new sessions from adding work first.
+func (s *Server) WaitForIndexWork() {
+	s.index.backgroundWork.Wait()
+}
+
+// OpenDocuments reports how many buffers this session holds. Daemon status
+// uses it to describe attached editor sessions; it is diagnostic only.
+func (s *Server) OpenDocuments() int { return s.docs.Count() }
+
+// ProjectRoot returns the workspace root this session answers for.
+func (s *Server) ProjectRoot() string { return s.projectRoot }
 
 // warmUsingCache parses every module's defmacro __using__ body ahead of the
 // first request that needs one.
@@ -253,9 +366,9 @@ func (s *Server) warmUsingCache() {
 // removed is still pruned, which is why the check is per candidate rather than
 // a test on seen being empty.
 func (s *Server) pruneMissingFiles(seen map[string]struct{}) {
-	s.indexWrites.Lock()
-	defer s.indexWrites.Unlock()
-	if s.indexUnavailable {
+	s.index.writes.Lock()
+	defer s.index.writes.Unlock()
+	if s.index.unavailable {
 		return
 	}
 
@@ -316,30 +429,30 @@ func (s *Server) showError(message string) {
 // the per-connection ones land on whichever pooled connection happens to serve
 // them. They were also the smallest part of the win.
 func (s *Server) fullBuild() (stats indexer.Stats, ran bool, err error) {
-	s.indexWrites.Lock()
-	defer s.indexWrites.Unlock()
+	s.index.writes.Lock()
+	defer s.index.writes.Unlock()
 	if !s.store.IsEmpty() {
 		return indexer.Stats{}, false, nil
 	}
 
 	stats, err = indexer.FullBuild(s.store, s.projectRoot, indexer.Options{
-		StdlibRoot: s.stdlibRoot,
+		StdlibRoot: s.StdlibRoot(),
 		InProcess:  true,
 		Warn: func(format string, args ...interface{}) {
 			log.Printf("Warning: "+format, args...)
 		},
 	})
 	if errors.Is(err, indexer.ErrUnindexed) {
-		s.indexUnavailable = true
+		s.index.unavailable = true
 	}
 	return stats, true, err
 }
 
 // indexOneFile parses and indexes a single file, the incremental path.
 func (s *Server) indexOneFile(path string) {
-	s.indexWrites.RLock()
-	defer s.indexWrites.RUnlock()
-	if s.indexUnavailable {
+	s.index.writes.RLock()
+	defer s.index.writes.RUnlock()
+	if s.index.unavailable {
 		return
 	}
 	s.indexOneFileLocked(path)
@@ -361,13 +474,17 @@ func (s *Server) indexOneFileLocked(path string) {
 // backgroundReindex runs in the background. If the index is empty it does a
 // full build, otherwise it does an incremental mtime-based update.
 func (s *Server) backgroundReindex() {
-	s.backgroundWork.Add(1)
+	s.startBackgroundReindex()
+}
+
+func (s *Server) startBackgroundReindex() <-chan struct{} {
+	done := make(chan struct{})
+	s.index.backgroundWork.Add(1)
 	go func() {
-		defer s.backgroundWork.Done()
-		if !s.reindexing.TryLock() {
-			return
-		}
-		defer s.reindexing.Unlock()
+		defer close(done)
+		defer s.index.backgroundWork.Done()
+		s.index.reindexing.Lock()
+		defer s.index.reindexing.Unlock()
 
 		start := time.Now()
 		reindexed := 0
@@ -465,18 +582,18 @@ func (s *Server) backgroundReindex() {
 			// The walk writes, so it takes indexWrites for reading, the same as
 			// every other single-file write. That is what keeps it from
 			// overlapping a cold build.
-			s.indexWrites.RLock()
-			if s.indexUnavailable {
-				s.indexWrites.RUnlock()
+			s.index.writes.RLock()
+			if s.index.unavailable {
+				s.index.writes.RUnlock()
 				return
 			}
 			// Index stdlib first (definitions only).
-			if s.stdlibRoot != "" {
-				walkAndIndex(s.stdlibRoot, false)
+			if stdlibRoot := s.StdlibRoot(); stdlibRoot != "" {
+				walkAndIndex(stdlibRoot, false)
 			}
 
 			walkAndIndex(s.projectRoot, true)
-			s.indexWrites.RUnlock()
+			s.index.writes.RUnlock()
 
 			s.pruneMissingFiles(seen)
 		}
@@ -504,6 +621,61 @@ func (s *Server) backgroundReindex() {
 			}
 		}
 	}()
+	return done
+}
+
+// ReindexWorkspace schedules the standard full-or-incremental reconciliation
+// and waits for all accepted index work. Daemon mutation coordinators call it
+// serially, so a concurrent pass can safely satisfy the request.
+func (s *Server) ReindexWorkspace() {
+	<-s.startBackgroundReindex()
+}
+
+// ReconcileFile applies one disk-backed file change under the workspace-wide
+// mutation lock shared by every attached LSP session.
+func (s *Server) ReconcileFile(path string) {
+	s.index.reindexing.Lock()
+	defer s.index.reindexing.Unlock()
+	s.indexOneFile(path)
+}
+
+// RemoveFile removes one deleted path under the workspace-wide mutation lock.
+func (s *Server) RemoveFile(path string) {
+	s.RemoveFiles([]string{path})
+}
+
+// RemoveFiles removes disk paths as one workspace mutation.
+func (s *Server) RemoveFiles(paths []string) {
+	s.index.reindexing.Lock()
+	defer s.index.reindexing.Unlock()
+	s.index.writes.RLock()
+	defer s.index.writes.RUnlock()
+	if s.index.unavailable {
+		return
+	}
+	if err := s.store.RemoveFiles(paths); err != nil {
+		log.Printf("Error removing %d files from index: %v", len(paths), err)
+	}
+}
+
+// RemoveFilesUnderRoot removes indexed files below root as one workspace
+// mutation. The runtime uses it before reconciling a changed stdlib root.
+func (s *Server) RemoveFilesUnderRoot(root string) {
+	if root == "" {
+		return
+	}
+	stored, err := s.store.ListFilePaths()
+	if err != nil {
+		return
+	}
+	prefix := filepath.Clean(root) + string(os.PathSeparator)
+	paths := make([]string, 0)
+	for _, path := range stored {
+		if strings.HasPrefix(filepath.Clean(path), prefix) {
+			paths = append(paths, path)
+		}
+	}
+	s.RemoveFiles(paths)
 }
 
 // watchGitHead polls .git/HEAD mtime and triggers reindex on branch switches.
@@ -578,16 +750,27 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 	// to store.FindProjectRoot. In a monorepo we want to anchor on
 	// .dexter/dexter.db or .git so the whole repo is indexed, not the first
 	// nested Mix app we encounter.
+	var clientRoot string
+	if len(params.WorkspaceFolders) > 0 {
+		clientRoot = uriToPath(protocol.DocumentURI(params.WorkspaceFolders[0].URI))
+	} else if params.RootURI != "" { //nolint:staticcheck // RootURI is deprecated but Neovim still sends it
+		clientRoot = uriToPath(params.RootURI) //nolint:staticcheck
+	}
 	if !s.explicitRoot {
-		if len(params.WorkspaceFolders) > 0 {
-			root := uriToPath(protocol.DocumentURI(params.WorkspaceFolders[0].URI))
-			if root != "" {
-				s.projectRoot = store.FindProjectRoot(root)
-			}
-		} else if params.RootURI != "" { //nolint:staticcheck // RootURI is deprecated but Neovim still sends it
-			root := uriToPath(params.RootURI) //nolint:staticcheck
-			if root != "" {
-				s.projectRoot = store.FindProjectRoot(root)
+		if clientRoot != "" {
+			s.projectRoot = store.FindProjectRoot(clientRoot)
+		}
+	} else if clientRoot != "" && s.workspaceEvents != nil {
+		rel, err := filepath.Rel(s.projectRoot, clientRoot)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+			return nil, fmt.Errorf("editor workspace root %s does not use daemon root spelling %s", clientRoot, s.projectRoot)
+		}
+		resolvedProject, projectErr := filepath.EvalSymlinks(s.projectRoot)
+		resolvedClient, clientErr := filepath.EvalSymlinks(clientRoot)
+		if projectErr == nil && clientErr == nil {
+			resolvedRel, relErr := filepath.Rel(resolvedProject, resolvedClient)
+			if relErr != nil || filepath.Clean(resolvedRel) != filepath.Clean(rel) {
+				return nil, fmt.Errorf("editor workspace root %s uses a symlink spelling that differs from daemon root %s", clientRoot, s.projectRoot)
 			}
 		}
 	}
@@ -614,7 +797,13 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 	log.Printf("Initialize: projectRoot=%s debug=%v", s.projectRoot, s.debug)
 
 	if root, ok := stdlib.Resolve(s.store, explicitStdlibPath, s.projectRoot); ok {
-		s.stdlibRoot = root
+		if explicitStdlibPath != "" && s.workspaceEvents != nil {
+			if err := s.workspaceEvents.SetStdlibRoot(ctx, root); err != nil {
+				return nil, err
+			}
+		} else if s.workspaceEvents == nil {
+			s.SetStdlibRoot(root)
+		}
 		log.Printf("Elixir stdlib at: %s", root)
 
 		// Derive mix binary from the same Elixir install
@@ -636,17 +825,22 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 		}
 	}
 
-	// Fallback: find mix in PATH
+	// Fallback: the PATH, then the standard version-manager locations and a
+	// login shell, because an editor-launched process often never ran the mise
+	// or asdf hook that puts mix on its PATH.
 	if s.mixBin == "" {
-		if p, err := exec.LookPath("mix"); err == nil {
+		if p, ok := stdlib.FindExecutable("mix"); ok {
 			s.mixBin = p
 			log.Printf("Mix binary at: %s (PATH fallback)", p)
+		} else if p, ok := stdlib.FindViaLoginShell("mix"); ok {
+			s.mixBin = p
+			log.Printf("Mix binary at: %s (login shell)", p)
 		} else {
 			log.Printf("Could not find mix binary — formatting will not work")
 		}
 	}
 
-	if !s.initialized {
+	if !s.initialized && s.manageWorkspace {
 		s.initialized = true
 		s.backgroundReindex()
 		s.watchGitHead()
@@ -714,6 +908,11 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 }
 
 func (s *Server) Initialized(ctx context.Context, params *protocol.InitializedParams) error {
+	// Registered for daemon-backed sessions too. The workspace's native watcher
+	// deliberately skips deps/ — one watch per dependency directory would cost
+	// thousands of descriptors — while the editor's glob covers it, along with
+	// path dependencies. Events from both sources coalesce by path in the one
+	// mutation queue, so the overlap costs a map insert, not a second reindex.
 	if s.client != nil {
 		go func() {
 			if err := s.client.RegisterCapability(context.Background(), &protocol.RegistrationParams{
@@ -738,11 +937,26 @@ func (s *Server) Initialized(ctx context.Context, params *protocol.InitializedPa
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
-	s.closeBeams()
+	s.CloseSession()
 	return nil
 }
 
+// CloseSession releases resources owned by one LSP client. Daemon transports
+// call it even when a client disconnects without the protocol shutdown request.
+func (s *Server) CloseSession() {
+	s.closeOnce.Do(func() {
+		s.closeBeams()
+		s.docs.CloseAll()
+	})
+}
+
 func (s *Server) Exit(ctx context.Context) error {
+	if !s.manageWorkspace {
+		if s.conn != nil {
+			return s.conn.Close()
+		}
+		return nil
+	}
 	os.Exit(0)
 	return nil
 }
@@ -815,7 +1029,11 @@ func (s *Server) DidSave(ctx context.Context, params *protocol.DidSaveTextDocume
 		return nil
 	}
 
-	go s.indexOneFile(path)
+	if s.workspaceEvents != nil {
+		s.workspaceEvents.ReconcileFile(path)
+	} else {
+		go s.indexOneFile(path)
+	}
 
 	return nil
 }
@@ -3712,7 +3930,8 @@ func (s *Server) CompletionResolve(ctx context.Context, params *protocol.Complet
 
 	cleaned := filepath.Clean(data.FilePath)
 	inProject := strings.HasPrefix(cleaned, s.projectRoot+string(os.PathSeparator))
-	inStdlib := s.stdlibRoot != "" && strings.HasPrefix(cleaned, s.stdlibRoot+string(os.PathSeparator))
+	stdlibRoot := s.StdlibRoot()
+	inStdlib := stdlibRoot != "" && strings.HasPrefix(cleaned, stdlibRoot+string(os.PathSeparator))
 	if !inProject && !inStdlib {
 		return params, nil
 	}
@@ -3954,18 +4173,17 @@ func (s *Server) DidChangeWatchedFiles(ctx context.Context, params *protocol.Did
 		}
 		switch change.Type {
 		case protocol.FileChangeTypeCreated, protocol.FileChangeTypeChanged:
-			go s.indexOneFile(path)
+			if s.workspaceEvents != nil {
+				s.workspaceEvents.ReconcileFile(path)
+			} else {
+				go s.indexOneFile(path)
+			}
 		case protocol.FileChangeTypeDeleted:
-			go func(filePath string) {
-				s.indexWrites.RLock()
-				defer s.indexWrites.RUnlock()
-				if s.indexUnavailable {
-					return
-				}
-				if err := s.store.RemoveFile(filePath); err != nil {
-					log.Printf("Error removing %s from index: %v", filePath, err)
-				}
-			}(path)
+			if s.workspaceEvents != nil {
+				s.workspaceEvents.RemoveFile(path)
+			} else {
+				go s.RemoveFile(path)
+			}
 		}
 	}
 	return nil
@@ -5016,7 +5234,7 @@ func (s *Server) PrepareRename(ctx context.Context, params *protocol.PrepareRena
 			}
 			hasFirstPartyDef := false
 			for _, p := range defPaths {
-				if (s.stdlibRoot != "" && strings.HasPrefix(p, s.stdlibRoot)) || s.isDepsFile(p) {
+				if s.isStdlibPath(p) || s.isDepsFile(p) {
 					continue
 				}
 				hasFirstPartyDef = true
@@ -5363,7 +5581,7 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 		}
 	}
 	for _, r := range refResults {
-		if s.stdlibRoot != "" && strings.HasPrefix(r.FilePath, s.stdlibRoot) {
+		if s.isStdlibPath(r.FilePath) {
 			continue
 		}
 		k := refKey{r.FilePath, r.Line}
@@ -5387,7 +5605,7 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 		if err == nil {
 			defResults = byKindForContext(tf, lineNum, defResults)
 			for _, r := range defResults {
-				if s.stdlibRoot != "" && strings.HasPrefix(r.FilePath, s.stdlibRoot) {
+				if s.isStdlibPath(r.FilePath) {
 					continue
 				}
 				k := refKey{r.FilePath, r.Line}
@@ -5547,7 +5765,7 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*Wor
 	var sites []renameSite
 
 	addSiteOpts := func(filePath string, line int, includeKeyword bool) {
-		if s.stdlibRoot != "" && strings.HasPrefix(filePath, s.stdlibRoot) {
+		if s.isStdlibPath(filePath) {
 			return
 		}
 		if s.isDepsFile(filePath) {
@@ -5669,7 +5887,7 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*Wor
 		delegates, err := s.store.LookupDelegatesTo(module, functionName)
 		if err == nil {
 			for _, del := range delegates {
-				if s.stdlibRoot != "" && strings.HasPrefix(del.FilePath, s.stdlibRoot) {
+				if s.isStdlibPath(del.FilePath) {
 					continue
 				}
 				if s.isDepsFile(del.FilePath) {
@@ -5893,7 +6111,7 @@ func (mr *moduleRename) checkCollisions() error {
 }
 
 func (mr *moduleRename) isExcluded(filePath string) bool {
-	return (mr.server.stdlibRoot != "" && strings.HasPrefix(filePath, mr.server.stdlibRoot)) || mr.server.isDepsFile(filePath)
+	return mr.server.isStdlibPath(filePath) || mr.server.isDepsFile(filePath)
 }
 
 func (mr *moduleRename) collectSites() {
@@ -6506,13 +6724,15 @@ func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string) *
 // removals and inserts prevents a build from observing an empty intermediate
 // state and starting its insert-only transaction in the middle of the rename.
 func (s *Server) reindexAfterRename(removePaths, diskPaths []string, textPaths []textReindex) {
-	s.backgroundWork.Add(1)
+	s.index.backgroundWork.Add(1)
 	go func() {
-		defer s.backgroundWork.Done()
+		defer s.index.backgroundWork.Done()
 
-		s.indexWrites.RLock()
-		defer s.indexWrites.RUnlock()
-		if s.indexUnavailable {
+		s.index.reindexing.Lock()
+		defer s.index.reindexing.Unlock()
+		s.index.writes.RLock()
+		defer s.index.writes.RUnlock()
+		if s.index.unavailable {
 			return
 		}
 
@@ -6828,7 +7048,7 @@ func (s *Server) Symbols(ctx context.Context, params *protocol.WorkspaceSymbolPa
 		return nil, nil
 	}
 
-	results, err := s.store.SearchSymbols(query, s.stdlibRoot)
+	results, err := s.store.SearchSymbols(query, s.StdlibRoot())
 	if err != nil {
 		return nil, err
 	}
@@ -7056,7 +7276,7 @@ func (s *Server) IncomingCalls(ctx context.Context, params *protocol.CallHierarc
 	var calls []protocol.CallHierarchyIncomingCall
 
 	for _, r := range refResults {
-		if s.stdlibRoot != "" && strings.HasPrefix(r.FilePath, s.stdlibRoot) {
+		if s.isStdlibPath(r.FilePath) {
 			continue
 		}
 		k := refKey{r.FilePath, r.Line}
@@ -7162,7 +7382,7 @@ func (s *Server) OutgoingCalls(ctx context.Context, params *protocol.CallHierarc
 			continue
 		}
 		td := targetDefs[0]
-		if s.stdlibRoot != "" && strings.HasPrefix(td.FilePath, s.stdlibRoot) {
+		if s.isStdlibPath(td.FilePath) {
 			continue
 		}
 

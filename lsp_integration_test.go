@@ -6,9 +6,11 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/remoteoss/dexter/internal/daemon"
 	"github.com/remoteoss/dexter/internal/lsptest"
 )
 
@@ -41,13 +43,99 @@ func TestLSP_ColdStartBuildsInServer(t *testing.T) {
 	}
 
 	client.Close()
-	logs := stderr.String()
+	// The workspace — and therefore the cold build — lives in the daemon, so its
+	// log carries what the server process used to print on its own stderr. The
+	// proxy's stderr is included too: if a rebuild ever moves back into the
+	// frontend, the mismatch assertion below still catches it there.
+	logs := stderr.String() + daemonLogs(t, root)
 	if strings.Contains(logs, "Index version mismatch") {
 		t.Errorf("cold LSP startup rebuilt through cmdInit before serving:\n%s", logs)
 	}
 	if !strings.Contains(logs, "No index found, building from scratch") {
 		t.Errorf("cold LSP startup did not use the server's background build:\n%s", logs)
 	}
+}
+
+// TestLSP_RootFlagServesWorkspaceFromAnotherDirectory starts the server from a
+// directory outside the project and names the workspace with --root, the shape
+// an agent or an editor wrapper uses when it does not run from the project.
+func TestLSP_RootFlagServesWorkspaceFromAnotherDirectory(t *testing.T) {
+	binary := buildDexter(t)
+	root := scaffoldProject(t)
+	runDexter(t, binary, root, "init", "--root", root)
+	client := lsptest.StartInT(t, binary, root, t.TempDir())
+
+	path := filepath.Join(root, "lib/my_app/workers/direct_worker.ex")
+	line, char := lsptest.FindT(t, path, "get", 1)
+	got := lsptest.Lines(root, client.Definition(path, line, char))
+	want := []string{"lib/my_app/repo.ex:2"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("definition from outside the project = %v, want %v", got, want)
+	}
+}
+
+// TestLSP_WarnsOnNonProjectRoot covers the editor side of the not-a-project
+// guard: an editor is authoritative about what the user opened, so the LSP
+// warns and serves rather than refusing, and the warning reaches the server log
+// an editor collects.
+func TestLSP_WarnsOnNonProjectRoot(t *testing.T) {
+	binary := buildDexter(t)
+	root := t.TempDir()
+	var stderr safeBuffer
+	client, err := lsptest.Start(binary, root, &stderr)
+	if err != nil {
+		t.Fatalf("lsp refused a directory that is not a project: %v", err)
+	}
+	defer client.Close()
+
+	// The warning is written by the child before the handshake completes, but
+	// the parent's stderr copy goroutine may not have landed it yet when Start
+	// returns, so wait for it rather than sampling once.
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(stderr.String(), "does not look like an Elixir project") {
+		if time.Now().After(deadline) {
+			t.Fatalf("serving a non-project root logged no warning:\n%s", stderr.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// safeBuffer is a bytes.Buffer the test may read while os/exec's stderr copy
+// goroutine writes it; bytes.Buffer itself is not safe for that.
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *safeBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *safeBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// daemonLogs returns what the workspace daemon logged for root. The daemon exits
+// on its idle timeout but its log stays at the endpoint, so this is readable
+// after the client that started it is gone.
+func daemonLogs(t *testing.T, root string) string {
+	t.Helper()
+	endpoint, err := daemon.ResolveEndpoint(root)
+	if err != nil {
+		t.Fatalf("resolving the daemon endpoint for %s: %v", root, err)
+	}
+	data, err := os.ReadFile(endpoint.Log)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return ""
+		}
+		t.Fatalf("reading the daemon log %s: %v", endpoint.Log, err)
+	}
+	return string(data)
 }
 
 // These tests drive a real dexter LSP server over stdio through internal/lsptest
@@ -78,7 +166,7 @@ func startIndexedServer(t *testing.T, extra map[string]string) (*lsptest.T, stri
 	if extra != nil {
 		writeFiles(t, root, extra)
 	}
-	runDexter(t, binary, root, "init")
+	runDexter(t, binary, root, "init", "--root", root)
 	return lsptest.StartT(t, binary, root), root
 }
 

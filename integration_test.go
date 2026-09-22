@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/remoteoss/dexter/internal/daemon"
+	"github.com/remoteoss/dexter/internal/lsptest"
 	"github.com/remoteoss/dexter/internal/store"
 )
 
@@ -211,6 +213,13 @@ func runDexter(t *testing.T, binary string, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command(binary, args...)
 	cmd.Dir = dir
+	// A CLI call spawns the workspace daemon, which outlives the call by its idle
+	// timeout. Tests want it gone shortly after, not 15 minutes later.
+	//
+	// PWD mirrors what a shell exports after cd: os.Getwd trusts it when it
+	// points at the process's directory, and the spelled path is what the daemon
+	// indexes so stored paths match the URIs this test sends.
+	cmd.Env = append(os.Environ(), "DEXTER_DAEMON_IDLE_TIMEOUT=1s", "PWD="+mustAbs(t, dir))
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("dexter %v failed: %v\n%s", args, err, out)
@@ -497,6 +506,32 @@ func TestIntegration_InitForce(t *testing.T) {
 	}
 }
 
+func TestIntegration_InitExistingIndexKeepsDaemonRunning(t *testing.T) {
+	binary := buildDexter(t)
+	root := scaffoldProject(t)
+	runDexter(t, binary, root, "init", root)
+	runDexter(t, binary, root, "lookup", "MyApp.Repo")
+	t.Cleanup(func() {
+		cmd := exec.Command(binary, "stop", "--force", "--root", root)
+		cmd.Dir = root
+		_ = cmd.Run()
+	})
+
+	pid, ok := daemon.FindDaemonProcess(root)
+	if !ok {
+		t.Fatal("lookup did not start a workspace daemon")
+	}
+	cmd := exec.Command(binary, "init", root)
+	cmd.Dir = root
+	out, err := cmd.CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "already exists") {
+		t.Fatalf("second init = %v\n%s", err, out)
+	}
+	if next, running := daemon.FindDaemonProcess(root); !running || next != pid {
+		t.Fatalf("daemon after no-op init = pid %d, running %v; want pid %d", next, running, pid)
+	}
+}
+
 // TestIntegration_CorruptDBRecovery simulates the LSP startup recovery path:
 // a corrupted DB is detected, deleted, and rebuilt so that lookups still work.
 // This mirrors the open-with-retry loop in cmdLSP.
@@ -523,6 +558,261 @@ func TestIntegration_CorruptDBRecovery(t *testing.T) {
 	if !strings.Contains(out2, "repo.ex:2") {
 		t.Errorf("expected lookup to work after corrupt DB recovery, got: %s", out2)
 	}
+}
+
+// TestIntegration_RootFlagRunsFromAnotherDirectory covers --root/-C: every
+// command can name the workspace it operates on, so an init, a lookup, or a
+// reindex runs from a directory that is neither the project nor one of its
+// ancestors. A relative reindex target resolves from the named root.
+func TestIntegration_RootFlagRunsFromAnotherDirectory(t *testing.T) {
+	binary := buildDexter(t)
+	root := scaffoldProject(t)
+	elsewhere := t.TempDir()
+
+	runDexter(t, binary, elsewhere, "init", "--root", root)
+
+	out := runDexter(t, binary, elsewhere, "lookup", "--root", root, "MyApp.Repo")
+	if want := filepath.Join(root, "lib/my_app/repo.ex") + ":1"; !strings.Contains(out, want) {
+		t.Errorf("lookup --root = %q, want it to contain %q", out, want)
+	}
+
+	out = runDexter(t, binary, elsewhere, "lookup", "-C", root, "MyApp.Repo", "get")
+	if want := filepath.Join(root, "lib/my_app/repo.ex") + ":2"; !strings.Contains(out, want) {
+		t.Errorf("lookup -C = %q, want it to contain %q", out, want)
+	}
+
+	out = runDexter(t, binary, elsewhere, "references", "--root", root, "MyApp.Repo", "get")
+	if want := filepath.Join(root, "lib/my_app/workers/direct_worker.ex") + ":3"; !strings.Contains(out, want) {
+		t.Errorf("references --root = %q, want it to contain %q", out, want)
+	}
+
+	// A relative target resolves from the named root, not from the caller.
+	repo := filepath.Join(root, "lib/my_app/repo.ex")
+	updated := `defmodule MyApp.Repo do
+  def all(schema) do
+    :ok
+  end
+
+  def get(schema, id) do
+    :ok
+  end
+end
+`
+	if err := os.WriteFile(repo, []byte(updated), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runDexter(t, binary, elsewhere, "reindex", "--root", root, "lib/my_app/repo.ex")
+
+	out = runDexter(t, binary, elsewhere, "lookup", "--root", root, "MyApp.Repo", "all")
+	if want := filepath.Join(root, "lib/my_app/repo.ex") + ":2"; !strings.Contains(out, want) {
+		t.Errorf("lookup after relative reindex --root = %q, want it to contain %q", out, want)
+	}
+}
+
+// TestIntegration_RootFlagRejectsMissingDirectory covers the failure mode that
+// would otherwise be silent: a bad --root must fail instead of falling back to
+// the caller's directory and answering from the wrong workspace.
+func TestIntegration_RootFlagRejectsMissingDirectory(t *testing.T) {
+	binary := buildDexter(t)
+	root := scaffoldProject(t)
+	missing := filepath.Join(t.TempDir(), "missing")
+
+	cmd := exec.Command(binary, "lookup", "--root", missing, "MyApp.Repo")
+	cmd.Dir = root
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("lookup --root %s succeeded, want a failure\n%s", missing, out)
+	}
+	if !strings.Contains(string(out), "--root") {
+		t.Errorf("error should name --root, got:\n%s", out)
+	}
+}
+
+// TestIntegration_StopDaemon covers `dexter stop`: it takes the daemon down
+// without needing a pid, confirms it exited, is idempotent, and a later lookup
+// starts a fresh one.
+func TestIntegration_StopDaemon(t *testing.T) {
+	binary := buildDexter(t)
+	root := scaffoldProject(t)
+	runDexter(t, binary, root, "init", "--root", root)
+
+	// Spawn the daemon with a long idle timeout so it cannot disappear between
+	// the commands on a slow machine.
+	spawn := exec.Command(binary, "lookup", "--root", root, "MyApp.Repo")
+	spawn.Dir = root
+	spawn.Env = append(os.Environ(), "DEXTER_DAEMON_IDLE_TIMEOUT=30s", "PWD="+root)
+	if out, err := spawn.CombinedOutput(); err != nil {
+		t.Fatalf("lookup before stop failed: %v\n%s", err, out)
+	}
+
+	out := runDexter(t, binary, root, "stop", "--root", root)
+	if !strings.Contains(out, "Stopped workspace daemon") {
+		t.Errorf("stop = %q, want a stopped confirmation", out)
+	}
+
+	out = runDexter(t, binary, root, "stop", "--root", root)
+	if !strings.Contains(out, "No workspace daemon is running") {
+		t.Errorf("second stop = %q, want a no-daemon note", out)
+	}
+
+	out = runDexter(t, binary, root, "lookup", "--root", root, "MyApp.Repo")
+	if !strings.Contains(out, "repo.ex:1") {
+		t.Errorf("lookup after stop = %q, want a fresh daemon's answer", out)
+	}
+}
+
+// TestIntegration_StopDaemonForce covers --force: a plain stop refuses while an
+// editor session is attached, and --force takes the workspace anyway.
+func TestIntegration_StopDaemonForce(t *testing.T) {
+	binary := buildDexter(t)
+	root := scaffoldProject(t)
+	runDexter(t, binary, root, "init", "--root", root)
+
+	client := lsptest.StartT(t, binary, root) // holds a daemon lease
+	defer client.Close()
+
+	cmd := exec.Command(binary, "stop", "--root", root)
+	cmd.Dir = root
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("plain stop succeeded with an editor attached:\n%s", out)
+	}
+	if !strings.Contains(string(out), "--force") {
+		t.Errorf("refusal should point at --force, got:\n%s", out)
+	}
+
+	out2 := runDexter(t, binary, root, "stop", "--force", "--root", root)
+	if !strings.Contains(out2, "Stopped workspace daemon") {
+		t.Errorf("forced stop = %q, want a stopped confirmation", out2)
+	}
+}
+
+// TestIntegration_RefusesNonProjectRoot covers the guard against indexing the
+// wrong tree: a human-typed command in a directory with no mix.exs, .git, or
+// .dexter refuses instead of building a database over it. -y/--yes is the way
+// through, and it is needed only once because the .dexter it creates is itself
+// a marker.
+func TestIntegration_RefusesNonProjectRoot(t *testing.T) {
+	binary := buildDexter(t)
+	scratch := t.TempDir()
+
+	run := func(args ...string) (string, error) {
+		cmd := exec.Command(binary, args...)
+		cmd.Dir = scratch
+		cmd.Env = append(os.Environ(), "DEXTER_DAEMON_IDLE_TIMEOUT=1s", "PWD="+scratch)
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+
+	for _, args := range [][]string{
+		{"init"},
+		{"lookup", "MyApp.Repo"},
+		{"references", "MyApp.Repo"},
+		{"reindex"},
+	} {
+		out, err := run(args...)
+		if err == nil {
+			t.Errorf("dexter %v in a non-project directory succeeded:\n%s", args, out)
+		}
+		if !strings.Contains(out, "--yes") {
+			t.Errorf("dexter %v refusal should mention -y/--yes:\n%s", args, out)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(scratch, ".dexter")); !os.IsNotExist(err) {
+		t.Fatalf("refused commands left an index behind: %v", err)
+	}
+
+	// -y/--yes is the way through, and it is sticky.
+	if out, err := run("lookup", "-y", "MyApp.Repo"); err != nil {
+		t.Fatalf("lookup -y failed: %v\n%s", err, out)
+	}
+	_, _ = run("stop") // the forced lookup starts a daemon; do not leave it behind
+	if _, err := os.Stat(filepath.Join(scratch, ".dexter", "dexter.db")); err != nil {
+		t.Fatalf("-y did not create an index: %v", err)
+	}
+	if out, err := run("lookup", "MyApp.Repo"); err != nil {
+		t.Fatalf("lookup after -y was refused: %v\n%s", err, out)
+	}
+}
+
+func TestIntegration_RefusesGitBackedHome(t *testing.T) {
+	binary := buildDexter(t)
+	home := t.TempDir()
+	if err := os.Mkdir(filepath.Join(home, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	child := filepath.Join(home, "work")
+	if err := os.Mkdir(child, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(binary, "lookup", "MyApp.Repo")
+	cmd.Dir = child
+	cmd.Env = append(os.Environ(), "HOME="+home, "PWD="+child)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("lookup in a git-backed home succeeded:\n%s", out)
+	}
+	if !strings.Contains(string(out), "home directory") {
+		t.Fatalf("lookup refusal did not identify the home directory:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".dexter")); !os.IsNotExist(err) {
+		t.Fatalf("refused lookup left an index behind: %v", err)
+	}
+}
+
+func TestIntegration_FindsProjectInsideGitBackedHome(t *testing.T) {
+	binary := buildDexter(t)
+	home := t.TempDir()
+	if err := os.Mkdir(filepath.Join(home, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	project := filepath.Join(home, "project")
+	if err := os.Mkdir(project, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(project, "mix.exs"), []byte("defmodule Nested.MixProject do\nend\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(binary, "lookup", "Nested.Module")
+	cmd.Dir = project
+	cmd.Env = append(os.Environ(), "HOME="+home, "PWD="+project, "DEXTER_DAEMON_IDLE_TIMEOUT=1s")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("lookup in nested project failed: %v\n%s", err, out)
+	}
+	t.Cleanup(func() {
+		stop := exec.Command(binary, "stop", "--force", "--root", project)
+		stop.Dir = project
+		_ = stop.Run()
+	})
+	if _, err := os.Stat(filepath.Join(project, ".dexter", "dexter.db")); err != nil {
+		t.Fatalf("nested project was not indexed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".dexter")); !os.IsNotExist(err) {
+		t.Fatalf("lookup indexed the git-backed home: %v", err)
+	}
+}
+
+func TestIntegration_GitBackedHomeYesIsSticky(t *testing.T) {
+	binary := buildDexter(t)
+	home := t.TempDir()
+	if err := os.Mkdir(filepath.Join(home, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run := func(args ...string) (string, error) {
+		cmd := exec.Command(binary, args...)
+		cmd.Dir = home
+		cmd.Env = append(os.Environ(), "HOME="+home, "PWD="+home, "DEXTER_DAEMON_IDLE_TIMEOUT=1s")
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+	if out, err := run("lookup", "-y", "MyApp.Repo"); err != nil {
+		t.Fatalf("lookup -y in home failed: %v\n%s", err, out)
+	}
+	_, _ = run("stop")
+	if out, err := run("lookup", "MyApp.Repo"); err != nil {
+		t.Fatalf("lookup after home opt-in was refused: %v\n%s", err, out)
+	}
+	_, _ = run("stop")
 }
 
 // TestIntegration_LegacyMigration simulates an upgrade path: a project with

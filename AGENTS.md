@@ -26,10 +26,13 @@ go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.4
 - When writing code that affects the in-document runtime parsing that is similar to the index parsing (or vice versa),
   see if the code can be unified to reduce deduplication. But we should never do this at the cost of performance.
   Indexing must be kept fast no matter what.
-- Keep the CLI commands (`init`, `reindex`, `lookup`) working independently of the LSP server
+- Keep the CLI commands (`init`, `reindex`, `lookup`, `references`, `stop`) working with no editor open. They are frontends to the workspace daemon, not clients of the LSP; `init` is the only one that takes exclusive workspace ownership. The daemon is the only process that opens the index for normal operation, and it belongs to the workspace rather than to any frontend: `dexter lsp` is also a frontend, a stdio proxy, and nothing may serve an editor in-process
 - Parser tests should cover real-world Elixir patterns from large codebases
-- Version strings (`Version` and `IndexVersion`) live in `internal/version/version.go`. Do not bump them in feature PRs;
-  version bumps are made together in a separate release PR.
+- Version strings (`Version`, `IndexVersion`, and `daemon.ContractVersion`) live in
+  `internal/version/version.go` and `internal/daemon/endpoint.go`. Do not bump them in feature PRs;
+  version bumps are made together in a separate release PR. Whenever `IndexVersion` is bumped,
+  bump `daemon.ContractVersion` with it: a running daemon from the older build would otherwise keep
+  serving the new frontend from the stale index.
 
 ## When a release PR should bump IndexVersion
 
@@ -51,6 +54,8 @@ a store that has no rows.
 | `ExtractAliases` | LSP handlers use `ExtractAliasesInScope(text, lineNum)` — scope-aware. Only `Completion` and `CodeAction` use the unscoped `ExtractAliases` intentionally |
 | Any new store query | Add an index if the query will run on hot paths (definition, hover, references) |
 | `internal/beam` ETF tag handling | The ERTS external term format spec. One wrong field width desynchronises every later term in the chunk (`EXPORT_EXT` carries its arity as an integer term, `NEW_FUN_EXT` as a raw byte) |
+| `internal/workspace/runtime.go` (mutation queue, readiness, subscribers) | `internal/lsp` write coordination (`IndexCoordinator`), `watch.go` event filtering, failed-watch retries and one-shot coverage reconciliation, `workspace/watch` subscribers, and the `Close` ordering: watchers stop before the queue drains, and the queue drains before the store checkpoints |
+| `internal/daemon` (protocol, registries, endpoint) | `ContractVersion`, the reserved method and kind names in `registry.go`, `client.go` multiplexing (one reader, ids matched to callers, notifications interleaved), and `docs/daemon.md`. Socket paths must stay short: `sockaddr_un` is capped near 104 bytes |
 
 ## Token walking
 
@@ -72,3 +77,7 @@ The consistency tests in `elixir_test.go` (`TestModuleScopeConsistency`, `TestDe
 - **Dynamic use-chain imports**: `import unquote(mod)` goes into `optBindings`, not `imports`. Static `findModulesWhoseUsingImports` won't find these — the fast opt-binding path in the References handler handles them instead.
 - **ExUnit.CaseTemplate**: Uses `using opts do` instead of `defmacro __using__`. Only recognised when the module has `use ExUnit.CaseTemplate`. The body may delegate to a helper function (`using_block(opts)`) — `parseHelperQuoteBlock` follows this.
 - **Performance**: `findModulesWhoseUsingImports` is expensive (~30-65ms). The References handler skips it when the fast opt-binding check already found injectors.
+- **A session is not a process**: one daemon serves every editor and CLI client on a workspace, so nothing on a path shared with daemon-backed sessions may call `os.Exit`. `Server.Exit` closes the stream instead when `manageWorkspace` is false (every daemon session); `Shutdown` and disconnects go through `CloseSession`, which is `sync.Once`-guarded. The embedded `manageWorkspace` path exists for tests and library use only — the CLI never selects it, because one workspace has one owner
+- **Session state stays per-session, index state stays shared**: open documents, client capabilities, and position encoding belong to one `Server`; the store, `IndexCoordinator`, watchers, and caches belong to the `workspace.Runtime`. A new field on `Server` is a new per-editor copy unless it deliberately goes on the coordinator.
+- **Daemon-backed sessions do not manage the workspace**: with `ManageWorkspace: false`, `Initialize` starts no reindex and no `.git/HEAD` poll — the runtime does both. It still registers `didChangeWatchedFiles`, because the editor's glob covers `deps/` and path dependencies that the native watcher deliberately skips; duplicate events from both sources coalesce by path. Editor notifications are routed through `WorkspaceEvents` into the one mutation queue rather than written to the index directly.
+- **A workspace has to look like one**: `init`, `reindex`, `lookup`, and `references` refuse a directory with no `mix.exs`, `.git`, or `.dexter` unless `-y/--yes` is passed, so a mistyped command cannot build an index over the home directory. `lsp` warns and serves anyway (the editor decides), and `stop` never checks, so a stray daemon can always be cleaned up
