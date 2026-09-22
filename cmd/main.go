@@ -492,6 +492,20 @@ func cmdStop(projectRoot string, force bool) {
 			cmdStopIncompatible(ctx, projectRoot, incompatible, force)
 			return
 		}
+		var mismatch *daemon.RootMismatchError
+		if errors.As(err, &mismatch) {
+			if force {
+				handled, stopErr := daemon.StopForced(ctx, mismatch.Daemon)
+				if stopErr != nil {
+					fatal(stopErr)
+				}
+				if handled {
+					fmt.Fprintf(os.Stderr, "Stopped workspace daemon\n")
+					return
+				}
+			}
+			fatal(mismatch)
+		}
 		if pid, ok := daemon.FindDaemonProcess(projectRoot); ok {
 			fatal(fmt.Errorf("workspace daemon (pid %d) is not answering; use `dexter stop --force` to terminate it", pid))
 		}
@@ -519,22 +533,56 @@ func cmdStop(projectRoot string, force bool) {
 	// Shutdown is asynchronous: it answers first, then drains and exits. Wait
 	// for the process to go away. A replacement daemon another frontend started
 	// in the meantime has a different pid and counts as stopped.
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		probe, dialErr := daemon.Dial(ctx, projectRoot)
+	waitCtx, cancelWait := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelWait()
+	replacementPID, waitErr := waitForDaemonStop(waitCtx, pid, func(probeCtx context.Context) stopProbeResult {
+		probe, dialErr := daemon.Dial(probeCtx, projectRoot)
 		if dialErr != nil {
-			fmt.Fprintf(os.Stderr, "Stopped workspace daemon (pid %d)\n", pid)
-			return
+			return stopProbeResult{running: daemon.ProcessAlive(pid), pid: pid}
 		}
-		next, statusErr := probe.DaemonStatus(ctx)
+		next, statusErr := probe.DaemonStatus(probeCtx)
 		_ = probe.Close()
-		if statusErr == nil && next.PID != pid {
-			fmt.Fprintf(os.Stderr, "Stopped workspace daemon (pid %d); a new one (pid %d) is already serving\n", pid, next.PID)
-			return
+		if statusErr != nil {
+			return stopProbeResult{running: true, pid: pid}
 		}
-		time.Sleep(50 * time.Millisecond)
+		return stopProbeResult{running: true, pid: next.PID}
+	})
+	if waitErr != nil {
+		fatal(waitErr)
 	}
-	fatal(fmt.Errorf("daemon (pid %d) did not stop; it may be wedged", pid))
+	if replacementPID != 0 {
+		fmt.Fprintf(os.Stderr, "Stopped workspace daemon (pid %d); a new one (pid %d) is already serving\n", pid, replacementPID)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "Stopped workspace daemon (pid %d)\n", pid)
+}
+
+type stopProbeResult struct {
+	running bool
+	pid     int
+}
+
+func waitForDaemonStop(ctx context.Context, pid int, probe func(context.Context) stopProbeResult) (int, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return 0, fmt.Errorf("daemon (pid %d) did not stop; use `dexter stop --force` to terminate it", pid)
+		}
+		result := probe(ctx)
+		if err := ctx.Err(); err != nil {
+			return 0, fmt.Errorf("daemon (pid %d) did not stop; use `dexter stop --force` to terminate it", pid)
+		}
+		if !result.running {
+			return 0, nil
+		}
+		if result.pid != pid {
+			return result.pid, nil
+		}
+		select {
+		case <-ctx.Done():
+			return 0, fmt.Errorf("daemon (pid %d) did not stop; use `dexter stop --force` to terminate it", pid)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
 }
 
 // cmdStopIncompatible stops a daemon this build cannot speak to: a binary from

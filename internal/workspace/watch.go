@@ -2,13 +2,14 @@ package workspace
 
 import (
 	"errors"
-	"fmt"
 	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/fsnotify/fsnotify"
 
@@ -17,38 +18,60 @@ import (
 
 // Watcher owns the one native recursive watcher for a workspace daemon.
 type Watcher struct {
-	fsw      *fsnotify.Watcher
-	root     string
-	onChange func(string)
-	wg       sync.WaitGroup
+	fsw              *fsnotify.Watcher
+	root             string
+	onChange         func(string)
+	onCoverageChange func(bool)
+	add              func(string) error
+	wg               sync.WaitGroup
 
-	mu      sync.Mutex
-	missing int // directories the kernel refused to watch
+	mu     sync.Mutex
+	failed map[string]struct{}
 }
 
-// Degraded reports whether any directory could not be watched. The runtime uses
-// it to add a periodic reconciliation: a project tree that outgrew the kernel's
-// watch limit still has to converge, just more slowly.
+var watchRetryInterval = 5 * time.Second
+
+// Degraded reports whether any directory could not be watched.
 func (w *Watcher) Degraded() bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.missing > 0
+	return len(w.failed) > 0
+}
+
+func (w *Watcher) failedDirectories() []string {
+	w.mu.Lock()
+	paths := make([]string, 0, len(w.failed))
+	for path := range w.failed {
+		paths = append(paths, path)
+	}
+	w.mu.Unlock()
+	sort.Strings(paths)
+	return paths
 }
 
 // Watch starts recursive native watching. Dependencies are reconciled when
 // their Mix manifests change instead of consuming one watch per deps directory.
-// It fails only when no directory at all can be watched; a partial watcher is
-// still valuable, and the runtime adds the periodic fallback for the rest.
-func Watch(root string, onChange func(string)) (*Watcher, error) {
+// Registration failures are retried without rescanning the project tree.
+func Watch(root string, onChange func(string), onCoverageChange func(bool)) (*Watcher, error) {
 	fsw, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
 	}
-	w := &Watcher{fsw: fsw, root: root, onChange: onChange}
-	if watched := w.watchTree(root); watched == 0 {
-		_ = fsw.Close()
-		return nil, fmt.Errorf("no directory under %s could be watched", root)
+	w := &Watcher{
+		fsw:      fsw,
+		root:     root,
+		onChange: onChange,
+		add:      fsw.Add,
+		failed:   make(map[string]struct{}),
 	}
+	if watched := w.watchTree(root); watched == 0 {
+		log.Printf("Warning: no directory under %s could be watched", root)
+	}
+	// The runtime's initial index covers startup gaps. Report only later coverage
+	// edges, which need their own reconciliation, and try transient failures once
+	// before waiting for the retry timer.
+	w.retryFailed()
+	w.onCoverageChange = onCoverageChange
 	w.wg.Add(1)
 	go w.loop()
 	return w, nil
@@ -75,6 +98,10 @@ func skipWatchDir(name string) bool {
 // whole tree because one directory could not be watched would leave a large
 // repository with no native watching at all, which is far worse.
 func (w *Watcher) watchTree(root string) int {
+	return w.walkDirectories(root, true)
+}
+
+func (w *Watcher) walkDirectories(root string, includeRoot bool) int {
 	watched := 0
 	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || !d.IsDir() {
@@ -83,13 +110,15 @@ func (w *Watcher) watchTree(root string) int {
 		if skipWatchDir(d.Name()) {
 			return filepath.SkipDir
 		}
-		if addErr := w.fsw.Add(path); addErr != nil {
-			w.mu.Lock()
-			w.missing++
-			w.mu.Unlock()
+		if path == root && !includeRoot {
+			return nil
+		}
+		if addErr := w.add(path); addErr != nil {
+			w.setFailed(path, true)
 			log.Printf("Warning: cannot watch %s: %v", path, addErr)
 			return nil
 		}
+		w.setFailed(path, false)
 		watched++
 		return nil
 	})
@@ -99,8 +128,60 @@ func (w *Watcher) watchTree(root string) int {
 	return watched
 }
 
+// setFailed emits only coverage edges. The callback runs without mu held because
+// it can enqueue runtime work and must not block watch registration or shutdown.
+func (w *Watcher) setFailed(path string, failed bool) {
+	w.mu.Lock()
+	wasDegraded := len(w.failed) > 0
+	if failed {
+		w.failed[path] = struct{}{}
+	} else {
+		delete(w.failed, path)
+	}
+	isDegraded := len(w.failed) > 0
+	w.mu.Unlock()
+	if wasDegraded != isDegraded && w.onCoverageChange != nil {
+		w.onCoverageChange(isDegraded)
+	}
+}
+
+func (w *Watcher) retryFailed() {
+	w.retryPaths(w.failedDirectories())
+}
+
+func (w *Watcher) retryFailedUnder(root string) {
+	paths := w.failedDirectories()
+	selected := paths[:0]
+	for _, path := range paths {
+		rel, err := filepath.Rel(root, path)
+		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+			selected = append(selected, path)
+		}
+	}
+	w.retryPaths(selected)
+}
+
+func (w *Watcher) retryPaths(paths []string) {
+	for _, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil || !info.IsDir() {
+			w.setFailed(path, false)
+			continue
+		}
+		if err := w.add(path); err != nil {
+			continue
+		}
+		// The recovered parent watch closes the race with this walk. Add any
+		// descendants created while the parent had no coverage before restoring.
+		w.walkDirectories(path, false)
+		w.setFailed(path, false)
+	}
+}
+
 func (w *Watcher) loop() {
 	defer w.wg.Done()
+	ticker := time.NewTicker(watchRetryInterval)
+	defer ticker.Stop()
 	for {
 		select {
 		case ev, ok := <-w.fsw.Events:
@@ -118,6 +199,8 @@ func (w *Watcher) loop() {
 				continue
 			}
 			log.Printf("Warning: workspace watcher: %v", err)
+		case <-ticker.C:
+			w.retryFailed()
 		}
 	}
 }
@@ -132,6 +215,7 @@ func (w *Watcher) handle(ev fsnotify.Event) {
 			if added := w.watchTree(path); added == 0 {
 				log.Printf("Warning: no directory under %s could be watched", path)
 			}
+			w.retryFailedUnder(path)
 			_ = parser.WalkElixirFiles(path, func(file string, _ fs.DirEntry) error {
 				w.onChange(file)
 				return nil

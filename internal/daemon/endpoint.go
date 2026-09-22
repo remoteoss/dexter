@@ -33,9 +33,9 @@ type Endpoint struct {
 	// for a project reached through one: on macOS a temp dir is /var/... to the
 	// editor and /private/var/... after EvalSymlinks.
 	Root string
-	// Identity is the symlink-resolved path. It, not Root, decides which daemon a
-	// frontend attaches to, so aliases of one directory share one workspace and
-	// one writer instead of indexing the same tree under two spellings.
+	// Identity is the symlink-resolved path. It decides which daemon owns the
+	// physical workspace; the handshake then rejects a different Root spelling
+	// because path-keyed answers cannot safely mix aliases.
 	Identity string
 	Socket   string
 	Lock     string
@@ -43,9 +43,8 @@ type Endpoint struct {
 }
 
 // ResolveEndpoint derives the private runtime paths for root. Runtime files go
-// in the first candidate directory that can be created, is owned by this user,
-// and leaves the socket path short enough: XDG_RUNTIME_DIR when the session
-// provides one, otherwise /tmp, otherwise $TMPDIR.
+// in an environment-independent directory owned by this user. A session-local
+// location would let a GUI editor and a shell derive different ownership locks.
 func ResolveEndpoint(root string) (Endpoint, error) {
 	abs, err := filepath.Abs(root)
 	if err != nil {

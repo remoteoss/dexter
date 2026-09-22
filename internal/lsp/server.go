@@ -84,6 +84,7 @@ type erlangRuntimeCache struct {
 type WorkspaceEvents interface {
 	ReconcileFile(path string)
 	RemoveFile(path string)
+	SetStdlibRoot(ctx context.Context, path string) error
 }
 
 // IndexCoordinator contains the write-side state that must be shared by every
@@ -92,6 +93,8 @@ type WorkspaceEvents interface {
 // Server.
 type IndexCoordinator struct {
 	reindexing sync.Mutex
+	stdlibMu   sync.RWMutex
+	stdlibRoot string
 
 	// writes is held for writing by a cold full build and for reading by every
 	// single-file write. The bulk path is insert-only and cannot overlap any
@@ -100,6 +103,23 @@ type IndexCoordinator struct {
 	unavailable bool // guarded by writes
 
 	backgroundWork sync.WaitGroup
+}
+
+func (c *IndexCoordinator) setStdlibRoot(root string) (string, bool) {
+	c.stdlibMu.Lock()
+	defer c.stdlibMu.Unlock()
+	if c.stdlibRoot == root {
+		return c.stdlibRoot, false
+	}
+	old := c.stdlibRoot
+	c.stdlibRoot = root
+	return old, true
+}
+
+func (c *IndexCoordinator) getStdlibRoot() string {
+	c.stdlibMu.RLock()
+	defer c.stdlibMu.RUnlock()
+	return c.stdlibRoot
 }
 
 // NewIndexCoordinator returns write coordination for one workspace store.
@@ -122,7 +142,6 @@ type Server struct {
 	docs            *DocumentStore
 	projectRoot     string
 	explicitRoot    bool // true when projectRoot was provided via CLI, not inferred from Initialize
-	stdlibRoot      string
 	initialized     bool
 	client          protocol.Client
 	followDelegates bool
@@ -188,12 +207,14 @@ func NewServerWithOptions(s *store.Store, projectRoot string, opts ServerOptions
 	if index == nil {
 		index = NewIndexCoordinator()
 	}
+	if opts.InitialStdlibRoot != "" {
+		_, _ = index.setStdlibRoot(opts.InitialStdlibRoot)
+	}
 	return &Server{
 		store:              s,
 		docs:               NewDocumentStore(),
 		projectRoot:        projectRoot,
 		explicitRoot:       projectRoot != "",
-		stdlibRoot:         opts.InitialStdlibRoot,
 		followDelegates:    true,
 		erlangBuildRoots:   make(map[string]*erlangBuildRootState),
 		erlangRuntimeCache: make(map[string]*erlangRuntimeCache),
@@ -209,6 +230,22 @@ func NewServerWithOptions(s *store.Store, projectRoot string, opts ServerOptions
 		// Dexter does not.
 		positionEncoding: EncodingUTF16,
 	}
+}
+
+// StdlibRoot returns the workspace-wide stdlib root shared by all sessions.
+func (s *Server) StdlibRoot() string { return s.index.getStdlibRoot() }
+
+// SetStdlibRoot changes the workspace-wide stdlib root and returns its previous
+// value. Workspace runtimes use both values to reconcile the shared index.
+func (s *Server) SetStdlibRoot(root string) (string, bool) { return s.index.setStdlibRoot(root) }
+
+func (s *Server) isStdlibPath(path string) bool {
+	root := s.StdlibRoot()
+	if root == "" {
+		return false
+	}
+	rel, err := filepath.Rel(root, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
 }
 
 // ServeStream runs one preconstructed LSP session over a stream the session is
@@ -399,7 +436,7 @@ func (s *Server) fullBuild() (stats indexer.Stats, ran bool, err error) {
 	}
 
 	stats, err = indexer.FullBuild(s.store, s.projectRoot, indexer.Options{
-		StdlibRoot: s.stdlibRoot,
+		StdlibRoot: s.StdlibRoot(),
 		InProcess:  true,
 		Warn: func(format string, args ...interface{}) {
 			log.Printf("Warning: "+format, args...)
@@ -551,8 +588,8 @@ func (s *Server) startBackgroundReindex() <-chan struct{} {
 				return
 			}
 			// Index stdlib first (definitions only).
-			if s.stdlibRoot != "" {
-				walkAndIndex(s.stdlibRoot, false)
+			if stdlibRoot := s.StdlibRoot(); stdlibRoot != "" {
+				walkAndIndex(stdlibRoot, false)
 			}
 
 			walkAndIndex(s.projectRoot, true)
@@ -619,6 +656,26 @@ func (s *Server) RemoveFiles(paths []string) {
 	if err := s.store.RemoveFiles(paths); err != nil {
 		log.Printf("Error removing %d files from index: %v", len(paths), err)
 	}
+}
+
+// RemoveFilesUnderRoot removes indexed files below root as one workspace
+// mutation. The runtime uses it before reconciling a changed stdlib root.
+func (s *Server) RemoveFilesUnderRoot(root string) {
+	if root == "" {
+		return
+	}
+	stored, err := s.store.ListFilePaths()
+	if err != nil {
+		return
+	}
+	prefix := filepath.Clean(root) + string(os.PathSeparator)
+	paths := make([]string, 0)
+	for _, path := range stored {
+		if strings.HasPrefix(filepath.Clean(path), prefix) {
+			paths = append(paths, path)
+		}
+	}
+	s.RemoveFiles(paths)
 }
 
 // watchGitHead polls .git/HEAD mtime and triggers reindex on branch switches.
@@ -693,16 +750,27 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 	// to store.FindProjectRoot. In a monorepo we want to anchor on
 	// .dexter/dexter.db or .git so the whole repo is indexed, not the first
 	// nested Mix app we encounter.
+	var clientRoot string
+	if len(params.WorkspaceFolders) > 0 {
+		clientRoot = uriToPath(protocol.DocumentURI(params.WorkspaceFolders[0].URI))
+	} else if params.RootURI != "" { //nolint:staticcheck // RootURI is deprecated but Neovim still sends it
+		clientRoot = uriToPath(params.RootURI) //nolint:staticcheck
+	}
 	if !s.explicitRoot {
-		if len(params.WorkspaceFolders) > 0 {
-			root := uriToPath(protocol.DocumentURI(params.WorkspaceFolders[0].URI))
-			if root != "" {
-				s.projectRoot = store.FindProjectRoot(root)
-			}
-		} else if params.RootURI != "" { //nolint:staticcheck // RootURI is deprecated but Neovim still sends it
-			root := uriToPath(params.RootURI) //nolint:staticcheck
-			if root != "" {
-				s.projectRoot = store.FindProjectRoot(root)
+		if clientRoot != "" {
+			s.projectRoot = store.FindProjectRoot(clientRoot)
+		}
+	} else if clientRoot != "" && s.workspaceEvents != nil {
+		rel, err := filepath.Rel(s.projectRoot, clientRoot)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+			return nil, fmt.Errorf("editor workspace root %s does not use daemon root spelling %s", clientRoot, s.projectRoot)
+		}
+		resolvedProject, projectErr := filepath.EvalSymlinks(s.projectRoot)
+		resolvedClient, clientErr := filepath.EvalSymlinks(clientRoot)
+		if projectErr == nil && clientErr == nil {
+			resolvedRel, relErr := filepath.Rel(resolvedProject, resolvedClient)
+			if relErr != nil || filepath.Clean(resolvedRel) != filepath.Clean(rel) {
+				return nil, fmt.Errorf("editor workspace root %s uses a symlink spelling that differs from daemon root %s", clientRoot, s.projectRoot)
 			}
 		}
 	}
@@ -729,7 +797,13 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 	log.Printf("Initialize: projectRoot=%s debug=%v", s.projectRoot, s.debug)
 
 	if root, ok := stdlib.Resolve(s.store, explicitStdlibPath, s.projectRoot); ok {
-		s.stdlibRoot = root
+		if explicitStdlibPath != "" && s.workspaceEvents != nil {
+			if err := s.workspaceEvents.SetStdlibRoot(ctx, root); err != nil {
+				return nil, err
+			}
+		} else if s.workspaceEvents == nil {
+			s.SetStdlibRoot(root)
+		}
 		log.Printf("Elixir stdlib at: %s", root)
 
 		// Derive mix binary from the same Elixir install
@@ -3856,7 +3930,8 @@ func (s *Server) CompletionResolve(ctx context.Context, params *protocol.Complet
 
 	cleaned := filepath.Clean(data.FilePath)
 	inProject := strings.HasPrefix(cleaned, s.projectRoot+string(os.PathSeparator))
-	inStdlib := s.stdlibRoot != "" && strings.HasPrefix(cleaned, s.stdlibRoot+string(os.PathSeparator))
+	stdlibRoot := s.StdlibRoot()
+	inStdlib := stdlibRoot != "" && strings.HasPrefix(cleaned, stdlibRoot+string(os.PathSeparator))
 	if !inProject && !inStdlib {
 		return params, nil
 	}
@@ -5159,7 +5234,7 @@ func (s *Server) PrepareRename(ctx context.Context, params *protocol.PrepareRena
 			}
 			hasFirstPartyDef := false
 			for _, p := range defPaths {
-				if (s.stdlibRoot != "" && strings.HasPrefix(p, s.stdlibRoot)) || s.isDepsFile(p) {
+				if s.isStdlibPath(p) || s.isDepsFile(p) {
 					continue
 				}
 				hasFirstPartyDef = true
@@ -5506,7 +5581,7 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 		}
 	}
 	for _, r := range refResults {
-		if s.stdlibRoot != "" && strings.HasPrefix(r.FilePath, s.stdlibRoot) {
+		if s.isStdlibPath(r.FilePath) {
 			continue
 		}
 		k := refKey{r.FilePath, r.Line}
@@ -5530,7 +5605,7 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 		if err == nil {
 			defResults = byKindForContext(tf, lineNum, defResults)
 			for _, r := range defResults {
-				if s.stdlibRoot != "" && strings.HasPrefix(r.FilePath, s.stdlibRoot) {
+				if s.isStdlibPath(r.FilePath) {
 					continue
 				}
 				k := refKey{r.FilePath, r.Line}
@@ -5690,7 +5765,7 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*Wor
 	var sites []renameSite
 
 	addSiteOpts := func(filePath string, line int, includeKeyword bool) {
-		if s.stdlibRoot != "" && strings.HasPrefix(filePath, s.stdlibRoot) {
+		if s.isStdlibPath(filePath) {
 			return
 		}
 		if s.isDepsFile(filePath) {
@@ -5812,7 +5887,7 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string) (*Wor
 		delegates, err := s.store.LookupDelegatesTo(module, functionName)
 		if err == nil {
 			for _, del := range delegates {
-				if s.stdlibRoot != "" && strings.HasPrefix(del.FilePath, s.stdlibRoot) {
+				if s.isStdlibPath(del.FilePath) {
 					continue
 				}
 				if s.isDepsFile(del.FilePath) {
@@ -6036,7 +6111,7 @@ func (mr *moduleRename) checkCollisions() error {
 }
 
 func (mr *moduleRename) isExcluded(filePath string) bool {
-	return (mr.server.stdlibRoot != "" && strings.HasPrefix(filePath, mr.server.stdlibRoot)) || mr.server.isDepsFile(filePath)
+	return mr.server.isStdlibPath(filePath) || mr.server.isDepsFile(filePath)
 }
 
 func (mr *moduleRename) collectSites() {
@@ -6973,7 +7048,7 @@ func (s *Server) Symbols(ctx context.Context, params *protocol.WorkspaceSymbolPa
 		return nil, nil
 	}
 
-	results, err := s.store.SearchSymbols(query, s.stdlibRoot)
+	results, err := s.store.SearchSymbols(query, s.StdlibRoot())
 	if err != nil {
 		return nil, err
 	}
@@ -7201,7 +7276,7 @@ func (s *Server) IncomingCalls(ctx context.Context, params *protocol.CallHierarc
 	var calls []protocol.CallHierarchyIncomingCall
 
 	for _, r := range refResults {
-		if s.stdlibRoot != "" && strings.HasPrefix(r.FilePath, s.stdlibRoot) {
+		if s.isStdlibPath(r.FilePath) {
 			continue
 		}
 		k := refKey{r.FilePath, r.Line}
@@ -7307,7 +7382,7 @@ func (s *Server) OutgoingCalls(ctx context.Context, params *protocol.CallHierarc
 			continue
 		}
 		td := targetDefs[0]
-		if s.stdlibRoot != "" && strings.HasPrefix(td.FilePath, s.stdlibRoot) {
+		if s.isStdlibPath(td.FilePath) {
 			continue
 		}
 

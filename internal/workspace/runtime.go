@@ -29,17 +29,14 @@ import (
 // shrink it.
 var eventDebounce = 25 * time.Millisecond
 
-// fallbackReconcile is how often a workspace with no native watcher, or one
-// that could not watch every directory, sweeps for changes. Native events are
-// the fast path; this is what keeps a daemon-only workspace — no editor sending
-// didChangeWatchedFiles — from going stale behind an inotify limit.
-var fallbackReconcile = 30 * time.Second
+var startNativeWatch = Watch
 
 type eventKind uint8
 
 const (
 	eventPath eventKind = iota
 	eventFull
+	eventStdlib
 	eventStop
 )
 
@@ -54,11 +51,10 @@ type event struct {
 // frontends. Open must only be called by the process holding the workspace's
 // external ownership lock.
 type Runtime struct {
-	root       string
-	store      *store.Store
-	index      *lsp.IndexCoordinator
-	core       *lsp.Server
-	stdlibRoot string
+	root  string
+	store *store.Store
+	index *lsp.IndexCoordinator
+	core  *lsp.Server
 
 	events   chan event
 	ready    chan struct{}
@@ -69,13 +65,14 @@ type Runtime struct {
 	closeOnce sync.Once
 	closeErr  error
 
-	watcher *Watcher
-	gitStop chan struct{}
-	gitWG   sync.WaitGroup
-	loopWG  sync.WaitGroup
-
-	fallbackStop chan struct{}
-	fallbackWG   sync.WaitGroup
+	watcherMu    sync.RWMutex
+	watcher      *Watcher
+	watcherReady chan struct{}
+	watcherStop  chan struct{}
+	watcherWG    sync.WaitGroup
+	gitStop      chan struct{}
+	gitWG        sync.WaitGroup
+	loopWG       sync.WaitGroup
 
 	subsMu sync.Mutex
 	subs   map[*changeSubscriber]struct{}
@@ -110,6 +107,7 @@ func OpenWithOptions(root string, opts Options) (*Runtime, error) {
 	}
 
 	index := lsp.NewIndexCoordinator()
+	previousStdlibRoot, _ := s.GetStdlibRoot()
 	stdlibRoot := ""
 	if resolved, ok := stdlib.Resolve(s, "", root); ok {
 		stdlibRoot = resolved
@@ -119,32 +117,30 @@ func OpenWithOptions(root string, opts Options) (*Runtime, error) {
 		ManageWorkspace:   false,
 		InitialStdlibRoot: stdlibRoot,
 	})
+	if previousStdlibRoot != "" && previousStdlibRoot != stdlibRoot {
+		core.RemoveFilesUnderRoot(previousStdlibRoot)
+	}
 	r := &Runtime{
 		root:         root,
 		store:        s,
 		index:        index,
 		core:         core,
-		stdlibRoot:   stdlibRoot,
 		events:       make(chan event, 4096),
 		ready:        make(chan struct{}),
+		watcherReady: make(chan struct{}),
+		watcherStop:  make(chan struct{}),
 		gitStop:      make(chan struct{}),
-		fallbackStop: make(chan struct{}),
 		subs:         make(map[*changeSubscriber]struct{}),
 		sessions:     make(map[string]*lspSession),
 		sessTag:      newSessionTag(),
 	}
 
-	if !opts.NoWatch {
-		watcher, watchErr := Watch(root, r.ReconcileFile)
-		if watchErr != nil {
-			log.Printf("Warning: native file watching unavailable for %s: %v", root, watchErr)
-		} else {
-			r.watcher = watcher
-		}
-	}
 	r.startGitWatch()
-	if r.watcher == nil || r.watcher.Degraded() {
-		r.startFallbackPoll()
+	if opts.NoWatch {
+		close(r.watcherReady)
+	} else {
+		r.watcherWG.Add(1)
+		go r.startNativeWatcher()
 	}
 	r.loopWG.Add(1)
 	go r.loop()
@@ -175,10 +171,9 @@ func (r *Runtime) WaitReady(ctx context.Context) error {
 // parser and BEAM caches, so a caller cannot leak them by forgetting.
 func (r *Runtime) AttachLSPSession() (id string, session *lsp.Server, release func()) {
 	session = lsp.NewServerWithOptions(r.store, r.root, lsp.ServerOptions{
-		Index:             r.index,
-		Events:            r,
-		ManageWorkspace:   false,
-		InitialStdlibRoot: r.stdlibRoot,
+		Index:           r.index,
+		Events:          r,
+		ManageWorkspace: false,
 	})
 	r.sessMu.Lock()
 	r.sessSeq++
@@ -246,12 +241,16 @@ func (r *Runtime) Store() *store.Store { return r.store }
 
 // StdlibRoot returns the resolved Elixir stdlib directory, or "" when none was
 // detected.
-func (r *Runtime) StdlibRoot() string { return r.stdlibRoot }
+func (r *Runtime) StdlibRoot() string { return r.core.StdlibRoot() }
 
 // Watching reports whether native filesystem watching is active. When false the
 // workspace still reconciles on editor notifications, git HEAD changes, and
 // explicit reindex requests.
-func (r *Runtime) Watching() bool { return r.watcher != nil }
+func (r *Runtime) Watching() bool {
+	r.watcherMu.RLock()
+	defer r.watcherMu.RUnlock()
+	return r.watcher != nil
+}
 
 // IsReady reports whether the initial reconciliation has completed.
 func (r *Runtime) IsReady() bool {
@@ -288,7 +287,7 @@ func (r *Runtime) IndexStatus() (IndexStatus, error) {
 		Root:                 r.root,
 		Ready:                r.IsReady(),
 		Watching:             r.Watching(),
-		StdlibRoot:           r.stdlibRoot,
+		StdlibRoot:           r.StdlibRoot(),
 		IndexVersion:         r.store.GetIndexVersion(),
 		ExpectedIndexVersion: version.IndexVersion,
 		Files:                st.Files,
@@ -413,6 +412,31 @@ func (r *Runtime) RemoveFile(path string) {
 	r.send(event{kind: eventPath, path: path})
 }
 
+// watchCoverageChanged schedules one sweep when a gap opens and one when it
+// closes, to catch changes made while native watcher coverage was incomplete.
+func (r *Runtime) watchCoverageChanged(bool) {
+	r.send(event{kind: eventFull})
+}
+
+// SetStdlibRoot updates the shared root used by every LSP session and waits for
+// the runtime-owned reconciliation that indexes it.
+func (r *Runtime) SetStdlibRoot(ctx context.Context, path string) error {
+	old, changed := r.core.SetStdlibRoot(path)
+	if !changed {
+		return nil
+	}
+	done := make(chan error, 1)
+	if !r.send(event{kind: eventStdlib, path: old, done: done}) {
+		return errors.New("workspace is shutting down")
+	}
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // Reindex schedules a full incremental reconciliation and waits for a queue
 // barrier. Every event accepted before the call is reflected when it returns.
 func (r *Runtime) Reindex(ctx context.Context) error {
@@ -471,6 +495,7 @@ func (r *Runtime) send(ev event) bool {
 
 func (r *Runtime) loop() {
 	defer r.loopWG.Done()
+	<-r.watcherReady
 	r.core.ReindexWorkspace()
 	close(r.ready)
 	r.publish(Change{Full: true})
@@ -478,6 +503,7 @@ func (r *Runtime) loop() {
 	for {
 		ev := <-r.events
 		paths := make(map[string]struct{})
+		oldStdlibRoots := make(map[string]struct{})
 		full := false
 		stop := false
 		var barriers []chan error
@@ -487,6 +513,11 @@ func (r *Runtime) loop() {
 				paths[e.path] = struct{}{}
 			case eventFull:
 				full = true
+			case eventStdlib:
+				full = true
+				if e.path != "" {
+					oldStdlibRoots[e.path] = struct{}{}
+				}
 			case eventStop:
 				stop = true
 			}
@@ -524,6 +555,9 @@ func (r *Runtime) loop() {
 
 		var batchErr error
 		if full {
+			for root := range oldStdlibRoots {
+				r.core.RemoveFilesUnderRoot(root)
+			}
 			r.core.ReindexWorkspace()
 		} else {
 			for path := range paths {
@@ -613,13 +647,17 @@ func (r *Runtime) reconcilePath(path string) error {
 // index work, checkpoints, and closes the store.
 func (r *Runtime) Close() error {
 	r.closeOnce.Do(func() {
-		if r.watcher != nil {
-			r.closeErr = errors.Join(r.closeErr, r.watcher.Close())
+		close(r.watcherStop)
+		r.watcherWG.Wait()
+		<-r.watcherReady
+		r.watcherMu.RLock()
+		watcher := r.watcher
+		r.watcherMu.RUnlock()
+		if watcher != nil {
+			r.closeErr = errors.Join(r.closeErr, watcher.Close())
 		}
 		close(r.gitStop)
 		r.gitWG.Wait()
-		close(r.fallbackStop)
-		r.fallbackWG.Wait()
 
 		done := make(chan error, 1)
 		r.sendMu.Lock()
@@ -635,29 +673,37 @@ func (r *Runtime) Close() error {
 	return r.closeErr
 }
 
-func (r *Runtime) startFallbackPoll() {
-	reason := "native watching unavailable"
-	if r.watcher != nil {
-		reason = "some directories could not be watched"
-	}
-	interval := fallbackReconcile
-	log.Printf("Workspace %s: %s; reconciling every %s", r.root, reason, interval)
-	r.fallbackWG.Add(1)
-	go func() {
-		defer r.fallbackWG.Done()
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-r.fallbackStop:
-				return
-			case <-ticker.C:
-				if !r.send(event{kind: eventFull}) {
-					return
-				}
+func (r *Runtime) startNativeWatcher() {
+	defer r.watcherWG.Done()
+	firstAttempt := true
+	for {
+		watcher, err := startNativeWatch(r.root, r.ReconcileFile, r.watchCoverageChanged)
+		if err == nil {
+			r.watcherMu.Lock()
+			r.watcher = watcher
+			r.watcherMu.Unlock()
+			if firstAttempt {
+				close(r.watcherReady)
+			} else {
+				r.watchCoverageChanged(false)
 			}
+			return
 		}
-	}()
+		log.Printf("Warning: native file watching unavailable for %s: %v", r.root, err)
+		if firstAttempt {
+			close(r.watcherReady)
+			firstAttempt = false
+		}
+		timer := time.NewTimer(watchRetryInterval)
+		select {
+		case <-timer.C:
+		case <-r.watcherStop:
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return
+		}
+	}
 }
 
 func (r *Runtime) startGitWatch() {

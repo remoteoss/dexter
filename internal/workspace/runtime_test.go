@@ -2,14 +2,106 @@ package workspace
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"go.lsp.dev/protocol"
+
 	"github.com/remoteoss/dexter/internal/version"
 )
+
+func TestOpenDoesNotWaitForNativeWatchSetup(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv("SHELL", "/bin/false")
+	root := t.TempDir()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	previous := startNativeWatch
+	startNativeWatch = func(string, func(string), func(bool)) (*Watcher, error) {
+		close(started)
+		<-release
+		return nil, errors.New("watch unavailable")
+	}
+	t.Cleanup(func() { startNativeWatch = previous })
+
+	type openResult struct {
+		runtime *Runtime
+		err     error
+	}
+	opened := make(chan openResult, 1)
+	go func() {
+		runtime, err := Open(root)
+		opened <- openResult{runtime: runtime, err: err}
+	}()
+	<-started
+
+	var result openResult
+	select {
+	case result = <-opened:
+	case <-time.After(100 * time.Millisecond):
+		close(release)
+		result = <-opened
+		if result.runtime != nil {
+			_ = result.runtime.Close()
+		}
+		t.Fatal("Open waited for native watcher setup")
+	}
+	if result.err != nil {
+		close(release)
+		t.Fatal(result.err)
+	}
+	t.Cleanup(func() { _ = result.runtime.Close() })
+
+	writeTestModule(t, root, "lib/during_startup.ex", "SharedLib.DuringStartup")
+	close(release)
+	if err := result.runtime.WaitReady(testContext(t, 30*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if countModule(t, result.runtime, "SharedLib.DuringStartup") == 0 {
+		t.Fatal("initial reconciliation missed a file created during watcher setup")
+	}
+}
+
+func TestRuntimeRetriesNativeWatcherCreation(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv("SHELL", "/bin/false")
+	root := t.TempDir()
+	previousStart := startNativeWatch
+	previousInterval := watchRetryInterval
+	var attempts atomic.Int32
+	startNativeWatch = func(root string, onChange func(string), onCoverageChange func(bool)) (*Watcher, error) {
+		if attempts.Add(1) == 1 {
+			return nil, errors.New("file descriptors exhausted")
+		}
+		return previousStart(root, onChange, onCoverageChange)
+	}
+	watchRetryInterval = 10 * time.Millisecond
+	t.Cleanup(func() {
+		startNativeWatch = previousStart
+		watchRetryInterval = previousInterval
+	})
+
+	rt, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rt.Close() })
+	deadline := time.Now().Add(time.Second)
+	for !rt.Watching() {
+		if time.Now().After(deadline) {
+			t.Fatalf("native watcher was not restored after %d attempts", attempts.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if attempts.Load() < 2 {
+		t.Fatalf("watch creation attempts = %d, want at least 2", attempts.Load())
+	}
+}
 
 // These tests open the runtime with NoWatch so the mutation queue is driven
 // explicitly. With a native watcher running, every write also produces an event
@@ -253,6 +345,88 @@ func TestSessionRegistryIsExplicit(t *testing.T) {
 	releaseFirst()
 }
 
+func TestDaemonSessionExplicitStdlibPathUpdatesRuntimeIndex(t *testing.T) {
+	initialStdlib := t.TempDir()
+	t.Setenv("DEXTER_ELIXIR_LIB_ROOT", initialStdlib)
+	writeTestModule(t, initialStdlib, "initial/lib/initial.ex", "InitialStdlib.Module")
+
+	root := t.TempDir()
+	rt, err := OpenWithOptions(root, Options{NoWatch: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rt.Close() })
+	if err := rt.WaitReady(testContext(t, 30*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	explicitStdlib := t.TempDir()
+	writeTestModule(t, explicitStdlib, "explicit/lib/explicit.ex", "ExplicitStdlib.Module")
+	_, existingSession, releaseExisting := rt.AttachLSPSession()
+	defer releaseExisting()
+	_, session, release := rt.AttachLSPSession()
+	defer release()
+	if _, err := session.Initialize(context.Background(), &protocol.InitializeParams{
+		InitializationOptions: map[string]interface{}{"stdlibPath": explicitStdlib},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := rt.StdlibRoot(); got != explicitStdlib {
+		t.Fatalf("runtime stdlib root = %q, want %q", got, explicitStdlib)
+	}
+	if got := existingSession.StdlibRoot(); got != explicitStdlib {
+		t.Fatalf("existing session stdlib root = %q, want %q", got, explicitStdlib)
+	}
+	if countModule(t, rt, "ExplicitStdlib.Module") == 0 {
+		t.Fatal("explicit session stdlib was not indexed by the runtime")
+	}
+	if got := countModule(t, rt, "InitialStdlib.Module"); got != 0 {
+		t.Fatalf("old runtime stdlib remains indexed (%d results)", got)
+	}
+}
+
+func TestRuntimeRemovesRowsFromPreviousStdlibRoot(t *testing.T) {
+	oldStdlib := t.TempDir()
+	writeTestModule(t, oldStdlib, "lib/old.ex", "OldStdlib.Module")
+	root := t.TempDir()
+	t.Setenv("DEXTER_ELIXIR_LIB_ROOT", oldStdlib)
+	first, err := OpenWithOptions(root, Options{NoWatch: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.WaitReady(testContext(t, 30*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if countModule(t, first, "OldStdlib.Module") == 0 {
+		t.Fatal("first stdlib root was not indexed")
+	}
+	if err := first.store.SetStdlibRoot(oldStdlib); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	newStdlib := t.TempDir()
+	writeTestModule(t, newStdlib, "lib/new.ex", "NewStdlib.Module")
+	t.Setenv("DEXTER_ELIXIR_LIB_ROOT", newStdlib)
+	second, err := OpenWithOptions(root, Options{NoWatch: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = second.Close() })
+	if err := second.WaitReady(testContext(t, 30*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if countModule(t, second, "NewStdlib.Module") == 0 {
+		t.Fatal("new stdlib root was not indexed")
+	}
+	if got := countModule(t, second, "OldStdlib.Module"); got != 0 {
+		t.Fatalf("previous stdlib root remains indexed (%d results)", got)
+	}
+}
+
 func TestIndexStatusReportsReadinessAndSize(t *testing.T) {
 	rt, root := newTestRuntime(t)
 	ctx := testContext(t, 20*time.Second)
@@ -303,33 +477,23 @@ func TestCloseIsIdempotentAndRejectsLaterWork(t *testing.T) {
 	rt.RemoveFile(path)
 }
 
-// TestNoNativeWatchFallsBackToPeriodicReconcile covers the daemon-only case:
-// with no editor to send didChangeWatchedFiles and no kernel watcher (inotify
-// exhausted, unsupported filesystem), the runtime still has to notice a change
-// on disk. A timer sweep is the guarantee; native events stay the fast path.
-func TestNoNativeWatchFallsBackToPeriodicReconcile(t *testing.T) {
-	previous := fallbackReconcile
-	fallbackReconcile = 25 * time.Millisecond
-	t.Cleanup(func() { fallbackReconcile = previous })
+func TestWatchCoverageTransitionsTriggerOneFullReconcileEach(t *testing.T) {
+	rt, _ := newTestRuntime(t)
+	changes, cancel := rt.Subscribe(8)
+	defer cancel()
 
-	t.Setenv("PATH", t.TempDir())
-	t.Setenv("SHELL", "/bin/false")
-	root := t.TempDir()
-	rt, err := OpenWithOptions(root, Options{NoWatch: true})
-	if err != nil {
-		t.Fatal(err)
+	rt.watchCoverageChanged(true)
+	if change := readChange(t, changes); !change.Full {
+		t.Fatalf("degradation change = %+v, want full", change)
 	}
-	t.Cleanup(func() { _ = rt.Close() })
-	if err := rt.WaitReady(testContext(t, 30*time.Second)); err != nil {
-		t.Fatal(err)
+	rt.watchCoverageChanged(false)
+	if change := readChange(t, changes); !change.Full {
+		t.Fatalf("restoration change = %+v, want full", change)
 	}
 
-	writeTestModule(t, root, "lib/late.ex", "Late")
-	deadline := time.Now().Add(5 * time.Second)
-	for countModule(t, rt, "Late") == 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("the periodic fallback never picked up a new file")
-		}
-		time.Sleep(10 * time.Millisecond)
+	select {
+	case change := <-changes:
+		t.Fatalf("coverage transitions caused a recurring change: %+v", change)
+	case <-time.After(100 * time.Millisecond):
 	}
 }

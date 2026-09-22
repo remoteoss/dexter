@@ -4,7 +4,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -40,11 +39,9 @@ func TestAcquireOwnershipIsExclusiveAndCrashSafeFileMayRemain(t *testing.T) {
 	}
 }
 
-// Two spellings of one directory must reach one daemon: two writers on a single
-// index file is the failure the ownership lock exists to prevent. But the root
-// the daemon indexes keeps the caller's spelling, because stored paths are
-// matched against the URIs an editor sends, and canonicalizing them would break
-// every path-keyed lookup for a project reached through a symlink.
+// Two spellings of one directory must resolve the same ownership endpoint: two
+// writers on one index file is the failure the lock exists to prevent. The
+// handshake separately rejects an alias that does not match the indexed root.
 func TestResolveEndpointSharesOneDaemonAcrossSymlinks(t *testing.T) {
 	physical := t.TempDir()
 	link := filepath.Join(t.TempDir(), "workspace")
@@ -93,21 +90,24 @@ func TestOwnershipIsSharedAcrossSymlinks(t *testing.T) {
 	}
 }
 
-// TestResolveEndpointFallsBackWhenTheFirstCandidateIsUnusable: a broken
-// XDG_RUNTIME_DIR must not take dexter down; the next stable candidate is used.
-func TestResolveEndpointFallsBackWhenTheFirstCandidateIsUnusable(t *testing.T) {
-	blocker := filepath.Join(t.TempDir(), "blocker")
-	if err := os.WriteFile(blocker, []byte("not a directory"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("XDG_RUNTIME_DIR", blocker)
-
-	endpoint, err := ResolveEndpoint(t.TempDir())
+// GUI and shell sessions can carry different runtime environment variables, but
+// they must still derive one ownership lock and socket.
+func TestResolveEndpointDoesNotDependOnSessionEnvironment(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	t.Setenv("TMPDIR", t.TempDir())
+	first, err := ResolveEndpoint(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.HasPrefix(endpoint.Socket, blocker) {
-		t.Fatalf("socket %s used the unusable XDG candidate", endpoint.Socket)
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	t.Setenv("TMPDIR", t.TempDir())
+	second, err := ResolveEndpoint(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Socket != second.Socket || first.Lock != second.Lock {
+		t.Fatalf("session environments resolved different ownership paths:\n%+v\n%+v", first, second)
 	}
 }
 

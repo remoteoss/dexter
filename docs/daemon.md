@@ -40,16 +40,11 @@ CLI lookup/references/reindex -------/                   +-- SQLite store
                                                           +-- shared caches
 ```
 
-Runtime files live in a user-private directory keyed by the workspace. The
-candidates, in order, are `$XDG_RUNTIME_DIR/dexter`, `/tmp/dexter-<uid>`, and
-`$TMPDIR/dexter-<uid>`: the first is the session's own runtime directory, the
-second is environment-independent, and the third is a last resort for a shared
-machine where another user pre-created the `/tmp` name. A candidate that cannot
-be created, is not a real directory owned by this user, is a symlink, or would
-leave the socket path past `sockaddr_un`'s limit is skipped. `$TMPDIR` comes
-last on purpose: it is per process, so preferring it would let `TMPDIR=x dexter
-lookup` resolve a different lock file than the editor's daemon and split the
-workspace between two writers. The key is
+Runtime files live in the user-private `/tmp/dexter-<uid>` directory, keyed by
+the workspace. The location is environment-independent so a GUI editor and a
+shell cannot derive different ownership locks for the same index. Dexter refuses
+the directory if it is not a real directory owned by this user, is a symlink, or
+would leave the socket path past `sockaddr_un`'s limit. The key is
 the first 16 bytes of the SHA-256 of the workspace identity, rendered as hex, and
 each workspace gets `<key>.sock`, `<key>.lock`, and `<key>.log`. Nothing is placed
 under the repository: `sockaddr_un` paths are capped near 104 bytes, repository
@@ -59,14 +54,14 @@ another process holds would let a second daemon take ownership of the same index
 
 Every connection starts with a small versioned handshake carrying the workspace
 *identity*, the connection kind, and the frontend's `ContractVersion`. Identity
-is the symlink-resolved root, and it — not the caller's spelling — decides which
-daemon a frontend reaches, so two aliases of one directory share one index and
-one writer instead of indexing the same tree twice under different path
-spellings. The root the daemon *indexes*
-keeps the spelling its starter used, because stored paths are matched against the
-URIs an editor sends: canonicalizing them would break every path-keyed lookup for
-a project reached through a symlink (on macOS a temp dir is `/var/...` to the
-editor and `/private/var/...` after resolution). A frontend that is not sitting
+is the symlink-resolved root, and it decides which daemon owns the physical
+workspace. The root the daemon *indexes* keeps the spelling its starter used,
+because stored paths are matched against the URIs an editor sends: canonicalizing
+them would break every path-keyed lookup for a project reached through a symlink
+(on macOS a temp dir is `/var/...` to the editor and `/private/var/...` after
+resolution). The handshake also carries that indexed spelling. A frontend using
+another alias is refused with the daemon's root instead of receiving incorrect
+path-keyed answers. A frontend that is not sitting
 in the project names it with `dexter --root <path>` (or `-C`), which changes
 directory before the workspace is resolved, so relative paths follow the named
 root and the spelling an editor or agent chose is the one that gets indexed.
@@ -190,12 +185,12 @@ manifest schedule a reconciliation instead, and an attached editor session still
 registers `didChangeWatchedFiles`, whose glob covers `deps/` and path
 dependencies. Events from both sources coalesce by path in the one queue, so the
 overlap costs a map insert rather than a second reindex. A watcher event overflow
-degrades to a full reconcile, and so does a directory the kernel refuses to
-watch: one unwatchable subtree is logged and skipped instead of aborting the
-whole tree, and the runtime adds a periodic reconciliation whenever watching is
-missing or partial. That timer is what keeps a daemon-only workspace — no editor
-sending `didChangeWatchedFiles` — from going stale behind an inotify watch
-limit.
+degrades to a full reconcile. A directory the kernel refuses to watch is logged
+and tracked instead of aborting the whole tree. The runtime reconciles once when
+coverage is lost, retries only failed registrations, and reconciles once more
+when coverage returns to catch changes made during the gap. Failure to create the
+native watcher is retried the same way. There is no periodic full-tree reindex,
+so a persistent kernel watch limit does not cause recurring CPU spikes.
 
 ## Lifecycle
 

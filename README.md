@@ -616,10 +616,10 @@ The daemon owns the SQLite index in `.dexter/` (one writer), the file watchers a
 discovery, and the use-chain, generated-function, and BEAM caches. A CLI call
 therefore reuses an editor's warm caches instead of starting cold.
 
-Its runtime files live outside your project, in `$XDG_RUNTIME_DIR/dexter`, then
-`/tmp/dexter-<uid>`, then `$TMPDIR/dexter-<uid>`: one socket, lock, and log per
-workspace. A candidate that is not a directory owned by you, or that would make
-the socket path too long, is skipped. Ownership is an
+Its runtime files live outside your project in the environment-independent
+`/tmp/dexter-<uid>` directory: one socket, lock, and log per workspace. Dexter
+refuses a runtime directory that is not owned by you or would make the socket
+path too long. Ownership is an
 advisory kernel lock, so a crash or `kill -9` releases it immediately — there is
 no stale lock to clean up and no PID file to go wrong. The log is the first place
 to look when something behaves oddly.

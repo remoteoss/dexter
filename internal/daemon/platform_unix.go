@@ -17,25 +17,12 @@ type lockHandle struct {
 	file *os.File
 }
 
-// platformRuntimeDirs lists where one workspace's runtime files may live, best
-// first. The order is about stability as much as privacy: every process of one
-// user has to resolve the same directory, or two daemons could hold two locks
-// over one index. XDG_RUNTIME_DIR is a per-session value set by the system, and
-// /tmp/dexter-<uid> is environment-independent; $TMPDIR comes last because it
-// is per process, so preferring it would let `TMPDIR=x dexter lookup` split the
-// lock from the editor's daemon. It is still the last-resort fallback for the
-// shared-machine case where another user pre-created the /tmp name.
+// platformRuntimeDirs returns one environment-independent location. Every
+// process for one user must resolve the same lock and socket or a GUI editor and
+// a shell can each start a daemon over the same index.
 func platformRuntimeDirs() []string {
-	var dirs []string
-	if dir := os.Getenv("XDG_RUNTIME_DIR"); dir != "" {
-		dirs = append(dirs, filepath.Join(dir, "dexter"))
-	}
 	uid := os.Getuid()
-	dirs = append(dirs, filepath.Join("/tmp", fmt.Sprintf("dexter-%d", uid)))
-	if tmp := os.TempDir(); tmp != "" {
-		dirs = append(dirs, filepath.Join(tmp, fmt.Sprintf("dexter-%d", uid)))
-	}
-	return dirs
+	return []string{filepath.Join("/tmp", fmt.Sprintf("dexter-%d", uid))}
 }
 
 // checkRuntimeDir rejects a candidate that is not a real directory owned by

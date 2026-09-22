@@ -1688,7 +1688,7 @@ func TestCompletionResolve_StdlibPath(t *testing.T) {
 	defer cleanup()
 
 	stdlibDir := t.TempDir()
-	server.stdlibRoot = stdlibDir
+	server.SetStdlibRoot(stdlibDir)
 
 	stdlibFile := filepath.Join(stdlibDir, "lib", "enum.ex")
 	if err := os.MkdirAll(filepath.Dir(stdlibFile), 0755); err != nil {
@@ -1735,7 +1735,7 @@ func TestCompletion_StdlibModule(t *testing.T) {
 	defer cleanup()
 
 	stdlibDir := t.TempDir()
-	server.stdlibRoot = stdlibDir
+	server.SetStdlibRoot(stdlibDir)
 
 	stdlibFile := filepath.Join(stdlibDir, "elixir", "lib", "enum.ex")
 	if err := os.MkdirAll(filepath.Dir(stdlibFile), 0755); err != nil {
@@ -1795,7 +1795,7 @@ func TestCompletion_StdlibModulePrefix(t *testing.T) {
 	defer cleanup()
 
 	stdlibDir := t.TempDir()
-	server.stdlibRoot = stdlibDir
+	server.SetStdlibRoot(stdlibDir)
 
 	stdlibFile := filepath.Join(stdlibDir, "elixir", "lib", "enum.ex")
 	if err := os.MkdirAll(filepath.Dir(stdlibFile), 0755); err != nil {
@@ -5151,7 +5151,7 @@ func TestWorkspaceSymbol_ExcludesStdlib(t *testing.T) {
 
 	// Simulate stdlib by setting stdlibRoot and indexing a file under it
 	stdlibDir := filepath.Join(server.projectRoot, "stdlib")
-	server.stdlibRoot = stdlibDir
+	server.SetStdlibRoot(stdlibDir)
 
 	indexFile(t, server.store, server.projectRoot, "stdlib/elixir/lib/enum.ex", `defmodule Enum do
   def map(list, fun), do: list

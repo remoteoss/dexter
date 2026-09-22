@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -181,6 +182,28 @@ func TestSecondServerCannotTakeOwnedWorkspace(t *testing.T) {
 	err = Run(context.Background(), root, time.Second)
 	if !errors.Is(err, ErrWorkspaceOwned) {
 		t.Fatalf("Run error = %v, want ErrWorkspaceOwned", err)
+	}
+}
+
+func TestDaemonRejectsAnotherSymlinkSpelling(t *testing.T) {
+	socketTestEnv(t)
+	root := t.TempDir()
+	alias := filepath.Join(t.TempDir(), "workspace")
+	if err := os.Symlink(root, alias); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	client := startDaemon(t, root, time.Minute)
+	defer func() { _ = client.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err := Ensure(ctx, alias)
+	var mismatch *RootMismatchError
+	if !errors.As(err, &mismatch) {
+		t.Fatalf("Ensure through alias error = %v, want RootMismatchError", err)
+	}
+	if mismatch.Daemon != root || mismatch.Requested != alias {
+		t.Fatalf("root mismatch = %+v", mismatch)
 	}
 }
 
@@ -558,6 +581,17 @@ func TestConcurrentCallsReachTheirOwnCallers(t *testing.T) {
 // srvtestFrontendServed reports the connection a registered adapter was handed.
 var srvtestFrontendServed = make(chan FrontendConn, 1)
 
+type blockingMethodState struct {
+	started  chan struct{}
+	canceled chan struct{}
+	release  chan struct{}
+}
+
+var (
+	blockingMethodMu sync.Mutex
+	blockingMethod   *blockingMethodState
+)
+
 type srvtestFrontend struct{}
 
 func (srvtestFrontend) Serve(fc FrontendConn) error {
@@ -575,6 +609,91 @@ func init() {
 			"session": mc.Session,
 		}, nil
 	})
+	RegisterMethod("srvtest/panic", func(MethodContext, json.RawMessage) (any, error) {
+		panic("method exploded on purpose")
+	})
+	RegisterMethod("srvtest/block", func(mc MethodContext, _ json.RawMessage) (any, error) {
+		blockingMethodMu.Lock()
+		state := blockingMethod
+		blockingMethodMu.Unlock()
+		close(state.started)
+		<-mc.Done
+		close(state.canceled)
+		<-state.release
+		_, err := mc.Runtime.IndexStatus()
+		return nil, err
+	})
+}
+
+func TestControlMethodPanicDoesNotStopDaemon(t *testing.T) {
+	socketTestEnv(t)
+	root := t.TempDir()
+	client := startDaemon(t, root, time.Minute)
+	if err := client.Call(context.Background(), "srvtest/panic", struct{}{}, nil); err == nil {
+		t.Fatal("panicking method returned no error")
+	}
+	if _, err := client.DaemonStatus(context.Background()); err != nil {
+		t.Fatalf("daemon stopped after method panic: %v", err)
+	}
+}
+
+func TestConnectionWaitsForControlRequestsBeforeRuntimeClose(t *testing.T) {
+	quietEnv(t)
+	root := t.TempDir()
+	s, endpoint := pipeServer(t, root)
+	serverConn, clientConn := net.Pipe()
+	served := make(chan error, 1)
+	go func() { served <- s.serveConn(serverConn) }()
+	reader := bufio.NewReader(clientConn)
+	if err := writeJSONLine(clientConn, hello{
+		Contract: ContractVersion,
+		Kind:     kindControl,
+		Root:     endpoint.Root,
+		Identity: endpoint.Identity,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var response helloResponse
+	if err := readJSONLine(reader, &response); err != nil || !response.OK {
+		t.Fatalf("handshake = %+v, %v", response, err)
+	}
+	client := newClient(clientConn, reader)
+	state := &blockingMethodState{
+		started:  make(chan struct{}),
+		canceled: make(chan struct{}),
+		release:  make(chan struct{}),
+	}
+	blockingMethodMu.Lock()
+	blockingMethod = state
+	blockingMethodMu.Unlock()
+	t.Cleanup(func() {
+		blockingMethodMu.Lock()
+		blockingMethod = nil
+		blockingMethodMu.Unlock()
+	})
+	callDone := make(chan error, 1)
+	go func() { callDone <- client.Call(context.Background(), "srvtest/block", struct{}{}, nil) }()
+	<-state.started
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	<-state.canceled
+	select {
+	case err := <-served:
+		t.Fatalf("connection returned before its request completed: %v", err)
+	default:
+	}
+	close(state.release)
+	select {
+	case <-served:
+	case <-time.After(time.Second):
+		t.Fatal("connection did not wait for its request")
+	}
+	select {
+	case <-callDone:
+	case <-time.After(time.Second):
+		t.Fatal("client call did not finish")
+	}
 }
 
 // Adapters register instead of editing the daemon, so a protocol added later

@@ -76,7 +76,7 @@ func pipeDial(t *testing.T, s *server, endpoint Endpoint, kind, session string) 
 	})
 
 	reader := bufio.NewReader(clientConn)
-	helloMsg := hello{Contract: ContractVersion, Kind: kind, Identity: endpoint.Identity, Session: session}
+	helloMsg := hello{Contract: ContractVersion, Kind: kind, Root: endpoint.Root, Identity: endpoint.Identity, Session: session}
 	if err := writeJSONLine(clientConn, helloMsg); err != nil {
 		t.Fatal(err)
 	}
@@ -124,11 +124,12 @@ func TestPipeHandshakeRejectsMismatchedPeers(t *testing.T) {
 		incompatible bool
 		exiting      bool
 	}{
-		{"newer contract", hello{Contract: ContractVersion + 1, Kind: kindControl, Identity: endpoint.Identity}, true, true},
-		{"older contract", hello{Contract: ContractVersion - 1, Kind: kindControl, Identity: endpoint.Identity}, true, false},
-		{"other workspace", hello{Contract: ContractVersion, Kind: kindControl, Identity: filepath.Join(t.TempDir(), "elsewhere")}, false, false},
-		{"unknown kind", hello{Contract: ContractVersion, Kind: "not-a-frontend", Identity: endpoint.Identity}, false, false},
-		{"unknown session", hello{Contract: ContractVersion, Kind: kindControl, Identity: endpoint.Identity, Session: "nosuch-999"}, false, false},
+		{"newer contract", hello{Contract: ContractVersion + 1, Kind: kindControl, Root: endpoint.Root, Identity: endpoint.Identity}, true, true},
+		{"older contract", hello{Contract: ContractVersion - 1, Kind: kindControl, Root: endpoint.Root, Identity: endpoint.Identity}, true, false},
+		{"other workspace", hello{Contract: ContractVersion, Kind: kindControl, Root: endpoint.Root, Identity: filepath.Join(t.TempDir(), "elsewhere")}, false, false},
+		{"other root spelling", hello{Contract: ContractVersion, Kind: kindControl, Root: filepath.Join(t.TempDir(), "alias"), Identity: endpoint.Identity}, false, false},
+		{"unknown kind", hello{Contract: ContractVersion, Kind: "not-a-frontend", Root: endpoint.Root, Identity: endpoint.Identity}, false, false},
+		{"unknown session", hello{Contract: ContractVersion, Kind: kindControl, Root: endpoint.Root, Identity: endpoint.Identity, Session: "nosuch-999"}, false, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -36,8 +36,8 @@ const (
 	serverHandshakeTimeout = 10 * time.Second
 
 	// maxConcurrentRequests bounds in-flight control requests per connection so
-	// one client cannot exhaust the daemon. The read loop blocks while
-	// saturated, which applies backpressure instead of dropping requests.
+	// one client cannot exhaust the daemon. Excess requests get an error instead
+	// of blocking the connection reader, which must remain able to observe close.
 	maxConcurrentRequests = 64
 
 	// maxReadyWait caps how long one request waits for the initial
@@ -406,6 +406,7 @@ func (s *server) touch() {
 func (s *server) stop() {
 	s.stopOnce.Do(func() {
 		close(s.stopping)
+		s.cancelCtx()
 		if s.listener != nil {
 			_ = s.listener.Close()
 		}
@@ -447,10 +448,12 @@ func (s *server) watchIdle() {
 // conn is one accepted connection's server-side state: a cancellation scope,
 // serialized writes, and the watch subscriptions it owns.
 type conn struct {
-	s   *server
-	raw net.Conn
-	ctx context.Context
-	sem chan struct{}
+	s        *server
+	raw      net.Conn
+	ctx      context.Context
+	cancel   context.CancelFunc
+	sem      chan struct{}
+	requests sync.WaitGroup
 
 	writeMu sync.Mutex
 	subsMu  sync.Mutex
@@ -554,6 +557,15 @@ func (s *server) serveConn(raw net.Conn) error {
 	if h.Identity != s.identity {
 		return reject("workspace does not match daemon")
 	}
+	if h.Root != s.root {
+		_ = writeJSONLine(raw, helloResponse{
+			Error:    fmt.Sprintf("workspace is indexed as %s, not %s", s.root, h.Root),
+			Contract: ContractVersion,
+			PID:      os.Getpid(),
+			Root:     s.root,
+		})
+		return nil
+	}
 	if h.Kind != kindControl && h.Kind != kindLSP {
 		if _, ok := lookupFrontend(h.Kind); !ok {
 			return reject(fmt.Sprintf("unsupported connection kind %q", h.Kind))
@@ -566,10 +578,12 @@ func (s *server) serveConn(raw net.Conn) error {
 	}
 
 	ctx, cancel := context.WithCancel(s.ctx)
-	c := &conn{s: s, raw: raw, ctx: ctx, sem: make(chan struct{}, maxConcurrentRequests)}
+	c := &conn{s: s, raw: raw, ctx: ctx, cancel: cancel, sem: make(chan struct{}, maxConcurrentRequests)}
 	defer func() {
-		c.dropAllSubs()
 		cancel()
+		_ = raw.Close()
+		c.dropAllSubs()
+		c.requests.Wait()
 	}()
 
 	if h.Kind == kindLSP {
@@ -647,11 +661,28 @@ func (s *server) serveControl(c *conn, reader *bufio.Reader, sessionID string) e
 		if err := readJSONLine(reader, &req); err != nil {
 			return err
 		}
-		c.sem <- struct{}{}
+		select {
+		case c.sem <- struct{}{}:
+		case <-c.ctx.Done():
+			return c.ctx.Err()
+		default:
+			_ = c.write(response{ID: req.ID, Error: "too many concurrent control requests"})
+			continue
+		}
+		c.requests.Add(1)
 		go func(req request) {
-			defer func() { <-c.sem }()
-			result, err := s.handleRequest(c, mc, req)
 			res := response{ID: req.ID}
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					log.Printf("Daemon control method %q panic: %v\n%s", req.Method, recovered, debug.Stack())
+					res.Result = nil
+					res.Error = fmt.Sprintf("control method %q panicked", req.Method)
+				}
+				_ = c.write(res)
+				<-c.sem
+				c.requests.Done()
+			}()
+			result, err := s.handleRequest(c, mc, req)
 			if err != nil {
 				res.Error = err.Error()
 			} else if result != nil {
@@ -660,7 +691,6 @@ func (s *server) serveControl(c *conn, reader *bufio.Reader, sessionID string) e
 					res.Error = err.Error()
 				}
 			}
-			_ = c.write(res)
 		}(req)
 	}
 }

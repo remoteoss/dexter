@@ -120,10 +120,16 @@ func Ensure(ctx context.Context, root string) (*Client, error) {
 		if client, err := Dial(ctx, root); err == nil {
 			return client, nil
 		}
+	} else if mismatch := new(RootMismatchError); errors.As(err, &mismatch) {
+		return nil, mismatch
 	} else if ownership, _, ownErr := AcquireOwnership(root); errors.Is(ownErr, ErrWorkspaceOwned) {
 		client, dialErr := dialWithin(ctx, root, ownerBindGrace)
 		if client != nil {
 			return client, nil
+		}
+		var mismatch *RootMismatchError
+		if errors.As(dialErr, &mismatch) {
+			return nil, mismatch
 		}
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
@@ -151,6 +157,10 @@ func Ensure(ctx context.Context, root string) (*Client, error) {
 		client, err := Dial(ctx, root)
 		if err == nil {
 			return client, nil
+		}
+		var mismatch *RootMismatchError
+		if errors.As(err, &mismatch) {
+			return nil, mismatch
 		}
 		lastErr = err
 		select {
@@ -458,6 +468,18 @@ type IncompatibleDaemonError struct {
 	Exiting bool
 }
 
+// RootMismatchError reports that one physical workspace is already indexed
+// through another path spelling. Mixing spellings would corrupt path-keyed LSP
+// answers, so the frontend must use the daemon root or stop it first.
+type RootMismatchError struct {
+	Requested string
+	Daemon    string
+}
+
+func (e *RootMismatchError) Error() string {
+	return fmt.Sprintf("workspace is already served as %s, not %s; use that root spelling or stop its daemon first", e.Daemon, e.Requested)
+}
+
 func (e *IncompatibleDaemonError) Error() string {
 	what := e.Reason
 	if what == "" {
@@ -504,18 +526,37 @@ func dialKindTimeout(ctx context.Context, root, kind, session string, timeout ti
 		return nil, nil, none, err
 	}
 	reader := bufio.NewReader(conn)
-	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
+	defer stopCancel()
+	deadline := time.Now().Add(timeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
 		_ = conn.Close()
 		return nil, nil, none, err
 	}
-	if err := writeJSONLine(conn, hello{Contract: ContractVersion, Kind: kind, Identity: ep.Identity, Session: session}); err != nil {
+	if err := writeJSONLine(conn, hello{Contract: ContractVersion, Kind: kind, Root: ep.Root, Identity: ep.Identity, Session: session}); err != nil {
 		_ = conn.Close()
+		if ctx.Err() != nil {
+			return nil, nil, none, ctx.Err()
+		}
 		return nil, nil, none, err
 	}
 	var res helloResponse
 	if err := readJSONLine(reader, &res); err != nil {
 		_ = conn.Close()
+		if ctx.Err() != nil {
+			return nil, nil, none, ctx.Err()
+		}
 		return nil, nil, none, err
+	}
+	if !stopCancel() || ctx.Err() != nil {
+		_ = conn.Close()
+		if ctx.Err() != nil {
+			return nil, nil, none, ctx.Err()
+		}
+		return nil, nil, none, context.Canceled
 	}
 	if err := conn.SetDeadline(time.Time{}); err != nil {
 		_ = conn.Close()
@@ -523,6 +564,9 @@ func dialKindTimeout(ctx context.Context, root, kind, session string, timeout ti
 	}
 	if !res.OK {
 		_ = conn.Close()
+		if res.Root != "" && res.Root != ep.Root {
+			return nil, nil, none, &RootMismatchError{Requested: ep.Root, Daemon: res.Root}
+		}
 		if res.Incompatible || res.Contract != ContractVersion {
 			return nil, nil, none, incompatibleDaemonError(res)
 		}
@@ -566,6 +610,10 @@ func parseDaemonPid(psOutput, root string) (int, bool) {
 // FindDaemonProcess reports the pid of the daemon serving root, located by
 // command line. It is diagnostic; StopForced is the action.
 func FindDaemonProcess(root string) (int, bool) { return findDaemonProcess(root) }
+
+// ProcessAlive reports whether pid still names a live process. CLI shutdown
+// waits use it because the daemon closes its socket before it finishes draining.
+func ProcessAlive(pid int) bool { return processAlive(pid) }
 
 // StopForced terminates the workspace daemon without a protocol handshake by
 // locating its process. It is the recovery path for a wedged daemon and the

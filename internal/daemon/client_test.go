@@ -109,6 +109,50 @@ func TestDialRejectsADaemonThatPredatesVersionChecks(t *testing.T) {
 	}
 }
 
+func TestDialBoundsHandshakeByContext(t *testing.T) {
+	requireSocketSupport(t)
+	root := t.TempDir()
+	endpoint, err := ResolveEndpoint(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("unix", endpoint.Socket)
+	if err != nil {
+		t.Skipf("unix socket bind unavailable: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = listener.Close()
+		_ = os.Remove(endpoint.Socket)
+	})
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr == nil {
+			accepted <- conn
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	client, err := Dial(ctx, root)
+	if client != nil {
+		_ = client.Close()
+	}
+	if err == nil {
+		t.Fatal("Dial succeeded without a handshake response")
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("Dial took %v, want the context to bound the handshake", elapsed)
+	}
+	select {
+	case conn := <-accepted:
+		_ = conn.Close()
+	case <-time.After(time.Second):
+		t.Fatal("listener did not accept the handshake connection")
+	}
+}
+
 // TestEnsureLeavesANewerDaemonAlone: an old frontend must not replace the newer
 // daemon that serves the workspace; it reports the mismatch and stops.
 func TestEnsureLeavesANewerDaemonAlone(t *testing.T) {

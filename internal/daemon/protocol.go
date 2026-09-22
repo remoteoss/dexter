@@ -16,9 +16,12 @@ type hello struct {
 	// with a running daemon makes that daemon step aside.
 	Contract int    `json:"contract"`
 	Kind     string `json:"kind"`
-	// Identity is the symlink-resolved workspace path, so a frontend that
-	// reached the project through a different alias still attaches to the same
-	// daemon.
+	// Root is the absolute workspace spelling used by this frontend. Identity
+	// proves physical ownership; Root must also match because index paths and LSP
+	// document URIs are spelling-sensitive.
+	Root string `json:"root"`
+	// Identity is the symlink-resolved workspace path, so aliases reach the same
+	// ownership endpoint before Root validation rejects mixed path spellings.
 	Identity string `json:"identity"`
 	// Session names an editor session this connection explicitly attaches to.
 	// Empty means the workspace's headless language service.
@@ -30,6 +33,7 @@ type helloResponse struct {
 	Error    string `json:"error,omitempty"`
 	Contract int    `json:"contract"`
 	PID      int    `json:"pid,omitempty"`
+	Root     string `json:"root,omitempty"`
 	// Session is the id assigned to an LSP connection. A frontend that wants
 	// that editor's document overlay sends it back in a later handshake.
 	Session string `json:"session,omitempty"`
