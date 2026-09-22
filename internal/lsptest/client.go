@@ -105,14 +105,38 @@ type message struct {
 // initialize handshake. Call Close when finished. stderr is where the server's
 // own logging goes; pass nil to discard it.
 func Start(binary, root string, stderr io.Writer) (*Client, error) {
+	return StartIn(binary, root, root, stderr)
+}
+
+// StartIn is Start with the process's working directory set separately from the
+// workspace root. Pass dir="" to run in root. The workspace is named explicitly
+// with --root, so the server serves the project it was pointed at rather than
+// the tree it happens to sit in — the shape an editor wrapper, an agent, or a
+// probe needs when it does not run from the project itself.
+func StartIn(binary, root, dir string, stderr io.Writer) (*Client, error) {
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
 		return nil, fmt.Errorf("resolve root %s: %w", root, err)
 	}
+	absDir := absRoot
+	if dir != "" {
+		if absDir, err = filepath.Abs(dir); err != nil {
+			return nil, fmt.Errorf("resolve working directory %s: %w", dir, err)
+		}
+	}
 
-	cmd := exec.Command(binary, "lsp")
-	cmd.Dir = absRoot
+	cmd := exec.Command(binary, "lsp", "--root", absRoot)
+	cmd.Dir = absDir
 	cmd.Stderr = stderr
+	// The workspace daemon outlives the LSP connection by its idle timeout, which
+	// is a long time to leave running after a test finishes. The connection is a
+	// lease, so the daemon stays up for the whole session either way.
+	//
+	// PWD is part of the environment on purpose: a shell updates it when it
+	// changes directory and os.Getwd trusts it when it points at the process's
+	// directory. Letting the parent's value through would make the server see the
+	// symlink-resolved cwd, which is not the spelling this client sends in URIs.
+	cmd.Env = append(os.Environ(), "DEXTER_DAEMON_IDLE_TIMEOUT=1s", "PWD="+absDir)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

@@ -38,6 +38,7 @@ A fast, full-featured Elixir LSP optimized for large Elixir codebases.
 - [Lightning-fast formatting](#lightning-fast-formatting)
 - [LSP options](#lsp-options)
 - [Index database location (.dexter/)](#index-database-location-dexter)
+- [Workspace daemon](#workspace-daemon)
 - [Debugging](#debugging)
 - [Development (building from source)](#development-building-from-source)
 - [Releasing](#releasing)
@@ -381,6 +382,28 @@ Measured on a 57k-file Elixir monorepo (330k definitions, 2.7M references) on a 
 
 The CLI commands are available for scripting and manual use.
 
+Every command accepts `--root <path>` (or `-C <path>`) and then runs as if it had
+been started there, which lets a shell, an agent, or an editor wrapper query a
+project from somewhere else entirely:
+
+```sh
+# the flag goes anywhere on the command line
+# note that relative paths, including the reindex target, resolve from the root
+dexter --root ~/code/my-elixir-project lookup MyApp.Accounts fetch_user
+dexter lookup --root ~/code/my-elixir-project MyApp.Accounts fetch_user
+dexter reindex --root ~/code/my-elixir-project lib/my_app/accounts.ex
+dexter lsp --root ~/code/my-elixir-project
+dexter stop --root ~/code/my-elixir-project
+```
+
+Dexter refuses to treat a directory with no `mix.exs`, `.git`, or `.dexter` as a
+workspace, so a mistyped `dexter lookup` in your home directory stops instead of
+building a database over everything you own. Pass `--root <path>` to name the
+project, or `-y`/`--yes` if that directory really is what you meant; the
+`.dexter` directory the first run creates is itself a marker, so the flag is only
+needed once. `dexter lsp` is the exception: an editor is authoritative about what
+the user opened, so it logs a warning and serves the directory anyway.
+
 ### Index a project
 
 ```sh
@@ -570,6 +593,60 @@ dexter init .
 cd ~/code/my-monorepo/apps/my_app
 dexter init .
 ```
+
+## Workspace daemon
+
+One background process per project owns the index, so your editor and the CLI
+see the same fresh index instead of each maintaining their own.
+
+The first `dexter lsp`, `dexter lookup`, `dexter references`, or `dexter reindex`
+starts it, and it exits on its own after 15 minutes with no clients. Nothing
+about editor configuration changes: `dexter lsp` still speaks LSP over stdio, it
+just proxies to the daemon, and the protocol bytes are copied rather than
+re-parsed.
+
+The daemon belongs to the workspace, not to whichever frontend started it. No
+editor owns the index for another: a second editor and a lookup in a shell both
+attach to the same daemon and share its index and resolution caches, so neither
+can see a different, staler answer. It is also the process an MCP frontend will
+attach to, so every frontend answers from one index.
+
+The daemon owns the SQLite index in `.dexter/` (one writer), the file watchers and
+`.git/HEAD` poll that drive incremental reindexes, stdlib and dependency
+discovery, and the use-chain, generated-function, and BEAM caches. A CLI call
+therefore reuses an editor's warm caches instead of starting cold.
+
+Its runtime files live outside your project, in `$XDG_RUNTIME_DIR/dexter`, then
+`/tmp/dexter-<uid>`, then `$TMPDIR/dexter-<uid>`: one socket, lock, and log per
+workspace. A candidate that is not a directory owned by you, or that would make
+the socket path too long, is skipped. Ownership is an
+advisory kernel lock, so a crash or `kill -9` releases it immediately — there is
+no stale lock to clean up and no PID file to go wrong. The log is the first place
+to look when something behaves oddly.
+
+```sh
+# how long an idle daemon waits before exiting (0 = never)
+export DEXTER_DAEMON_IDLE_TIMEOUT=30m
+
+# stop the workspace daemon now
+# a plain stop refuses while clients are attached; --force stops it anyway
+dexter stop
+dexter stop --force
+```
+
+`dexter stop` is the manual version, useful when a daemon is stuck,
+misbehaving, or just in the way — it finds the process by workspace rather than
+by pid, reports whether one was running, and is a no-op when there was nothing to
+stop. A plain stop asks the daemon politely and refuses while clients are
+attached; `--force` skips the handshake and signals the process directly, so it
+works even for a daemon that is wedged or built by another version, escalating
+to an outright kill if the process will not exit. Editors attached to a forced
+stop lose the workspace until it restarts on the next `dexter lsp`, lookup, or
+reindex.
+
+`dexter init` is the one command that needs the workspace to itself. It asks an
+idle daemon to exit and refuses while a client is attached, so close your editor
+(or wait for the idle timeout) before rebuilding an index from scratch.
 
 ## Debugging
 

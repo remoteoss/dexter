@@ -947,6 +947,31 @@ func (s *Store) ListModuleFunctions(module string, publicOnly bool) ([]Completio
 	return results, rows.Err()
 }
 
+// IndexStats summarizes the size of the index.
+type IndexStats struct {
+	Files       int
+	Definitions int
+	References  int
+}
+
+// Stats returns row counts for the files, definitions, and refs tables.
+func (s *Store) Stats() (IndexStats, error) {
+	var st IndexStats
+	for _, q := range []struct {
+		query string
+		dst   *int
+	}{
+		{"SELECT COUNT(*) FROM files", &st.Files},
+		{"SELECT COUNT(*) FROM definitions", &st.Definitions},
+		{"SELECT COUNT(*) FROM refs", &st.References},
+	} {
+		if err := s.db.QueryRow(q.query).Scan(q.dst); err != nil {
+			return IndexStats{}, err
+		}
+	}
+	return st, nil
+}
+
 // FunctionKey identifies a function by name and arity.
 type FunctionKey struct {
 	Name  string
