@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/remoteoss/dexter/internal/daemon"
 	"github.com/remoteoss/dexter/internal/lsptest"
 	"github.com/remoteoss/dexter/internal/store"
 )
@@ -505,6 +506,32 @@ func TestIntegration_InitForce(t *testing.T) {
 	}
 }
 
+func TestIntegration_InitExistingIndexKeepsDaemonRunning(t *testing.T) {
+	binary := buildDexter(t)
+	root := scaffoldProject(t)
+	runDexter(t, binary, root, "init", root)
+	runDexter(t, binary, root, "lookup", "MyApp.Repo")
+	t.Cleanup(func() {
+		cmd := exec.Command(binary, "stop", "--force", "--root", root)
+		cmd.Dir = root
+		_ = cmd.Run()
+	})
+
+	pid, ok := daemon.FindDaemonProcess(root)
+	if !ok {
+		t.Fatal("lookup did not start a workspace daemon")
+	}
+	cmd := exec.Command(binary, "init", root)
+	cmd.Dir = root
+	out, err := cmd.CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "already exists") {
+		t.Fatalf("second init = %v\n%s", err, out)
+	}
+	if next, running := daemon.FindDaemonProcess(root); !running || next != pid {
+		t.Fatalf("daemon after no-op init = pid %d, running %v; want pid %d", next, running, pid)
+	}
+}
+
 // TestIntegration_CorruptDBRecovery simulates the LSP startup recovery path:
 // a corrupted DB is detected, deleted, and rebuilt so that lookups still work.
 // This mirrors the open-with-retry loop in cmdLSP.
@@ -705,6 +732,31 @@ func TestIntegration_RefusesNonProjectRoot(t *testing.T) {
 	}
 	if out, err := run("lookup", "MyApp.Repo"); err != nil {
 		t.Fatalf("lookup after -y was refused: %v\n%s", err, out)
+	}
+}
+
+func TestIntegration_RefusesGitBackedHome(t *testing.T) {
+	binary := buildDexter(t)
+	home := t.TempDir()
+	if err := os.Mkdir(filepath.Join(home, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	child := filepath.Join(home, "work")
+	if err := os.Mkdir(child, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(binary, "lookup", "MyApp.Repo")
+	cmd.Dir = child
+	cmd.Env = append(os.Environ(), "HOME="+home, "PWD="+child)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("lookup in a git-backed home succeeded:\n%s", out)
+	}
+	if !strings.Contains(string(out), "home directory") {
+		t.Fatalf("lookup refusal did not identify the home directory:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".dexter")); !os.IsNotExist(err) {
+		t.Fatalf("refused lookup left an index behind: %v", err)
 	}
 }
 

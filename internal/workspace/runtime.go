@@ -412,29 +412,30 @@ func (r *Runtime) RemoveFile(path string) {
 	r.send(event{kind: eventPath, path: path})
 }
 
-// watchCoverageChanged schedules one sweep when a gap opens and one when it
-// closes, to catch changes made while native watcher coverage was incomplete.
+// watchCoverageChanged schedules a sweep when a gap opens and whenever coverage
+// returns to a subtree, to catch changes made while that watch was unavailable.
 func (r *Runtime) watchCoverageChanged(bool) {
 	r.send(event{kind: eventFull})
 }
 
-// SetStdlibRoot updates the shared root used by every LSP session and waits for
-// the runtime-owned reconciliation that indexes it.
+// SetStdlibRoot updates the shared root used by every LSP session and queues the
+// runtime-owned reconciliation. Initialize must not wait for a workspace scan.
 func (r *Runtime) SetStdlibRoot(ctx context.Context, path string) error {
-	old, changed := r.core.SetStdlibRoot(path)
-	if !changed {
-		return nil
-	}
-	done := make(chan error, 1)
-	if !r.send(event{kind: eventStdlib, path: old, done: done}) {
-		return errors.New("workspace is shutting down")
-	}
 	select {
-	case err := <-done:
-		return err
 	case <-ctx.Done():
 		return ctx.Err()
+	default:
 	}
+	r.sendMu.Lock()
+	defer r.sendMu.Unlock()
+	if r.closing {
+		return errors.New("workspace is shutting down")
+	}
+	old, changed := r.core.SetStdlibRoot(path)
+	if changed {
+		r.events <- event{kind: eventStdlib, path: old}
+	}
+	return nil
 }
 
 // Reindex schedules a full incremental reconciliation and waits for a queue
@@ -677,11 +678,17 @@ func (r *Runtime) startNativeWatcher() {
 	defer r.watcherWG.Done()
 	firstAttempt := true
 	for {
-		watcher, err := startNativeWatch(r.root, r.ReconcileFile, r.watchCoverageChanged)
+		started := time.Now()
+		watcher, err := startNativeWatch(r.root, WatchCallbacks{
+			PathChanged:     r.ReconcileFile,
+			FullReconcile:   func() { r.send(event{kind: eventFull}) },
+			CoverageChanged: r.watchCoverageChanged,
+		})
 		if err == nil {
 			r.watcherMu.Lock()
 			r.watcher = watcher
 			r.watcherMu.Unlock()
+			log.Printf("Workspace watcher %s started in %s", watcher.Kind(), time.Since(started).Round(time.Millisecond))
 			if firstAttempt {
 				close(r.watcherReady)
 			} else {

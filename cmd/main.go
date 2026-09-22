@@ -254,11 +254,14 @@ func looksLikeProjectRoot(dir string) bool {
 // needed only once because the `.dexter` directory it creates is itself a
 // marker.
 func requireProjectRoot(dir string, allowNonProject bool) {
-	if allowNonProject || looksLikeProjectRoot(dir) {
+	if allowNonProject {
 		return
 	}
 	if home, err := os.UserHomeDir(); err == nil && sameDir(dir, home) {
 		fatal(fmt.Errorf("refusing to use %s as a workspace: it is your home directory, not a project\nhint: run from a project, pass --root <path>, or pass -y/--yes if you really mean it", dir))
+	}
+	if looksLikeProjectRoot(dir) {
+		return
 	}
 	fatal(fmt.Errorf("refusing to use %s as a workspace: no mix.exs, .git, or .dexter found, so it does not look like an Elixir project\nhint: run from a project, pass --root <path>, or pass -y/--yes to index it anyway", dir))
 }
@@ -269,11 +272,11 @@ func requireProjectRoot(dir string, allowNonProject bool) {
 // explain it — so this warns loudly and serves the directory anyway. The warning
 // is written to stderr, which every LSP client keeps in its server log.
 func warnProjectRoot(dir string) {
-	if looksLikeProjectRoot(dir) {
-		return
-	}
 	if home, err := os.UserHomeDir(); err == nil && sameDir(dir, home) {
 		log.Printf("Warning: %s is your home directory, not a project; indexing it because the editor asked. Set --root <path> in the editor's dexter command if that is wrong.", dir)
+		return
+	}
+	if looksLikeProjectRoot(dir) {
 		return
 	}
 	log.Printf("Warning: %s does not look like an Elixir project (no mix.exs, .git, or .dexter); indexing it because the editor asked. Set --root <path> if that is the wrong directory.", dir)
@@ -318,6 +321,12 @@ func envFlag(name string) bool {
 
 func cmdInit(projectRoot string, force bool, allowNonProject bool, profile bool) {
 	requireProjectRoot(projectRoot, allowNonProject)
+	dbPath := store.DBPath(projectRoot)
+	if _, err := os.Stat(dbPath); err == nil && !force {
+		fmt.Fprintf(os.Stderr, "Index already exists at %s\n", dbPath)
+		fmt.Fprintf(os.Stderr, "Run `dexter reindex` to update, or `dexter init --force` to delete and rebuild from scratch.\n")
+		os.Exit(1)
+	}
 	maintenanceCtx, cancelMaintenance := context.WithTimeout(context.Background(), controlCallTimeout)
 	defer cancelMaintenance()
 	ownership, _, err := daemon.AcquireMaintenance(maintenanceCtx, projectRoot)
@@ -333,7 +342,6 @@ func cmdInit(projectRoot string, force bool, allowNonProject bool, profile bool)
 		}
 	}()
 
-	dbPath := store.DBPath(projectRoot)
 	if _, err := os.Stat(dbPath); err == nil {
 		if !force {
 			fmt.Fprintf(os.Stderr, "Index already exists at %s\n", dbPath)

@@ -22,7 +22,7 @@ func TestOpenDoesNotWaitForNativeWatchSetup(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	previous := startNativeWatch
-	startNativeWatch = func(string, func(string), func(bool)) (*Watcher, error) {
+	startNativeWatch = func(string, WatchCallbacks) (*Watcher, error) {
 		close(started)
 		<-release
 		return nil, errors.New("watch unavailable")
@@ -74,11 +74,11 @@ func TestRuntimeRetriesNativeWatcherCreation(t *testing.T) {
 	previousStart := startNativeWatch
 	previousInterval := watchRetryInterval
 	var attempts atomic.Int32
-	startNativeWatch = func(root string, onChange func(string), onCoverageChange func(bool)) (*Watcher, error) {
+	startNativeWatch = func(root string, callbacks WatchCallbacks) (*Watcher, error) {
 		if attempts.Add(1) == 1 {
 			return nil, errors.New("file descriptors exhausted")
 		}
-		return previousStart(root, onChange, onCoverageChange)
+		return previousStart(root, callbacks)
 	}
 	watchRetryInterval = 10 * time.Millisecond
 	t.Cleanup(func() {
@@ -371,6 +371,9 @@ func TestDaemonSessionExplicitStdlibPathUpdatesRuntimeIndex(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	if err := rt.Reindex(testContext(t, 30*time.Second)); err != nil {
+		t.Fatal(err)
+	}
 
 	if got := rt.StdlibRoot(); got != explicitStdlib {
 		t.Fatalf("runtime stdlib root = %q, want %q", got, explicitStdlib)
@@ -383,6 +386,67 @@ func TestDaemonSessionExplicitStdlibPathUpdatesRuntimeIndex(t *testing.T) {
 	}
 	if got := countModule(t, rt, "InitialStdlib.Module"); got != 0 {
 		t.Fatalf("old runtime stdlib remains indexed (%d results)", got)
+	}
+}
+
+func TestDaemonSessionExplicitStdlibPathDoesNotWaitForInitialReconcile(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv("SHELL", "/bin/false")
+	root := t.TempDir()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	previous := startNativeWatch
+	startNativeWatch = func(string, WatchCallbacks) (*Watcher, error) {
+		close(started)
+		<-release
+		return nil, errors.New("watch unavailable")
+	}
+	t.Cleanup(func() { startNativeWatch = previous })
+
+	rt, err := Open(root)
+	if err != nil {
+		close(release)
+		t.Fatal(err)
+	}
+	<-started
+	released := false
+	t.Cleanup(func() {
+		if !released {
+			close(release)
+		}
+		_ = rt.Close()
+	})
+	_, existing, releaseExisting := rt.AttachLSPSession()
+	defer releaseExisting()
+	_, session, releaseSession := rt.AttachLSPSession()
+	defer releaseSession()
+	explicitStdlib := t.TempDir()
+
+	initialized := make(chan error, 1)
+	go func() {
+		_, initErr := session.Initialize(context.Background(), &protocol.InitializeParams{
+			InitializationOptions: map[string]interface{}{"stdlibPath": explicitStdlib},
+		})
+		initialized <- initErr
+	}()
+	select {
+	case err := <-initialized:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		close(release)
+		released = true
+		<-initialized
+		t.Fatal("Initialize waited for the initial workspace reconciliation")
+	}
+	if got := existing.StdlibRoot(); got != explicitStdlib {
+		t.Fatalf("existing session stdlib root = %q, want %q", got, explicitStdlib)
+	}
+	close(release)
+	released = true
+	if err := rt.Reindex(testContext(t, 30*time.Second)); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -471,6 +535,13 @@ func TestCloseIsIdempotentAndRejectsLaterWork(t *testing.T) {
 	}
 	if err := rt.Reindex(testContext(t, 2*time.Second)); err == nil {
 		t.Fatal("reindex after close succeeded")
+	}
+	stdlibRoot := rt.StdlibRoot()
+	if err := rt.SetStdlibRoot(context.Background(), t.TempDir()); err == nil {
+		t.Fatal("stdlib root update after close succeeded")
+	}
+	if got := rt.StdlibRoot(); got != stdlibRoot {
+		t.Fatalf("stdlib root changed after close from %q to %q", stdlibRoot, got)
 	}
 	// Fire-and-forget notifications must neither block nor panic after close.
 	rt.ReconcileFile(path)

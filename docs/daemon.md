@@ -114,9 +114,10 @@ Startup is ordered as follows:
    workspace is opened: a client that races startup finds a listening socket
    immediately and its handshake completes from the backlog as soon as the
    runtime exists.
-6. Open the store, start the watchers, then run the initial full-or-incremental
-   reconciliation. Watchers come first so their events queue behind that pass and
-   no startup change is lost.
+6. Open the store and start watcher setup asynchronously, so persisted-index
+   queries can run immediately. The initial full-or-incremental reconciliation
+   waits for watcher setup: changes made before coverage starts are found by the
+   reconciliation, and later changes arrive as events.
 7. Report readiness. Frontends that must not answer from a half-built index wait
    on it (`workspace/status` with `waitReadyMs`). The LSP path serves immediately
    and converges, exactly as the standalone server always has, so opening an
@@ -179,18 +180,20 @@ receive each coalesced batch. Delivery never blocks indexing: a consumer that
 falls behind loses detail and its next delivery reports a full change, so it
 refreshes coarsely rather than silently missing an edit.
 
-`deps` does not get a permanent recursive watcher: one watch per dependency
-directory would cost thousands of descriptors. Changes to `mix.lock` or a Mix
-manifest schedule a reconciliation instead, and an attached editor session still
+On macOS with cgo, one recursive FSEvents stream watches the project. Other
+builds use fsnotify and register each project directory. `deps` and generated
+trees are excluded from both backends. Changes to `mix.lock` or a Mix manifest
+schedule dependency reconciliation instead, and an attached editor session still
 registers `didChangeWatchedFiles`, whose glob covers `deps/` and path
 dependencies. Events from both sources coalesce by path in the one queue, so the
 overlap costs a map insert rather than a second reindex. A watcher event overflow
-degrades to a full reconcile. A directory the kernel refuses to watch is logged
-and tracked instead of aborting the whole tree. The runtime reconciles once when
-coverage is lost, retries only failed registrations, and reconciles once more
-when coverage returns to catch changes made during the gap. Failure to create the
-native watcher is retried the same way. There is no periodic full-tree reindex,
-so a persistent kernel watch limit does not cause recurring CPU spikes.
+or an FSEvents dropped-event flag causes a full reconcile. If FSEvents cannot
+start, Dexter falls back to fsnotify. A directory the kernel refuses to watch is
+logged and tracked instead of aborting the fsnotify tree. The runtime reconciles
+once when coverage is lost, retries only failed registrations, and reconciles
+after each restored subtree to catch changes made during its gap. Failure to
+create the native watcher is retried the same way. There is no periodic full-tree
+reindex, so a persistent kernel watch limit does not cause recurring CPU spikes.
 
 ## Lifecycle
 
@@ -255,7 +258,7 @@ Built-in control surface:
 
 MCP is not migrated onto the daemon yet. Its server still carries its own copy of
 workspace ownership: a store handle, a headless `lsp.Server`, stdlib discovery,
-an fsnotify tree, a Git HEAD poll, an initial index pass, and an index barrier.
+a filesystem watcher, a Git HEAD poll, an initial index pass, and an index barrier.
 The daemon exists so those can be deleted rather than duplicated a second time.
 The table below is the mapping that migration applies, and the sections after it
 are the design it should follow.
@@ -265,7 +268,7 @@ are the design it should follow.
 | `binding.init`, `openStore` recovery | `workspace.Open` (same recovery path) |
 | `binding.lsp = lsp.NewServer(...)` | `Runtime.LanguageServices()` |
 | `stdlib.Resolve` + `SetStdlibRoot` | resolved once by the runtime, inherited by sessions |
-| `WatchFiles` (own fsnotify tree) | `workspace.Watcher` → one mutation queue |
+| `WatchFiles` (own watcher) | `workspace.Watcher` → one mutation queue |
 | `lsp.WatchGitHead` | `Runtime.startGitWatch` |
 | `binding.awaitIndex`, `indexWaitLimit` | `workspace/status` with `waitReadyMs` |
 | `binding.close` | close the connection; the daemon idles out |
@@ -286,7 +289,7 @@ control calls. Register one method per tool backend —
 `workspace/search` — each a thin wrapper over the equivalent `internal/lsp/api.go`
 call made against `mc.LSP()`. The frontend's per-root binding becomes
 `daemon.Ensure(ctx, root)`; its index barrier becomes `client.WorkspaceStatus(ctx,
-waitReadyMs)`; its fsnotify tree becomes `client.Watch(ctx, buffer, onChange)`;
+waitReadyMs)`; its watcher becomes `client.Watch(ctx, buffer, onChange)`;
 its `close` becomes `client.Close()`. The cost is one local JSON round trip per
 tool call, which is noise next to the model latency that triggered the call, and
 it needs no transport work and no SDK coupling. Multi-root negotiation stays in

@@ -43,27 +43,31 @@ func (s *watchAddStub) paths() []string {
 	return slices.Clone(s.calls)
 }
 
-func newTestWatcher(add func(string) error, changed func(bool)) *Watcher {
-	return &Watcher{add: add, failed: make(map[string]struct{}), onCoverageChange: changed}
+func newTestWatcher(add func(string) error, changed func(bool)) *fsnotifyWatcher {
+	return &fsnotifyWatcher{add: add, failed: make(map[string]struct{}), onCoverageChange: changed}
 }
 
 func TestWatcherRetriesOnlyFailedDirectoriesAndReportsRestoration(t *testing.T) {
 	root := t.TempDir()
 	good := filepath.Join(root, "good")
 	failed := filepath.Join(root, "failed")
+	stillFailed := filepath.Join(root, "still-failed")
 	if err := os.MkdirAll(good, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(failed, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.MkdirAll(stillFailed, 0o755); err != nil {
+		t.Fatal(err)
+	}
 
-	stub := &watchAddStub{failing: map[string]bool{failed: true}}
+	stub := &watchAddStub{failing: map[string]bool{failed: true, stillFailed: true}}
 	var transitions []bool
 	w := newTestWatcher(stub.add, func(degraded bool) { transitions = append(transitions, degraded) })
 	w.watchTree(root)
-	if got := w.failedDirectories(); !slices.Equal(got, []string{failed}) {
-		t.Fatalf("failed directories = %v, want [%s]", got, failed)
+	if got := w.failedDirectories(); !slices.Equal(got, []string{failed, stillFailed}) {
+		t.Fatalf("failed directories = %v, want [%s %s]", got, failed, stillFailed)
 	}
 	if !slices.Equal(transitions, []bool{true}) {
 		t.Fatalf("coverage transitions = %v, want [true]", transitions)
@@ -71,8 +75,8 @@ func TestWatcherRetriesOnlyFailedDirectoriesAndReportsRestoration(t *testing.T) 
 
 	stub.resetCalls()
 	w.retryFailed()
-	if got := stub.paths(); !slices.Equal(got, []string{failed}) {
-		t.Fatalf("retry paths = %v, want only [%s]", got, failed)
+	if got := stub.paths(); !slices.Equal(got, []string{failed, stillFailed}) {
+		t.Fatalf("retry paths = %v, want [%s %s]", got, failed, stillFailed)
 	}
 	if !slices.Equal(transitions, []bool{true}) {
 		t.Fatalf("repeated failure emitted another transition: %v", transitions)
@@ -81,14 +85,20 @@ func TestWatcherRetriesOnlyFailedDirectoriesAndReportsRestoration(t *testing.T) 
 	stub.setFailing(failed, false)
 	stub.resetCalls()
 	w.retryFailed()
-	if got := stub.paths(); !slices.Equal(got, []string{failed}) {
-		t.Fatalf("restoration retry paths = %v, want only [%s]", got, failed)
+	if got := stub.paths(); !slices.Equal(got, []string{failed, stillFailed}) {
+		t.Fatalf("restoration retry paths = %v, want [%s %s]", got, failed, stillFailed)
 	}
-	if got := w.failedDirectories(); len(got) != 0 {
-		t.Fatalf("failed directories after restoration = %v", got)
+	if got := w.failedDirectories(); !slices.Equal(got, []string{stillFailed}) {
+		t.Fatalf("failed directories after partial restoration = %v", got)
 	}
-	if !slices.Equal(transitions, []bool{true, false}) {
-		t.Fatalf("coverage transitions = %v, want [true false]", transitions)
+	if !slices.Equal(transitions, []bool{true, true}) {
+		t.Fatalf("coverage transitions = %v, want [true true]", transitions)
+	}
+
+	stub.setFailing(stillFailed, false)
+	w.retryFailed()
+	if !slices.Equal(transitions, []bool{true, true, false}) {
+		t.Fatalf("coverage transitions = %v, want [true true false]", transitions)
 	}
 }
 
@@ -115,8 +125,8 @@ func TestWatcherTracksStartupTotalFailure(t *testing.T) {
 	stub.setFailing(root, false)
 	stub.setFailing(child, false)
 	w.retryFailed()
-	if !slices.Equal(transitions, []bool{true, false}) {
-		t.Fatalf("coverage transitions after recovery = %v, want [true false]", transitions)
+	if !slices.Equal(transitions, []bool{true, true, false}) {
+		t.Fatalf("coverage transitions after recovery = %v, want [true true false]", transitions)
 	}
 }
 
@@ -146,5 +156,22 @@ func TestWatcherTracksFailureForNewDirectory(t *testing.T) {
 	}
 	if !slices.Equal(transitions, []bool{true, false}) {
 		t.Fatalf("coverage transitions = %v, want [true false]", transitions)
+	}
+}
+
+func TestIgnoredWatchPath(t *testing.T) {
+	root := t.TempDir()
+	for _, path := range []string{
+		filepath.Join(root, ".git", "HEAD"),
+		filepath.Join(root, "deps", "library", "lib", "module.ex"),
+		filepath.Join(root, "assets", "node_modules", "package", "index.js"),
+		filepath.Join(root, ".dexter", "index.db"),
+	} {
+		if !ignoredWatchPath(root, path) {
+			t.Errorf("ignoredWatchPath(%q) = false", path)
+		}
+	}
+	if path := filepath.Join(root, "apps", "my_app", "lib", "module.ex"); ignoredWatchPath(root, path) {
+		t.Errorf("ignoredWatchPath(%q) = true", path)
 	}
 }
