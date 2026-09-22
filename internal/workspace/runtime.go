@@ -498,8 +498,8 @@ func (r *Runtime) loop() {
 	defer r.loopWG.Done()
 	<-r.watcherReady
 	r.core.ReindexWorkspace()
-	close(r.ready)
 	r.publish(Change{Full: true})
+	close(r.ready)
 
 	for {
 		ev := <-r.events
