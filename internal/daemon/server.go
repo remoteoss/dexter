@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/remoteoss/dexter/internal/lsp"
-	"github.com/remoteoss/dexter/internal/store"
 	"github.com/remoteoss/dexter/internal/version"
 	"github.com/remoteoss/dexter/internal/workspace"
 )
@@ -121,8 +120,8 @@ type LookupParams struct {
 }
 
 type LookupResult struct {
-	Locations []store.LookupResult `json:"locations"`
-	Ready     bool                 `json:"ready"`
+	Locations []lsp.NameLocation `json:"locations"`
+	Ready     bool               `json:"ready"`
 }
 
 type ReferencesParams struct {
@@ -132,8 +131,8 @@ type ReferencesParams struct {
 }
 
 type ReferencesResult struct {
-	Locations []store.ReferenceResult `json:"locations"`
-	Ready     bool                    `json:"ready"`
+	Locations []lsp.NameLocation `json:"locations"`
+	Ready     bool               `json:"ready"`
 }
 
 type ReindexParams struct {
@@ -756,12 +755,12 @@ func (s *server) handleRequest(c *conn, mc MethodContext, req request) (any, err
 			return nil, err
 		}
 		s.waitReady(mc.Context, req.Method, params.WaitReadyMs)
-		locations, err := s.runtime.Lookup(params.Module, params.Function, params.FollowDelegates)
+		locations, err := mc.LSP().LookupName(params.Module, params.Function, lsp.NameLookupOptions{
+			FollowDelegates:  params.FollowDelegates,
+			FallbackToModule: !params.Strict,
+		})
 		if err != nil {
 			return nil, err
-		}
-		if len(locations) == 0 && params.Function != "" && !params.Strict {
-			locations, err = s.runtime.Lookup(params.Module, "", params.FollowDelegates)
 		}
 		return LookupResult{Locations: locations, Ready: s.runtime.IsReady()}, err
 	case MethodReferences:
@@ -770,7 +769,10 @@ func (s *server) handleRequest(c *conn, mc MethodContext, req request) (any, err
 			return nil, err
 		}
 		s.waitReady(mc.Context, req.Method, params.WaitReadyMs)
-		locations, err := s.runtime.References(params.Module, params.Function)
+		locations, err := mc.LSP().ReferenceNames(params.Module, params.Function, lsp.NameReferenceOptions{
+			FollowDelegates: true,
+			ExcludeStdlib:   true,
+		})
 		if err != nil {
 			return nil, err
 		}

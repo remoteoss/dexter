@@ -250,7 +250,7 @@ Built-in control surface:
 | `daemon/shutdown` | exit when no other client is attached; refuse otherwise |
 | `workspace/status` | readiness, watcher state, stdlib root, index version and size, attached sessions; `waitReadyMs` turns it into an index barrier |
 | `workspace/lookup` | module/function lookup with the CLI's non-strict module fallback |
-| `workspace/references` | store-level references |
+| `workspace/references` | semantic references through the shared language service |
 | `workspace/reindex` | whole workspace or one path, returning after the barrier |
 | `workspace/watch`, `workspace/unwatch` | subscribe to coalesced index changes, pushed as `workspace/changed` notifications |
 

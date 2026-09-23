@@ -12,6 +12,7 @@ import (
 
 	"go.lsp.dev/protocol"
 
+	"github.com/remoteoss/dexter/internal/lsp"
 	"github.com/remoteoss/dexter/internal/version"
 )
 
@@ -154,7 +155,7 @@ func writeTestModule(t *testing.T, root, relative, module string) string {
 
 func countModule(t *testing.T, rt *Runtime, module string) int {
 	t.Helper()
-	results, err := rt.Lookup(module, "", false)
+	results, err := rt.LanguageServices().LookupName(module, "", lsp.NameLookupOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

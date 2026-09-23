@@ -396,11 +396,11 @@ dexter lsp --root ~/code/my-elixir-project
 dexter stop --root ~/code/my-elixir-project
 ```
 
-Dexter refuses to treat a directory with no `mix.exs`, `.git`, or `.dexter` as a
+Dexter refuses to treat a directory with no `mix.exs`, `.git`, or Dexter database as a
 workspace, so a mistyped `dexter lookup` in your home directory stops instead of
 building a database over everything you own. Pass `--root <path>` to name the
 project, or `-y`/`--yes` if that directory really is what you meant; the
-`.dexter` directory the first run creates is itself a marker, so the flag is only
+`.dexter/dexter.db` database the first run creates is itself a marker, so the flag is only
 needed once. `dexter lsp` is the exception: an editor is authoritative about what
 the user opened, so it logs a warning and serves the directory anyway.
 

@@ -86,7 +86,7 @@ func FindProjectRoot(path string, extraMarkers ...string) string {
 	for _, marker := range markers {
 		dir := path
 		for {
-			if _, err := os.Stat(filepath.Join(dir, marker)); err == nil {
+			if validProjectMarker(filepath.Join(dir, marker), marker) {
 				return dir
 			}
 			parent := filepath.Dir(dir)
@@ -97,6 +97,20 @@ func FindProjectRoot(path string, extraMarkers ...string) string {
 		}
 	}
 	return path
+}
+
+func validProjectMarker(path, marker string) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	switch marker {
+	case ".git":
+		// Linked worktrees and submodules use a regular .git file.
+		return info.IsDir() || info.Mode().IsRegular()
+	default:
+		return info.Mode().IsRegular()
+	}
 }
 
 func Open(projectRoot string) (*Store, error) {

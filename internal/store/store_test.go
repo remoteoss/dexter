@@ -1324,6 +1324,23 @@ func TestFindProjectRoot(t *testing.T) {
 		}
 	})
 
+	t.Run("git worktree file", func(t *testing.T) {
+		root := mktree(t, []string{".git", "lib/foo.ex"})
+		got := FindProjectRoot(filepath.Join(root, "lib"))
+		if got != root {
+			t.Errorf("got %q, want %q", got, root)
+		}
+	})
+
+	t.Run("wrong marker types are ignored", func(t *testing.T) {
+		root := mktree(t, []string{".dexter/dexter.db/", ".dexter.db/", "mix.exs/", "lib/"})
+		start := filepath.Join(root, "lib")
+		got := FindProjectRoot(start, "mix.exs")
+		if got != start {
+			t.Errorf("got %q, want %q", got, start)
+		}
+	})
+
 	t.Run("mix.exs extra marker", func(t *testing.T) {
 		root := mktree(t, []string{"apps/app/mix.exs", "apps/app/lib/foo.ex"})
 		start := filepath.Join(root, "apps", "app", "lib")
