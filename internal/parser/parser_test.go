@@ -3020,12 +3020,45 @@ end
 	}
 
 	withoutLocal := strings.Replace(src, "  defp perform(value), do: value\n", "  def dsl(value) do\n    perform value\n  end\n", 1)
-	_, _, edges, err = ParseTextWithCalls("lib/my_app/worker.ex", withoutLocal)
+	_, edges, err = ParseTextForImpact("lib/my_app/worker.ex", withoutLocal)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(edges) != 0 {
-		t.Fatalf("ambiguous imported calls were stored as concrete edges: %+v", edges)
+	wantImported := map[CallEdge]bool{
+		{Caller: FunctionID{Module: "MyApp.Worker", Function: "imported", Arity: 1}, Callee: FunctionID{Module: "SharedLib.Worker", Function: "perform", Arity: 1}, Kind: "injected"}:       true,
+		{Caller: FunctionID{Module: "MyApp.Worker", Function: "local", Arity: 1}, Callee: FunctionID{Module: "SharedLib.Worker", Function: "perform", Arity: 1}, Kind: "injected"}:          true,
+		{Caller: FunctionID{Module: "MyApp.Worker", Function: "dsl", Arity: 1}, Callee: FunctionID{Module: "SharedLib.Worker", Function: "perform", Arity: UnknownArity}, Kind: "injected"}: true,
+	}
+	if len(edges) != len(wantImported) {
+		t.Fatalf("imported edges = %+v, want %+v", edges, wantImported)
+	}
+	for _, edge := range edges {
+		if !wantImported[edge] {
+			t.Errorf("unexpected imported edge: %+v", edge)
+		}
+	}
+}
+
+func TestParseCallEdgesBareLocalCallUsesUnknownArity(t *testing.T) {
+	src := `defmodule MyApp.Worker do
+  def run(value) do
+    helper value
+  end
+
+  defp helper(value), do: value
+end
+`
+	_, edges, err := ParseTextForImpact("lib/my_app/worker.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := CallEdge{
+		Caller: FunctionID{Module: "MyApp.Worker", Function: "run", Arity: 1},
+		Callee: FunctionID{Module: "MyApp.Worker", Function: "helper", Arity: UnknownArity},
+		Kind:   "call",
+	}
+	if len(edges) != 1 || edges[0] != want {
+		t.Fatalf("edges = %+v, want [%+v]", edges, want)
 	}
 }
 
@@ -3116,6 +3149,40 @@ end
 	}
 }
 
+func TestParseTextForImpactMatchesDefinitionsAndCalls(t *testing.T) {
+	source := `defmodule MyApp.Worker do
+  alias SharedLib.Service, as: Service
+
+  defdelegate delegated(value), to: Service, as: :fetch
+  def run(value \\ Service.default()) do
+    local(value)
+    Service.fetch(value)
+    "result: #{Service.render(value)}"
+    &Service.capture/1
+  end
+
+  defp local(value), do: value
+end
+`
+	wantDefs, refs, wantCalls, err := ParseTextWithCalls("lib/my_app/worker.ex", source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) == 0 {
+		t.Fatal("normal call parser returned no references")
+	}
+	gotDefs, gotCalls, err := ParseTextForImpact("lib/my_app/worker.ex", source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(gotDefs, wantDefs) {
+		t.Fatalf("impact definitions differ:\n got: %+v\nwant: %+v", gotDefs, wantDefs)
+	}
+	if !reflect.DeepEqual(gotCalls, wantCalls) {
+		t.Fatalf("impact calls differ:\n got: %+v\nwant: %+v", gotCalls, wantCalls)
+	}
+}
+
 // TestCollectElixirFilesParallelMatchesWalk asserts that the parallel collector
 // finds exactly the same files as the sequential walk, including the directory
 // exclusions, so swapping it into the indexer cannot change what gets indexed.
@@ -3184,6 +3251,40 @@ func TestCollectElixirFilesParallelEmptyAndMissing(t *testing.T) {
 	}
 	if got := CollectElixirFilesParallel(t.TempDir()); len(got) != 0 {
 		t.Errorf("empty root should yield no files, got %v", got)
+	}
+}
+
+func TestCollectImpactElixirFilesParallelSkipsDependencyDirectories(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{
+		"lib/kept.ex",
+		"mydeps/kept.ex",
+		"lib/deps.ex",
+		"deps/vendor/skipped.ex",
+		"apps/example/deps/vendor/skipped.ex",
+		"lib/deps/nested/skipped.exs",
+	} {
+		path := filepath.Join(root, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("defmodule X do\nend\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got := CollectImpactElixirFilesParallel(root)
+	for i := range got {
+		relative, err := filepath.Rel(root, got[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+		got[i] = filepath.ToSlash(relative)
+	}
+	sort.Strings(got)
+	want := []string{"lib/deps.ex", "lib/kept.ex", "mydeps/kept.ex"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("impact files = %v, want %v", got, want)
 	}
 }
 

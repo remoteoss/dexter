@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 )
 
 // ETF tags, from the Erlang external term format specification. Only the tags
@@ -40,9 +41,9 @@ func isAtomTag(tag byte) bool {
 	return tag == tagAtom || tag == tagAtomUTF8 || tag == tagSmallAtom || tag == tagSmallAtomUTF8
 }
 
-// maxETFDepth bounds recursion in skip. A Docs chunk nests at most five levels
-// deep, so a corrupt length that implied more is rejected rather than followed.
-const maxETFDepth = 64
+// maxETFDepth bounds recursive ETF terms. Docs are shallow, but expanded Elixir
+// Dbgi ASTs from generated routers can legitimately exceed 64 levels.
+const maxETFDepth = 512
 
 var (
 	errUnsupportedTag = errors.New("unsupported ETF tag")
@@ -67,6 +68,22 @@ type etfReader struct {
 	pos   int
 	depth int
 }
+
+type etfAtom string
+type etfTuple []interface{}
+type etfOpaque byte
+
+type etfListValue struct {
+	Values []interface{}
+	Tail   interface{}
+}
+
+type etfMapPair struct {
+	Key   interface{}
+	Value interface{}
+}
+
+type etfMapValue []etfMapPair
 
 func (r *etfReader) remaining() int { return len(r.buf) - r.pos }
 
@@ -294,6 +311,166 @@ func (r *etfReader) binarySpan() (start, length int, err error) {
 	start = r.pos
 	r.pos += int(n)
 	return start, int(n), nil
+}
+
+// decode materializes one bounded ETF term. Hot Docs queries use the selective
+// reader above; Dbgi evidence uses this decoder because expanded Elixir ASTs
+// require recursive semantic inspection.
+func (r *etfReader) decode() (interface{}, error) {
+	if r.depth >= maxETFDepth {
+		return nil, errTooDeep
+	}
+	tag, err := r.u8()
+	if err != nil {
+		return nil, err
+	}
+	switch tag {
+	case tagNil:
+		return etfListValue{}, nil
+	case tagSmallInteger:
+		value, err := r.u8()
+		return int(value), err
+	case tagInteger:
+		if err := r.need(4); err != nil {
+			return nil, err
+		}
+		value := int(int32(binary.BigEndian.Uint32(r.buf[r.pos:])))
+		r.pos += 4
+		return value, nil
+	case tagNewFloat:
+		if err := r.need(8); err != nil {
+			return nil, err
+		}
+		value := math.Float64frombits(binary.BigEndian.Uint64(r.buf[r.pos:]))
+		r.pos += 8
+		return value, nil
+	case tagAtom, tagAtomUTF8:
+		length, err := r.u16()
+		if err != nil {
+			return nil, err
+		}
+		return r.decodeAtomBytes(length)
+	case tagSmallAtom, tagSmallAtomUTF8:
+		length, err := r.u8()
+		if err != nil {
+			return nil, err
+		}
+		return r.decodeAtomBytes(int(length))
+	case tagString:
+		length, err := r.u16()
+		if err != nil {
+			return nil, err
+		}
+		if err := r.need(length); err != nil {
+			return nil, err
+		}
+		value := string(r.buf[r.pos : r.pos+length])
+		r.pos += length
+		return value, nil
+	case tagBinary:
+		length, err := r.u32()
+		if err != nil || length > int64(r.remaining()) {
+			return nil, errTruncated
+		}
+		value := string(r.buf[r.pos : r.pos+int(length)])
+		r.pos += int(length)
+		return value, nil
+	case tagBitBinary:
+		length, err := r.u32()
+		if err != nil {
+			return nil, err
+		}
+		bits, err := r.u8()
+		if err != nil || length > int64(r.remaining()) {
+			return nil, errTruncated
+		}
+		value := struct {
+			Data string
+			Bits byte
+		}{string(r.buf[r.pos : r.pos+int(length)]), bits}
+		r.pos += int(length)
+		return value, nil
+	case tagSmallTuple, tagLargeTuple:
+		r.pos--
+		count, err := r.enterTuple()
+		if err != nil {
+			return nil, err
+		}
+		values := make(etfTuple, count)
+		if err := r.decodeValues(values); err != nil {
+			return nil, err
+		}
+		return values, nil
+	case tagList:
+		count, err := r.u32()
+		if err != nil || r.checkCount(count, 1) != nil {
+			return nil, errBadCount
+		}
+		values := make([]interface{}, int(count))
+		if err := r.decodeValues(values); err != nil {
+			return nil, err
+		}
+		tail, err := r.decodeChild()
+		if err != nil {
+			return nil, err
+		}
+		return etfListValue{Values: values, Tail: tail}, nil
+	case tagMap:
+		count, err := r.u32()
+		if err != nil || r.checkCount(count, 2) != nil {
+			return nil, errBadCount
+		}
+		pairs := make(etfMapValue, int(count))
+		for i := range pairs {
+			pairs[i].Key, err = r.decodeChild()
+			if err == nil {
+				pairs[i].Value, err = r.decodeChild()
+			}
+			if err != nil {
+				return nil, err
+			}
+		}
+		return pairs, nil
+	case tagSmallBig, tagLargeBig:
+		r.pos--
+		start := r.pos
+		if err := r.skip(); err != nil {
+			return nil, err
+		}
+		return append([]byte(nil), r.buf[start:r.pos]...), nil
+	default:
+		r.pos--
+		if err := r.skip(); err != nil {
+			return nil, err
+		}
+		return etfOpaque(tag), nil
+	}
+}
+
+func (r *etfReader) decodeAtomBytes(length int) (interface{}, error) {
+	if err := r.need(length); err != nil {
+		return nil, err
+	}
+	value := etfAtom(r.buf[r.pos : r.pos+length])
+	r.pos += length
+	return value, nil
+}
+
+func (r *etfReader) decodeValues(values []interface{}) error {
+	for i := range values {
+		value, err := r.decodeChild()
+		if err != nil {
+			return err
+		}
+		values[i] = value
+	}
+	return nil
+}
+
+func (r *etfReader) decodeChild() (interface{}, error) {
+	r.depth++
+	defer func() { r.depth-- }()
+	return r.decode()
 }
 
 // skip advances past one term of any shape without allocating for it.

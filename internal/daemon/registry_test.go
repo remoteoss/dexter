@@ -61,7 +61,7 @@ func TestRegisteredMethodIsDispatched(t *testing.T) {
 func TestRegisterMethodRejectsBuiltins(t *testing.T) {
 	for _, name := range []string{
 		MethodStatus, MethodShutdown, MethodWorkspaceStatus, MethodLookup,
-		MethodReferences, MethodReindex, MethodWatch, MethodUnwatch,
+		MethodReferences, MethodReindex, MethodImpactSnapshot, MethodWatch, MethodUnwatch,
 	} {
 		assertPanics(t, "RegisterMethod("+name+")", func() {
 			RegisterMethod(name, func(MethodContext, json.RawMessage) (any, error) { return nil, nil })

@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -10,19 +11,33 @@ import (
 // It walks a []Token stream from the tokenizer and produces identical Definition
 // and Reference output.
 func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]Definition, []Reference, error) {
-	defs, refs, _, err := parseTextFromTokensInternal(path, source, tokens, interp, false)
+	defs, refs, _, err := parseTextFromTokensInternal(path, source, tokens, interp, parseMode{references: true})
 	return defs, refs, err
 }
 
 func parseTextFromTokensWithCalls(path string, source []byte, tokens, interp []Token) ([]Definition, []Reference, []CallEdge, error) {
-	return parseTextFromTokensInternal(path, source, tokens, interp, true)
+	return parseTextFromTokensInternal(path, source, tokens, interp, parseMode{references: true, calls: true})
 }
 
-func parseTextFromTokensInternal(path string, source []byte, tokens, interp []Token, collectCalls bool) ([]Definition, []Reference, []CallEdge, error) {
+type parseMode struct {
+	references        bool
+	calls             bool
+	conservativeCalls bool
+}
+
+func parseTextFromTokensInternal(path string, source []byte, tokens, interp []Token, mode parseMode) ([]Definition, []Reference, []CallEdge, error) {
 	var defs []Definition
 	var refs []Reference
+	type blockFingerprint struct {
+		definitionStart int
+		definitionEnd   int
+		startByte       int
+		depth           int
+	}
+	var blockFingerprints []blockFingerprint
 	var callSet, localCallSet map[CallEdge]struct{}
-	if collectCalls {
+	isTestFile := strings.HasSuffix(filepath.ToSlash(path), "_test.exs")
+	if mode.calls {
 		callSet = make(map[CallEdge]struct{})
 		localCallSet = make(map[CallEdge]struct{})
 	}
@@ -83,12 +98,20 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 			return inlineFunction.id, true
 		}
 		if len(functionStack) == 0 {
+			if isTestFile && currentModule() != "" {
+				return FunctionID{Module: currentModule(), Function: "__dexter_test_root__", Arity: 0}, true
+			}
 			return FunctionID{}, false
 		}
 		return functionStack[len(functionStack)-1].id, true
 	}
 
-	popScopes := func(prevDepth int) {
+	popScopes := func(prevDepth, endByte int) {
+		for len(blockFingerprints) > 0 && blockFingerprints[len(blockFingerprints)-1].depth == prevDepth {
+			frame := blockFingerprints[len(blockFingerprints)-1]
+			blockFingerprints = blockFingerprints[:len(blockFingerprints)-1]
+			setDefinitionFingerprint(defs, frame.definitionStart, frame.definitionEnd, source, frame.startByte, endByte)
+		}
 		if len(functionStack) > 0 && functionStack[len(functionStack)-1].depth == prevDepth {
 			functionStack = functionStack[:len(functionStack)-1]
 		}
@@ -110,7 +133,7 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 	}
 
 	emitEdge := func(caller FunctionID, callee FunctionID, kind string, local bool) {
-		if !collectCalls {
+		if !mode.calls {
 			return
 		}
 		edge := CallEdge{Caller: caller, Callee: callee, Kind: kind}
@@ -155,7 +178,7 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 	}
 
 	emitLocalCall := func(pos int, caller FunctionID) {
-		if !collectCalls {
+		if !mode.calls {
 			return
 		}
 		if pos+1 >= n || tokens[pos].Kind != TokIdent || tokens[pos+1].Kind != TokOpenParen || elixirKeyword[tokenText(tokens[pos])] {
@@ -172,6 +195,26 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 			arity++
 		}
 		emitEdge(caller, FunctionID{Module: caller.Module, Function: tokenText(tokens[pos]), Arity: arity}, "call", true)
+	}
+
+	emitBareLocalCall := func(pos int, caller FunctionID) {
+		if !mode.conservativeCalls || tokens[pos].Kind != TokIdent || elixirKeyword[tokenText(tokens[pos])] {
+			return
+		}
+		prev := prevSig(pos)
+		statementStart := prev < 0 || tokens[prev].Kind == TokEOL || tokens[prev].Kind == TokComment ||
+			tokens[prev].Kind == TokDo || tokens[prev].Kind == TokColon
+		if inlineFunction != nil && tokens[pos].Start == inlineFunction.start {
+			statementStart = true
+		}
+		if !statementStart || pos+1 >= n || tokens[pos+1].Kind == TokOpenParen {
+			return
+		}
+		switch tokens[pos+1].Kind {
+		case TokIdent, TokModule, TokString, TokHeredoc, TokSigil, TokCharLiteral,
+			TokAtom, TokNumber, TokOpenBracket, TokOpenBrace, TokPercent:
+			emitEdge(caller, FunctionID{Module: caller.Module, Function: tokenText(tokens[pos]), Arity: UnknownArity}, "call", true)
+		}
 	}
 
 	// processModuleDef handles defmodule/defprotocol/defimpl.
@@ -198,6 +241,17 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 			FilePath: path,
 			Kind:     kind,
 		})
+		if isTestFile {
+			defs = append(defs, Definition{
+				Module:      name,
+				Function:    "__dexter_test_root__",
+				Arity:       0,
+				Fingerprint: sourceTestRootFingerprint(name),
+				Line:        kwLine,
+				FilePath:    path,
+				Kind:        "test_root",
+			})
+		}
 
 		// Scan forward to find and consume TokDo (skipping "for: Module" etc.).
 		// Do not stop at TokEOL — Elixir allows `defmodule Name` then `do` on the
@@ -232,6 +286,9 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 	}
 
 	emitModuleRef := func(modName string, line int, kind string) {
+		if !mode.references {
+			return
+		}
 		resolved := resolveModule(modName, currentModule())
 		if !strings.Contains(resolved, "__MODULE__") {
 			refs = append(refs, Reference{Module: resolved, Line: line, FilePath: path, Kind: kind})
@@ -306,7 +363,7 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 	// extractModuleRefs emits call/struct refs for module references in a token range.
 	// Only processes TokModule tokens that start with ASCII uppercase (matching old regex behavior).
 	extractModuleRefs := func(lineStart, lineEnd int) {
-		refs = collectModuleRefs(source, path, tokens, lineStart, lineEnd, aliases, currentModule(), callKind, nil, refs)
+		refs = collectModuleRefs(source, path, tokens, lineStart, lineEnd, aliases, currentModule(), callKind, nil, refs, mode.references)
 	}
 
 	// flushInterpRefs emits the refs written inside a #{} interpolation. The
@@ -322,7 +379,7 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 		}
 		if interpPos > start {
 			var onCall func(QualifiedCall)
-			if collectCalls && hasCaller {
+			if mode.calls && hasCaller {
 				onCall = func(call QualifiedCall) {
 					module := ResolveModuleRef(call.Module, aliases, currentModule())
 					if module != "" {
@@ -330,7 +387,7 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 					}
 				}
 			}
-			refs = collectModuleRefs(source, path, interp, start, interpPos, aliases, currentModule(), callRefKind, onCall, refs)
+			refs = collectModuleRefs(source, path, interp, start, interpPos, aliases, currentModule(), callRefKind, onCall, refs, mode.references)
 		}
 	}
 
@@ -344,14 +401,13 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 			case TokEnd:
 				prevDepth := depth
 				TrackBlockDepth(tokens[j].Kind, &depth)
-				popScopes(prevDepth)
+				popScopes(prevDepth, tokens[j].End)
 			}
 		}
 	}
 
 	// Main token walker
 	functionHeadEnd := -1
-	suppressBareRefsLine := -1
 	i := 0
 	for i < n {
 		tok := tokens[i]
@@ -368,7 +424,7 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 			}
 			flushInterpRefs(tok.Start, caller, hasCaller)
 		}
-		if collectCalls {
+		if mode.calls {
 			caller, ok := currentFunction(i)
 			if ok {
 				switch tok.Kind {
@@ -381,6 +437,7 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 						break
 					}
 					emitLocalCall(i, caller)
+					emitBareLocalCall(i, caller)
 				}
 			}
 		}
@@ -402,7 +459,7 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 		case TokEnd:
 			prevDepth := depth
 			TrackBlockDepth(tok.Kind, &depth)
-			popScopes(prevDepth)
+			popScopes(prevDepth, tok.End)
 			i++
 			continue
 
@@ -434,7 +491,6 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 			}
 			kind := tokenText(tok)
 			defLine := tok.Line
-			suppressBareRefsLine = defLine
 			declarationIdx := i
 			funcName, j, ok := StaticDeclarationName(source, tokens, n, declarationIdx)
 			if !ok {
@@ -463,6 +519,7 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 				}
 
 				minArity := maxArity - defaultCount
+				definitionStart := len(defs)
 				for arity := minArity; arity <= maxArity; arity++ {
 					params := JoinParams(paramNames, arity)
 					defs = append(defs, Definition{
@@ -476,6 +533,14 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 						DelegateAs: delegateAs,
 						Params:     params,
 					})
+					if isTestFile {
+						emitEdge(
+							FunctionID{Module: cm, Function: "__dexter_test_root__", Arity: 0},
+							FunctionID{Module: cm, Function: funcName, Arity: arity},
+							"test_owner",
+							false,
+						)
+					}
 				}
 
 				caller := FunctionID{Module: cm, Function: funcName, Arity: maxArity}
@@ -496,20 +561,35 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 				}
 				doIdx, _, hasDo := ScanForwardToBlockDo(tokens, n, pj)
 				if hasDo {
+					blockFingerprints = append(blockFingerprints, blockFingerprint{
+						definitionStart: definitionStart,
+						definitionEnd:   len(defs),
+						startByte:       tok.Start,
+						depth:           depth + 1,
+					})
 					functionHeadEnd = doIdx + 1
-					if collectCalls {
+					if mode.calls {
 						functionStack = append(functionStack, functionFrame{id: caller, depth: depth + 1})
 					}
 				} else {
 					start, end, ok := ScanKeywordDoBody(source, tokens, n, pj)
 					if ok {
+						endByte := tokens[end-1].End
+						setDefinitionFingerprint(defs, definitionStart, len(defs), source, tok.Start, endByte)
 						functionHeadEnd = start
-						if collectCalls {
+						if mode.calls {
 							inlineFunction = &struct {
 								id         FunctionID
 								start, end int
 							}{id: caller, start: start, end: end}
 						}
+					} else {
+						end = scanFingerprintStatementEnd(source, tokens, declarationIdx)
+						endByte := tok.End
+						if end > declarationIdx+1 {
+							endByte = tokens[end-1].End
+						}
+						setDefinitionFingerprint(defs, definitionStart, len(defs), source, tok.Start, endByte)
 					}
 				}
 				i = nameIdx + 1
@@ -526,6 +606,12 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 					FilePath: path,
 					Kind:     "defstruct",
 				})
+				end := scanFingerprintStatementEnd(source, tokens, i)
+				endByte := tok.End
+				if end > i+1 {
+					endByte = tokens[end-1].End
+				}
+				setDefinitionFingerprint(defs, len(defs)-1, len(defs), source, tok.Start, endByte)
 			}
 			i++
 			goto extractRefsForLine
@@ -540,6 +626,12 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 					FilePath: path,
 					Kind:     "defexception",
 				})
+				end := scanFingerprintStatementEnd(source, tokens, i)
+				endByte := tok.End
+				if end > i+1 {
+					endByte = tokens[end-1].End
+				}
+				setDefinitionFingerprint(defs, len(defs)-1, len(defs), source, tok.Start, endByte)
 			}
 			i++
 			goto extractRefsForLine
@@ -576,7 +668,9 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 				resolved := resolveModule(modName, cm)
 				if !strings.Contains(resolved, "__MODULE__") {
 					aliases[asName] = resolved
-					refs = append(refs, Reference{Module: resolved, Line: aliasLine, FilePath: path, Kind: "alias"})
+					if mode.references {
+						refs = append(refs, Reference{Module: resolved, Line: aliasLine, FilePath: path, Kind: "alias"})
+					}
 				}
 				i = nextPos
 				continue
@@ -599,7 +693,9 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 			if modName != "" {
 				resolved := ResolveModuleRef(modName, aliases, currentModule())
 				if resolved != "" {
-					refs = append(refs, Reference{Module: resolved, Line: importLine, FilePath: path, Kind: "import"})
+					if mode.references {
+						refs = append(refs, Reference{Module: resolved, Line: importLine, FilePath: path, Kind: "import"})
+					}
 					injectors[resolved] = true
 				}
 			}
@@ -614,7 +710,9 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 			if modName != "" {
 				resolved := ResolveModuleRef(modName, aliases, currentModule())
 				if resolved != "" {
-					refs = append(refs, Reference{Module: resolved, Line: useLine, FilePath: path, Kind: "use"})
+					if mode.references {
+						refs = append(refs, Reference{Module: resolved, Line: useLine, FilePath: path, Kind: "use"})
+					}
 					injectors[resolved] = true
 				}
 			}
@@ -637,7 +735,9 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 				resolved := ResolveModuleRef(modName, aliases, cm)
 				if resolved != "" {
 					aliases[asName] = resolved
-					refs = append(refs, Reference{Module: resolved, Line: requireLine, FilePath: path, Kind: "require"})
+					if mode.references {
+						refs = append(refs, Reference{Module: resolved, Line: requireLine, FilePath: path, Kind: "require"})
+					}
 				}
 				i = nextPos
 				continue
@@ -646,7 +746,9 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 			// Simple require (no as:) — still emit reference but no alias
 			resolved := ResolveModuleRef(modName, aliases, cm)
 			if resolved != "" {
-				refs = append(refs, Reference{Module: resolved, Line: requireLine, FilePath: path, Kind: "require"})
+				if mode.references {
+					refs = append(refs, Reference{Module: resolved, Line: requireLine, FilePath: path, Kind: "require"})
+				}
 			}
 			i = k
 			continue
@@ -699,7 +801,9 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 				if modName != "" {
 					resolved := resolveModule(modName, cm)
 					if !strings.Contains(resolved, "__MODULE__") {
-						refs = append(refs, Reference{Module: resolved, Line: attrLine, FilePath: path, Kind: "behaviour"})
+						if mode.references {
+							refs = append(refs, Reference{Module: resolved, Line: attrLine, FilePath: path, Kind: "behaviour"})
+						}
 					}
 				}
 				i = k
@@ -760,7 +864,9 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 					cm := currentModule()
 					resolved := ResolveModuleRef(modName, aliases, cm)
 					if resolved != "" {
-						refs = append(refs, Reference{Module: resolved, Line: tok.Line, FilePath: path, Kind: callKind(i)})
+						if mode.references {
+							refs = append(refs, Reference{Module: resolved, Line: tok.Line, FilePath: path, Kind: callKind(i)})
+						}
 					}
 					i = k + 1
 					continue
@@ -790,10 +896,12 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 				if !elixirKeyword[call.Function] {
 					resolved := ResolveModuleRef(call.Module, aliases, cm)
 					if resolved != "" {
-						refs = append(refs, Reference{Module: resolved, Function: call.Function, Line: tok.Line, FilePath: path, Kind: callKind(i)})
+						if mode.references {
+							refs = append(refs, Reference{Module: resolved, Function: call.Function, Line: tok.Line, FilePath: path, Kind: callKind(i)})
+						}
 						prev := prevSig(i)
 						capture := prev >= 0 && tokens[prev].Kind == TokOther && tokenText(tokens[prev]) == "&"
-						if collectCalls && !inFunctionHead && callKind(i) == "call" && !capture {
+						if mode.calls && !inFunctionHead && callKind(i) == "call" && !capture {
 							if caller, ok := currentFunction(i); ok {
 								arity := call.Arity
 								if arity != UnknownArity {
@@ -814,7 +922,9 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 			if modName != cm {
 				resolved := ResolveModuleRef(modName, aliases, cm)
 				if resolved != "" {
-					refs = append(refs, Reference{Module: resolved, Line: tok.Line, FilePath: path, Kind: callKind(i)})
+					if mode.references {
+						refs = append(refs, Reference{Module: resolved, Line: tok.Line, FilePath: path, Kind: callKind(i)})
+					}
 				}
 			}
 			i = k
@@ -828,7 +938,9 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 					name := tokenText(tokens[j])
 					if !elixirKeyword[name] {
 						for mod := range injectors {
-							refs = append(refs, Reference{Module: mod, Function: name, Line: tokens[j].Line, FilePath: path, Kind: callKind(j)})
+							if mode.references {
+								refs = append(refs, Reference{Module: mod, Function: name, Line: tokens[j].Line, FilePath: path, Kind: callKind(j)})
+							}
 						}
 					}
 				}
@@ -838,7 +950,7 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 
 		case TokIdent:
 			cm := currentModule()
-			if !inFunctionHead && tok.Line != suppressBareRefsLine && cm != "" && len(injectors) > 0 {
+			if !inFunctionHead && cm != "" && len(injectors) > 0 {
 				isStatementStart := i == 0 || tokens[i-1].Kind == TokEOL || tokens[i-1].Kind == TokComment
 				// A parenthesized bare call can be nested inside another call,
 				// collection, or keyword value. It is still a candidate for a
@@ -882,8 +994,23 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 							}
 						}
 						if emit {
+							if mode.conservativeCalls {
+								if caller, ok := currentFunction(i); ok {
+									arity := UnknownArity
+									if isParenthesizedCall {
+										if exact, ok := ParenthesizedCallArity(tokens, n, i+1); ok {
+											arity = exact
+										}
+									}
+									for mod := range injectors {
+										emitEdge(caller, FunctionID{Module: mod, Function: name, Arity: arity}, "injected", false)
+									}
+								}
+							}
 							for mod := range injectors {
-								refs = append(refs, Reference{Module: mod, Function: name, Line: tok.Line, FilePath: path, Kind: callKind(i)})
+								if mode.references {
+									refs = append(refs, Reference{Module: mod, Function: name, Line: tok.Line, FilePath: path, Kind: callKind(i)})
+								}
 							}
 						}
 					}
@@ -922,7 +1049,9 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 							name := tokenText(tokens[pj])
 							if !elixirKeyword[name] {
 								for mod := range injectors {
-									refs = append(refs, Reference{Module: mod, Function: name, Line: tokens[pj].Line, FilePath: path, Kind: callKind(pj)})
+									if mode.references {
+										refs = append(refs, Reference{Module: mod, Function: name, Line: tokens[pj].Line, FilePath: path, Kind: callKind(pj)})
+									}
 								}
 							}
 						}
@@ -940,20 +1069,40 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 	if interpPos < len(interp) {
 		flushInterpRefs(len(source)+1, FunctionID{}, false)
 	}
+	for _, frame := range blockFingerprints {
+		setDefinitionFingerprint(defs, frame.definitionStart, frame.definitionEnd, source, frame.startByte, len(source))
+	}
 
-	if !collectCalls {
+	if !mode.calls {
 		return defs, dedupeRefs(refs), nil, nil
 	}
 
 	known := make(map[FunctionID]struct{}, len(defs))
+	knownNames := make(map[string]struct{}, len(defs))
 	for _, def := range defs {
 		if def.Function != "" {
 			known[FunctionID{Module: def.Module, Function: def.Function, Arity: def.Arity}] = struct{}{}
+			knownNames[def.Module+"\x00"+def.Function] = struct{}{}
 		}
 	}
 	for edge := range localCallSet {
 		if _, ok := known[edge.Callee]; ok {
 			callSet[edge] = struct{}{}
+		} else if edge.Callee.Arity == UnknownArity {
+			if _, ok := knownNames[edge.Callee.Module+"\x00"+edge.Callee.Function]; ok {
+				callSet[edge] = struct{}{}
+			}
+		}
+	}
+	for edge := range callSet {
+		if edge.Kind != "injected" || edge.Caller.Module == edge.Callee.Module {
+			continue
+		}
+		local := FunctionID{Module: edge.Caller.Module, Function: edge.Callee.Function, Arity: edge.Callee.Arity}
+		_, exact := known[local]
+		_, anyArity := knownNames[local.Module+"\x00"+local.Function]
+		if exact || (edge.Callee.Arity == UnknownArity && anyArity) {
+			delete(callSet, edge)
 		}
 	}
 	edges := make([]CallEdge, 0, len(callSet))
@@ -982,7 +1131,10 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 		}
 		return a.Kind < b.Kind
 	})
-	return defs, dedupeRefs(refs), edges, nil
+	if mode.references {
+		refs = dedupeRefs(refs)
+	}
+	return defs, refs, edges, nil
 }
 
 // callRefKind is the kind every interpolated reference carries: a typespec
@@ -995,7 +1147,7 @@ func callRefKind(int) string { return "call" }
 // the interpolation tokens the tokenizer keeps beside them — so the two cannot
 // drift apart. kindAt gives the reference kind for a token index, which is how
 // a typespec reference is told apart from a call.
-func collectModuleRefs(source []byte, path string, toks []Token, from, to int, aliases map[string]string, cm string, kindAt func(int) string, onCall func(QualifiedCall), refs []Reference) []Reference {
+func collectModuleRefs(source []byte, path string, toks []Token, from, to int, aliases map[string]string, cm string, kindAt func(int) string, onCall func(QualifiedCall), refs []Reference, collectReferences bool) []Reference {
 	tn := len(toks)
 	for j := from; j < to; j++ {
 		tok := toks[j]
@@ -1005,7 +1157,9 @@ func collectModuleRefs(source []byte, path string, toks []Token, from, to int, a
 			modName, k := CollectModuleName(source, toks, tn, j+1)
 			if k < to && toks[k].Kind == TokOpenBrace {
 				if resolved := ResolveModuleRef(modName, aliases, cm); resolved != "" {
-					refs = append(refs, Reference{Module: resolved, Line: tok.Line, FilePath: path, Kind: kindAt(j)})
+					if collectReferences {
+						refs = append(refs, Reference{Module: resolved, Line: tok.Line, FilePath: path, Kind: kindAt(j)})
+					}
 				}
 				j = k
 				continue
@@ -1028,7 +1182,9 @@ func collectModuleRefs(source []byte, path string, toks []Token, from, to int, a
 		if call, ok := QualifiedCallAt(source, toks, tn, j); ok && call.NameEnd <= to {
 			if !elixirKeyword[call.Function] {
 				if resolved := ResolveModuleRef(call.Module, aliases, cm); resolved != "" {
-					refs = append(refs, Reference{Module: resolved, Function: call.Function, Line: tok.Line, FilePath: path, Kind: kindAt(j)})
+					if collectReferences {
+						refs = append(refs, Reference{Module: resolved, Function: call.Function, Line: tok.Line, FilePath: path, Kind: kindAt(j)})
+					}
 				}
 			}
 			if onCall != nil && kindAt(j) == "call" {
@@ -1041,7 +1197,9 @@ func collectModuleRefs(source []byte, path string, toks []Token, from, to int, a
 		// Standalone module ref (skip self-references)
 		if modName != cm {
 			if resolved := ResolveModuleRef(modName, aliases, cm); resolved != "" {
-				refs = append(refs, Reference{Module: resolved, Line: tok.Line, FilePath: path, Kind: kindAt(j)})
+				if collectReferences {
+					refs = append(refs, Reference{Module: resolved, Line: tok.Line, FilePath: path, Kind: kindAt(j)})
+				}
 			}
 		}
 		j = k - 1

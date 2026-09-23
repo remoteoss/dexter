@@ -1,8 +1,11 @@
 package store
 
 import (
+	"context"
+	"crypto/sha256"
 	"database/sql"
 	"fmt"
+	"hash"
 	"os"
 	"path/filepath"
 	"sort"
@@ -11,6 +14,8 @@ import (
 	"sync"
 
 	sqlite3 "github.com/mattn/go-sqlite3"
+	"github.com/remoteoss/dexter/internal/beam"
+	"github.com/remoteoss/dexter/internal/evidence"
 	"github.com/remoteoss/dexter/internal/parser"
 )
 
@@ -35,15 +40,53 @@ func registerDriver() {
 	registerDriverOnce.Do(func() {
 		sql.Register(driverName, &sqlite3.SQLiteDriver{
 			ConnectHook: func(conn *sqlite3.SQLiteConn) error {
-				_, err := conn.Exec(fmt.Sprintf("PRAGMA journal_size_limit = %d", walSizeLimitBytes), nil)
-				return err
+				if _, err := conn.Exec(fmt.Sprintf("PRAGMA journal_size_limit = %d", walSizeLimitBytes), nil); err != nil {
+					return err
+				}
+				return conn.RegisterAggregator("dexter_function_fingerprint", func() *fingerprintAggregator {
+					return &fingerprintAggregator{}
+				}, true)
 			},
 		})
 	})
 }
 
+type fingerprintAggregator struct {
+	first [sha256.Size]byte
+	hash  hash.Hash
+	count int
+}
+
+func (a *fingerprintAggregator) Step(fingerprint []byte) {
+	if len(fingerprint) != sha256.Size {
+		return
+	}
+	a.count++
+	if a.count == 1 {
+		copy(a.first[:], fingerprint)
+		return
+	}
+	if a.count == 2 {
+		a.hash = sha256.New()
+		_, _ = a.hash.Write([]byte("dexter:function-clauses:v1\x00"))
+		_, _ = a.hash.Write(a.first[:])
+	}
+	_, _ = a.hash.Write(fingerprint)
+}
+
+func (a *fingerprintAggregator) Done() []byte {
+	result := make([]byte, sha256.Size)
+	if a.hash == nil {
+		copy(result, a.first[:])
+		return result
+	}
+	a.hash.Sum(result[:0])
+	return result
+}
+
 type Store struct {
-	db *sql.DB
+	db             *sql.DB
+	impactSnapshot bool
 }
 
 // DBPath returns the canonical database path for a project root:
@@ -112,7 +155,19 @@ func Open(projectRoot string) (*Store, error) {
 		_ = os.WriteFile(gitignorePath, []byte("*\n"), 0o644)
 	}
 
-	dbPath := DBPath(projectRoot)
+	return openWritableDatabase(DBPath(projectRoot))
+}
+
+// OpenTemporary opens a writable index at an explicit path. It is for isolated
+// derived indexes and does not create or modify the project's .dexter directory.
+func OpenTemporary(path string) (*Store, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+	return openWritableDatabase(path)
+}
+
+func openWritableDatabase(dbPath string) (*Store, error) {
 	registerDriver()
 	db, err := sql.Open(driverName, dbPath+"?_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=5000&_foreign_keys=ON")
 	if err != nil {
@@ -126,6 +181,206 @@ func Open(projectRoot string) (*Store, error) {
 	}
 
 	return &Store{db: db}, nil
+}
+
+// OpenImpactSnapshot opens a compact, immutable impact snapshot without running
+// normal index migrations or creating workspace files.
+func OpenImpactSnapshot(path string) (*Store, error) {
+	registerDriver()
+	db, err := sql.Open(driverName, path+"?mode=ro&_busy_timeout=5000")
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(2)
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return &Store{db: db, impactSnapshot: true}, nil
+}
+
+const (
+	ImpactSnapshotVersion = 12
+	ImpactSourceVersion   = 1
+)
+
+const impactCallableKinds = "'def','defp','defmacro','defmacrop','defguard','defguardp','defdelegate','defstruct','defexception','test_root'"
+
+// ExportImpactSnapshot writes the graph and fingerprints needed by impact
+// analysis. Navigation references and non-project rows are removed, and file
+// paths become project-relative so the artifact is portable across runners.
+func (s *Store) ExportImpactSnapshot(path, projectRoot, commit, indexPath string) error {
+	return s.exportImpactSnapshot(path, projectRoot, commit, indexPath)
+}
+
+// ExportImpactSnapshotWithEvidence includes validated generated provider data.
+func (s *Store) ExportImpactSnapshotWithEvidence(path, projectRoot, commit, indexPath string, providers []evidence.LoadedArtifact) error {
+	return s.exportImpactSnapshotWithEvidence(context.Background(), path, projectRoot, commit, indexPath, providers, nil)
+}
+
+func (s *Store) ExportImpactSnapshotWithEvidenceContext(ctx context.Context, path, projectRoot, commit, indexPath string, providers []evidence.LoadedArtifact) error {
+	return s.exportImpactSnapshotWithEvidence(ctx, path, projectRoot, commit, indexPath, providers, nil)
+}
+
+// CompiledEvidenceSink receives native compiled evidence while an impact
+// snapshot is private and its write transaction is open.
+type CompiledEvidenceSink interface {
+	AddCompiledEvidence(path string, compiled beam.CompiledEvidence) error
+	AddCompiledEdges(edges []parser.CallEdge) error
+	AddCompiledOpaque(module, detail string) error
+	SetCompiledEvidenceComplete(digest string)
+}
+
+// ExportImpactSnapshotWithAugmentContext streams augmentation into the same
+// transaction that exports source evidence from the canonical workspace index.
+func (s *Store) ExportImpactSnapshotWithAugmentContext(ctx context.Context, path, projectRoot, commit, indexPath string,
+	providers []evidence.LoadedArtifact, augment func(CompiledEvidenceSink) error,
+) error {
+	return s.exportImpactSnapshotWithEvidence(ctx, path, projectRoot, commit, indexPath, providers, augment)
+}
+
+// ImpactSnapshotCommit validates the snapshot format and returns its exact
+// source revision.
+func (s *Store) ImpactSnapshotCommit() (string, error) {
+	var versionNumber int
+	if err := s.db.QueryRow("SELECT value FROM metadata WHERE key = 'impact_snapshot_version'").Scan(&versionNumber); err != nil {
+		return "", err
+	}
+	if versionNumber != ImpactSnapshotVersion {
+		return "", fmt.Errorf("impact snapshot version %d, want %d", versionNumber, ImpactSnapshotVersion)
+	}
+	var commit string
+	if err := s.db.QueryRow("SELECT value FROM metadata WHERE key = 'impact_commit'").Scan(&commit); err != nil {
+		return "", err
+	}
+	return commit, nil
+}
+
+// ImpactSnapshotIndexPath returns the repository-relative root indexed by the
+// snapshot.
+func (s *Store) ImpactSnapshotIndexPath() (string, error) {
+	var path string
+	if err := s.db.QueryRow("SELECT value FROM metadata WHERE key = 'impact_index_path'").Scan(&path); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// MissingImpactEvidenceProviders returns required repository providers that
+// were not attached to this snapshot.
+func (s *Store) MissingImpactEvidenceProviders() ([]string, error) {
+	if !s.impactSnapshot {
+		return nil, nil
+	}
+	rows, err := s.db.Query("SELECT provider FROM impact_evidence_requirements WHERE satisfied = 0 ORDER BY provider")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var providers []string
+	for rows.Next() {
+		var provider string
+		if err := rows.Scan(&provider); err != nil {
+			return nil, err
+		}
+		providers = append(providers, provider)
+	}
+	return providers, rows.Err()
+}
+
+// ImpactEvidenceDigests returns the provider artifacts embedded in a snapshot.
+func (s *Store) ImpactEvidenceDigests() (map[string]string, error) {
+	if !s.impactSnapshot {
+		return nil, nil
+	}
+	rows, err := s.db.Query("SELECT provider, digest FROM impact_evidence_requirements WHERE satisfied = 1 ORDER BY provider")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	digests := make(map[string]string)
+	for rows.Next() {
+		var provider, digest string
+		if err := rows.Scan(&provider, &digest); err != nil {
+			return nil, err
+		}
+		digests[provider] = digest
+	}
+	return digests, rows.Err()
+}
+
+// ImpactSnapshotStats reports compact artifact row counts.
+type ImpactSnapshotStats struct {
+	Files      int
+	Functions  int
+	CallEdges  int
+	Unresolved int
+}
+
+func (s *Store) GetImpactSnapshotStats() (ImpactSnapshotStats, error) {
+	var stats ImpactSnapshotStats
+	for _, query := range []struct {
+		sql string
+		dst *int
+	}{
+		{"SELECT COUNT(*) FROM files", &stats.Files},
+		{"SELECT COUNT(*) FROM impact_functions", &stats.Functions},
+		{"SELECT COUNT(*) FROM call_edges", &stats.CallEdges},
+		{"SELECT COUNT(*) FROM impact_unresolved", &stats.Unresolved},
+	} {
+		if err := s.db.QueryRow(query.sql).Scan(query.dst); err != nil {
+			return ImpactSnapshotStats{}, err
+		}
+	}
+	return stats, nil
+}
+
+func (s *Store) ImpactEdgeKindCounts() (map[string]int, error) {
+	rows, err := s.db.Query("SELECT kind, COUNT(*) FROM call_edges GROUP BY kind ORDER BY kind")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	counts := make(map[string]int)
+	for rows.Next() {
+		var kind string
+		var count int
+		if err := rows.Scan(&kind, &count); err != nil {
+			return nil, err
+		}
+		counts[kind] = count
+	}
+	return counts, rows.Err()
+}
+
+// ValidateImpactSource verifies that the normal index was built with all source
+// evidence required to export an impact snapshot.
+func (s *Store) ValidateImpactSource() error {
+	var sourceVersion int
+	if err := s.db.QueryRow("SELECT value FROM metadata WHERE key = 'impact_source_version'").Scan(&sourceVersion); err != nil {
+		return fmt.Errorf("impact source version unavailable: %w", err)
+	}
+	if sourceVersion != ImpactSourceVersion {
+		return fmt.Errorf("impact source version %d, want %d", sourceVersion, ImpactSourceVersion)
+	}
+	var missing int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM definitions
+		WHERE function != '' AND kind IN (` + impactCallableKinds + `) AND length(fingerprint) != 32`).Scan(&missing); err != nil {
+		return err
+	}
+	if missing > 0 {
+		return fmt.Errorf("%d callable definitions have no impact fingerprint", missing)
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM files f
+		WHERE substr(f.path, -9) = '_test.exs'
+		AND EXISTS (SELECT 1 FROM definitions m WHERE m.file_id = f.id AND m.kind = 'module')
+		AND NOT EXISTS (SELECT 1 FROM definitions r WHERE r.file_id = f.id AND r.kind = 'test_root')`).Scan(&missing); err != nil {
+		return err
+	}
+	if missing > 0 {
+		return fmt.Errorf("%d test files have no source test root", missing)
+	}
+	return nil
 }
 
 // migrateLegacyLayout deletes any pre-.dexter/ folder artifacts so that a
@@ -245,6 +500,7 @@ func migrate(db *sql.DB) error {
 			delegate_to TEXT NOT NULL DEFAULT '',
 			delegate_as TEXT NOT NULL DEFAULT '',
 			params TEXT NOT NULL DEFAULT '',
+			fingerprint BLOB NOT NULL DEFAULT X'',
 			FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
 		);
 
@@ -285,6 +541,9 @@ func migrate(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
+	if err := ensureDefinitionFingerprintColumn(db); err != nil {
+		return err
+	}
 	// idx_refs_function_kind was retired: no query leads with `function`, so
 	// SQLite never chose it (the two queries that filter on function/kind both
 	// lead with file_path and use idx_refs_file_path). On a 3.9M-row index it
@@ -294,6 +553,38 @@ func migrate(db *sql.DB) error {
 		return err
 	}
 	return createIndexes(db)
+}
+
+func ensureDefinitionFingerprintColumn(db *sql.DB) error {
+	rows, err := db.Query("PRAGMA table_info(definitions)")
+	if err != nil {
+		return err
+	}
+	found := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue interface{}
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if name == "fingerprint" {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if found {
+		return nil
+	}
+	_, err = db.Exec("ALTER TABLE definitions ADD COLUMN fingerprint BLOB NOT NULL DEFAULT X''")
+	return err
 }
 
 // fileIDSubquery resolves a path argument to files.id inside a WHERE clause, so
@@ -390,6 +681,13 @@ func (s *Store) SetIndexVersion(v int) error {
 	return err
 }
 
+// SetImpactSourceVersion records the parser evidence generation in a normal
+// index. Snapshot export rejects older or missing generations.
+func (s *Store) SetImpactSourceVersion(v int) error {
+	_, err := s.db.Exec("INSERT OR REPLACE INTO metadata (key, value) VALUES ('impact_source_version', ?)", strconv.Itoa(v))
+	return err
+}
+
 // GetStdlibRoot returns the cached Elixir stdlib lib root, if any.
 func (s *Store) GetStdlibRoot() (string, bool) {
 	var value string
@@ -466,14 +764,14 @@ func (s *Store) IndexFileWithRefsAndCalls(path string, defs []parser.Definition,
 		return err
 	}
 
-	defStmt, err := tx.Prepare("INSERT INTO definitions (module, function, arity, kind, line, file_id, delegate_to, delegate_as, params) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+	defStmt, err := tx.Prepare("INSERT INTO definitions (module, function, arity, kind, line, file_id, delegate_to, delegate_as, params, fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
 	if err != nil {
 		return err
 	}
 	defer func() { _ = defStmt.Close() }()
 
 	for _, d := range defs {
-		if _, err := defStmt.Exec(d.Module, d.Function, d.Arity, d.Kind, d.Line, fileID, d.DelegateTo, d.DelegateAs, d.Params); err != nil {
+		if _, err := defStmt.Exec(d.Module, d.Function, d.Arity, d.Kind, d.Line, fileID, d.DelegateTo, d.DelegateAs, d.Params, d.Fingerprint[:]); err != nil {
 			return err
 		}
 	}
@@ -592,7 +890,7 @@ func upsertFileID(tx txExecQuerier, path string, mtimeNano int64) (int64, error)
 // SQLITE_MAX_VARIABLE_NUMBER of 999, so the batch size never depends on how
 // the driver's SQLite was compiled.
 const (
-	defColumns      = 9
+	defColumns      = 10
 	refColumns      = 5
 	symbolColumns   = 4
 	callColumns     = 4
@@ -678,7 +976,7 @@ func (s *Store) beginBatch(insertOnly bool) (*Batch, error) {
 		return nil, err
 	}
 
-	defStmt, err := tx.Prepare("INSERT INTO definitions (module, function, arity, kind, line, file_id, delegate_to, delegate_as, params) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+	defStmt, err := tx.Prepare("INSERT INTO definitions (module, function, arity, kind, line, file_id, delegate_to, delegate_as, params, fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
 	if err != nil {
 		_ = tx.Rollback()
 		return nil, err
@@ -770,7 +1068,7 @@ func (s *Store) beginBatch(insertOnly bool) (*Batch, error) {
 	} else {
 		b.defChunkStmt, err = tx.Prepare(multiRowInsert(
 			"definitions",
-			"module, function, arity, kind, line, file_id, delegate_to, delegate_as, params",
+			"module, function, arity, kind, line, file_id, delegate_to, delegate_as, params, fingerprint",
 			defColumns, defChunkRows))
 		if err != nil {
 			b.closeStmts()
@@ -864,8 +1162,9 @@ func (b *Batch) indexFile(path string, mtimeNano int64, defs []parser.Definition
 		// Reset the buffer before checking the error: the chunk boundary is an
 		// exact-multiple test, so a buffer left full would never match again and
 		// the rest of the batch would silently fall back to flushPending.
-		for _, d := range defs {
-			b.defArgs = append(b.defArgs, d.Module, d.Function, d.Arity, d.Kind, d.Line, fileID, d.DelegateTo, d.DelegateAs, d.Params)
+		for i := range defs {
+			d := &defs[i]
+			b.defArgs = append(b.defArgs, d.Module, d.Function, d.Arity, d.Kind, d.Line, fileID, d.DelegateTo, d.DelegateAs, d.Params, d.Fingerprint[:])
 			if len(b.defArgs) == defColumns*defChunkRows {
 				_, err := b.defChunkStmt.Exec(b.defArgs...)
 				b.defArgs = b.defArgs[:0]
@@ -905,8 +1204,9 @@ func (b *Batch) indexFile(path string, mtimeNano int64, defs []parser.Definition
 		return nil
 	}
 
-	for _, d := range defs {
-		if _, err := b.defStmt.Exec(d.Module, d.Function, d.Arity, d.Kind, d.Line, fileID, d.DelegateTo, d.DelegateAs, d.Params); err != nil {
+	for i := range defs {
+		d := &defs[i]
+		if _, err := b.defStmt.Exec(d.Module, d.Function, d.Arity, d.Kind, d.Line, fileID, d.DelegateTo, d.DelegateAs, d.Params, d.Fingerprint[:]); err != nil {
 			return err
 		}
 	}
@@ -1271,6 +1571,202 @@ type IndexStats struct {
 	CallEdges   int
 }
 
+// FunctionRecord is one source definition row used by offline index comparison.
+// Repeated clauses remain separate and are returned in deterministic source order.
+type FunctionRecord struct {
+	Function    parser.FunctionID
+	FilePath    string
+	Kind        string
+	Line        int
+	Fingerprint [32]byte
+}
+
+// FunctionFingerprint is one aggregate fingerprint per callable identity.
+type FunctionFingerprint struct {
+	Function    parser.FunctionID
+	Fingerprint [32]byte
+}
+
+// ListFunctionFingerprints aggregates repeated clauses in deterministic source
+// order inside SQLite, so impact analysis does not retain every definition row.
+func (s *Store) ListFunctionFingerprints() ([]FunctionFingerprint, error) {
+	query := `SELECT d.module, d.function, d.arity,
+		dexter_function_fingerprint(d.fingerprint ORDER BY f.path, d.line)
+		FROM definitions d JOIN files f ON f.id = d.file_id
+		WHERE d.function != '' AND length(d.fingerprint) = 32 AND d.kind IN (` + impactCallableKinds + `)
+		GROUP BY d.module, d.function, d.arity
+		ORDER BY d.module, d.function, d.arity`
+	if s.impactSnapshot {
+		query = `SELECT module, function, arity, fingerprint FROM impact_functions
+			ORDER BY module, function, arity`
+	}
+	rows, err := s.db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var result []FunctionFingerprint
+	for rows.Next() {
+		var entry FunctionFingerprint
+		var fingerprint []byte
+		if err := rows.Scan(&entry.Function.Module, &entry.Function.Function, &entry.Function.Arity, &fingerprint); err != nil {
+			return nil, err
+		}
+		copy(entry.Fingerprint[:], fingerprint)
+		result = append(result, entry)
+	}
+	return result, rows.Err()
+}
+
+// ListTestFunctionRecords returns callable ownership rows only for source tests.
+func (s *Store) ListTestFunctionRecords() ([]FunctionRecord, error) {
+	if s.impactSnapshot {
+		return s.listImpactFunctionRecords(true)
+	}
+	return s.listFunctionRecords(` AND substr(f.path, -9) = '_test.exs' AND d.function = '__dexter_test_root__'`, nil)
+}
+
+// ListFunctionsInFiles returns callable identities owned by the supplied paths.
+func (s *Store) ListFunctionsInFiles(paths []string) ([]parser.FunctionID, error) {
+	seen := make(map[parser.FunctionID]struct{})
+	var result []parser.FunctionID
+	for start := 0; start < len(paths); start += maxBindVars {
+		end := min(start+maxBindVars, len(paths))
+		args := make([]interface{}, end-start)
+		for i, path := range paths[start:end] {
+			args[i] = path
+		}
+		query := `SELECT DISTINCT d.module, d.function, d.arity
+			FROM definitions d JOIN files f ON f.id = d.file_id
+			WHERE d.function != '' AND d.kind IN (` + impactCallableKinds + `) AND f.path IN (?` + strings.Repeat(",?", end-start-1) + `)`
+		if s.impactSnapshot {
+			query = `SELECT DISTINCT d.module, d.function, d.arity
+				FROM impact_function_files d JOIN files f ON f.id = d.file_id
+				WHERE f.path IN (?` + strings.Repeat(",?", end-start-1) + `)`
+		}
+		rows, err := s.db.Query(query, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var function parser.FunctionID
+			if err := rows.Scan(&function.Module, &function.Function, &function.Arity); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			if _, ok := seen[function]; !ok {
+				seen[function] = struct{}{}
+				result = append(result, function)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		_ = rows.Close()
+	}
+	sort.Slice(result, func(i, j int) bool { return functionIDLess(result[i], result[j]) })
+	return result, nil
+}
+
+// ListCallableFiles returns supplied paths that own at least one callable.
+func (s *Store) ListCallableFiles(paths []string) ([]string, error) {
+	seen := make(map[string]struct{})
+	var result []string
+	for start := 0; start < len(paths); start += maxBindVars {
+		end := min(start+maxBindVars, len(paths))
+		args := make([]interface{}, end-start)
+		for i, path := range paths[start:end] {
+			args[i] = path
+		}
+		query := `SELECT DISTINCT f.path FROM definitions d JOIN files f ON f.id = d.file_id
+			WHERE d.function != '' AND d.kind IN (` + impactCallableKinds + `) AND f.path IN (?` + strings.Repeat(",?", end-start-1) + `)`
+		if s.impactSnapshot {
+			query = `SELECT DISTINCT f.path FROM impact_function_files d JOIN files f ON f.id = d.file_id
+				WHERE f.path IN (?` + strings.Repeat(",?", end-start-1) + `)`
+		}
+		rows, err := s.db.Query(query, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var path string
+			if err := rows.Scan(&path); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			if _, ok := seen[path]; !ok {
+				seen[path] = struct{}{}
+				result = append(result, path)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		_ = rows.Close()
+	}
+	sort.Strings(result)
+	return result, nil
+}
+
+// ListFunctionRecords returns all fingerprinted callable source definitions.
+func (s *Store) ListFunctionRecords() ([]FunctionRecord, error) {
+	if s.impactSnapshot {
+		return s.listImpactFunctionRecords(false)
+	}
+	return s.listFunctionRecords("", nil)
+}
+
+func (s *Store) listImpactFunctionRecords(testsOnly bool) ([]FunctionRecord, error) {
+	query := `SELECT d.module, d.function, d.arity, f.path, p.fingerprint
+		FROM impact_function_files d
+		JOIN files f ON f.id = d.file_id
+		JOIN impact_functions p ON p.module = d.module AND p.function = d.function AND p.arity = d.arity`
+	if testsOnly {
+		query += ` WHERE substr(f.path, -9) = '_test.exs' AND d.function = '__dexter_test_root__'`
+	}
+	query += ` ORDER BY f.path, d.module, d.function, d.arity`
+	rows, err := s.db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var records []FunctionRecord
+	for rows.Next() {
+		var record FunctionRecord
+		var fingerprint []byte
+		if err := rows.Scan(&record.Function.Module, &record.Function.Function, &record.Function.Arity, &record.FilePath, &fingerprint); err != nil {
+			return nil, err
+		}
+		copy(record.Fingerprint[:], fingerprint)
+		records = append(records, record)
+	}
+	return records, rows.Err()
+}
+
+func (s *Store) listFunctionRecords(extraWhere string, args []interface{}) ([]FunctionRecord, error) {
+	rows, err := s.db.Query(`SELECT d.module, d.function, d.arity, f.path, d.kind, d.line, d.fingerprint
+		FROM definitions d JOIN files f ON f.id = d.file_id
+		WHERE d.function != '' AND length(d.fingerprint) = 32 AND d.kind IN (`+impactCallableKinds+`)`+extraWhere+`
+		ORDER BY f.path, d.line, d.module, d.function, d.arity`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var records []FunctionRecord
+	for rows.Next() {
+		var record FunctionRecord
+		var fingerprint []byte
+		if err := rows.Scan(&record.Function.Module, &record.Function.Function, &record.Function.Arity, &record.FilePath, &record.Kind, &record.Line, &fingerprint); err != nil {
+			return nil, err
+		}
+		copy(record.Fingerprint[:], fingerprint)
+		records = append(records, record)
+	}
+	return records, rows.Err()
+}
+
 // Stats returns row counts for the files, definitions, and refs tables.
 func (s *Store) Stats() (IndexStats, error) {
 	var st IndexStats
@@ -1294,6 +1790,160 @@ func (s *Store) Stats() (IndexStats, error) {
 type CallResult struct {
 	Function parser.FunctionID
 	Kind     string
+}
+
+// CallSymbol is one interned function identity in the call graph.
+type CallSymbol struct {
+	ID       int64
+	Function parser.FunctionID
+}
+
+// CallRelation connects one requested frontier symbol to an adjacent symbol.
+type CallRelation struct {
+	FrontierID int64
+	Adjacent   CallSymbol
+	Kind       string
+}
+
+// ImpactUnresolved is one provider call site whose target was not proven.
+type ImpactUnresolved struct {
+	Provider string
+	Caller   parser.FunctionID
+	Kind     string
+	Detail   string
+}
+
+// ListImpactUnresolved returns generated evidence that must remain uncertain.
+func (s *Store) ListImpactUnresolved() ([]ImpactUnresolved, error) {
+	if !s.impactSnapshot {
+		return nil, nil
+	}
+	rows, err := s.db.Query(`SELECT provider, caller_module, caller_function, caller_arity, kind, detail
+		FROM impact_unresolved ORDER BY provider, caller_module, caller_function, caller_arity, kind, detail`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var result []ImpactUnresolved
+	for rows.Next() {
+		var unresolved ImpactUnresolved
+		if err := rows.Scan(&unresolved.Provider, &unresolved.Caller.Module, &unresolved.Caller.Function,
+			&unresolved.Caller.Arity, &unresolved.Kind, &unresolved.Detail); err != nil {
+			return nil, err
+		}
+		result = append(result, unresolved)
+	}
+	return result, rows.Err()
+}
+
+const callSymbolLookupChunk = maxBindVars / 3
+
+// ResolveCallSymbols resolves function identities in bounded batches. Missing
+// identities are omitted from the result.
+func (s *Store) ResolveCallSymbols(functions []parser.FunctionID) ([]CallSymbol, error) {
+	seen := make(map[int64]struct{}, len(functions))
+	result := make([]CallSymbol, 0, len(functions))
+	for start := 0; start < len(functions); start += callSymbolLookupChunk {
+		end := min(start+callSymbolLookupChunk, len(functions))
+		query, args := resolveCallSymbolsQuery(functions[start:end])
+		rows, err := s.db.Query(query, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var symbol CallSymbol
+			if err := rows.Scan(&symbol.ID, &symbol.Function.Module, &symbol.Function.Function, &symbol.Function.Arity); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			if _, ok := seen[symbol.ID]; !ok {
+				seen[symbol.ID] = struct{}{}
+				result = append(result, symbol)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		_ = rows.Close()
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return functionIDLess(result[i].Function, result[j].Function)
+	})
+	return result, nil
+}
+
+func resolveCallSymbolsQuery(functions []parser.FunctionID) (string, []interface{}) {
+	values := make([]string, len(functions))
+	args := make([]interface{}, 0, len(functions)*3)
+	for i, fn := range functions {
+		values[i] = "(?,?,?)"
+		args = append(args, fn.Module, fn.Function, fn.Arity)
+	}
+	return `WITH requested(module, function, arity) AS (VALUES ` + strings.Join(values, ",") + `)
+		SELECT s.id, s.module, s.function, s.arity
+		FROM requested r
+		JOIN call_symbols s ON s.module = r.module AND s.function = r.function AND s.arity = r.arity`, args
+}
+
+// LookupCalleeFrontier returns all callees adjacent to the supplied caller IDs.
+func (s *Store) LookupCalleeFrontier(ids []int64) ([]CallRelation, error) {
+	return s.lookupCallFrontier(ids, true)
+}
+
+// LookupCallerFrontier returns all callers adjacent to the supplied callee IDs.
+func (s *Store) LookupCallerFrontier(ids []int64) ([]CallRelation, error) {
+	return s.lookupCallFrontier(ids, false)
+}
+
+func (s *Store) lookupCallFrontier(ids []int64, forward bool) ([]CallRelation, error) {
+	var result []CallRelation
+	for start := 0; start < len(ids); start += maxBindVars {
+		end := min(start+maxBindVars, len(ids))
+		query := callFrontierQuery(end-start, forward)
+		args := make([]interface{}, end-start)
+		for i, id := range ids[start:end] {
+			args[i] = id
+		}
+		rows, err := s.db.Query(query, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var relation CallRelation
+			if err := rows.Scan(&relation.FrontierID, &relation.Adjacent.ID, &relation.Adjacent.Function.Module, &relation.Adjacent.Function.Function, &relation.Adjacent.Function.Arity, &relation.Kind); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			result = append(result, relation)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		_ = rows.Close()
+	}
+	return result, nil
+}
+
+func callFrontierQuery(count int, forward bool) string {
+	frontierColumn, adjacentColumn, index := "caller_id", "callee_id", "idx_call_edges_caller"
+	if !forward {
+		frontierColumn, adjacentColumn, index = "callee_id", "caller_id", "idx_call_edges_callee"
+	}
+	return "SELECT e." + frontierColumn + ", s.id, s.module, s.function, s.arity, e.kind " +
+		"FROM call_edges e INDEXED BY " + index + " JOIN call_symbols s ON s.id = e." + adjacentColumn +
+		" WHERE e." + frontierColumn + " IN (?" + strings.Repeat(",?", count-1) + ")"
+}
+
+func functionIDLess(a, b parser.FunctionID) bool {
+	if a.Module != b.Module {
+		return a.Module < b.Module
+	}
+	if a.Function != b.Function {
+		return a.Function < b.Function
+	}
+	return a.Arity < b.Arity
 }
 
 // LookupCallees returns the functions called by caller.

@@ -2,6 +2,7 @@ package beam
 
 import (
 	"bytes"
+	"compress/gzip"
 	"compress/zlib"
 	"encoding/binary"
 	"os"
@@ -47,6 +48,36 @@ func TestReadDocumentedFunctions(t *testing.T) {
 			got[i].Params != want[i].Params || got[i].Kind != want[i].Kind || got[i].Hidden {
 			t.Fatalf("function %d = %#v, want %#v", i, got[i], want[i])
 		}
+	}
+}
+
+func TestReadExportsFromGzipCompressedBEAM(t *testing.T) {
+	beamPath := filepath.Join(t.TempDir(), "Elixir.Example.beam")
+	writeTestBEAM(t, beamPath, buildDocsTerm())
+	data, err := os.ReadFile(beamPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Create(beamPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	compressed := gzip.NewWriter(file)
+	if _, err := compressed.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := compressed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	functions, err := ReadExports(beamPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(functions) == 0 {
+		t.Fatal("compressed BEAM has no exports")
 	}
 }
 
@@ -374,6 +405,7 @@ type testBEAMOptions struct {
 	exports   [][3]uint32
 	docs      []byte
 	attrs     []byte
+	dbgi      []byte
 }
 
 func writeTestBEAM(t *testing.T, path string, docs []byte) {
@@ -442,6 +474,9 @@ func writeTestBEAMOpts(t *testing.T, path string, opts testBEAMOptions) {
 	writeTestChunk(&chunks, "ExpT", exports.Bytes())
 	if len(opts.attrs) > 0 {
 		writeTestChunk(&chunks, "Attr", opts.attrs)
+	}
+	if len(opts.dbgi) > 0 {
+		writeTestChunk(&chunks, "Dbgi", opts.dbgi)
 	}
 	writeTestChunk(&chunks, "Docs", raw.Bytes())
 

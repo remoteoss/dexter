@@ -37,13 +37,15 @@ const (
 	eventPath eventKind = iota
 	eventFull
 	eventStdlib
+	eventAction
 	eventStop
 )
 
 type event struct {
-	kind eventKind
-	path string
-	done chan error
+	kind   eventKind
+	path   string
+	done   chan error
+	action func() error
 }
 
 // Runtime owns one workspace store, its index mutation coordinator, its native
@@ -453,6 +455,21 @@ func (r *Runtime) Reindex(ctx context.Context) error {
 	}
 }
 
+// RunAfterMutations executes action on the mutation loop after all events
+// accepted before it. No later index mutation can run until action returns.
+func (r *Runtime) RunAfterMutations(ctx context.Context, action func() error) error {
+	done := make(chan error, 1)
+	if !r.send(event{kind: eventAction, action: action, done: done}) {
+		return errors.New("workspace is shutting down")
+	}
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // ReindexPath reconciles one file and waits for it, schedules a full pass for a
 // directory, and prunes a path that no longer exists. Reconciliation stats the
 // path itself, so create, change, and delete share one idempotent code path.
@@ -508,6 +525,7 @@ func (r *Runtime) loop() {
 		full := false
 		stop := false
 		var barriers []chan error
+		var actions []func() error
 		collect := func(e event) {
 			switch e.kind {
 			case eventPath:
@@ -518,6 +536,10 @@ func (r *Runtime) loop() {
 				full = true
 				if e.path != "" {
 					oldStdlibRoots[e.path] = struct{}{}
+				}
+			case eventAction:
+				if e.action != nil {
+					actions = append(actions, e.action)
 				}
 			case eventStop:
 				stop = true
@@ -563,6 +585,11 @@ func (r *Runtime) loop() {
 		} else {
 			for path := range paths {
 				batchErr = errors.Join(batchErr, r.reconcilePath(path))
+			}
+		}
+		if batchErr == nil {
+			for _, action := range actions {
+				batchErr = errors.Join(batchErr, action())
 			}
 		}
 		r.publishBatch(full, paths)

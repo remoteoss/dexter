@@ -252,6 +252,7 @@ Built-in control surface:
 | `workspace/lookup` | module/function lookup with the CLI's non-strict module fallback |
 | `workspace/references` | store-level references |
 | `workspace/reindex` | whole workspace or one path, returning after the barrier |
+| `workspace/impactSnapshot` | reconcile the mutation queue, validate impact evidence, and export an exact portable snapshot from the daemon-owned index |
 | `workspace/watch`, `workspace/unwatch` | subscribe to coalesced index changes, pushed as `workspace/changed` notifications |
 
 ## The MCP frontend

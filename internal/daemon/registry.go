@@ -129,7 +129,7 @@ func lookupMethod(name string) (MethodHandler, bool) {
 func isBuiltinMethod(name string) bool {
 	switch name {
 	case MethodStatus, MethodShutdown, MethodWorkspaceStatus, MethodLookup,
-		MethodReferences, MethodReindex, MethodWatch, MethodUnwatch:
+		MethodReferences, MethodReindex, MethodImpactSnapshot, MethodWatch, MethodUnwatch:
 		return true
 	}
 	return false

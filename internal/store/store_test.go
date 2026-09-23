@@ -1,12 +1,16 @@
 package store
 
 import (
+	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/remoteoss/dexter/internal/beam"
 	"github.com/remoteoss/dexter/internal/parser"
 )
 
@@ -190,6 +194,326 @@ end
 	if staleSymbols != 0 {
 		t.Fatalf("reindex retained %d orphaned call symbols", staleSymbols)
 	}
+}
+
+func TestBatchedCallGraphQueriesCrossChunkBoundaries(t *testing.T) {
+	s, _ := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec("INSERT INTO files (id, path, mtime) VALUES (1, '/project/graph.ex', 0)"); err != nil {
+		t.Fatal(err)
+	}
+	symbolStmt, err := tx.Prepare("INSERT INTO call_symbols (id, module, function, arity) VALUES (?, ?, 'run', 0)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	edgeStmt, err := tx.Prepare("INSERT INTO call_edges (file_id, caller_id, callee_id, kind) VALUES (1, ?, ?, 'call')")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const count = maxBindVars + 1
+	functions := make([]parser.FunctionID, count)
+	ids := make([]int64, count)
+	for i := range count {
+		id := int64(i + 1)
+		module := "MyApp.Module" + strconv.Itoa(i)
+		functions[i] = parser.FunctionID{Module: module, Function: "run", Arity: 0}
+		ids[i] = id
+		if _, err := symbolStmt.Exec(id, module); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i, callerID := range ids {
+		calleeID := ids[(i+1)%len(ids)]
+		if _, err := edgeStmt.Exec(callerID, calleeID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := symbolStmt.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := edgeStmt.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	resolved, err := s.ResolveCallSymbols(functions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resolved) != count {
+		t.Fatalf("ResolveCallSymbols returned %d symbols, want %d", len(resolved), count)
+	}
+	callees, err := s.LookupCalleeFrontier(ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	callers, err := s.LookupCallerFrontier(ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(callees) != count || len(callers) != count {
+		t.Fatalf("frontier sizes = callees %d, callers %d; want %d each", len(callees), len(callers), count)
+	}
+}
+
+func TestExportImpactSnapshotIsPortableAndCompact(t *testing.T) {
+	s, root := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+	path := writeElixirFile(t, root, "test/worker_test.exs", `defmodule MyApp.WorkerTest do
+  def helper(value), do: SharedLib.Worker.run(value)
+end`)
+	definitions, references, calls, err := parser.ParseFileWithCalls(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IndexFileWithRefsAndCalls(path, definitions, references, calls); err != nil {
+		t.Fatal(err)
+	}
+	snapshotPath := filepath.Join(t.TempDir(), "impact.db")
+	if err := s.ExportImpactSnapshot(snapshotPath, root, "abc123", "apps/example"); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := OpenImpactSnapshot(snapshotPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = snapshot.Close() }()
+	commit, err := snapshot.ImpactSnapshotCommit()
+	if err != nil || commit != "abc123" {
+		t.Fatalf("snapshot commit = %q, err = %v", commit, err)
+	}
+	indexPath, err := snapshot.ImpactSnapshotIndexPath()
+	if err != nil || indexPath != "apps/example" {
+		t.Fatalf("snapshot index path = %q, err = %v", indexPath, err)
+	}
+	paths, err := snapshot.ListFilePaths()
+	if err != nil || !reflect.DeepEqual(paths, []string{"test/worker_test.exs"}) {
+		t.Fatalf("snapshot paths = %v, err = %v", paths, err)
+	}
+	records, err := snapshot.ListFunctionRecords()
+	if err != nil || len(records) != 2 {
+		t.Fatalf("snapshot records = %+v, err = %v", records, err)
+	}
+	for _, record := range records {
+		if record.FilePath != "test/worker_test.exs" {
+			t.Fatalf("snapshot record path = %q", record.FilePath)
+		}
+	}
+	callers, err := snapshot.LookupCallers(parser.FunctionID{Module: "SharedLib.Worker", Function: "run", Arity: 1})
+	if err != nil || len(callers) != 1 {
+		t.Fatalf("snapshot callers = %+v, err = %v", callers, err)
+	}
+	tables, err := schemaObjectNames(snapshot.db, "table")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantTables := []string{"call_edge_evidence", "call_edges", "call_symbols", "files", "impact_compiled_test_files", "impact_evidence_requirements", "impact_function_files", "impact_functions", "impact_unresolved", "metadata"}
+	if !reflect.DeepEqual(tables, wantTables) {
+		t.Fatalf("snapshot tables = %v, want %v", tables, wantTables)
+	}
+	indexes, err := schemaObjectNames(snapshot.db, "index")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantIndexes := []string{"idx_call_edges_callee", "idx_call_edges_caller"}
+	if !reflect.DeepEqual(indexes, wantIndexes) {
+		t.Fatalf("snapshot indexes = %v, want %v", indexes, wantIndexes)
+	}
+	resolveQuery, resolveArgs := resolveCallSymbolsQuery([]parser.FunctionID{
+		{Module: "SharedLib.Worker", Function: "run", Arity: 1},
+	})
+	plan := explainQueryPlan(t, snapshot, resolveQuery, resolveArgs...)
+	if !strings.Contains(plan, "COVERING INDEX sqlite_autoindex_call_symbols_1") || strings.Contains(plan, "SCAN s") {
+		t.Errorf("snapshot symbol lookup does not use its identity index:\n%s", plan)
+	}
+	for _, tt := range []struct {
+		forward bool
+		index   string
+	}{
+		{forward: true, index: "idx_call_edges_caller"},
+		{forward: false, index: "idx_call_edges_callee"},
+	} {
+		plan = explainQueryPlan(t, snapshot, callFrontierQuery(1, tt.forward), int64(1))
+		if !strings.Contains(plan, "COVERING INDEX "+tt.index) || strings.Contains(plan, "SCAN call_edges") {
+			t.Errorf("snapshot frontier does not use %s:\n%s", tt.index, plan)
+		}
+	}
+}
+
+func TestExportImpactSnapshotStreamsCompiledDelta(t *testing.T) {
+	s, root := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+	path := writeElixirFile(t, root, "lib/worker.ex", `defmodule MyApp.Worker do
+  def run(value), do: SharedLib.Service.fetch(value)
+end`)
+	definitions, references, calls, err := parser.ParseFileWithCalls(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IndexFileWithRefsAndCalls(path, definitions, references, calls); err != nil {
+		t.Fatal(err)
+	}
+	caller := parser.FunctionID{Module: "MyApp.Worker", Function: "run", Arity: 1}
+	callee := parser.FunctionID{Module: "SharedLib.Service", Function: "fetch", Arity: 1}
+	output := filepath.Join(t.TempDir(), "impact.db")
+	err = s.ExportImpactSnapshotWithAugmentContext(context.Background(), output, root, "abc123", ".", nil,
+		func(sink CompiledEvidenceSink) error {
+			return sink.AddCompiledEvidence("lib/worker.ex", beam.CompiledEvidence{
+				Module: caller.Module,
+				Digest: [32]byte{1},
+				Edges:  []parser.CallEdge{{Caller: caller, Callee: callee, Kind: "call"}},
+			})
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := OpenImpactSnapshot(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = snapshot.Close() }()
+	var edges, evidenceRows int
+	if err := snapshot.db.QueryRow("SELECT COUNT(*) FROM call_edges").Scan(&edges); err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshot.db.QueryRow("SELECT COUNT(*) FROM call_edge_evidence").Scan(&evidenceRows); err != nil {
+		t.Fatal(err)
+	}
+	if edges != 1 || evidenceRows != 2 {
+		t.Fatalf("graph edges = %d, evidence rows = %d; want 1 and 2", edges, evidenceRows)
+	}
+	callers, err := snapshot.LookupCallers(callee)
+	if err != nil || len(callers) != 1 || callers[0].Kind != "call" {
+		t.Fatalf("callers = %+v, err = %v", callers, err)
+	}
+}
+
+func TestImpactSnapshotBuilderOwnsCompiledTestFunctions(t *testing.T) {
+	output := filepath.Join(t.TempDir(), "impact.db")
+	builder, err := NewImpactSnapshotBuilder(output, "abc123", ".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	generated := parser.FunctionID{Module: "MyApp.GeneratedTest", Function: "generated_setup", Arity: 1}
+	target := parser.FunctionID{Module: "SharedLib.Worker", Function: "perform", Arity: 1}
+	var fingerprint [32]byte
+	fingerprint[0] = 1
+	compiled := beam.CompiledEvidence{
+		Module:    "MyApp.GeneratedTest",
+		Functions: []beam.CompiledFunction{{Function: generated, Kind: "def", Fingerprint: fingerprint}},
+		Edges:     []parser.CallEdge{{Caller: generated, Callee: target, Kind: "call"}},
+	}
+	if err := builder.AddCompiledEvidence("test/generated_test.exs", compiled); err != nil {
+		builder.Abort()
+		t.Fatal(err)
+	}
+	builder.SetCompiledEvidenceComplete("test-digest")
+	if _, err := builder.Finish(); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := OpenImpactSnapshot(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = snapshot.Close() }()
+	roots, err := snapshot.ListTestFunctionRecords()
+	if err != nil || len(roots) != 1 || roots[0].FilePath != "test/generated_test.exs" {
+		t.Fatalf("roots = %+v, err = %v", roots, err)
+	}
+	callers, err := snapshot.LookupCallers(target)
+	if err != nil || len(callers) != 1 || callers[0].Function != generated {
+		t.Fatalf("target callers = %+v, err = %v", callers, err)
+	}
+	rootCallers, err := snapshot.LookupCallers(generated)
+	wantRoot := parser.FunctionID{Module: "MyApp.GeneratedTest", Function: "__dexter_test_root__", Arity: 0}
+	if err != nil || len(rootCallers) != 1 || rootCallers[0].Function != wantRoot {
+		t.Fatalf("generated callers = %+v, err = %v", rootCallers, err)
+	}
+}
+
+func TestImpactSnapshotBuilderCompactsCompiledEdgeDelta(t *testing.T) {
+	output := filepath.Join(t.TempDir(), "impact.db")
+	builder, err := NewImpactSnapshotBuilder(output, "abc123", ".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	caller := parser.FunctionID{Module: "MyApp.Worker", Function: "run", Arity: 1}
+	callee := parser.FunctionID{Module: "SharedLib.Service", Function: "fetch", Arity: 1}
+	var sourceFingerprint, compiledFingerprint [32]byte
+	sourceFingerprint[0] = 1
+	compiledFingerprint[0] = 2
+	if err := builder.AddFile("lib/worker.ex", 0, []parser.Definition{{
+		Module: caller.Module, Function: caller.Function, Arity: caller.Arity,
+		Kind: "def", Line: 1, Fingerprint: sourceFingerprint,
+	}}, []parser.CallEdge{{Caller: caller, Callee: callee, Kind: "call"}}); err != nil {
+		builder.Abort()
+		t.Fatal(err)
+	}
+	if err := builder.AddCompiledEvidence("lib/worker.ex", beam.CompiledEvidence{
+		Module: caller.Module,
+		Digest: [32]byte{3},
+		Functions: []beam.CompiledFunction{{
+			Function: caller, Kind: "def", Fingerprint: compiledFingerprint,
+		}},
+		Edges: []parser.CallEdge{{Caller: caller, Callee: callee, Kind: "call"}},
+	}); err != nil {
+		builder.Abort()
+		t.Fatal(err)
+	}
+	if _, err := builder.Finish(); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := OpenImpactSnapshot(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = snapshot.Close() }()
+	var graphEdges, evidenceRows int
+	if err := snapshot.db.QueryRow("SELECT COUNT(*) FROM call_edges").Scan(&graphEdges); err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshot.db.QueryRow("SELECT COUNT(*) FROM call_edge_evidence").Scan(&evidenceRows); err != nil {
+		t.Fatal(err)
+	}
+	if graphEdges != 1 || evidenceRows != 2 {
+		t.Fatalf("graph edges = %d, evidence rows = %d; want 1 and 2", graphEdges, evidenceRows)
+	}
+	callers, err := snapshot.LookupCallers(callee)
+	if err != nil || len(callers) != 1 || callers[0].Function != caller || callers[0].Kind != "call" {
+		t.Fatalf("callers = %+v, err = %v", callers, err)
+	}
+	fingerprints, err := snapshot.ListFunctionFingerprints()
+	if err != nil || len(fingerprints) != 1 {
+		t.Fatalf("fingerprints = %+v, err = %v", fingerprints, err)
+	}
+	if fingerprints[0].Fingerprint == compiledFingerprint {
+		t.Fatal("compiled fingerprint replaced the source fingerprint")
+	}
+}
+
+func schemaObjectNames(db *sql.DB, objectType string) ([]string, error) {
+	rows, err := db.Query(`SELECT name FROM sqlite_master
+		WHERE type = ? AND name NOT LIKE 'sqlite_%' ORDER BY name`, objectType)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	return names, rows.Err()
 }
 
 func TestLookupCallersKeepsUnknownAritySeparate(t *testing.T) {
@@ -1160,6 +1484,29 @@ func TestOpen_CreatesDexterFolder(t *testing.T) {
 	}
 }
 
+func TestMigrateAddsDefinitionFingerprintColumn(t *testing.T) {
+	registerDriver()
+	db, err := sql.Open(driverName, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.Exec(`CREATE TABLE definitions (
+		module TEXT NOT NULL, function TEXT NOT NULL DEFAULT '', arity INTEGER NOT NULL DEFAULT 0,
+		kind TEXT NOT NULL, line INTEGER NOT NULL, file_id INTEGER NOT NULL,
+		delegate_to TEXT NOT NULL DEFAULT '', delegate_as TEXT NOT NULL DEFAULT '', params TEXT NOT NULL DEFAULT ''
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	var fingerprint []byte
+	if err := db.QueryRow("SELECT fingerprint FROM definitions LIMIT 1").Scan(&fingerprint); err != sql.ErrNoRows {
+		t.Fatalf("fingerprint column query error = %v, want no rows", err)
+	}
+}
+
 func TestOpen_MigratesLegacyLayout(t *testing.T) {
 	dir := t.TempDir()
 
@@ -1463,14 +1810,16 @@ func makeFile(t *testing.T, dir, name string) string {
 }
 
 // genRows builds enough definitions and references to cross the multi-row
-// INSERT chunk boundaries (defChunkRows=100, refChunkRows=180) and leave a
+// INSERT chunk boundaries (defChunkRows=90, refChunkRows=180) and leave a
 // partial chunk behind, so both the chunked path and flushPending are exercised.
 func genRows(path string, defCount, refCount int) ([]parser.Definition, []parser.Reference) {
 	defs := make([]parser.Definition, 0, defCount)
 	for i := 0; i < defCount; i++ {
+		var fingerprint [32]byte
+		fingerprint[0] = byte(i)
 		defs = append(defs, parser.Definition{
 			Module: "MyApp.Gen", Function: "fn" + strconv.Itoa(i), Arity: i % 4,
-			Kind: "def", Line: i + 1, FilePath: path,
+			Kind: "def", Line: i + 1, FilePath: path, Fingerprint: fingerprint,
 		})
 	}
 	refs := make([]parser.Reference, 0, refCount)
@@ -1500,11 +1849,11 @@ func genCalls(count int) []parser.CallEdge {
 // buffers rows and flushes them in chunks, so a boundary or flush bug would
 // silently drop or duplicate rows.
 func TestBulkInsertMatchesRowAtATime(t *testing.T) {
-	// 250 defs = 2 full chunks of 100 + 50 pending; 425 refs = 2 full chunks of
+	// 250 defs = 2 full chunks of 90 + 70 pending; 425 refs = 2 full chunks of
 	// 180 + 65 pending. Both remainders exercise flushPending.
 	const defCount, refCount, callCount = 250, 425, 250
 
-	read := func(s *Store, path string) (int, []ReferenceResult) {
+	read := func(s *Store, path string) (int, []string, []ReferenceResult) {
 		t.Helper()
 		var defs int
 		if err := s.db.QueryRow("SELECT COUNT(*) FROM definitions WHERE file_id = (SELECT id FROM files WHERE path = ?)", path).Scan(&defs); err != nil {
@@ -1514,7 +1863,20 @@ func TestBulkInsertMatchesRowAtATime(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return defs, refs
+		rows, err := s.db.Query("SELECT hex(fingerprint) FROM definitions WHERE file_id = (SELECT id FROM files WHERE path = ?) ORDER BY function", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = rows.Close() }()
+		var fingerprints []string
+		for rows.Next() {
+			var fingerprint string
+			if err := rows.Scan(&fingerprint); err != nil {
+				t.Fatal(err)
+			}
+			fingerprints = append(fingerprints, fingerprint)
+		}
+		return defs, fingerprints, refs
 	}
 
 	bulkStore, bulkDir := setupTestStore(t)
@@ -1547,14 +1909,17 @@ func TestBulkInsertMatchesRowAtATime(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	bulkDefs, bulkRefs := read(bulkStore, bulkPath)
-	rowDefs, rowRefs := read(rowStore, rowPath)
+	bulkDefs, bulkFingerprints, bulkRefs := read(bulkStore, bulkPath)
+	rowDefs, rowFingerprints, rowRefs := read(rowStore, rowPath)
 
 	if bulkDefs != defCount {
 		t.Errorf("bulk definitions = %d, want %d", bulkDefs, defCount)
 	}
 	if bulkDefs != rowDefs {
 		t.Errorf("definition count: bulk %d, row-at-a-time %d", bulkDefs, rowDefs)
+	}
+	if !reflect.DeepEqual(bulkFingerprints, rowFingerprints) {
+		t.Error("bulk and row-at-a-time fingerprints differ")
 	}
 	if len(bulkRefs) != 1 {
 		t.Errorf("bulk refs for call7 = %d, want 1", len(bulkRefs))
@@ -1824,6 +2189,63 @@ func TestCallEdgesUseCoveringIndexes(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestBatchedCallGraphQueriesUseCoveringIndexes(t *testing.T) {
+	s, _ := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	functions := []parser.FunctionID{
+		{Module: "MyApp.First", Function: "run", Arity: 0},
+		{Module: "MyApp.Second", Function: "run", Arity: 1},
+	}
+	resolveQuery, resolveArgs := resolveCallSymbolsQuery(functions)
+	plan := explainQueryPlan(t, s, resolveQuery, resolveArgs...)
+	if !strings.Contains(plan, "SEARCH s USING COVERING INDEX sqlite_autoindex_call_symbols_1") || strings.Contains(plan, "SCAN s") {
+		t.Errorf("symbol batch query does not use the identity index:\n%s", plan)
+	}
+
+	for _, tt := range []struct {
+		name    string
+		forward bool
+		index   string
+	}{
+		{name: "callees", forward: true, index: "idx_call_edges_caller"},
+		{name: "callers", forward: false, index: "idx_call_edges_callee"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			plan := explainQueryPlan(t, s, callFrontierQuery(2, tt.forward), int64(1), int64(2))
+			if !strings.Contains(plan, "COVERING INDEX "+tt.index) {
+				t.Errorf("frontier query does not use covering index %s:\n%s", tt.index, plan)
+			}
+			if strings.Contains(plan, "SCAN call_edges") || strings.Contains(plan, "TEMP B-TREE") {
+				t.Errorf("frontier query performs avoidable work:\n%s", plan)
+			}
+		})
+	}
+}
+
+func explainQueryPlan(t *testing.T, s *Store, query string, args ...interface{}) string {
+	t.Helper()
+	rows, err := s.db.Query("EXPLAIN QUERY PLAN "+query, args...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	var plan strings.Builder
+	for rows.Next() {
+		var id, parent, notUsed int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notUsed, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan.WriteString(detail)
+		plan.WriteByte('\n')
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return plan.String()
 }
 
 // TestReindexKeepsFileID guards the id that definitions and refs point at. The

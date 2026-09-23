@@ -4,6 +4,7 @@ package beam
 
 import (
 	"bytes"
+	"compress/gzip"
 	"compress/zlib"
 	"encoding/binary"
 	"errors"
@@ -56,6 +57,14 @@ func ReadDocumentedFunctions(path string) ([]Function, error) {
 // ReadExports reads the cheap AtU8/ExpT chunks and returns every callable
 // export without inflating the much larger Docs term.
 func ReadExports(path string) ([]Function, error) {
+	return readExportsFromFile(path, false)
+}
+
+func readAllExports(path string) ([]Function, error) {
+	return readExportsFromFile(path, true)
+}
+
+func readExportsFromFile(path string, includeInfrastructure bool) ([]Function, error) {
 	// AtU8 has been the only atom table since OTP 20, so the latin1 "Atom" chunk
 	// is not worth looking for.
 	chunks, err := readChunks(path, "AtU8", "ExpT")
@@ -74,7 +83,7 @@ func ReadExports(path string) ([]Function, error) {
 	if err != nil {
 		return nil, err
 	}
-	return readExports(exportsChunk, atoms)
+	return readExportsWithOptions(exportsChunk, atoms, includeInfrastructure)
 }
 
 // ReadDocBody extracts one function's documentation prose from a BEAM's Docs
@@ -122,14 +131,45 @@ func readChunks(path string, wanted ...string) (map[string][]byte, error) {
 	}
 
 	var header [12]byte
-	if _, err := io.ReadFull(f, header[:]); err != nil {
+	if _, err := f.ReadAt(header[:], 0); err != nil {
 		return nil, err
 	}
+	if header[0] == 0x1f && header[1] == 0x8b {
+		return readGzipChunks(f, wanted...)
+	}
+	return readChunksAt(f, info.Size(), header, wanted...)
+}
+
+func readGzipChunks(f *os.File, wanted ...string) (map[string][]byte, error) {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	compressed, err := gzip.NewReader(f)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = compressed.Close() }()
+	data, err := io.ReadAll(io.LimitReader(compressed, maxBEAMSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxBEAMSize {
+		return nil, fmt.Errorf("inflated BEAM too large: %d", len(data))
+	}
+	if len(data) < 12 {
+		return nil, fmt.Errorf("invalid inflated BEAM size %d", len(data))
+	}
+	var header [12]byte
+	copy(header[:], data[:12])
+	return readChunksAt(bytes.NewReader(data), int64(len(data)), header, wanted...)
+}
+
+func readChunksAt(reader io.ReaderAt, size int64, header [12]byte, wanted ...string) (map[string][]byte, error) {
 	if string(header[:4]) != "FOR1" || string(header[8:]) != "BEAM" {
 		return nil, errors.New("invalid BEAM header")
 	}
 	declared := int64(binary.BigEndian.Uint32(header[4:8])) + 8
-	if declared > info.Size() {
+	if declared > size {
 		return nil, errors.New("truncated BEAM container")
 	}
 
@@ -141,7 +181,7 @@ func readChunks(path string, wanted ...string) (map[string][]byte, error) {
 
 	for offset := int64(12); offset+8 <= declared && len(found) < len(pending); {
 		var chunkHeader [8]byte
-		if _, err := f.ReadAt(chunkHeader[:], offset); err != nil {
+		if _, err := reader.ReadAt(chunkHeader[:], offset); err != nil {
 			return nil, err
 		}
 		length := int64(binary.BigEndian.Uint32(chunkHeader[4:8]))
@@ -157,7 +197,7 @@ func readChunks(path string, wanted ...string) (map[string][]byte, error) {
 				return nil, fmt.Errorf("%s chunk too large: %d", name, length)
 			}
 			data := make([]byte, length)
-			if _, err := f.ReadAt(data, dataOffset); err != nil {
+			if _, err := reader.ReadAt(data, dataOffset); err != nil {
 				return nil, err
 			}
 			found[name] = data
@@ -257,7 +297,7 @@ func readTaggedLength(data []byte, offset int) (length, next int, err error) {
 	}
 }
 
-func readExports(data []byte, atoms []string) ([]Function, error) {
+func readExportsWithOptions(data []byte, atoms []string, includeInfrastructure bool) ([]Function, error) {
 	if len(data) < 4 {
 		return nil, errors.New("truncated export table")
 	}
@@ -282,7 +322,7 @@ func readExports(data []byte, atoms []string) ([]Function, error) {
 			arity-- // The compiler prepends the caller environment to macros.
 			kind = "defmacro"
 		}
-		if isInfrastructureExport(name) {
+		if !includeInfrastructure && isInfrastructureExport(name) {
 			continue
 		}
 		params := make([]string, arity)

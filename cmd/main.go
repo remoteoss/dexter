@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/remoteoss/dexter/internal/daemon"
+	"github.com/remoteoss/dexter/internal/impact"
 	"github.com/remoteoss/dexter/internal/indexer"
 	"github.com/remoteoss/dexter/internal/stdlib"
 	"github.com/remoteoss/dexter/internal/store"
@@ -183,7 +185,94 @@ func main() {
 		},
 	}
 
-	rootCmd.AddCommand(initCmd, reindexCmd, lookupCmd, referencesCmd, stopCmd, lspCmd, daemonCmd, versionCmd)
+	var impactBase, impactHead, impactFormat string
+	var impactBaseSnapshot, impactHeadSnapshot, impactCacheDir string
+	var impactBaseEvidence, impactHeadEvidence []string
+	var impactSelectionRoot string
+	var impactMaxDepth, impactMaxNodes int
+	impactCmd := &cobra.Command{
+		Use:   "impact",
+		Short: "Report tests affected between two exact revisions",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if impactFormat != "json" {
+				return fmt.Errorf("unsupported impact format %q; only json is available", impactFormat)
+			}
+			cwd, err := os.Getwd()
+			if err != nil {
+				return err
+			}
+			projectRoot := cwd
+			if rootDir == "" {
+				projectRoot = findProjectRoot(cwd)
+			}
+			requireProjectRoot(projectRoot, false)
+			selectionRoot := cwd
+			if impactSelectionRoot != "" {
+				selectionRoot, err = filepath.Abs(impactSelectionRoot)
+				if err != nil {
+					return err
+				}
+			}
+			report, err := impact.Run(projectRoot, impact.RunOptions{
+				Base: impactBase, Head: impactHead, ScopeRoot: selectionRoot,
+				BaseSnapshot: impactBaseSnapshot, HeadSnapshot: impactHeadSnapshot, CacheDir: impactCacheDir,
+				MaxDepth: impactMaxDepth, MaxNodes: impactMaxNodes,
+				BaseEvidence: impactBaseEvidence, HeadEvidence: impactHeadEvidence,
+			})
+			if err != nil {
+				return err
+			}
+			encoder := json.NewEncoder(os.Stdout)
+			return encoder.Encode(report)
+		},
+	}
+	impactCmd.Flags().StringVar(&impactBase, "base", "", "Exact base Git revision")
+	impactCmd.Flags().StringVar(&impactHead, "head", "", "Exact head Git revision")
+	impactCmd.Flags().StringVar(&impactFormat, "format", "json", "Output format")
+	impactCmd.Flags().StringVar(&impactBaseSnapshot, "base-snapshot", "", "Exact base impact snapshot artifact")
+	impactCmd.Flags().StringVar(&impactHeadSnapshot, "head-snapshot", "", "Exact head impact snapshot artifact")
+	impactCmd.Flags().StringSliceVar(&impactBaseEvidence, "base-evidence", nil, "Revision-matched base evidence artifact (repeatable)")
+	impactCmd.Flags().StringSliceVar(&impactHeadEvidence, "head-evidence", nil, "Revision-matched head evidence artifact (repeatable)")
+	impactCmd.Flags().StringVar(&impactCacheDir, "cache-dir", "", "Impact snapshot cache directory")
+	impactCmd.Flags().StringVar(&impactSelectionRoot, "selection-root", "", "Limit candidate tests to this project path (default: current directory)")
+	impactCmd.Flags().IntVar(&impactMaxDepth, "max-depth", -1, "Maximum graph depth (-1 is unlimited)")
+	impactCmd.Flags().IntVar(&impactMaxNodes, "max-nodes", -1, "Maximum graph nodes per changed function (-1 is unlimited)")
+	_ = impactCmd.MarkFlagRequired("base")
+	_ = impactCmd.MarkFlagRequired("head")
+
+	var snapshotRevision, snapshotOutput, snapshotCacheDir string
+	var snapshotEvidence []string
+	impactSnapshotCmd := &cobra.Command{
+		Use:   "snapshot",
+		Short: "Create a portable impact snapshot artifact",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cwd, err := os.Getwd()
+			if err != nil {
+				return err
+			}
+			projectRoot := cwd
+			if rootDir == "" {
+				projectRoot = findProjectRoot(cwd)
+			}
+			requireProjectRoot(projectRoot, false)
+			report, err := impact.CreateSnapshot(projectRoot, snapshotRevision, snapshotOutput, snapshotCacheDir, snapshotEvidence)
+			if err != nil {
+				return err
+			}
+			encoder := json.NewEncoder(os.Stdout)
+			return encoder.Encode(report)
+		},
+	}
+	impactSnapshotCmd.Flags().StringVar(&snapshotRevision, "revision", "HEAD", "Exact Git revision")
+	impactSnapshotCmd.Flags().StringVar(&snapshotOutput, "output", "impact.db", "Snapshot output path")
+	impactSnapshotCmd.Flags().StringVar(&snapshotCacheDir, "cache-dir", "", "Impact snapshot cache directory")
+	impactSnapshotCmd.Flags().StringSliceVar(&snapshotEvidence, "evidence", nil, "Revision-matched evidence artifact (repeatable)")
+
+	impactCmd.AddCommand(impactSnapshotCmd)
+
+	rootCmd.AddCommand(initCmd, reindexCmd, lookupCmd, referencesCmd, stopCmd, lspCmd, daemonCmd, versionCmd, impactCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)

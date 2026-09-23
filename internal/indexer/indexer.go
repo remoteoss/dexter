@@ -10,14 +10,22 @@
 package indexer
 
 import (
+	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"runtime"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/remoteoss/dexter/internal/beam"
+	"github.com/remoteoss/dexter/internal/evidence"
 	"github.com/remoteoss/dexter/internal/parser"
 	"github.com/remoteoss/dexter/internal/store"
 	"github.com/remoteoss/dexter/internal/version"
@@ -48,6 +56,16 @@ type Options struct {
 	// accumulates should still not assume single-threaded access from any other
 	// caller.
 	Warn func(format string, args ...interface{})
+
+	// ProviderEvidence is revision-matched generated evidence for ImpactBuild.
+	// FullBuild ignores it.
+	ProviderEvidence []evidence.LoadedArtifact
+
+	// CompiledBuildRoots and CompiledApplications override repository config for
+	// library callers and focused benchmarks.
+	CompiledBuildRoots   []string
+	CompiledApplications map[string]string
+	ProjectFiles         []string
 }
 
 // serialWarn returns a callback that forwards to Warn under a mutex. Options is
@@ -83,7 +101,9 @@ type Stats struct {
 	Parse         time.Duration // summed across workers, so larger than wall time
 	Write         time.Duration
 	Commit        time.Duration
+	Finalize      time.Duration
 	CreateIndexes time.Duration
+	Rename        time.Duration
 	Total         time.Duration
 }
 
@@ -175,38 +195,8 @@ func FullBuild(s *store.Store, projectRoot string, opts Options) (Stats, error) 
 	stdlibResults := parseStdlib(stdlibFiles)
 
 	// Phase 2b: parse project files in parallel, streaming to the writer.
-	workers := runtime.NumCPU()
+	resultCh, parseNanos, workers := parseProject(files, warn, false)
 	stats.Workers = workers
-	fileCh := make(chan fileEntry, workers)
-	resultCh := make(chan parseResult, 1024)
-
-	var parseNanos atomic.Int64
-	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for f := range fileCh {
-				t0 := time.Now()
-				defs, refs, calls, err := parser.ParseFileWithCalls(f.path)
-				if err != nil {
-					warn("%s: %v", f.path, err)
-					continue
-				}
-				parseNanos.Add(int64(time.Since(t0)))
-				resultCh <- parseResult{path: f.path, mtimeNano: f.mtimeNano, defs: defs, refs: refs, calls: calls}
-			}
-		}()
-	}
-
-	go func() {
-		for _, f := range files {
-			fileCh <- f
-		}
-		close(fileCh)
-		wg.Wait()
-		close(resultCh)
-	}()
 
 	// Phase 3: bulk insert (single writer, single transaction, no indexes).
 	//
@@ -242,7 +232,12 @@ func FullBuild(s *store.Store, projectRoot string, opts Options) (Stats, error) 
 	}
 
 	var writeNanos time.Duration
+	sourceIncomplete := false
 	for res := range resultCh {
+		if res.err != nil {
+			sourceIncomplete = true
+			continue
+		}
 		writeStart := time.Now()
 		err := batch.IndexFileWithMtimeRefsAndCalls(res.path, res.mtimeNano, res.defs, res.refs, res.calls)
 		writeNanos += time.Since(writeStart)
@@ -274,9 +269,503 @@ func FullBuild(s *store.Store, projectRoot string, opts Options) (Stats, error) 
 	if err := s.SetIndexVersion(version.IndexVersion); err != nil {
 		warn("failed to store index version: %v", err)
 	}
+	impactSourceVersion := store.ImpactSourceVersion
+	if sourceIncomplete {
+		impactSourceVersion = 0
+	}
+	if err := s.SetImpactSourceVersion(impactSourceVersion); err != nil {
+		warn("failed to store impact source version: %v", err)
+	}
 
 	stats.Total = time.Since(start)
 	return stats, nil
+}
+
+// ImpactBuild parses project source once and writes the immutable impact schema
+// directly. It excludes dependency source before parsing and never creates a
+// normal navigation index.
+func ImpactBuild(output, projectRoot, commit, indexPath string, opts Options) (Stats, error) {
+	var stats Stats
+	started := time.Now()
+	warn := opts.serialWarn()
+
+	walkStarted := time.Now()
+	projectFiles := opts.ProjectFiles
+	if projectFiles == nil {
+		projectFiles = parser.CollectImpactElixirFilesParallel(projectRoot)
+	}
+	files := statFilesParallel(projectFiles)
+	stats.Walk = time.Since(walkStarted)
+
+	builder, err := store.NewImpactSnapshotBuilder(output, commit, indexPath)
+	if err != nil {
+		return stats, err
+	}
+	config, _, err := evidence.LoadRepositoryConfig(projectRoot)
+	if err != nil {
+		builder.Abort()
+		return stats, err
+	}
+	if len(opts.CompiledBuildRoots) > 0 {
+		config.CompiledBuildRoots = opts.CompiledBuildRoots
+	}
+	if len(opts.CompiledApplications) > 0 {
+		config.CompiledApplications = opts.CompiledApplications
+	}
+	builder.SetRepositoryEvidence(config)
+	builder.SetProviderEvidence(opts.ProviderEvidence)
+	resultCh, parseNanos, workers := parseProject(files, warn, true)
+	stats.Workers = workers
+	var writeNanos time.Duration
+	for result := range resultCh {
+		relative, err := filepath.Rel(projectRoot, result.path)
+		if err != nil {
+			builder.Abort()
+			drain(resultCh)
+			return stats, err
+		}
+		writeStarted := time.Now()
+		err = builder.AddFile(relative, result.mtimeNano, result.defs, result.calls)
+		writeNanos += time.Since(writeStarted)
+		if err != nil {
+			builder.Abort()
+			drain(resultCh)
+			return stats, fmt.Errorf("%s: %w", result.path, err)
+		}
+		if result.err != nil {
+			builder.SetSourceEvidenceIncomplete()
+		}
+		stats.Files++
+		stats.Definitions += len(result.defs)
+		stats.References += len(result.refs)
+		stats.CallEdges += len(result.calls)
+	}
+	stats.Parse = time.Duration(parseNanos.Load())
+	stats.Write = writeNanos
+	if err := AddCompiledEvidence(context.Background(), projectRoot, config, builder, warn); err != nil {
+		builder.Abort()
+		return stats, err
+	}
+	finalize, err := builder.Finish()
+	if err != nil {
+		return stats, err
+	}
+	stats.Finalize = finalize.Compact
+	stats.Commit = finalize.Commit
+	stats.CreateIndexes = finalize.CreateIndexes
+	stats.Rename = finalize.Rename
+	stats.Total = time.Since(started)
+	return stats, nil
+}
+
+type compiledImplementor struct {
+	module     string
+	behaviours []string
+	functions  map[parser.FunctionID]struct{}
+}
+
+// AddCompiledEvidence scans configured repository-built BEAM files and streams
+// native deltas to a private snapshot. It never invokes a compiler.
+func AddCompiledEvidence(ctx context.Context, projectRoot string, config evidence.RepositoryConfig,
+	sink store.CompiledEvidenceSink, warn func(string, ...interface{}),
+) error {
+	if warn == nil {
+		warn = func(string, ...interface{}) {}
+	}
+	callbacks := builtinCompiledCallbacks()
+	for _, callback := range config.BehaviourCallbacks {
+		callbacks[callback.Behaviour] = append(callbacks[callback.Behaviour], parser.FunctionID{
+			Module: callback.Behaviour, Function: callback.Function, Arity: callback.Arity,
+		})
+	}
+	var implementors []compiledImplementor
+	compiledModules := make(map[string]string)
+	compiledDigests := make(map[string][sha256.Size]byte)
+	compiledComplete := len(config.CompiledBuildRoots) > 0
+	for _, configuredRoot := range config.CompiledBuildRoots {
+		buildRoot := filepath.FromSlash(configuredRoot)
+		if !filepath.IsAbs(buildRoot) {
+			buildRoot = filepath.Join(projectRoot, buildRoot)
+		}
+		paths, inventoryErr := declaredBeamPaths(buildRoot)
+		if inventoryErr != nil || len(paths) == 0 {
+			compiledComplete = false
+			warn("compiled evidence unavailable at %s: %v", buildRoot, inventoryErr)
+			continue
+		}
+		inventoryDigests := make(map[string][sha256.Size]byte, len(paths))
+		for _, path := range paths {
+			digest, err := fileSHA256(path)
+			if err != nil {
+				compiledComplete = false
+				warn("compiled evidence unavailable at %s: %v", path, err)
+				continue
+			}
+			inventoryDigests[path] = digest
+		}
+		err := beam.ScanCompiledEvidence(ctx, paths, runtime.NumCPU(), func(beamPath string, compiled beam.CompiledEvidence, readErr error) error {
+			if readErr != nil {
+				opaque, opaqueErr := beam.ReadOpaqueEvidence(beamPath)
+				if opaqueErr != nil {
+					compiledComplete = false
+					module := strings.TrimSuffix(filepath.Base(beamPath), ".beam")
+					module = strings.TrimPrefix(module, "Elixir.")
+					return sink.AddCompiledOpaque(module, readErr.Error()+"; "+opaqueErr.Error())
+				}
+				compiled = opaque
+			}
+			if previous, duplicate := compiledModules[compiled.Module]; duplicate && previous != beamPath {
+				return fmt.Errorf("duplicate compiled module %s: %s and %s", compiled.Module, previous, beamPath)
+			}
+			compiledModules[compiled.Module] = beamPath
+			fileDigest, ok := inventoryDigests[beamPath]
+			if !ok {
+				compiledComplete = false
+				return sink.AddCompiledOpaque(compiled.Module, "compiled file was unreadable during inventory hashing")
+			}
+			compiledDigests[compiled.Module] = fileDigest
+			applyCompiledResourceFingerprints(projectRoot, &compiled)
+			if len(compiled.Callbacks) > 0 {
+				callbacks[compiled.Module] = append(callbacks[compiled.Module], compiled.Callbacks...)
+			}
+			if len(compiled.Behaviours) > 0 {
+				functions := make(map[parser.FunctionID]struct{}, len(compiled.Functions))
+				for _, function := range compiled.Functions {
+					functions[function.Function] = struct{}{}
+				}
+				implementors = append(implementors, compiledImplementor{
+					module: compiled.Module, behaviours: compiled.Behaviours, functions: functions,
+				})
+			}
+			source := compiledSourcePath(beamPath, compiled, config.CompiledApplications)
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return sink.AddCompiledEvidence(source, compiled)
+		})
+		if err != nil {
+			return err
+		}
+		pathsAfter, err := declaredBeamPaths(buildRoot)
+		if err != nil || !equalStrings(paths, pathsAfter) {
+			return fmt.Errorf("compiled inventory changed while scanning %s", buildRoot)
+		}
+		for _, path := range paths {
+			before, ok := inventoryDigests[path]
+			if !ok {
+				continue
+			}
+			digest, err := fileSHA256(path)
+			if err != nil || digest != before {
+				return fmt.Errorf("compiled file changed while scanning %s", path)
+			}
+		}
+	}
+	callbackEdges := make(map[parser.CallEdge]struct{})
+	for _, edge := range builtinCallbackDispatches() {
+		callbackEdges[edge] = struct{}{}
+	}
+	for _, implementor := range implementors {
+		for _, behaviour := range implementor.behaviours {
+			for _, callback := range callbacks[behaviour] {
+				implementation := parser.FunctionID{Module: implementor.module, Function: callback.Function, Arity: callback.Arity}
+				if _, ok := implementor.functions[implementation]; !ok {
+					continue
+				}
+				callbackEdges[parser.CallEdge{
+					Caller: parser.FunctionID{Module: "callback:" + behaviour, Function: callback.Function, Arity: callback.Arity},
+					Callee: implementation, Kind: "callback",
+				}] = struct{}{}
+			}
+		}
+	}
+	compiledCallbackEdges := make([]parser.CallEdge, 0, len(callbackEdges))
+	for edge := range callbackEdges {
+		compiledCallbackEdges = append(compiledCallbackEdges, edge)
+	}
+	if err := sink.AddCompiledEdges(compiledCallbackEdges); err != nil {
+		return err
+	}
+	inventoryDigest := compiledEvidenceDigest(compiledDigests)
+	if compiledComplete {
+		sink.SetCompiledEvidenceComplete(inventoryDigest)
+	}
+	return nil
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func declaredBeamPaths(buildRoot string) ([]string, error) {
+	appFiles, err := filepath.Glob(filepath.Join(buildRoot, "*", "ebin", "*.app"))
+	if err != nil {
+		return nil, err
+	}
+	if len(appFiles) == 0 {
+		return nil, errors.New("no .app declarations")
+	}
+	seen := make(map[string]string)
+	var paths []string
+	for _, appFile := range appFiles {
+		data, err := os.ReadFile(appFile)
+		if err != nil {
+			return nil, err
+		}
+		modules, err := parseAppModules(data)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", appFile, err)
+		}
+		for _, module := range modules {
+			path := filepath.Join(filepath.Dir(appFile), module+".beam")
+			if previous, ok := seen[module]; ok {
+				return nil, fmt.Errorf("duplicate declared module %s: %s and %s", module, previous, path)
+			}
+			if _, err := os.Stat(path); err != nil {
+				return nil, fmt.Errorf("declared module %s: %w", module, err)
+			}
+			seen[module] = path
+			paths = append(paths, path)
+		}
+	}
+	sort.Strings(paths)
+	return paths, nil
+}
+
+func parseAppModules(data []byte) ([]string, error) {
+	text := string(data)
+	marker := strings.Index(text, "{modules")
+	if marker < 0 {
+		return nil, errors.New("missing modules declaration")
+	}
+	start := strings.IndexByte(text[marker:], '[')
+	if start < 0 {
+		return nil, errors.New("invalid modules declaration")
+	}
+	start += marker + 1
+	var modules []string
+	for i := start; i < len(text); {
+		for i < len(text) && (text[i] == ' ' || text[i] == '\t' || text[i] == '\r' || text[i] == '\n' || text[i] == ',') {
+			i++
+		}
+		if i >= len(text) {
+			return nil, errors.New("unterminated modules declaration")
+		}
+		if text[i] == ']' {
+			return modules, nil
+		}
+		if text[i] == '%' {
+			if end := strings.IndexByte(text[i:], '\n'); end >= 0 {
+				i += end + 1
+				continue
+			}
+			return nil, errors.New("unterminated modules declaration")
+		}
+		var module strings.Builder
+		if text[i] == '\'' {
+			i++
+			closed := false
+			for i < len(text) {
+				if text[i] == '\\' && i+1 < len(text) {
+					module.WriteByte(text[i+1])
+					i += 2
+					continue
+				}
+				if text[i] == '\'' {
+					i++
+					closed = true
+					break
+				}
+				module.WriteByte(text[i])
+				i++
+			}
+			if !closed {
+				return nil, errors.New("unterminated quoted module")
+			}
+		} else {
+			for i < len(text) && text[i] != ',' && text[i] != ']' && text[i] != ' ' && text[i] != '\t' && text[i] != '\r' && text[i] != '\n' {
+				module.WriteByte(text[i])
+				i++
+			}
+		}
+		if module.Len() == 0 {
+			return nil, errors.New("empty module atom")
+		}
+		modules = append(modules, module.String())
+	}
+	return nil, errors.New("unterminated modules declaration")
+}
+
+func fileSHA256(path string) ([sha256.Size]byte, error) {
+	var digest [sha256.Size]byte
+	file, err := os.Open(path)
+	if err != nil {
+		return digest, err
+	}
+	defer func() { _ = file.Close() }()
+	h := sha256.New()
+	if _, err := io.Copy(h, file); err != nil {
+		return digest, err
+	}
+	copy(digest[:], h.Sum(nil))
+	return digest, nil
+}
+
+func compiledEvidenceDigest(digests map[string][sha256.Size]byte) string {
+	modules := make([]string, 0, len(digests))
+	for module := range digests {
+		modules = append(modules, module)
+	}
+	sort.Strings(modules)
+	h := sha256.New()
+	_, _ = h.Write([]byte("dexter:compiled-inventory:v1\x00"))
+	for _, module := range modules {
+		_, _ = h.Write([]byte(module))
+		_, _ = h.Write([]byte{0})
+		digest := digests[module]
+		_, _ = h.Write(digest[:])
+	}
+	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+func applyCompiledResourceFingerprints(projectRoot string, compiled *beam.CompiledEvidence) {
+	if len(compiled.Resources) == 0 {
+		return
+	}
+	metadata := parser.FunctionID{Module: compiled.Module, Function: "__module_metadata__", Arity: 0}
+	for i := range compiled.Functions {
+		if compiled.Functions[i].Function != metadata {
+			continue
+		}
+		h := sha256.New()
+		_, _ = h.Write([]byte("dexter:compiled-resources:v1\x00"))
+		_, _ = h.Write(compiled.Functions[i].Fingerprint[:])
+		for _, resource := range compiled.Resources {
+			path := resource
+			if !filepath.IsAbs(path) {
+				path = filepath.Join(projectRoot, filepath.FromSlash(resource))
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				compiled.Unresolved = append(compiled.Unresolved, beam.CompiledUnresolved{
+					Caller: metadata, Kind: "external_resource",
+				})
+				continue
+			}
+			_, _ = h.Write([]byte(filepath.ToSlash(resource)))
+			resourceHash := sha256.Sum256(data)
+			_, _ = h.Write(resourceHash[:])
+		}
+		h.Sum(compiled.Functions[i].Fingerprint[:0])
+		return
+	}
+}
+
+func builtinCompiledCallbacks() map[string][]parser.FunctionID {
+	result := make(map[string][]parser.FunctionID)
+	for _, module := range []string{"GenServer", "gen_server"} {
+		for _, callback := range []struct {
+			name  string
+			arity int
+		}{
+			{"init", 1}, {"handle_call", 3}, {"handle_cast", 2}, {"handle_info", 2},
+			{"handle_continue", 2}, {"terminate", 2}, {"code_change", 3},
+		} {
+			result[module] = append(result[module], parser.FunctionID{Module: module, Function: callback.name, Arity: callback.arity})
+		}
+	}
+	return result
+}
+
+func builtinCallbackDispatches() []parser.CallEdge {
+	type dispatch struct {
+		module, function string
+		arity            int
+		callback         string
+		callbackArity    int
+	}
+	dispatches := []dispatch{
+		{"GenServer", "start", 3, "init", 1},
+		{"GenServer", "start_link", 3, "init", 1},
+		{"GenServer", "call", 2, "handle_call", 3},
+		{"GenServer", "call", 3, "handle_call", 3},
+		{"GenServer", "cast", 2, "handle_cast", 2},
+		{"gen_server", "start", 3, "init", 1},
+		{"gen_server", "start_link", 3, "init", 1},
+		{"gen_server", "call", 2, "handle_call", 3},
+		{"gen_server", "call", 3, "handle_call", 3},
+		{"gen_server", "cast", 2, "handle_cast", 2},
+	}
+	edges := make([]parser.CallEdge, 0, len(dispatches))
+	for _, dispatch := range dispatches {
+		edges = append(edges, parser.CallEdge{
+			Caller: parser.FunctionID{Module: dispatch.module, Function: dispatch.function, Arity: dispatch.arity},
+			Callee: parser.FunctionID{Module: "callback:" + dispatch.module, Function: dispatch.callback, Arity: dispatch.callbackArity},
+			Kind:   "callback_dispatch",
+		})
+	}
+	return edges
+}
+
+func compiledSourcePath(beamPath string, compiled beam.CompiledEvidence, applications map[string]string) string {
+	app := filepath.Base(filepath.Dir(filepath.Dir(beamPath)))
+	if appRoot, ok := applications[app]; ok {
+		source := filepath.ToSlash(compiled.Source)
+		if source != "" && !filepath.IsAbs(source) && source != ".." && !strings.HasPrefix(source, "../") {
+			return filepath.ToSlash(filepath.Join(appRoot, filepath.FromSlash(source)))
+		}
+	}
+	return filepath.ToSlash(filepath.Join(".dexter-dependency", app, compiled.Module+".ex"))
+}
+
+func parseProject(files []fileEntry, warn func(string, ...interface{}), impactOnly bool) (<-chan parseResult, *atomic.Int64, int) {
+	workers := runtime.NumCPU()
+	fileCh := make(chan fileEntry, workers)
+	resultCh := make(chan parseResult, 1024)
+	parseNanos := &atomic.Int64{}
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for f := range fileCh {
+				t0 := time.Now()
+				var defs []parser.Definition
+				var refs []parser.Reference
+				var calls []parser.CallEdge
+				var err error
+				if impactOnly {
+					defs, calls, err = parser.ParseFileForImpact(f.path)
+				} else {
+					defs, refs, calls, err = parser.ParseFileWithCalls(f.path)
+				}
+				if err != nil {
+					warn("%s: %v", f.path, err)
+					resultCh <- parseResult{path: f.path, mtimeNano: f.mtimeNano, err: err}
+					continue
+				}
+				parseNanos.Add(int64(time.Since(t0)))
+				resultCh <- parseResult{path: f.path, mtimeNano: f.mtimeNano, defs: defs, refs: refs, calls: calls}
+			}
+		}()
+	}
+	go func() {
+		for _, f := range files {
+			fileCh <- f
+		}
+		close(fileCh)
+		wg.Wait()
+		close(resultCh)
+	}()
+	return resultCh, parseNanos, workers
 }
 
 type parseResult struct {
@@ -285,6 +774,7 @@ type parseResult struct {
 	defs      []parser.Definition
 	refs      []parser.Reference
 	calls     []parser.CallEdge
+	err       error
 }
 
 type stdlibResult struct {

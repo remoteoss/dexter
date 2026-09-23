@@ -15,6 +15,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/remoteoss/dexter/internal/evidence"
+	"github.com/remoteoss/dexter/internal/indexer"
 	"github.com/remoteoss/dexter/internal/lsp"
 	"github.com/remoteoss/dexter/internal/store"
 	"github.com/remoteoss/dexter/internal/version"
@@ -62,6 +64,7 @@ const (
 	MethodLookup          = "workspace/lookup"
 	MethodReferences      = "workspace/references"
 	MethodReindex         = "workspace/reindex"
+	MethodImpactSnapshot  = "workspace/impactSnapshot"
 	MethodWatch           = "workspace/watch"
 	MethodUnwatch         = "workspace/unwatch"
 )
@@ -141,6 +144,17 @@ type ReindexParams struct {
 }
 
 type ReindexResult struct {
+	Elapsed time.Duration `json:"elapsed"`
+}
+
+type ImpactSnapshotParams struct {
+	Path          string   `json:"path"`
+	Commit        string   `json:"commit"`
+	IndexPath     string   `json:"indexPath"`
+	EvidencePaths []string `json:"evidencePaths,omitempty"`
+}
+
+type ImpactSnapshotResult struct {
 	Elapsed time.Duration `json:"elapsed"`
 }
 
@@ -788,6 +802,38 @@ func (s *server) handleRequest(c *conn, mc MethodContext, req request) (any, err
 			err = s.runtime.ReindexPath(mc.Context, params.Target)
 		}
 		return ReindexResult{Elapsed: time.Since(start).Round(time.Millisecond)}, err
+	case MethodImpactSnapshot:
+		var params ImpactSnapshotParams
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			return nil, err
+		}
+		if params.Path == "" || params.Commit == "" {
+			return nil, errors.New("impact snapshot path and commit are required")
+		}
+		start := time.Now()
+		providers, err := evidence.LoadArtifacts(params.EvidencePaths, params.Commit)
+		if err != nil {
+			return nil, err
+		}
+		config, _, err := evidence.LoadRepositoryConfig(s.runtime.Root())
+		if err != nil {
+			return nil, err
+		}
+		if err := s.runtime.WaitReady(mc.Context); err != nil {
+			return nil, err
+		}
+		if err := s.runtime.RunAfterMutations(mc.Context, func() error {
+			if err := s.runtime.Store().ValidateImpactSource(); err != nil {
+				return err
+			}
+			return s.runtime.Store().ExportImpactSnapshotWithAugmentContext(mc.Context, params.Path, s.runtime.Root(), params.Commit, params.IndexPath, providers,
+				func(sink store.CompiledEvidenceSink) error {
+					return indexer.AddCompiledEvidence(mc.Context, s.runtime.Root(), config, sink, nil)
+				})
+		}); err != nil {
+			return nil, err
+		}
+		return ImpactSnapshotResult{Elapsed: time.Since(start).Round(time.Millisecond)}, nil
 	case MethodWatch:
 		var params WatchParams
 		if len(req.Params) > 0 {

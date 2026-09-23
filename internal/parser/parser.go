@@ -33,15 +33,16 @@ var elixirKeyword = map[string]bool{
 }
 
 type Definition struct {
-	Module     string
-	Function   string
-	Arity      int
-	Line       int
-	FilePath   string
-	Kind       string
-	DelegateTo string
-	DelegateAs string // for defdelegate with as: — the function name in the target module
-	Params     string // comma-separated parameter names for this arity
+	Module      string
+	Function    string
+	Arity       int
+	Fingerprint [32]byte
+	Line        int
+	FilePath    string
+	Kind        string
+	DelegateTo  string
+	DelegateAs  string // for defdelegate with as: — the function name in the target module
+	Params      string // comma-separated parameter names for this arity
 }
 
 type Reference struct {
@@ -54,9 +55,9 @@ type Reference struct {
 
 // FunctionID identifies one callable function or macro in the call graph.
 type FunctionID struct {
-	Module   string
-	Function string
-	Arity    int
+	Module   string `json:"module"`
+	Function string `json:"function"`
+	Arity    int    `json:"arity"`
 }
 
 // UnknownArity marks a call whose target is known but whose arity cannot be
@@ -87,6 +88,16 @@ func ParseFileWithCalls(path string) ([]Definition, []Reference, []CallEdge, err
 	return ParseTextWithCalls(path, string(data))
 }
 
+// ParseFileForImpact parses definitions and caller-callee edges without
+// allocating navigation references.
+func ParseFileForImpact(path string) ([]Definition, []CallEdge, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	return ParseTextForImpact(path, string(data))
+}
+
 // ParseText parses Elixir source text and returns definitions and references.
 // The path is used to populate FilePath fields but the text is not read from disk.
 func ParseText(path, text string) ([]Definition, []Reference, error) {
@@ -100,6 +111,14 @@ func ParseTextWithCalls(path, text string) ([]Definition, []Reference, []CallEdg
 	source := []byte(text)
 	result := TokenizeFull(source)
 	return parseTextFromTokensWithCalls(path, source, result.Tokens, result.Interp)
+}
+
+// ParseTextForImpact uses the normal token walk but omits navigation references.
+func ParseTextForImpact(path, text string) ([]Definition, []CallEdge, error) {
+	source := []byte(text)
+	result := TokenizeFull(source)
+	defs, _, calls, err := parseTextFromTokensInternal(path, source, result.Tokens, result.Interp, parseMode{calls: true, conservativeCalls: true})
+	return defs, calls, err
 }
 
 // ScanFuncName reads a function/type name ([a-z_][a-z0-9_?!]*) from the start of s.
@@ -271,6 +290,16 @@ func readDirUnsorted(dir string) ([]fs.DirEntry, error) {
 // The returned order is unspecified. Callers key rows by path, so traversal
 // order does not affect any query result.
 func CollectElixirFilesParallel(root string) []string {
+	return collectElixirFilesParallel(root, false)
+}
+
+// CollectImpactElixirFilesParallel excludes dependency directories that are not
+// revision-owned impact evidence. Normal indexing still includes those paths.
+func CollectImpactElixirFilesParallel(root string) []string {
+	return collectElixirFilesParallel(root, true)
+}
+
+func collectElixirFilesParallel(root string, excludeDeps bool) []string {
 	workers := runtime.NumCPU()
 	sem := make(chan struct{}, workers)
 
@@ -297,7 +326,7 @@ func CollectElixirFilesParallel(root string) []string {
 			// IsDir() is false for a symlink to a directory, so symlinked trees
 			// are not descended into — the same behaviour as filepath.WalkDir.
 			if e.IsDir() {
-				if skipDir(name) {
+				if skipDir(name) || (excludeDeps && name == "deps") {
 					continue
 				}
 				wg.Add(1)

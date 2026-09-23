@@ -4,8 +4,12 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
+	"strings"
 	"testing"
 
+	"github.com/remoteoss/dexter/internal/evidence"
 	"github.com/remoteoss/dexter/internal/parser"
 	"github.com/remoteoss/dexter/internal/store"
 	"github.com/remoteoss/dexter/internal/version"
@@ -99,6 +103,312 @@ end`)
 	}
 }
 
+func TestImpactBuildWritesCompactSnapshotDirectly(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "lib/accounts.ex", `defmodule MyApp.Accounts do
+  def fetch(id), do: SharedLib.Worker.perform(id)
+end`)
+	writeFile(t, dir, "test/accounts_test.exs", `defmodule MyApp.AccountsTest do
+  def helper(id), do: MyApp.Accounts.fetch(id)
+end`)
+	writeFile(t, dir, "deps/vendor/lib/vendor.ex", `defmodule Vendor do
+  def ignored, do: :ok
+end`)
+
+	output := filepath.Join(t.TempDir(), "impact.db")
+	stats, err := ImpactBuild(output, dir, "abc123", "apps/example", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Files != 2 {
+		t.Fatalf("Files = %d, want 2", stats.Files)
+	}
+	if stats.References != 0 {
+		t.Fatalf("References = %d, want 0 for impact-only parsing", stats.References)
+	}
+
+	snapshot, err := store.OpenImpactSnapshot(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = snapshot.Close() }()
+	paths, err := snapshot.ListFilePaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"lib/accounts.ex", "test/accounts_test.exs"}; !reflect.DeepEqual(paths, want) {
+		t.Fatalf("paths = %v, want %v", paths, want)
+	}
+	if commit, err := snapshot.ImpactSnapshotCommit(); err != nil || commit != "abc123" {
+		t.Fatalf("commit = %q, err = %v", commit, err)
+	}
+	callers, err := snapshot.LookupCallers(parser.FunctionID{Module: "SharedLib.Worker", Function: "perform", Arity: 1})
+	if err != nil || len(callers) != 1 {
+		t.Fatalf("callers = %+v, err = %v", callers, err)
+	}
+	records, err := snapshot.ListTestFunctionRecords()
+	if err != nil || len(records) != 1 || records[0].FilePath != "test/accounts_test.exs" {
+		t.Fatalf("test roots = %+v, err = %v", records, err)
+	}
+
+	normal, err := store.OpenTemporary(filepath.Join(t.TempDir(), "normal.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = normal.Close() }()
+	if _, err := FullBuild(normal, dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	exportedPath := filepath.Join(t.TempDir(), "exported.db")
+	if err := normal.ExportImpactSnapshot(exportedPath, dir, "abc123", "apps/example"); err != nil {
+		t.Fatal(err)
+	}
+	exported, err := store.OpenImpactSnapshot(exportedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = exported.Close() }()
+	exportedPaths, err := exported.ListFilePaths()
+	if err != nil || !reflect.DeepEqual(exportedPaths, paths) {
+		t.Fatalf("exported paths = %v, direct paths = %v, err = %v", exportedPaths, paths, err)
+	}
+	directFunctions, err := snapshot.ListFunctionFingerprints()
+	if err != nil {
+		t.Fatal(err)
+	}
+	exportedFunctions, err := exported.ListFunctionFingerprints()
+	if err != nil || !reflect.DeepEqual(exportedFunctions, directFunctions) {
+		t.Fatalf("exported functions differ from direct build: exported=%+v direct=%+v err=%v", exportedFunctions, directFunctions, err)
+	}
+	exportedRoots, err := exported.ListTestFunctionRecords()
+	if err != nil || !reflect.DeepEqual(exportedRoots, records) {
+		t.Fatalf("exported test roots = %+v, direct roots = %+v, err = %v", exportedRoots, records, err)
+	}
+}
+
+func TestImpactBuildKeepsUnreadableFileInInventory(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root, an unreadable file is still readable")
+	}
+	dir := t.TempDir()
+	writeFile(t, dir, "lib/readable.ex", "defmodule MyApp.Readable do\n  def run, do: :ok\nend")
+	unreadable := writeFile(t, dir, "test/unreadable_test.exs", "defmodule MyApp.UnreadableTest do\nend")
+	if err := os.Chmod(unreadable, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(unreadable, 0o644) })
+
+	var warnings int
+	output := filepath.Join(t.TempDir(), "impact.db")
+	stats, err := ImpactBuild(output, dir, "abc123", ".", Options{
+		Warn: func(string, ...interface{}) { warnings++ },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Files != 2 || warnings != 1 {
+		t.Fatalf("Files = %d, warnings = %d; want 2 files and 1 warning", stats.Files, warnings)
+	}
+	snapshot, err := store.OpenImpactSnapshot(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = snapshot.Close() }()
+	paths, err := snapshot.ListFilePaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"lib/readable.ex", "test/unreadable_test.exs"}
+	if !reflect.DeepEqual(paths, want) {
+		t.Fatalf("paths = %v, want %v", paths, want)
+	}
+	missing, err := snapshot.MissingImpactEvidenceProviders()
+	if err != nil || !reflect.DeepEqual(missing, []string{"source_parse"}) {
+		t.Fatalf("missing providers = %v, err = %v", missing, err)
+	}
+}
+
+func TestFullBuildDoesNotCertifyUnreadableSource(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root, an unreadable file is still readable")
+	}
+	dir := t.TempDir()
+	writeFile(t, dir, "lib/readable.ex", "defmodule MyApp.Readable do\n  def run, do: :ok\nend")
+	unreadable := writeFile(t, dir, "lib/unreadable.ex", "defmodule MyApp.Unreadable do\nend")
+	if err := os.Chmod(unreadable, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(unreadable, 0o644) })
+
+	index, err := store.OpenTemporary(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = index.Close() }()
+	if _, err := FullBuild(index, dir, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := index.ValidateImpactSource(); err == nil {
+		t.Fatal("incomplete source index was certified for impact export")
+	}
+}
+
+func TestImpactBuildAddsRepositoryEvidenceMappings(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "lib/events.ex", "defmodule MyApp.Events do\n  def dispatch(value), do: value\nend")
+	config := `{
+  "schema_version": 1,
+  "required_providers": ["framework_runtime"],
+  "mappings": [{
+    "caller": {"module": "MyApp.Events", "function": "dispatch", "arity": 1},
+    "callee": {"module": "SharedLib.Consumer", "function": "handle", "arity": 1},
+    "kind": "hook"
+  }]
+}`
+	writeFile(t, dir, "dexter-impact.json", config)
+
+	output := filepath.Join(t.TempDir(), "impact.db")
+	if _, err := ImpactBuild(output, dir, "abc123", ".", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.OpenImpactSnapshot(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = snapshot.Close() }()
+	callers, err := snapshot.LookupCallers(parser.FunctionID{Module: "SharedLib.Consumer", Function: "handle", Arity: 1})
+	wantCaller := parser.FunctionID{Module: "MyApp.Events", Function: "dispatch", Arity: 1}
+	if err != nil || len(callers) != 1 || callers[0].Function != wantCaller || callers[0].Kind != "repository:hook" {
+		t.Fatalf("callers = %+v, err = %v", callers, err)
+	}
+	missing, err := snapshot.MissingImpactEvidenceProviders()
+	if err != nil || !reflect.DeepEqual(missing, []string{"framework_runtime"}) {
+		t.Fatalf("missing providers = %v, err = %v", missing, err)
+	}
+}
+
+func TestImpactBuildMergesRevisionMatchedProviderEvidence(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "test/generated_test.exs", "defmodule MyApp.GeneratedTest do\nend")
+	writeFile(t, dir, "dexter-impact.json", `{"schema_version":1,"required_providers":["compiler_trace"]}`)
+	evidencePath := writeFile(t, t.TempDir(), "compiled.json", `{
+  "schema_version": 1,
+  "provider": "compiler_trace",
+  "revision": "abc123",
+  "functions": [{
+    "function": {"module": "MyApp.GeneratedTest", "function": "generated_setup", "arity": 1},
+    "file": "test/generated_test.exs",
+    "fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  }],
+  "edges": [{
+    "caller": {"module": "MyApp.GeneratedTest", "function": "generated_setup", "arity": 1},
+    "callee": {"module": "SharedLib.Worker", "function": "perform", "arity": 1},
+    "kind": "compiled_call"
+  }],
+  "test_ownership": [{
+    "root": {"module": "MyApp.GeneratedTest", "function": "__dexter_test_root__", "arity": 0},
+    "function": {"module": "MyApp.GeneratedTest", "function": "generated_setup", "arity": 1},
+    "file": "test/generated_test.exs"
+  }],
+  "unresolved": [{
+    "caller": {"module": "MyApp.GeneratedTest", "function": "generated_setup", "arity": 1},
+    "kind": "dynamic_call",
+    "detail": "variable module"
+  }]
+}`)
+	providers, err := evidence.LoadArtifacts([]string{evidencePath}, "abc123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	output := filepath.Join(t.TempDir(), "impact.db")
+	if _, err := ImpactBuild(output, dir, "abc123", ".", Options{ProviderEvidence: providers}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.OpenImpactSnapshot(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = snapshot.Close() }()
+	missing, err := snapshot.MissingImpactEvidenceProviders()
+	if err != nil || len(missing) != 0 {
+		t.Fatalf("missing providers = %v, err = %v", missing, err)
+	}
+	callers, err := snapshot.LookupCallers(parser.FunctionID{Module: "SharedLib.Worker", Function: "perform", Arity: 1})
+	wantCaller := parser.FunctionID{Module: "MyApp.GeneratedTest", Function: "generated_setup", Arity: 1}
+	if err != nil || len(callers) != 1 || callers[0].Function != wantCaller || callers[0].Kind != "provider:compiler_trace:compiled_call" {
+		t.Fatalf("callers = %+v, err = %v", callers, err)
+	}
+	records, err := snapshot.ListTestFunctionRecords()
+	if err != nil || len(records) != 1 || records[0].FilePath != "test/generated_test.exs" {
+		t.Fatalf("test roots = %+v, err = %v", records, err)
+	}
+	unresolved, err := snapshot.ListImpactUnresolved()
+	if err != nil || len(unresolved) != 1 || unresolved[0].Kind != "dynamic_call" {
+		t.Fatalf("unresolved = %+v, err = %v", unresolved, err)
+	}
+}
+
+func TestDeclaredBeamPathsExcludeOrphans(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "sample/ebin/sample.app", `{application,sample,[
+  {modules,['Elixir.MyApp.Worker',sample_server]}
+]}.`)
+	wantFirst := writeFile(t, root, "sample/ebin/Elixir.MyApp.Worker.beam", "first")
+	wantSecond := writeFile(t, root, "sample/ebin/sample_server.beam", "second")
+	writeFile(t, root, "sample/ebin/Elixir.MyApp.Orphan.beam", "orphan")
+
+	paths, err := declaredBeamPaths(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{wantFirst, wantSecond}
+	sort.Strings(want)
+	if !reflect.DeepEqual(paths, want) {
+		t.Fatalf("paths = %v, want %v", paths, want)
+	}
+}
+
+func TestDeclaredBeamPathsRejectMissingModule(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "sample/ebin/sample.app", `{application,sample,[{modules,['Elixir.MyApp.Missing']} ]}.`)
+	if _, err := declaredBeamPaths(root); err == nil || !strings.Contains(err.Error(), "Elixir.MyApp.Missing") {
+		t.Fatalf("error = %v, want missing declared module", err)
+	}
+}
+
+func TestBuiltinCallbackDispatchesConnectFrameworkCalls(t *testing.T) {
+	want := parser.CallEdge{
+		Caller: parser.FunctionID{Module: "GenServer", Function: "call", Arity: 2},
+		Callee: parser.FunctionID{Module: "callback:GenServer", Function: "handle_call", Arity: 3},
+		Kind:   "callback_dispatch",
+	}
+	for _, edge := range builtinCallbackDispatches() {
+		if edge == want {
+			return
+		}
+	}
+	t.Fatalf("missing dispatch edge %+v", want)
+}
+
+func TestFullBuildRealInventory(t *testing.T) {
+	root := os.Getenv("DEXTER_FULL_BUILD_PROJECT_ROOT")
+	if root == "" {
+		t.Skip("DEXTER_FULL_BUILD_PROJECT_ROOT is not set")
+	}
+	index, err := store.OpenTemporary(filepath.Join(t.TempDir(), "normal.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = index.Close() }()
+	stats, err := FullBuild(index, root, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("files=%d definitions=%d references=%d edges=%d total=%s parse=%s write=%s indexes=%s",
+		stats.Files, stats.Definitions, stats.References, stats.CallEdges, stats.Total,
+		stats.Parse, stats.Write, stats.CreateIndexes)
+}
+
 func TestFullBuild_SetsIndexVersion(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, "lib/a.ex", "defmodule A do\n  def a, do: :ok\nend")
@@ -115,6 +425,9 @@ func TestFullBuild_SetsIndexVersion(t *testing.T) {
 
 	if got := s.GetIndexVersion(); got != version.IndexVersion {
 		t.Errorf("index version = %d, want %d", got, version.IndexVersion)
+	}
+	if err := s.ValidateImpactSource(); err != nil {
+		t.Errorf("full build did not stamp valid impact source evidence: %v", err)
 	}
 }
 
