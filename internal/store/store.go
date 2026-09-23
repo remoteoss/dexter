@@ -512,6 +512,8 @@ func (s *Store) IndexFileWithRefsAndCalls(path string, defs []parser.Definition,
 			if _, err := callStmt.Exec(fileID, callerID, calleeID, call.Kind); err != nil {
 				return err
 			}
+			delete(staleSymbols, callerID)
+			delete(staleSymbols, calleeID)
 		}
 	}
 	if err := cleanupCallSymbols(tx, staleSymbols); err != nil {
@@ -935,6 +937,7 @@ func (b *Batch) indexFile(path string, mtimeNano int64, defs []parser.Definition
 
 func (b *Batch) callSymbolID(fn parser.FunctionID) (int64, error) {
 	if id, ok := b.symbolIDs[fn]; ok {
+		delete(b.staleSymbolIDs, id)
 		return id, nil
 	}
 	if !b.insertOnly {
@@ -942,6 +945,7 @@ func (b *Batch) callSymbolID(fn parser.FunctionID) (int64, error) {
 		err := b.symbolQuery.QueryRow(fn.Module, fn.Function, fn.Arity).Scan(&id)
 		if err == nil {
 			b.symbolIDs[fn] = id
+			delete(b.staleSymbolIDs, id)
 			return id, nil
 		}
 		if err != sql.ErrNoRows {

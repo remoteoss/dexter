@@ -28,24 +28,37 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 	}
 
 	type moduleFrame struct {
-		name           string
-		depth          int
-		savedAliases   map[string]string
-		savedInjectors map[string]bool
+		name             string
+		depth            int
+		savedAliases     map[string]string
+		savedCallAliases map[string]string
+		savedInjectors   map[string]bool
 	}
 
 	var moduleStack []moduleFrame
 	type functionFrame struct {
-		id    FunctionID
-		depth int
+		id                FunctionID
+		depth             int
+		savedCallAliases  map[string]string
+		callAliasesShared bool
 	}
 	var functionStack []functionFrame
+	type callAliasBlockFrame struct {
+		depth  int
+		saved  map[string]string
+		shared bool
+	}
+	var callAliasBlocks []callAliasBlockFrame
 	var inlineFunction *struct {
-		id         FunctionID
-		start, end int
+		id                FunctionID
+		start, end        int
+		savedCallAliases  map[string]string
+		callAliasesShared bool
 	}
 	depth := 0
 	aliases := map[string]string{}
+	callAliases := map[string]string{}
+	var clauseGuardAliases map[string]string
 	injectors := map[string]bool{}
 
 	n := len(tokens)
@@ -88,15 +101,48 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 		return functionStack[len(functionStack)-1].id, true
 	}
 
+	activeCallAliases := func() map[string]string {
+		if clauseGuardAliases != nil {
+			return clauseGuardAliases
+		}
+		return callAliases
+	}
+
 	popScopes := func(prevDepth int) {
+		if len(callAliasBlocks) > 0 && callAliasBlocks[len(callAliasBlocks)-1].depth == prevDepth {
+			callAliases = callAliasBlocks[len(callAliasBlocks)-1].saved
+			callAliasBlocks = callAliasBlocks[:len(callAliasBlocks)-1]
+		}
 		if len(functionStack) > 0 && functionStack[len(functionStack)-1].depth == prevDepth {
+			callAliases = functionStack[len(functionStack)-1].savedCallAliases
 			functionStack = functionStack[:len(functionStack)-1]
 		}
 		if len(moduleStack) > 0 && moduleStack[len(moduleStack)-1].depth == prevDepth {
 			frame := moduleStack[len(moduleStack)-1]
 			moduleStack = moduleStack[:len(moduleStack)-1]
 			aliases = frame.savedAliases
+			callAliases = frame.savedCallAliases
 			injectors = frame.savedInjectors
+		}
+	}
+
+	ensureCallAliasesScoped := func() {
+		if !collectCalls {
+			return
+		}
+		if inlineFunction != nil && inlineFunction.callAliasesShared {
+			callAliases = copyMap(callAliases)
+			inlineFunction.callAliasesShared = false
+			return
+		}
+		if len(callAliasBlocks) > 0 && callAliasBlocks[len(callAliasBlocks)-1].shared {
+			callAliases = copyMap(callAliases)
+			callAliasBlocks[len(callAliasBlocks)-1].shared = false
+			return
+		}
+		if len(functionStack) > 0 && functionStack[len(functionStack)-1].callAliasesShared {
+			callAliases = copyMap(callAliases)
+			functionStack[len(functionStack)-1].callAliasesShared = false
 		}
 	}
 
@@ -107,6 +153,31 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 			}
 		}
 		return -1
+	}
+
+	isStabGuard := func(from int) bool {
+		brackets := 0
+		for j := from; j < n; j++ {
+			switch tokens[j].Kind {
+			case TokOpenParen, TokOpenBracket, TokOpenBrace, TokOpenAngle:
+				brackets++
+			case TokCloseParen, TokCloseBracket, TokCloseBrace, TokCloseAngle:
+				if brackets > 0 {
+					brackets--
+				}
+			case TokRightArrow:
+				if brackets == 0 {
+					return true
+				}
+			case TokLeftArrow, TokDo, TokEnd,
+				TokDef, TokDefp, TokDefmacro, TokDefmacrop,
+				TokDefguard, TokDefguardp, TokDefdelegate:
+				if brackets == 0 {
+					return false
+				}
+			}
+		}
+		return false
 	}
 
 	emitEdge := func(caller FunctionID, callee FunctionID, kind string, local bool) {
@@ -135,7 +206,7 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 				return
 			}
 			namePos = nextSig(k + 1)
-			module = ResolveModuleRef(modName, aliases, currentModule())
+			module = ResolveModuleRef(modName, activeCallAliases(), currentModule())
 		} else {
 			local = true
 		}
@@ -209,10 +280,11 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 		if hasDo {
 			depth++
 			moduleStack = append(moduleStack, moduleFrame{
-				name:           name,
-				depth:          depth,
-				savedAliases:   copyMap(aliases),
-				savedInjectors: copyBoolMap(injectors),
+				name:             name,
+				depth:            depth,
+				savedAliases:     copyMap(aliases),
+				savedCallAliases: copyMap(callAliases),
+				savedInjectors:   copyBoolMap(injectors),
 			})
 		}
 		return scanPos
@@ -270,10 +342,10 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 						if currentModule() != "" {
 							target = strings.ReplaceAll(target, "__MODULE__", currentModule())
 						}
-						if resolved, ok := aliases[target]; ok {
+						if resolved, ok := callAliases[target]; ok {
 							delegateTo = resolved
 						} else if parts := strings.SplitN(target, ".", 2); len(parts) == 2 {
-							if resolved, ok := aliases[parts[0]]; ok {
+							if resolved, ok := callAliases[parts[0]]; ok {
 								delegateTo = resolved + "." + parts[1]
 							} else {
 								delegateTo = target
@@ -324,7 +396,7 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 			var onCall func(QualifiedCall)
 			if collectCalls && hasCaller {
 				onCall = func(call QualifiedCall) {
-					module := ResolveModuleRef(call.Module, aliases, currentModule())
+					module := ResolveModuleRef(call.Module, activeCallAliases(), currentModule())
 					if module != "" {
 						emitEdge(caller, FunctionID{Module: module, Function: call.Function, Arity: UnknownArity}, "call", false)
 					}
@@ -368,15 +440,21 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 			}
 			flushInterpRefs(tok.Start, caller, hasCaller)
 		}
-		if collectCalls {
+		if inlineFunction != nil && i >= inlineFunction.end {
+			callAliases = inlineFunction.savedCallAliases
+			inlineFunction = nil
+		}
+		callShaped := tok.Kind == TokIdent && i+1 < n && tokens[i+1].Kind == TokOpenParen
+		captureShaped := tok.Kind == TokOther && tok.End == tok.Start+1 && source[tok.Start] == '&'
+		if collectCalls && (callShaped || captureShaped) {
 			caller, ok := currentFunction(i)
 			if ok {
-				switch tok.Kind {
-				case TokOther:
+				switch {
+				case captureShaped:
 					if !inFunctionHead {
 						emitCapture(i, caller)
 					}
-				case TokIdent:
+				case callShaped:
 					if inFunctionHead {
 						break
 					}
@@ -390,8 +468,8 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 			TokCharLiteral, TokAtom, TokNumber, TokOther,
 			TokDot, TokColon, TokOpenParen, TokCloseParen,
 			TokOpenBracket, TokCloseBracket, TokOpenBrace, TokCloseBrace,
-			TokOpenAngle, TokCloseAngle, TokBackslash, TokRightArrow,
-			TokLeftArrow, TokAssoc, TokDoubleColon, TokComma, TokWhen:
+			TokOpenAngle, TokCloseAngle, TokBackslash,
+			TokLeftArrow, TokAssoc, TokDoubleColon, TokComma:
 			i++
 			continue
 
@@ -407,7 +485,31 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 			continue
 
 		case TokDo, TokFn:
+			if collectCalls {
+				if _, ok := currentFunction(i); ok {
+					callAliasBlocks = append(callAliasBlocks, callAliasBlockFrame{
+						depth: depth + 1, saved: callAliases, shared: true,
+					})
+				}
+			}
 			TrackBlockDepth(tok.Kind, &depth)
+			i++
+			continue
+
+		case TokRightArrow:
+			if len(callAliasBlocks) > 0 {
+				frame := &callAliasBlocks[len(callAliasBlocks)-1]
+				callAliases = frame.saved
+				frame.shared = true
+			}
+			clauseGuardAliases = nil
+			i++
+			continue
+
+		case TokWhen:
+			if len(callAliasBlocks) > 0 && isStabGuard(i+1) {
+				clauseGuardAliases = callAliasBlocks[len(callAliasBlocks)-1].saved
+			}
 			i++
 			continue
 
@@ -498,7 +600,10 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 				if hasDo {
 					functionHeadEnd = doIdx + 1
 					if collectCalls {
-						functionStack = append(functionStack, functionFrame{id: caller, depth: depth + 1})
+						functionStack = append(functionStack, functionFrame{
+							id: caller, depth: depth + 1,
+							savedCallAliases: callAliases, callAliasesShared: true,
+						})
 					}
 				} else {
 					start, end, ok := ScanKeywordDoBody(source, tokens, n, pj)
@@ -506,9 +611,14 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 						functionHeadEnd = start
 						if collectCalls {
 							inlineFunction = &struct {
-								id         FunctionID
-								start, end int
-							}{id: caller, start: start, end: end}
+								id                FunctionID
+								start, end        int
+								savedCallAliases  map[string]string
+								callAliasesShared bool
+							}{
+								id: caller, start: start, end: end,
+								savedCallAliases: callAliases, callAliasesShared: true,
+							}
 						}
 					}
 				}
@@ -557,14 +667,18 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 
 			// The module name on an alias line is itself resolved through the
 			// aliases already in scope: `alias A.B` then `alias B.C`.
+			callModName := ExpandAliasPrefix(modName, callAliases)
 			modName = ExpandAliasPrefix(modName, aliases)
+			ensureCallAliasesScoped()
 
 			// Multi-alias: alias MyApp.{Users, Accounts}
 			if children, nextPos, ok := ScanMultiAliasChildren(source, tokens, n, k, false); ok {
 				parentResolved := resolveModule(modName, cm)
+				callParentResolved := resolveModule(callModName, cm)
 				for _, childName := range children {
 					fullChild := parentResolved + "." + childName
 					aliases[AliasShortName(childName)] = fullChild
+					callAliases[AliasShortName(childName)] = callParentResolved + "." + childName
 					emitModuleRef(fullChild, aliasLine, "alias")
 				}
 				i = nextPos
@@ -576,6 +690,7 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 				resolved := resolveModule(modName, cm)
 				if !strings.Contains(resolved, "__MODULE__") {
 					aliases[asName] = resolved
+					callAliases[asName] = resolveModule(callModName, cm)
 					refs = append(refs, Reference{Module: resolved, Line: aliasLine, FilePath: path, Kind: "alias"})
 				}
 				i = nextPos
@@ -586,6 +701,8 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 			{
 				resolved := resolveModule(modName, cm)
 				aliases[AliasShortName(resolved)] = resolved
+				callResolved := resolveModule(callModName, cm)
+				callAliases[AliasShortName(callResolved)] = callResolved
 				emitModuleRef(resolved, aliasLine, "alias")
 			}
 			i = k
@@ -636,7 +753,9 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 			if asName, nextPos, ok := ScanKeywordOptionValue(source, tokens, n, k, "as"); ok {
 				resolved := ResolveModuleRef(modName, aliases, cm)
 				if resolved != "" {
+					ensureCallAliasesScoped()
 					aliases[asName] = resolved
+					callAliases[asName] = ResolveModuleRef(modName, callAliases, cm)
 					refs = append(refs, Reference{Module: resolved, Line: requireLine, FilePath: path, Kind: "require"})
 				}
 				i = nextPos
@@ -770,8 +889,26 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 			continue
 
 		case TokModule:
-			// Skip __MODULE__ and other non-ASCII-uppercase module tokens
-			if !isUserModule(source, tok) {
+			userModule := isUserModule(source, tok)
+			if !userModule {
+				if collectCalls && !inFunctionHead && callKind(i) == "call" {
+					if call, ok := QualifiedCallAt(source, tokens, n, i); ok {
+						prev := prevSig(i)
+						capture := prev >= 0 && tokens[prev].Kind == TokOther && tokenText(tokens[prev]) == "&"
+						if !capture {
+							if caller, ok := currentFunction(i); ok {
+								arity := call.Arity
+								if arity != UnknownArity && prev >= 0 && tokens[prev].Kind == TokPipe {
+									arity++
+								}
+								resolved := ResolveModuleRef(call.Module, activeCallAliases(), currentModule())
+								if resolved != "" {
+									emitEdge(caller, FunctionID{Module: resolved, Function: call.Function, Arity: arity}, "call", false)
+								}
+							}
+						}
+					}
+				}
 				i++
 				continue
 			}
@@ -801,7 +938,10 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 										arity++
 									}
 								}
-								emitEdge(caller, FunctionID{Module: resolved, Function: call.Function, Arity: arity}, "call", false)
+								callResolved := ResolveModuleRef(call.Module, activeCallAliases(), cm)
+								if callResolved != "" {
+									emitEdge(caller, FunctionID{Module: callResolved, Function: call.Function, Arity: arity}, "call", false)
+								}
 							}
 						}
 					}
@@ -822,7 +962,7 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 
 		case TokPipe:
 			cm := currentModule()
-			if !inFunctionHead && cm != "" && len(injectors) > 0 {
+			if cm != "" && len(injectors) > 0 {
 				j := nextSig(i + 1)
 				if j < n && tokens[j].Kind == TokIdent {
 					name := tokenText(tokens[j])
@@ -837,8 +977,20 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 			continue
 
 		case TokIdent:
+			text := tokenText(tok)
+			blockBranch := text == "else" || text == "after" || text == "rescue" || text == "catch"
+			prev := prevSig(i)
+			qualifiedIdent := prev >= 0 && tokens[prev].Kind == TokDot
+			if blockBranch && !qualifiedIdent && (i+1 >= n || tokens[i+1].Kind != TokColon) && len(callAliasBlocks) > 0 {
+				frame := &callAliasBlocks[len(callAliasBlocks)-1]
+				callAliases = frame.saved
+				frame.shared = true
+				clauseGuardAliases = nil
+				i++
+				continue
+			}
 			cm := currentModule()
-			if !inFunctionHead && tok.Line != suppressBareRefsLine && cm != "" && len(injectors) > 0 {
+			if tok.Line != suppressBareRefsLine && cm != "" && len(injectors) > 0 {
 				isStatementStart := i == 0 || tokens[i-1].Kind == TokEOL || tokens[i-1].Kind == TokComment
 				// A parenthesized bare call can be nested inside another call,
 				// collection, or keyword value. It is still a candidate for a
@@ -847,7 +999,7 @@ func parseTextFromTokensInternal(path string, source []byte, tokens, interp []To
 				// opening paren and therefore do not match this fast check.
 				isParenthesizedCall := i+1 < n && tokens[i+1].Kind == TokOpenParen
 				if isStatementStart || isParenthesizedCall {
-					name := tokenText(tok)
+					name := text
 					if !elixirKeyword[name] {
 						emit := false
 						j := i + 1
@@ -1012,7 +1164,16 @@ func collectModuleRefs(source []byte, path string, toks []Token, from, to int, a
 			}
 		}
 
-		if tok.Kind != TokModule || !isUserModule(source, tok) {
+		if tok.Kind != TokModule {
+			continue
+		}
+		if !isUserModule(source, tok) {
+			if onCall != nil && isCallableModuleToken(source, tok) {
+				if call, ok := QualifiedCallAt(source, toks, tn, j); ok && call.NameEnd <= to {
+					onCall(call)
+					j = call.NameEnd - 1
+				}
+			}
 			continue
 		}
 
@@ -1053,6 +1214,10 @@ func collectModuleRefs(source []byte, path string, toks []Token, from, to int, a
 // (an ASCII uppercase start), as opposed to __MODULE__.
 func isUserModule(source []byte, t Token) bool {
 	return source[t.Start] >= 'A' && source[t.Start] <= 'Z'
+}
+
+func isCallableModuleToken(source []byte, t Token) bool {
+	return isUserModule(source, t) || TokenText(source, t) == "__MODULE__"
 }
 
 // dedupeRefs removes exact duplicate rows from refs, preserving first-occurrence

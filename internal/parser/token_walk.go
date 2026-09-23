@@ -15,7 +15,7 @@ type QualifiedCall struct {
 // extraction and call-graph extraction. Calls without parentheses retain an
 // unknown arity instead of guessing from expression boundaries.
 func QualifiedCallAt(source []byte, tokens []Token, n, pos int) (QualifiedCall, bool) {
-	if pos < 0 || pos >= n || tokens[pos].Kind != TokModule || !isUserModule(source, tokens[pos]) {
+	if pos < 0 || pos >= n || tokens[pos].Kind != TokModule || !isCallableModuleToken(source, tokens[pos]) {
 		return QualifiedCall{}, false
 	}
 	module, k := CollectModuleName(source, tokens, n, pos)
@@ -30,10 +30,9 @@ func QualifiedCallAt(source []byte, tokens []Token, n, pos int) (QualifiedCall, 
 	}
 	if call.NameEnd < n && tokens[call.NameEnd].Kind == TokOpenParen {
 		arity, ok := ParenthesizedCallArity(tokens, n, call.NameEnd)
-		if !ok {
-			return QualifiedCall{}, false
+		if ok {
+			call.Arity = arity
 		}
-		call.Arity = arity
 	}
 	return call, true
 }

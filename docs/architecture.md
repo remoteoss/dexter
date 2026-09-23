@@ -14,6 +14,27 @@ Dexter is a fast Elixir LSP server. It indexes module and function definitions f
 - `internal/daemon/` — the per-workspace daemon and its local transport: endpoint and lock derivation (`endpoint.go`), handshake and framing (`protocol.go`), connection handling and the built-in control methods (`server.go`), the client and the stdio proxies (`client.go`), the adapter registries (`registry.go`), and the per-platform ownership lock. `docs/daemon.md` has the ownership, lifecycle, and extension contract.
 - `internal/treesitter/` — Tree-sitter integration for scope-aware variable rename and go-to-references.
 
+## Persisted call graph
+
+`call_edges` stores relationships that the source syntax proves during the
+normal parser pass: qualified calls, confirmed local calls, captures,
+delegates, and default-argument wrappers. Exact and unknown arities remain
+separate identities. Edges belong to their source file, so incremental indexing
+can replace them without scanning the rest of the graph.
+
+Imported and `use`-injected bare calls are resolved at query time rather than
+persisted. Dexter's language-service resolver already applies local precedence,
+explicit imports, static and option-driven `__using__` imports, inline injected
+definitions, atom dispatch, and transitive use chains. Persisting those results
+would either fan one ambiguous source call out to several providers or require
+reindexing every consumer when an injector changes. A semantic graph consumer
+must combine persisted edges with that shared resolver; broad rows in `refs`
+are reference candidates and must not be treated as call edges.
+
+The persisted graph is source evidence, not a complete runtime graph. Dynamic
+dispatch, calls through values, and generated code need compiled or runtime
+evidence when a consumer requires them.
+
 
 ## String interpolation (`TokenResult.Interp`)
 
@@ -195,9 +216,10 @@ Consequences that are easy to undo by accident:
 - **Call edges are also deduplicated in parser workers.** They live separately from line-level references and use interned function ids, so the two directional indexes do not repeat module and function strings for every edge. The file id remains part of the edge primary key so incremental reindex and removal can delete a file's contribution without affecting the same edge from another file.
 - **The bulk path batches inserts** into multi-row `INSERT`s (`multiRowInsert`, 900 bound parameters per statement, which is under even the legacy `SQLITE_MAX_VARIABLE_NUMBER` of 999). Incremental reindex keeps the row-at-a-time path, where a file's `DELETE` must stay ordered ahead of its `INSERT`s.
 - **Prefix queries use a range, never `LIKE`.** `LIKE` is case-insensitive by default, so SQLite cannot turn `module LIKE 'Prefix.%'` into an index range and scans all refs. `module >= 'Prefix.' AND module < 'Prefix/'` ('/' is '.'+1) uses `idx_refs_module_function` and turns that scan into a range search: on a 3.9M-row index, 11-14x faster with a warm page cache and ~190x faster cold.
-- **`idx_refs_function_kind` was retired.** No query leads with `function`; the two that filter on function/kind both lead with `file_path`. It cost 80 MB and a share of every index rebuild. Check `EXPLAIN QUERY PLAN` before adding an index here — index build time is ~40% of a cold index.
+- **`idx_refs_function_kind` was retired.** No query leads with `function`; the two that filter on function/kind both lead with `file_id`. It cost 80 MB and a share of every index rebuild. Check `EXPLAIN QUERY PLAN` before adding an index here — index build time is ~40% of a cold index.
 
-The largest remaining win is interning `file_path`: every ref row stores a ~122-character absolute path, but there are only ~69k distinct paths, so the column and `idx_refs_file_path` together account for well over half the database.
+File paths are interned in `files`; definitions, references, and call edges store
+only `file_id`. This keeps repeated absolute paths out of the hot row tables.
 
 ## Key design decisions
 
