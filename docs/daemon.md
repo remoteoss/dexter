@@ -73,6 +73,23 @@ responses carry an id, and the daemon may push notifications (a method, no id)
 between them. One connection therefore multiplexes concurrent calls and
 subscriptions, and a slow reindex cannot block a lookup.
 
+Each message is one line of at most 16 MiB, newline included. A writer refuses
+a longer line before sending anything, so the stream stays in step: a result
+that is too large fails only its own call, and a `workspace/changed`
+notification with too many paths is sent as a full change instead. Location
+lists from `workspace/lookup` and `workspace/references` keep that rare by
+sending each path once:
+
+```json
+{"files":["/w/lib/a.ex","/w/lib/b.ex"],
+ "locations":[{"file":1,"line":9,"kind":"call"},
+              {"file":0,"line":1,"kind":"function","arity":2,"declaration":true}],
+ "ready":true}
+```
+
+`file` indexes `files`, and the locations keep their result order. `kind`,
+`arity`, and `declaration` are omitted when empty, zero, or false.
+
 ## The restart contract
 
 `ContractVersion` is the one number that says whether a frontend and a daemon

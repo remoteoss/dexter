@@ -609,6 +609,9 @@ func init() {
 			"session": mc.Session,
 		}, nil
 	})
+	RegisterMethod("srvtest/oversized", func(MethodContext, json.RawMessage) (any, error) {
+		return strings.Repeat("x", maxProtocolLine), nil
+	})
 	RegisterMethod("srvtest/panic", func(MethodContext, json.RawMessage) (any, error) {
 		panic("method exploded on purpose")
 	})
@@ -634,6 +637,22 @@ func TestControlMethodPanicDoesNotStopDaemon(t *testing.T) {
 	}
 	if _, err := client.DaemonStatus(context.Background()); err != nil {
 		t.Fatalf("daemon stopped after method panic: %v", err)
+	}
+}
+
+// A result too large for one protocol line fails only its own call. Writing it
+// anyway made the client's reader give up on the connection, which failed every
+// other call multiplexed on it.
+func TestOversizedResultFailsOnlyItsCall(t *testing.T) {
+	socketTestEnv(t)
+	root := t.TempDir()
+	client := startDaemon(t, root, time.Minute)
+	err := client.Call(context.Background(), "srvtest/oversized", struct{}{}, nil)
+	if err == nil || !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("error = %v, want a too-large refusal", err)
+	}
+	if _, err := client.DaemonStatus(context.Background()); err != nil {
+		t.Fatalf("connection unusable after an oversized result: %v", err)
 	}
 }
 

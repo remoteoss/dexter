@@ -3,6 +3,7 @@ package daemon
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -59,5 +60,38 @@ func TestReadJSONLineRejectsOversizedLine(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "exceeds") {
 		t.Fatalf("error = %v, want it to report the line limit", err)
+	}
+}
+
+// The writer refuses exactly what the reader would reject, newline included,
+// and writes nothing when it does, so the stream stays in step for the next
+// message.
+func TestWriteJSONLineMatchesTheReaderLimit(t *testing.T) {
+	// {"pad":"..."} is 10 bytes of framing around the padding.
+	fits := strings.Repeat("x", maxProtocolLine-1-10)
+	var buf bytes.Buffer
+	if err := writeJSONLine(&buf, map[string]string{"pad": fits}); err != nil {
+		t.Fatalf("line at the limit was refused: %v", err)
+	}
+	if buf.Len() != maxProtocolLine {
+		t.Fatalf("wrote %d bytes, want %d", buf.Len(), maxProtocolLine)
+	}
+	var message struct {
+		Pad string `json:"pad"`
+	}
+	if err := readJSONLine(bufio.NewReader(&buf), &message); err != nil {
+		t.Fatalf("reader rejected a line the writer sent: %v", err)
+	}
+	if len(message.Pad) != len(fits) {
+		t.Fatalf("pad length = %d, want %d", len(message.Pad), len(fits))
+	}
+
+	buf.Reset()
+	err := writeJSONLine(&buf, map[string]string{"pad": fits + "x"})
+	if !errors.Is(err, errLineTooLarge) {
+		t.Fatalf("error = %v, want errLineTooLarge", err)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("refused line still wrote %d bytes", buf.Len())
 	}
 }

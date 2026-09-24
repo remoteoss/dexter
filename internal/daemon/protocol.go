@@ -107,10 +107,18 @@ func readJSONLine(r *bufio.Reader, dst any) error {
 	return nil
 }
 
+// errLineTooLarge reports a message the peer's reader would refuse. It is
+// returned before anything is written, so the stream stays in step.
+var errLineTooLarge = errors.New("daemon protocol line too large")
+
 func writeJSONLine(w io.Writer, value any) error {
 	data, err := json.Marshal(value)
 	if err != nil {
 		return err
+	}
+	// readJSONLine counts the newline against the limit.
+	if len(data)+1 > maxProtocolLine {
+		return fmt.Errorf("%w: %d bytes, limit %d", errLineTooLarge, len(data)+1, maxProtocolLine)
 	}
 	data = append(data, '\n')
 	_, err = w.Write(data)
