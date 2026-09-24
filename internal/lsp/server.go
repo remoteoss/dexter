@@ -1148,11 +1148,11 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		s.debugf("Definition: resolved bare %q -> %q", functionName, fullModule)
 		if fullModule == "" {
 			currentModule := s.store.LookupEnclosingModule(uriToPath(protocol.DocumentURI(docURI)), lineNum+1)
-			if provider, _, found := s.generatedSymbolInScope(currentModule, func() []string {
+			if provider, functions, found := s.generatedSymbolInScope(currentModule, func() []string {
 				return s.enclosingBlockPath(docURI, lineNum, col)
 			}, functionName); found {
-				if results := s.generatedDefinitionResults(provider.module); len(results) > 0 {
-					s.debugf("Definition: generated bare %q provider=%s", functionName, provider.module)
+				if results, precise := s.generatedDefinitionResultsFor(provider.module, provider.beamPath, functions); len(results) > 0 {
+					s.debugf("Definition: generated bare %q provider=%s precise=%t", functionName, provider.module, precise)
 					return storeResultsToLocations(results), nil
 				}
 			}
@@ -1208,11 +1208,11 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		}
 
 		currentModule = s.store.LookupEnclosingModule(uriToPath(protocol.DocumentURI(docURI)), lineNum+1)
-		if provider, _, found := s.generatedSymbolInScope(currentModule, func() []string {
+		if provider, functions, found := s.generatedSymbolInScope(currentModule, func() []string {
 			return s.enclosingBlockPath(docURI, lineNum, col)
 		}, functionName); found {
-			if results := s.generatedDefinitionResults(provider.module); len(results) > 0 {
-				s.debugf("Definition: generated fallback for bare %q provider=%s", functionName, provider.module)
+			if results, precise := s.generatedDefinitionResultsFor(provider.module, provider.beamPath, functions); len(results) > 0 {
+				s.debugf("Definition: generated fallback for bare %q provider=%s precise=%t", functionName, provider.module, precise)
 				return storeResultsToLocations(results), nil
 			}
 		}
@@ -1248,6 +1248,14 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		if results := s.lookupThroughUseOf(fullModule, functionName); len(results) > 0 {
 			s.debugf("Definition: found %d result(s) via use chain of %s for %s", len(results), fullModule, functionName)
 			return storeResultsToLocations(results), nil
+		}
+		// Generated into the compiled module by a macro. Only a recorded line is
+		// taken here; otherwise the module fallback below gives the same answer.
+		if functions, found := s.generatedSymbol(fullModule, "", functionName); found {
+			if results, precise := s.generatedDefinitionResultsFor(fullModule, "", functions); precise {
+				s.debugf("Definition: generated %s.%s -> %s:%d", fullModule, functionName, results[0].FilePath, results[0].Line)
+				return storeResultsToLocations(results), nil
+			}
 		}
 		s.debugf("Definition: no indexed or use-chain definition for %s.%s; falling back to module source", fullModule, functionName)
 	}
@@ -5599,7 +5607,8 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 	if params.Context.IncludeDeclaration {
 		defResults, err := s.store.LookupFunction(fullModule, functionName)
 		if (err != nil || len(defResults) == 0) && len(generatedInjectors) > 0 {
-			defResults = s.generatedDefinitionResults(fullModule)
+			functions, _ := s.generatedSymbol(fullModule, "", functionName)
+			defResults, _ = s.generatedDefinitionResultsFor(fullModule, "", functions)
 			err = nil
 		}
 		if err == nil {
@@ -7199,7 +7208,7 @@ func (s *Server) PrepareCallHierarchy(ctx context.Context, params *protocol.Call
 		if len(generatedFunctions) == 0 {
 			return nil, nil
 		}
-		defResults = s.generatedDefinitionResults(fullModule)
+		defResults, _ = s.generatedDefinitionResultsFor(fullModule, "", generatedFunctions)
 		if len(defResults) == 0 {
 			return nil, nil
 		}
