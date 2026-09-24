@@ -3225,7 +3225,10 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 	scanRefStream := func(tf *TokenizedFile, tokens []parser.Token, line int, module, function string, interp bool) []refOccurrence {
 		n := len(tokens)
 		var occurrences []refOccurrence
-		for i := 0; i < n; i++ {
+		// Both streams are in byte order, so their lines never decrease and the
+		// first token on the line can be found without walking the file.
+		start := sort.Search(n, func(k int) bool { return tokens[k].Line >= line })
+		for i := start; i < n; i++ {
 			if tokens[i].Line > line {
 				break
 			}
@@ -3306,9 +3309,45 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 		return parser.ResolveModuleRef(call.moduleExpr, aliases, current)
 	}
 	for _, ia := range aliases {
+		// Candidates come first: only a file holding one can yield a result, and
+		// an injector is typically used by far more files than contain the name.
+		// Tokenizing just those files is what keeps a hot target affordable.
+		var functionRefs []store.ReferenceResult
+		var prefixRefs []store.ModuleReferenceResult
+		candidateFiles := make(map[string]bool)
+		if functionName != "" {
+			refs, err := s.store.LookupReferences(ia.shortName, functionName)
+			if err != nil {
+				continue
+			}
+			functionRefs = refs
+			for _, r := range refs {
+				candidateFiles[r.FilePath] = true
+			}
+		} else {
+			// The short name stands in for ia.module, so `Repo.Migrations` under
+			// an injected `alias MyApp.Repo` names `MyApp.Repo.Migrations`.
+			refs, err := s.store.LookupReferencesByPrefix(ia.shortName)
+			if err != nil {
+				continue
+			}
+			for _, r := range refs {
+				if moduleSitesOnly && r.Kind != "alias" && r.Kind != "import" && r.Kind != "use" && r.Kind != "require" {
+					continue
+				}
+				prefixRefs = append(prefixRefs, r)
+				candidateFiles[r.FilePath] = true
+			}
+		}
+		if len(candidateFiles) == 0 {
+			continue
+		}
+
 		// Exact lexical module scopes whose `use` brings this alias in. Keeping
 		// the line also prevents an earlier bare name in the same module from
-		// being mistaken for an alias that is introduced later.
+		// being mistaken for an alias that is introduced later. Sites are read
+		// only in candidate files, which depend on nothing but the short name
+		// within one call, so the cache key stays sound.
 		consumers := make(map[string][]useSite)
 		for _, inj := range ia.injectors {
 			cacheKey := inj + "\x00" + ia.shortName + "\x00" + ia.module
@@ -3316,7 +3355,7 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 			if !ok {
 				if refs, err := s.store.LookupReferences(inj, ""); err == nil {
 					for _, r := range refs {
-						if r.Kind != "use" {
+						if r.Kind != "use" || !candidateFiles[r.FilePath] {
 							continue
 						}
 						tf, exists := tokenizedAt(r.FilePath)
@@ -3375,11 +3414,7 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 		}
 
 		if functionName != "" {
-			refs, err := s.store.LookupReferences(ia.shortName, functionName)
-			if err != nil {
-				continue
-			}
-			for _, r := range refs {
+			for _, r := range functionRefs {
 				columns := consumerColumns(r.FilePath, r.Line, ia.shortName, functionName)
 				if len(columns) == 0 {
 					continue
@@ -3398,16 +3433,7 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 			continue
 		}
 
-		// The short name stands in for ia.module, so `Repo.Migrations` under
-		// an injected `alias MyApp.Repo` names `MyApp.Repo.Migrations`.
-		refs, err := s.store.LookupReferencesByPrefix(ia.shortName)
-		if err != nil {
-			continue
-		}
-		for _, r := range refs {
-			if moduleSitesOnly && r.Kind != "alias" && r.Kind != "import" && r.Kind != "use" && r.Kind != "require" {
-				continue
-			}
+		for _, r := range prefixRefs {
 			columns := consumerColumns(r.FilePath, r.Line, r.Module, "")
 			if len(columns) == 0 {
 				continue
