@@ -229,6 +229,11 @@ type ReindexParams struct {
 
 type ReindexResult struct {
 	Elapsed time.Duration `json:"elapsed"`
+	// Missing reports a target that neither exists nor had anything indexed
+	// under it, so the reindex had nothing to do. It is not an error: the index
+	// already matches the disk, and the watcher may simply have pruned a
+	// deleted file first. A mistyped path is the usual cause.
+	Missing bool `json:"missing,omitempty"`
 }
 
 // WatchParams subscribes a connection to coalesced index mutations.
@@ -851,6 +856,7 @@ func (s *server) handleRequest(c *conn, mc MethodContext, req request) (any, err
 		locations, err := mc.LSP().LookupName(params.Module, params.Function, lsp.NameLookupOptions{
 			FollowDelegates:  params.FollowDelegates,
 			FallbackToModule: !params.Strict,
+			ExactModule:      params.Strict,
 		})
 		if err != nil {
 			return nil, err
@@ -877,12 +883,21 @@ func (s *server) handleRequest(c *conn, mc MethodContext, req request) (any, err
 		}
 		start := time.Now()
 		var err error
+		missing := false
 		if params.Target == "" {
 			err = s.runtime.Reindex(mc.Context)
 		} else {
+			// Checked before the reindex, which prunes whatever was indexed.
+			if _, statErr := os.Stat(params.Target); os.IsNotExist(statErr) {
+				indexed, indexErr := s.runtime.Indexes(params.Target)
+				if indexErr != nil {
+					return nil, indexErr
+				}
+				missing = !indexed
+			}
 			err = s.runtime.ReindexPath(mc.Context, params.Target)
 		}
-		return ReindexResult{Elapsed: time.Since(start).Round(time.Millisecond)}, err
+		return ReindexResult{Elapsed: time.Since(start).Round(time.Millisecond), Missing: missing}, err
 	case MethodWatch:
 		var params WatchParams
 		if len(req.Params) > 0 {

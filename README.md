@@ -662,6 +662,8 @@ If the issue persists, enable debug mode to get verbose logs. You can do this in
 1. Set the `debug` option in your editor's LSP `initializationOptions` (see [LSP options](#lsp-options))
 2. Or set the `DEXTER_DEBUG=true` environment variable before launching your editor
 
+The workspace daemon inherits the environment of whichever editor or CLI command starts it, and reads `DEXTER_DEBUG` when it starts. To debug CLI commands, or when a daemon is already running without it, run `dexter stop` and then start the next command with `DEXTER_DEBUG=true`. The daemon writes its log to `<key>.log` in its runtime directory (`/tmp/dexter-<uid>` on macOS and Linux; see [docs/daemon.md](docs/daemon.md)).
+
 Debug mode logs timing and resolution details for every definition, hover, references, and rename request to stderr. In Neovim you can usually view these at `~/.local/state/nvim/lsp.log`. In VS Code, you can see them in Output > Dexter.
 
 When [filing an issue](https://github.com/remoteoss/dexter/issues/new), please include:

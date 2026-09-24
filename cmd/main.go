@@ -226,12 +226,24 @@ func findProjectRoot(path string) string {
 	return findProjectRootWithMissing(path, false)
 }
 
+// findProjectRootWithMissing is findProjectRoot for a target that may have been
+// deleted. The search starts from the nearest ancestor that still exists: the
+// missing path itself can hold no marker, and returning it as the root would
+// name a workspace that is not there.
 func findProjectRootWithMissing(path string, allowMissing bool) string {
 	info, err := os.Stat(path)
-	if err != nil && (!allowMissing || !os.IsNotExist(err)) {
+	for allowMissing && os.IsNotExist(err) {
+		parent := filepath.Dir(path)
+		if parent == path {
+			break
+		}
+		path = parent
+		info, err = os.Stat(path)
+	}
+	if err != nil {
 		fatal(err)
 	}
-	if err == nil && !info.IsDir() {
+	if !info.IsDir() {
 		path = filepath.Dir(path)
 	}
 	root := store.FindProjectRoot(path, "mix.exs")
@@ -445,9 +457,12 @@ func cmdReindex(target string, allowNonProject bool) {
 	if err := client.Call(callCtx, daemon.MethodReindex, daemon.ReindexParams{Target: target}, &result); err != nil {
 		fatal(err)
 	}
-	if target == projectRoot {
+	switch {
+	case result.Missing:
+		fmt.Fprintf(os.Stderr, "Nothing to reindex at %s: it does not exist and nothing is indexed there\n", target)
+	case target == projectRoot:
 		fmt.Fprintf(os.Stderr, "Reindexed workspace (%s)\n", result.Elapsed)
-	} else {
+	default:
 		fmt.Fprintf(os.Stderr, "Reindexed %s (%s)\n", target, result.Elapsed)
 	}
 }

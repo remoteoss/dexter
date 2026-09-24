@@ -26,6 +26,11 @@ type NameLookupOptions struct {
 	External         bool
 	FallbackToModule bool
 	ExcludeStdlib    bool
+	// ExactModule places a generated function only at its own module's
+	// definition. Without it, a module that exists only as a BEAM, such as
+	// Phoenix route helpers, resolves to the nearest lexical parent with source;
+	// that is a fallback, which a strict lookup must not take.
+	ExactModule bool
 }
 
 type NameReferenceOptions struct {
@@ -64,7 +69,13 @@ func (s *Server) LookupName(module, function string, opts NameLookupOptions) ([]
 	}
 	if len(results) == 0 && opts.Kind != NameKindType {
 		if generated, found := s.generatedSymbol(module, "", function); found && len(generated) > 0 {
-			results = s.generatedDefinitionResults(module)
+			if opts.ExactModule {
+				if results, err = s.store.LookupModule(module); err != nil {
+					return nil, err
+				}
+			} else {
+				results = s.generatedDefinitionResults(module)
+			}
 			if len(results) > 0 {
 				results[0].Arity = generated[0].Arity
 				results[0].Kind = generated[0].Kind

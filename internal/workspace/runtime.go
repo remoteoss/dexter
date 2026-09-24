@@ -433,6 +433,12 @@ func (r *Runtime) Reindex(ctx context.Context) error {
 	}
 }
 
+// Indexes reports whether path is an indexed file or a directory holding one.
+// It is a read, so it does not wait behind queued mutations.
+func (r *Runtime) Indexes(path string) (bool, error) {
+	return r.store.HasPath(path)
+}
+
 // ReindexPath reconciles one file and waits for it, schedules a full pass for a
 // directory, and prunes a path that no longer exists. Reconciliation stats the
 // path itself, so create, change, and delete share one idempotent code path.

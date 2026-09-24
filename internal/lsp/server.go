@@ -211,11 +211,14 @@ func NewServerWithOptions(s *store.Store, projectRoot string, opts ServerOptions
 		_, _ = index.setStdlibRoot(opts.InitialStdlibRoot)
 	}
 	return &Server{
-		store:              s,
-		docs:               NewDocumentStore(),
-		projectRoot:        projectRoot,
-		explicitRoot:       projectRoot != "",
-		followDelegates:    true,
+		store:           s,
+		docs:            NewDocumentStore(),
+		projectRoot:     projectRoot,
+		explicitRoot:    projectRoot != "",
+		followDelegates: true,
+		// Read here as well as in Initialize: the daemon's headless service
+		// answers CLI and MCP calls and never receives an initialize request.
+		debug:              os.Getenv("DEXTER_DEBUG") == "true",
 		erlangBuildRoots:   make(map[string]*erlangBuildRootState),
 		erlangRuntimeCache: make(map[string]*erlangRuntimeCache),
 		usingCache:         make(map[string]*usingCacheEntry),

@@ -812,6 +812,24 @@ func (s *Store) ListFilePaths() ([]string, error) {
 	return paths, rows.Err()
 }
 
+// HasPath reports whether path is an indexed file or a directory holding one.
+// The range on the unique path index finds a descendant without listing every
+// file: sep+1 is the first byte after the separator, so [prefix, upper) spans
+// exactly the paths under the directory.
+func (s *Store) HasPath(path string) (bool, error) {
+	prefix := path + string(os.PathSeparator)
+	upper := path + string(rune(os.PathSeparator+1))
+	var found int
+	err := s.db.QueryRow(
+		"SELECT 1 FROM files WHERE path = ? OR (path >= ? AND path < ?) LIMIT 1",
+		path, prefix, upper,
+	).Scan(&found)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return err == nil, err
+}
+
 func (s *Store) RemoveFile(path string) error {
 	return s.RemoveFiles([]string{path})
 }

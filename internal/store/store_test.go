@@ -1952,3 +1952,36 @@ func TestModuleFunctionKeysUnknownModule(t *testing.T) {
 		t.Fatalf("expected no keys for an unknown module, got %v", keys)
 	}
 }
+
+// HasPath matches an indexed file or a directory that holds one, and nothing
+// that merely shares a name prefix with them.
+func TestHasPathMatchesFilesAndDirectoriesOnly(t *testing.T) {
+	s, dir := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	for _, relative := range []string{"lib/a.ex", "lib/sub/b.ex", "app.ex", "app0.ex", "appx/c.ex"} {
+		if err := s.IndexFile(writeElixirFile(t, dir, relative, ""), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for relative, want := range map[string]bool{
+		"lib/a.ex":  true,
+		"lib":       true,
+		"lib/sub":   true,
+		"app.ex":    true,
+		"appx":      true,
+		"lib/a":     false, // a prefix of a file name, not the file
+		"li":        false, // a prefix of a directory name
+		"app":       false, // app.ex, app0.ex, and appx/ share the prefix but are not under app/
+		"lib/sub/c": false,
+		"elsewhere": false,
+	} {
+		got, err := s.HasPath(filepath.Join(dir, relative))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Errorf("HasPath(%s) = %v, want %v", relative, got, want)
+		}
+	}
+}

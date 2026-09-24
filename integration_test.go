@@ -525,6 +525,39 @@ func TestIntegration_ReindexDeletedPath(t *testing.T) {
 	}
 }
 
+// Deleting a whole directory and reindexing it prunes every file under it.
+func TestIntegration_ReindexDeletedDirectory(t *testing.T) {
+	binary := buildDexter(t)
+	root := scaffoldProject(t)
+	runDexter(t, binary, root, "init", root)
+
+	deleted := filepath.Join(root, "lib", "my_app")
+	if err := os.RemoveAll(deleted); err != nil {
+		t.Fatal(err)
+	}
+	runDexter(t, binary, root, "reindex", deleted)
+
+	cmd := exec.Command(binary, "lookup", "--strict", "MyApp.Repo")
+	cmd.Dir = root
+	cmd.Env = append(os.Environ(), "PWD="+root)
+	if out, err := cmd.CombinedOutput(); err == nil {
+		t.Fatalf("module in deleted directory still resolves:\n%s", out)
+	}
+}
+
+// A mistyped reindex path is not an error, since the index already matches the
+// disk there, but the CLI says it found nothing instead of claiming a reindex.
+func TestIntegration_ReindexMistypedPathSaysNothingThere(t *testing.T) {
+	binary := buildDexter(t)
+	root := scaffoldProject(t)
+	runDexter(t, binary, root, "init", root)
+
+	out := runDexter(t, binary, root, "reindex", filepath.Join(root, "lib", "my_ap"))
+	if !strings.Contains(out, "Nothing to reindex at") || strings.Contains(out, "Reindexed") {
+		t.Fatalf("reindex of a mistyped path = %q, want a nothing-there note", out)
+	}
+}
+
 func TestIntegration_CLIUsesSemanticNavigation(t *testing.T) {
 	binary := buildDexter(t)
 	root := scaffoldProject(t)
