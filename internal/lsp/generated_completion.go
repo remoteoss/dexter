@@ -3,6 +3,7 @@ package lsp
 import (
 	"container/list"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -42,6 +43,12 @@ type generatedFunctionCacheEntry struct {
 	// invisible to static analysis, read from its compiled attributes.
 	providers         []string
 	providersResolved bool
+
+	// debugInfo holds the definition lines from the BEAM's Dbgi chunk, read on
+	// the first definition request that needs them. Memoized on the entry for
+	// the same reason as providers: the BEAM stamp invalidates both.
+	debugInfo         beam.DebugInfo
+	debugInfoResolved bool
 
 	// docs memoizes rendered documentation prose for functions a hover has asked
 	// about, so sweeping the mouse does not re-inflate the Docs chunk each time.
@@ -674,6 +681,94 @@ func (s *Server) generatedDefinitionResults(module string) []store.LookupResult 
 		candidate = candidate[:dot]
 	}
 	return nil
+}
+
+// generatedDebugInfo returns a compiled module's debug info and the stamp of the
+// BEAM it came from. It is read once per BEAM, and a failed read is memoized as
+// empty: a module compiled without debug info will not grow it until rebuilt.
+func (s *Server) generatedDebugInfo(module, beamPath string) (beam.DebugInfo, fileStamp, bool) {
+	// Resolving first validates the entry and yields the BEAM path.
+	_ = s.generatedFunctionsFor(module, beamPath)
+
+	entry, ok := s.generatedCache.get(module)
+	if !ok || entry.beamPath == "" {
+		return beam.DebugInfo{}, fileStamp{}, false
+	}
+	if !entry.debugInfoResolved {
+		started := s.debugNow()
+		info, err := beam.ReadDefinitionLines(entry.beamPath)
+		if !started.IsZero() {
+			s.debugf("Generated BEAM debug info: module=%s definitions=%d error=%v total=%s", module, len(info.Lines), err, time.Since(started).Round(time.Microsecond))
+		}
+		entry.debugInfo = info
+		entry.debugInfoResolved = true
+		s.generatedCache.put(module, entry)
+	}
+	return entry.debugInfo, entry.beamStamp, len(entry.debugInfo.Lines) > 0
+}
+
+// generatedDefinitionResultsFor is where navigation sends a generated function.
+// It starts from generatedDefinitionResults, the closest source-backed module,
+// and moves to the function's own line when the compiled module records one in
+// that module's source: for a function a DSL declared, that is the line that
+// declared it. precise reports whether it did.
+//
+// The recorded line is used only when it can be trusted in the file being
+// opened. The debug info must come from that file, the BEAM must not be older
+// than it (lines move when the source is edited), and the line must fall after
+// the module's own line, since a line at or before it says nothing the module
+// result does not. Anything else keeps the module result.
+func (s *Server) generatedDefinitionResultsFor(module, beamPath string, functions []beam.Function) (results []store.LookupResult, precise bool) {
+	results = s.generatedDefinitionResults(module)
+	if len(results) == 0 || len(functions) == 0 {
+		return results, false
+	}
+	info, beamStamp, ok := s.generatedDebugInfo(module, beamPath)
+	if !ok {
+		return results, false
+	}
+	for _, result := range results {
+		if !debugInfoDescribesFile(info, result.FilePath) {
+			continue
+		}
+		if source := statFileStamp(result.FilePath); !source.exists || source.mtime > beamStamp.mtime {
+			s.debugf("Definition: generated %s debug info is older than %s; keeping module line", module, result.FilePath)
+			return results, false
+		}
+		var lines []store.LookupResult
+		for _, function := range functions {
+			line := info.Lines[beam.FunctionKey{Name: function.Name, Arity: function.Arity}]
+			if line <= result.Line || slices.ContainsFunc(lines, func(r store.LookupResult) bool { return r.Line == line }) {
+				continue
+			}
+			lines = append(lines, store.LookupResult{
+				Module:   module,
+				FilePath: result.FilePath,
+				Line:     line,
+				Kind:     function.Kind,
+				Arity:    function.Arity,
+			})
+		}
+		if len(lines) > 0 {
+			return lines, true
+		}
+		return results, false
+	}
+	return results, false
+}
+
+// debugInfoDescribesFile reports whether debug info was compiled from path.
+// The absolute path is compared first; the relative one covers a project that
+// has moved or is reached through a symlink since it was compiled.
+func debugInfoDescribesFile(info beam.DebugInfo, path string) bool {
+	if info.File != "" && info.File == path {
+		return true
+	}
+	relative := filepath.ToSlash(info.RelativeFile)
+	if relative == "" || filepath.IsAbs(info.RelativeFile) {
+		return false
+	}
+	return strings.HasSuffix(filepath.ToSlash(path), "/"+relative)
 }
 
 // filterGeneratedProviderReferences removes the conservative false positives
