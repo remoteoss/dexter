@@ -2915,6 +2915,90 @@ func TestWalkAndCollectAgreeOnSymlinkedRoot(t *testing.T) {
 	}
 }
 
+// TestWalkAndCollectSkipNestedLinkedWorktrees covers a linked git worktree
+// checked out below the project root (e.g. `.claude/worktrees/<name>`): it is a
+// full copy of the repository, so indexing it returns every definition twice.
+// Submodules also carry a `.git` file, but theirs points into `.git/modules/`
+// and they are indexed; so are directories with a `.git` directory, such as
+// Mix git dependencies under deps/.
+func TestWalkAndCollectSkipNestedLinkedWorktrees(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "my_app")
+	write := func(rel, content string) {
+		t.Helper()
+		path := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mod := "defmodule X do\nend\n"
+	write("lib/my_app.ex", mod)
+	write(".git/HEAD", "ref: refs/heads/main\n")
+	// Linked worktrees, absolute and relative gitdir, at two depths.
+	write(".claude/worktrees/feature/.git", "gitdir: "+filepath.Join(root, ".git", "worktrees", "feature")+"\n")
+	write(".claude/worktrees/feature/.formatter.exs", "[]\n")
+	write(".claude/worktrees/feature/lib/my_app.ex", mod)
+	write("wt/.git", "gitdir: ../.git/worktrees/wt\n")
+	write("wt/lib/my_app.ex", mod)
+	// Indexed: a submodule and a git dependency.
+	write("vendor/shared_lib/.git", "gitdir: ../../.git/modules/vendor/shared_lib\n")
+	write("vendor/shared_lib/lib/shared_lib.ex", mod)
+	write("deps/dep_a/.git/HEAD", "ref: refs/heads/main\n")
+	write("deps/dep_a/lib/dep_a.ex", mod)
+
+	want := []string{
+		filepath.Join(root, "deps/dep_a/lib/dep_a.ex"),
+		filepath.Join(root, "lib/my_app.ex"),
+		filepath.Join(root, "vendor/shared_lib/lib/shared_lib.ex"),
+	}
+
+	var walked []string
+	if err := WalkElixirFiles(root, func(path string, d fs.DirEntry) error {
+		walked = append(walked, path)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	collected := CollectElixirFilesParallel(root)
+	sort.Strings(walked)
+	sort.Strings(collected)
+	if !reflect.DeepEqual(walked, want) {
+		t.Errorf("WalkElixirFiles = %v, want %v", walked, want)
+	}
+	if !reflect.DeepEqual(collected, want) {
+		t.Errorf("CollectElixirFilesParallel = %v, want %v", collected, want)
+	}
+
+	// A linked worktree opened as the project root is indexed normally.
+	wt := filepath.Join(root, "wt")
+	if got := CollectElixirFilesParallel(wt); len(got) != 1 {
+		t.Errorf("worktree as root: Collect = %v, want its one file", got)
+	}
+	walked = walked[:0]
+	_ = WalkElixirFiles(wt, func(path string, d fs.DirEntry) error { walked = append(walked, path); return nil })
+	if len(walked) != 1 {
+		t.Errorf("worktree as root: Walk = %v, want its one file", walked)
+	}
+
+	if !InLinkedWorktree(root, filepath.Join(root, "wt/lib/my_app.ex")) {
+		t.Error("InLinkedWorktree missed a file in a nested worktree")
+	}
+	for _, p := range []string{"lib/my_app.ex", "vendor/shared_lib/lib/shared_lib.ex", "deps/dep_a/lib/dep_a.ex"} {
+		if InLinkedWorktree(root, filepath.Join(root, p)) {
+			t.Errorf("InLinkedWorktree(%s) = true", p)
+		}
+	}
+	if InLinkedWorktree(wt, filepath.Join(wt, "lib/my_app.ex")) {
+		t.Error("InLinkedWorktree treated the root itself as nested")
+	}
+	if InLinkedWorktree(root, filepath.Join(base, "elsewhere/lib/a.ex")) {
+		t.Error("InLinkedWorktree matched a path outside the root")
+	}
+}
+
 // TestParse_AliasOverExistingAlias covers alias chaining on alias lines:
 // `alias SharedLib.Accounts` then `alias Accounts.Users` must record the
 // canonical SharedLib.Accounts.Users, not the literal "Accounts.Users".

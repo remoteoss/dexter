@@ -156,64 +156,123 @@ func IsElixirFile(path string) bool {
 	return extension == ".ex" || extension == ".exs"
 }
 
-// WalkElixirFiles walks root, skipping _build/.git/node_modules directories,
-// and calls fn for each .ex/.exs file found.
+// WalkElixirFiles walks root, skipping _build/.git/node_modules directories and
+// linked git worktrees nested below root, and calls fn for each .ex/.exs file
+// found.
 //
 // A root that is itself a symlink to a directory is followed; symlinks below it
 // are not. This has to match CollectElixirFilesParallel exactly, because the
 // two describe the same set of files to different phases of the same index: the
 // cold build enumerates with Collect, and the incremental sweep prunes every
-// stored path this walk does not yield. filepath.WalkDir alone stats the root
-// with Lstat, so it treats a symlinked root as a non-directory and yields
-// nothing — which on a symlinked project or stdlib root made the sweep prune
-// the entire index the cold build had just written. Walking the root's children
-// rather than the root keeps the caller's path prefix, which the editor's URIs
-// depend on, instead of the resolved one filepath.EvalSymlinks would give.
+// stored path this walk does not yield. Opening the root follows a symlink, and
+// the entries below it report a symlinked directory as a non-directory, as in
+// the collector. Paths keep the caller's prefix, which the editor's URIs depend
+// on, instead of the resolved one filepath.EvalSymlinks would give.
 func WalkElixirFiles(root string, fn func(path string, d fs.DirEntry) error) error {
-	walk := func(target string) error {
-		return filepath.WalkDir(target, func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return nil
-			}
-			if d.IsDir() {
-				if skipDir(filepath.Base(path)) {
-					return filepath.SkipDir
-				}
-				return nil
-			}
-			if !IsElixirFile(path) {
-				return nil
-			}
-			return fn(path, d)
-		})
-	}
-
 	info, err := os.Stat(root)
 	if err != nil {
 		return nil
 	}
 	if !info.IsDir() {
-		return walk(root)
+		if !IsElixirFile(root) {
+			return nil
+		}
+		return fn(root, fs.FileInfoToDirEntry(info))
 	}
 
-	entries, err := readDirUnsorted(root)
-	if err != nil {
+	var walk func(dir string, isRoot bool) error
+	walk = func(dir string, isRoot bool) error {
+		entries, err := readDirUnsorted(dir)
+		if err != nil {
+			return nil
+		}
+		if !isRoot && hasLinkedWorktreeGitFile(dir, entries) {
+			return nil
+		}
+		for _, e := range entries {
+			name := e.Name()
+			path := filepath.Join(dir, name)
+			if e.IsDir() {
+				if skipDir(name) {
+					continue
+				}
+				if err := walk(path, false); err != nil {
+					return err
+				}
+				continue
+			}
+			if IsElixirFile(name) {
+				if err := fn(path, e); err != nil {
+					return err
+				}
+			}
+		}
 		return nil
 	}
-	for _, e := range entries {
-		if e.IsDir() && skipDir(e.Name()) {
-			continue
-		}
-		if err := walk(filepath.Join(root, e.Name())); err != nil {
-			return err
-		}
-	}
-	return nil
+	return walk(root, true)
 }
 
 // skipDir reports whether a directory name is excluded from indexing.
 func skipDir(name string) bool {
 	return name == "_build" || name == ".git" || name == "node_modules"
+}
+
+// hasLinkedWorktreeGitFile reports whether dir, whose entries are given, is the
+// top of a linked git worktree. Such a checkout nested inside the project (e.g.
+// Claude Code's .claude/worktrees/) is a full copy of the repository, and
+// indexing it would duplicate every definition. Scanning the entries already
+// read costs no syscall; only a directory that has a .git file pays one read.
+func hasLinkedWorktreeGitFile(dir string, entries []fs.DirEntry) bool {
+	for _, e := range entries {
+		if e.Name() == ".git" {
+			return !e.IsDir() && isLinkedWorktreeGitFile(filepath.Join(dir, ".git"))
+		}
+	}
+	return false
+}
+
+// isLinkedWorktreeGitFile reports whether the .git file at path points into
+// another repository's .git/worktrees/. Submodules also have a .git file, but
+// it points into .git/modules/, and they stay indexed like any other directory.
+func isLinkedWorktreeGitFile(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	var buf [4096]byte
+	n, _ := f.Read(buf[:])
+	_ = f.Close()
+	line, _, _ := strings.Cut(string(buf[:n]), "\n")
+	gitdir, ok := strings.CutPrefix(strings.TrimSpace(line), "gitdir:")
+	if !ok {
+		return false
+	}
+	gitdir = filepath.ToSlash(filepath.Clean(strings.TrimSpace(gitdir)))
+	return strings.Contains(gitdir, "/.git/worktrees/") || strings.HasPrefix(gitdir, ".git/worktrees/")
+}
+
+// IsLinkedWorktree reports whether dir is the top of a linked git worktree.
+func IsLinkedWorktree(dir string) bool {
+	return isLinkedWorktreeGitFile(filepath.Join(dir, ".git"))
+}
+
+// InLinkedWorktree reports whether path lies inside a linked git worktree nested
+// below root, which the walkers skip. Single-file updates from watchers and
+// editors check it so they do not index what a full walk leaves out. root
+// itself may be a linked worktree; only directories strictly below it count.
+func InLinkedWorktree(root, path string) bool {
+	rel, err := filepath.Rel(root, filepath.Dir(path))
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	dir := root
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		dir = filepath.Join(dir, part)
+		if isLinkedWorktreeGitFile(filepath.Join(dir, ".git")) {
+			return true
+		}
+	}
+	return false
 }
 
 // readDirUnsorted lists a directory without sorting the entries. os.ReadDir and
@@ -230,7 +289,7 @@ func readDirUnsorted(dir string) ([]fs.DirEntry, error) {
 }
 
 // CollectElixirFilesParallel returns the paths of every .ex/.exs file below root,
-// skipping the same directories as WalkElixirFiles. It fans the traversal out
+// skipping the same directories and nested worktrees as WalkElixirFiles. It fans the traversal out
 // across all cores: on a large monorepo the single-threaded walk is a real share
 // of a cold index, and each directory read is an independent syscall.
 //
@@ -252,6 +311,9 @@ func CollectElixirFilesParallel(root string) []string {
 
 		entries, err := readDirUnsorted(dir)
 		if err != nil {
+			return
+		}
+		if dir != root && hasLinkedWorktreeGitFile(dir, entries) {
 			return
 		}
 

@@ -100,6 +100,9 @@ func (w *fsnotifyWatcher) walkDirectories(root string, includeRoot bool) int {
 		if skipWatchDir(d.Name()) {
 			return filepath.SkipDir
 		}
+		if path != w.root && parser.IsLinkedWorktree(path) {
+			return filepath.SkipDir
+		}
 		if path == root && !includeRoot {
 			return nil
 		}

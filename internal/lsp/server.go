@@ -472,6 +472,11 @@ func (s *Server) indexOneFile(path string) {
 // indexOneFileLocked is indexOneFile for callers already holding indexWrites.
 // Go's RWMutex is not reentrant, so the two must stay separate.
 func (s *Server) indexOneFileLocked(path string) {
+	// Watchers and editors report changes in nested worktrees too; the full
+	// walk skips them, so a single-file update must as well.
+	if parser.InLinkedWorktree(s.projectRoot, path) {
+		return
+	}
 	defs, refs, err := parser.ParseFile(path)
 	if err != nil {
 		log.Printf("Error parsing %s: %v", path, err)
