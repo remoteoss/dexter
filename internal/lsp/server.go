@@ -1159,9 +1159,15 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		s.debugf("Definition: resolved bare %q -> %q", functionName, fullModule)
 		if fullModule == "" {
 			currentModule := s.store.LookupEnclosingModule(uriToPath(protocol.DocumentURI(docURI)), lineNum+1)
-			if provider, _, found := s.generatedSymbolInScope(currentModule, func() []string {
+			if provider, functions, found := s.generatedSymbolInScope(currentModule, func() []string {
 				return s.enclosingBlockPath(docURI, lineNum, col)
 			}, functionName); found {
+				// A callable the compiler annotated with a specific line gets that
+				// line; the module row is the fallback for the rest.
+				if results := s.generatedSymbolLocations(provider.module, provider.beamPath, functions); len(results) > 0 {
+					s.debugf("Definition: generated source %q provider=%s line=%d", functionName, provider.module, results[0].Line)
+					return storeResultsToLocations(results), nil
+				}
 				if results := s.generatedDefinitionResults(provider.module); len(results) > 0 {
 					s.debugf("Definition: generated bare %q provider=%s", functionName, provider.module)
 					return storeResultsToLocations(results), nil
@@ -1207,9 +1213,13 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		}
 
 		currentModule = s.store.LookupEnclosingModule(uriToPath(protocol.DocumentURI(docURI)), lineNum+1)
-		if provider, _, found := s.generatedSymbolInScope(currentModule, func() []string {
+		if provider, functions, found := s.generatedSymbolInScope(currentModule, func() []string {
 			return s.enclosingBlockPath(docURI, lineNum, col)
 		}, functionName); found {
+			if results := s.generatedSymbolLocations(provider.module, provider.beamPath, functions); len(results) > 0 {
+				s.debugf("Definition: generated source %q provider=%s line=%d", functionName, provider.module, results[0].Line)
+				return storeResultsToLocations(results), nil
+			}
 			if results := s.generatedDefinitionResults(provider.module); len(results) > 0 {
 				s.debugf("Definition: generated fallback for bare %q provider=%s", functionName, provider.module)
 				return storeResultsToLocations(results), nil
