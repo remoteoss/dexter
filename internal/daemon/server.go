@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/remoteoss/dexter/internal/lsp"
-	"github.com/remoteoss/dexter/internal/store"
 	"github.com/remoteoss/dexter/internal/version"
 	"github.com/remoteoss/dexter/internal/workspace"
 )
@@ -120,9 +119,20 @@ type LookupParams struct {
 	WaitReadyMs     int    `json:"waitReadyMs,omitempty"`
 }
 
+// LookupResult travels in the location encoding described at locationsWire.
 type LookupResult struct {
-	Locations []store.LookupResult `json:"locations"`
-	Ready     bool                 `json:"ready"`
+	Locations []lsp.NameLocation
+	Ready     bool
+}
+
+func (r LookupResult) MarshalJSON() ([]byte, error) {
+	return marshalLocations(r.Locations, r.Ready)
+}
+
+func (r *LookupResult) UnmarshalJSON(data []byte) error {
+	var err error
+	r.Locations, r.Ready, err = unmarshalLocations(data)
+	return err
 }
 
 type ReferencesParams struct {
@@ -131,9 +141,86 @@ type ReferencesParams struct {
 	WaitReadyMs int    `json:"waitReadyMs,omitempty"`
 }
 
+// ReferencesResult travels in the location encoding described at
+// locationsWire.
 type ReferencesResult struct {
-	Locations []store.ReferenceResult `json:"locations"`
-	Ready     bool                    `json:"ready"`
+	Locations []lsp.NameLocation
+	Ready     bool
+}
+
+func (r ReferencesResult) MarshalJSON() ([]byte, error) {
+	return marshalLocations(r.Locations, r.Ready)
+}
+
+func (r *ReferencesResult) UnmarshalJSON(data []byte) error {
+	var err error
+	r.Locations, r.Ready, err = unmarshalLocations(data)
+	return err
+}
+
+// locationsWire is the wire shape of a location list: each path once in a file
+// table, and locations that index into it in their original order. A hot
+// reference result repeats a few thousand absolute paths across ~100k
+// locations; spelling every path out pushed such a result past the protocol
+// line limit, and the table keeps it about a fifth of that size.
+type locationsWire struct {
+	Files     []string       `json:"files"`
+	Locations []locationWire `json:"locations"`
+	Ready     bool           `json:"ready"`
+}
+
+type locationWire struct {
+	File        int    `json:"file"`
+	Line        int    `json:"line"`
+	Kind        string `json:"kind,omitempty"`
+	Arity       int    `json:"arity,omitempty"`
+	Declaration bool   `json:"declaration,omitempty"`
+}
+
+func marshalLocations(locations []lsp.NameLocation, ready bool) ([]byte, error) {
+	wire := locationsWire{
+		Files:     []string{},
+		Locations: make([]locationWire, len(locations)),
+		Ready:     ready,
+	}
+	fileIndex := make(map[string]int)
+	for i, location := range locations {
+		index, ok := fileIndex[location.FilePath]
+		if !ok {
+			index = len(wire.Files)
+			fileIndex[location.FilePath] = index
+			wire.Files = append(wire.Files, location.FilePath)
+		}
+		wire.Locations[i] = locationWire{
+			File:        index,
+			Line:        location.Line,
+			Kind:        location.Kind,
+			Arity:       location.Arity,
+			Declaration: location.IsDeclaration,
+		}
+	}
+	return json.Marshal(wire)
+}
+
+func unmarshalLocations(data []byte) ([]lsp.NameLocation, bool, error) {
+	var wire locationsWire
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return nil, false, err
+	}
+	locations := make([]lsp.NameLocation, len(wire.Locations))
+	for i, location := range wire.Locations {
+		if location.File < 0 || location.File >= len(wire.Files) {
+			return nil, false, fmt.Errorf("location %d names file %d of %d", i, location.File, len(wire.Files))
+		}
+		locations[i] = lsp.NameLocation{
+			FilePath:      wire.Files[location.File],
+			Line:          location.Line,
+			Kind:          location.Kind,
+			Arity:         location.Arity,
+			IsDeclaration: location.Declaration,
+		}
+	}
+	return locations, wire.Ready, nil
 }
 
 type ReindexParams struct {
@@ -142,6 +229,11 @@ type ReindexParams struct {
 
 type ReindexResult struct {
 	Elapsed time.Duration `json:"elapsed"`
+	// Missing reports a target that neither exists nor had anything indexed
+	// under it, so the reindex had nothing to do. It is not an error: the index
+	// already matches the disk, and the watcher may simply have pruned a
+	// deleted file first. A mistyped path is the usual cause.
+	Missing bool `json:"missing,omitempty"`
 }
 
 // WatchParams subscribes a connection to coalesced index mutations.
@@ -678,7 +770,12 @@ func (s *server) serveControl(c *conn, reader *bufio.Reader, sessionID string) e
 					res.Result = nil
 					res.Error = fmt.Sprintf("control method %q panicked", req.Method)
 				}
-				_ = c.write(res)
+				if err := c.write(res); errors.Is(err, errLineTooLarge) {
+					// Nothing was written, so the stream is still in step and only
+					// this call fails; the connection's other calls carry on.
+					log.Printf("Daemon control method %q: %v", req.Method, err)
+					_ = c.write(response{ID: req.ID, Error: fmt.Sprintf("%s result is too large to send (%d bytes, limit %d); narrow the query", req.Method, len(res.Result), maxProtocolLine)})
+				}
 				<-c.sem
 				c.requests.Done()
 			}()
@@ -756,12 +853,13 @@ func (s *server) handleRequest(c *conn, mc MethodContext, req request) (any, err
 			return nil, err
 		}
 		s.waitReady(mc.Context, req.Method, params.WaitReadyMs)
-		locations, err := s.runtime.Lookup(params.Module, params.Function, params.FollowDelegates)
+		locations, err := mc.LSP().LookupName(params.Module, params.Function, lsp.NameLookupOptions{
+			FollowDelegates:  params.FollowDelegates,
+			FallbackToModule: !params.Strict,
+			ExactModule:      params.Strict,
+		})
 		if err != nil {
 			return nil, err
-		}
-		if len(locations) == 0 && params.Function != "" && !params.Strict {
-			locations, err = s.runtime.Lookup(params.Module, "", params.FollowDelegates)
 		}
 		return LookupResult{Locations: locations, Ready: s.runtime.IsReady()}, err
 	case MethodReferences:
@@ -770,7 +868,10 @@ func (s *server) handleRequest(c *conn, mc MethodContext, req request) (any, err
 			return nil, err
 		}
 		s.waitReady(mc.Context, req.Method, params.WaitReadyMs)
-		locations, err := s.runtime.References(params.Module, params.Function)
+		locations, err := mc.LSP().ReferenceNames(params.Module, params.Function, lsp.NameReferenceOptions{
+			FollowDelegates: true,
+			ExcludeStdlib:   true,
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -782,12 +883,21 @@ func (s *server) handleRequest(c *conn, mc MethodContext, req request) (any, err
 		}
 		start := time.Now()
 		var err error
+		missing := false
 		if params.Target == "" {
 			err = s.runtime.Reindex(mc.Context)
 		} else {
+			// Checked before the reindex, which prunes whatever was indexed.
+			if _, statErr := os.Stat(params.Target); os.IsNotExist(statErr) {
+				indexed, indexErr := s.runtime.Indexes(params.Target)
+				if indexErr != nil {
+					return nil, indexErr
+				}
+				missing = !indexed
+			}
 			err = s.runtime.ReindexPath(mc.Context, params.Target)
 		}
-		return ReindexResult{Elapsed: time.Since(start).Round(time.Millisecond)}, err
+		return ReindexResult{Elapsed: time.Since(start).Round(time.Millisecond), Missing: missing}, err
 	case MethodWatch:
 		var params WatchParams
 		if len(req.Params) > 0 {
@@ -830,17 +940,29 @@ func (s *server) watch(c *conn, mc MethodContext, params WatchParams) (any, erro
 				if !ok {
 					return
 				}
-				if err := mc.Notify(NotificationChanged, Changed{
-					Subscription: id,
-					Full:         change.Full,
-					Paths:        change.Paths,
-				}); err != nil {
+				if err := notifyChange(mc.Notify, id, change); err != nil {
 					return
 				}
 			}
 		}
 	}()
 	return Subscription{ID: id}, nil
+}
+
+// notifyChange pushes one index change to a watch subscription. A change with
+// too many paths for one protocol line is reported as a full change, as the
+// runtime does when a subscriber drops changes, so the subscriber still learns
+// that something changed instead of silently losing the subscription.
+func notifyChange(notify func(method string, params any) error, id string, change workspace.Change) error {
+	err := notify(NotificationChanged, Changed{
+		Subscription: id,
+		Full:         change.Full,
+		Paths:        change.Paths,
+	})
+	if errors.Is(err, errLineTooLarge) {
+		err = notify(NotificationChanged, Changed{Subscription: id, Full: true})
+	}
+	return err
 }
 
 // readyLogThreshold is how long a request must actually have blocked on the

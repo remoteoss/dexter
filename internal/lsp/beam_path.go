@@ -1,10 +1,13 @@
 package lsp
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
+	"time"
 )
 
 // beamLibIndex is an immutable snapshot of one build root's _build/<profile>/lib.
@@ -231,4 +234,205 @@ func appForSource(buildRoot, sourcePath string) string {
 		return parts[1]
 	}
 	return ""
+}
+
+// locateCompiledModule finds a module's BEAM. hint is the source file that
+// places the module: its own, or for a generated module the nearest lexical
+// parent's.
+//
+// The build found from hint is usually the only one, and then this is
+// locateModuleBEAM. A monorepo can compile a library from another project
+// instead: tiger builds libs/* as path dependencies inside apps/tiger, so a
+// library's own tree has no _build at all. When the hinted build has no BEAM, or
+// the workspace holds several builds, the other builds are asked for the
+// library's application too, and the most recently compiled BEAM wins. A stale
+// choice only costs generated functions that a newer compile added, and a
+// library compiled in more than one place is rare.
+func (s *Server) locateCompiledModule(buildRoot, module, hint string) beamLocation {
+	loc := s.locateModuleBEAM(buildRoot, module, hint)
+	builds := s.workspaceBuildRoots()
+	if loc.beamPath != "" && len(builds) <= 1 {
+		return loc
+	}
+	app := s.mixAppFor(hint)
+	if app == "" {
+		return loc
+	}
+	fileName := "Elixir." + module + ".beam"
+	best := loc
+	var watch beamLocation
+	var compared []string
+	for _, root := range builds {
+		if root == buildRoot {
+			continue // locateModuleBEAM already asked it
+		}
+		idx := s.libIndex(root)
+		if idx == nil || !idx.loaded {
+			continue
+		}
+		candidate, ok := beamInApp(idx.libDir, app, fileName)
+		if !ok {
+			continue
+		}
+		if candidate.beamPath == "" {
+			if watch.watchDir == "" {
+				watch = candidate
+			}
+			continue
+		}
+		compared = append(compared, candidate.beamPath)
+		if best.beamPath == "" || candidate.beamStamp.mtime > best.beamStamp.mtime {
+			best = candidate
+		}
+	}
+	switch {
+	case best.beamPath != "":
+		if best.beamPath != loc.beamPath || len(compared) > 0 {
+			s.debugf("Generated BEAM locate: module=%s strategy=workspace-builds app=%s beam=%s compared=%v", module, app, best.beamPath, compared)
+		}
+		return best
+	case watch.watchDir != "" && !loc.watchStamp.exists:
+		// Not compiled anywhere yet, and the hinted build has no ebin to
+		// watch: the application's ebin in a build that compiles it moves
+		// when the module appears.
+		s.debugf("Generated BEAM locate: module=%s strategy=workspace-builds app=%s result=missing watch=%s", module, app, watch.watchDir)
+		return watch
+	default:
+		return loc
+	}
+}
+
+// workspaceBuildRootTTL bounds how long a discovered set of builds is trusted.
+// A first compile in another project creates a _build the scan has not seen.
+const workspaceBuildRootTTL = 30 * time.Second
+
+// workspaceBuildRootDepth is how deep below the workspace root Mix projects are
+// looked for: apps/<name> and libs/<name> are depth 2, and one more level
+// covers grouped layouts such as packages/<group>/<name>.
+const workspaceBuildRootDepth = 3
+
+type buildRootCache struct {
+	mu        sync.Mutex
+	roots     []string
+	scannedAt time.Time
+}
+
+// workspaceBuildRoots lists the Mix projects in the workspace that have been
+// compiled: directories holding both mix.exs and _build. Dependencies, build
+// output, node_modules, and hidden directories are skipped, so the walk reads
+// one directory per project-level folder rather than the source tree.
+func (s *Server) workspaceBuildRoots() []string {
+	c := s.buildRoots
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.scannedAt.IsZero() && time.Since(c.scannedAt) < workspaceBuildRootTTL {
+		return c.roots
+	}
+	var roots []string
+	var walk func(dir string, depth int)
+	walk = func(dir string, depth int) {
+		if isRegularFile(filepath.Join(dir, "mix.exs")) && isDir(filepath.Join(dir, "_build")) {
+			roots = append(roots, dir)
+		}
+		if depth == workspaceBuildRootDepth {
+			return
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return
+		}
+		for _, entry := range entries {
+			name := entry.Name()
+			if !entry.IsDir() || strings.HasPrefix(name, ".") || name == "deps" || name == "_build" || name == "node_modules" {
+				continue
+			}
+			walk(filepath.Join(dir, name), depth+1)
+		}
+	}
+	if s.projectRoot != "" {
+		walk(s.projectRoot, 0)
+	}
+	c.roots, c.scannedAt = roots, time.Now()
+	s.debugf("Generated BEAM builds: workspace=%s builds=%v", s.projectRoot, roots)
+	return roots
+}
+
+type mixAppEntry struct {
+	stamp fileStamp
+	app   string
+}
+
+type mixAppCache struct {
+	mu   sync.Mutex
+	apps map[string]mixAppEntry // mix.exs path → application name
+}
+
+var (
+	mixAppPattern       = regexp.MustCompile(`\bapp:\s*:([a-z_][A-Za-z0-9_]*)`)
+	mixAppAttrPattern   = regexp.MustCompile(`\bapp:\s*@([a-z_][A-Za-z0-9_]*)`)
+	mixModuleAttrFormat = `(?m)^\s*@%s\s+:([a-z_][A-Za-z0-9_]*)`
+)
+
+// mixAppFor returns the application of the Mix project that owns path: the
+// nearest mix.exs at or above it, within the workspace. The application name is
+// what a build calls the project's lib directory, and it need not match the
+// project's directory: libs/remote-library builds as `remote`.
+func (s *Server) mixAppFor(path string) string {
+	if path == "" || s.projectRoot == "" {
+		return ""
+	}
+	for dir := filepath.Dir(path); ; dir = filepath.Dir(dir) {
+		rel, err := filepath.Rel(s.projectRoot, dir)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+			return ""
+		}
+		mixPath := filepath.Join(dir, "mix.exs")
+		if stamp := statFileStamp(mixPath); stamp.exists {
+			return s.mixAppFromFile(mixPath, stamp)
+		}
+		if rel == "." {
+			return ""
+		}
+	}
+}
+
+func (s *Server) mixAppFromFile(mixPath string, stamp fileStamp) string {
+	c := s.mixApps
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if entry, ok := c.apps[mixPath]; ok && entry.stamp == stamp {
+		return entry.app
+	}
+	app := ""
+	if data, err := os.ReadFile(mixPath); err == nil {
+		app = parseMixApp(data)
+	}
+	c.apps[mixPath] = mixAppEntry{stamp: stamp, app: app}
+	return app
+}
+
+// parseMixApp reads the application name from a mix.exs project definition:
+// `app: :name`, or `app: @attr` with the attribute set to an atom. Anything
+// else is left unresolved, which only skips the cross-build lookup.
+func parseMixApp(data []byte) string {
+	if match := mixAppPattern.FindSubmatch(data); match != nil {
+		return string(match[1])
+	}
+	if match := mixAppAttrPattern.FindSubmatch(data); match != nil {
+		attr := regexp.MustCompile(fmt.Sprintf(mixModuleAttrFormat, regexp.QuoteMeta(string(match[1]))))
+		if value := attr.FindSubmatch(data); value != nil {
+			return string(value[1])
+		}
+	}
+	return ""
+}
+
+func isRegularFile(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular()
+}
+
+func isDir(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
 }

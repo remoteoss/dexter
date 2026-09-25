@@ -396,11 +396,11 @@ dexter lsp --root ~/code/my-elixir-project
 dexter stop --root ~/code/my-elixir-project
 ```
 
-Dexter refuses to treat a directory with no `mix.exs`, `.git`, or `.dexter` as a
+Dexter refuses to treat a directory with no `mix.exs`, `.git`, or Dexter database as a
 workspace, so a mistyped `dexter lookup` in your home directory stops instead of
 building a database over everything you own. Pass `--root <path>` to name the
 project, or `-y`/`--yes` if that directory really is what you meant; the
-`.dexter` directory the first run creates is itself a marker, so the flag is only
+`.dexter/dexter.db` database the first run creates is itself a marker, so the flag is only
 needed once. `dexter lsp` is the exception: an editor is authoritative about what
 the user opened, so it logs a warning and serves the directory anyway.
 
@@ -567,7 +567,7 @@ Dexter reads `initializationOptions` from your editor configuration:
 
 - **`followDelegates`** (boolean, default: `true`): follow `defdelegate` targets on lookup.
 - **`stdlibPath`** (string): override the Elixir stdlib directory to index. Defaults to auto-detection; use this if your install is non-standard.
-- **`debug`** (boolean, default: `false`): enable verbose logging to stderr. Logs timing and resolution details for every definition, hover, references, and rename request. Can also be enabled via the `DEXTER_DEBUG=true` environment variable.
+- **`debug`** (boolean, default: `false`): enable verbose logging for this editor session. Logs timing and resolution details for every definition, hover, references, and rename request to your editor's LSP log and to the workspace daemon's log (see [Debugging](#debugging)). Can also be enabled via the `DEXTER_DEBUG=true` environment variable.
 - **`maxTransientDocuments`** (integer, default: `50`): cap on how many lazily-loaded buffers the server retains in memory. When an LSP client (e.g. Claude Code) queries a file it never opened via `didOpen`, dexter reads it from disk and caches it. Editor-owned buffers are unaffected; only disk-loaded entries are subject to LRU eviction. Set to `0` to disable transient caching.
 
 ## Index database location (.dexter/)
@@ -659,14 +659,14 @@ dexter init --force ~/code/my-elixir-project
 
 If the issue persists, enable debug mode to get verbose logs. You can do this in two ways:
 
-1. Set the `debug` option in your editor's LSP `initializationOptions` (see [LSP options](#lsp-options))
-2. Or set the `DEXTER_DEBUG=true` environment variable before launching your editor
+1. Set the `debug` option in your editor's LSP `initializationOptions` (see [LSP options](#lsp-options)). It applies to that editor session as soon as it connects.
+2. Or set the `DEXTER_DEBUG=true` environment variable for the editor or CLI command that starts the workspace daemon. The daemon reads it when it starts, so if one is already running, run `dexter stop` first. This is also how to debug CLI commands such as `dexter lookup`.
 
-Debug mode logs timing and resolution details for every definition, hover, references, and rename request to stderr. In Neovim you can usually view these at `~/.local/state/nvim/lsp.log`. In VS Code, you can see them in Output > Dexter.
+Debug mode logs timing and resolution details for every definition, hover, references, and rename request. Each editor receives the lines for its own requests in its LSP log (in Neovim usually `~/.local/state/nvim/lsp.log`, in VS Code Output > Dexter). Every editor and CLI command for a workspace shares one daemon, and all of its lines, including those for CLI commands, also go to the daemon's log file: `<key>.log` in its runtime directory (`/tmp/dexter-<uid>` on macOS and Linux; see [docs/daemon.md](docs/daemon.md)). The first line `dexter lsp` writes to your editor's log names that file.
 
 When [filing an issue](https://github.com/remoteoss/dexter/issues/new), please include:
 
-- Your Dexter version (`dexter --version`)
+- Your Dexter version (`dexter version`)
 - Your Elixir version (`elixir --version`)
 - The debug logs from the failing operation
 - A minimal code snippet that reproduces the issue, if possible

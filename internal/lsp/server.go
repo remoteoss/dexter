@@ -144,6 +144,7 @@ type Server struct {
 	explicitRoot    bool // true when projectRoot was provided via CLI, not inferred from Initialize
 	initialized     bool
 	client          protocol.Client
+	clientLog       *clientLog // forwards this session's log lines to its editor
 	followDelegates bool
 	debug           bool
 	mixBin          string // resolved path to the mix binary
@@ -159,6 +160,8 @@ type Server struct {
 	usingCacheMu   sync.RWMutex
 	generatedCache *generatedFunctionCache
 	beamLibs       *beamLibIndexCache // build root → compiled application directories
+	buildRoots     *buildRootCache    // compiled Mix projects in the workspace
+	mixApps        *mixAppCache       // mix.exs → application name
 	ebinIndexes    *ebinIndexCache    // ebin dir → modules compiled into it
 
 	depsCache   map[string]bool // dir → whether files in that dir are deps
@@ -184,7 +187,9 @@ type Server struct {
 
 func (s *Server) debugf(format string, args ...interface{}) {
 	if s.debug {
-		log.Printf("[debug] "+format, args...)
+		line := "[debug] " + fmt.Sprintf(format, args...)
+		log.Print(line)
+		s.clientLog.send(line)
 	}
 }
 
@@ -211,16 +216,21 @@ func NewServerWithOptions(s *store.Store, projectRoot string, opts ServerOptions
 		_, _ = index.setStdlibRoot(opts.InitialStdlibRoot)
 	}
 	return &Server{
-		store:              s,
-		docs:               NewDocumentStore(),
-		projectRoot:        projectRoot,
-		explicitRoot:       projectRoot != "",
-		followDelegates:    true,
+		store:           s,
+		docs:            NewDocumentStore(),
+		projectRoot:     projectRoot,
+		explicitRoot:    projectRoot != "",
+		followDelegates: true,
+		// Read here as well as in Initialize: the daemon's headless service
+		// answers CLI and MCP calls and never receives an initialize request.
+		debug:              os.Getenv("DEXTER_DEBUG") == "true",
 		erlangBuildRoots:   make(map[string]*erlangBuildRootState),
 		erlangRuntimeCache: make(map[string]*erlangRuntimeCache),
 		usingCache:         make(map[string]*usingCacheEntry),
 		generatedCache:     newGeneratedFunctionCache(),
 		beamLibs:           newBeamLibIndexCache(),
+		buildRoots:         &buildRootCache{},
+		mixApps:            &mixAppCache{apps: make(map[string]mixAppEntry)},
 		ebinIndexes:        newEbinIndexCache(),
 		depsCache:          make(map[string]bool),
 		index:              index,
@@ -262,6 +272,7 @@ func ServeStream(server *Server, rwc io.ReadWriteCloser) error {
 	conn := jsonrpc2.NewConn(stream)
 	server.client = protocol.ClientDispatcher(conn, logger)
 	server.conn = conn
+	server.clientLog = startClientLog(server.client, conn.Done())
 
 	handler := server.renameHandler(protocol.ServerHandler(server, nil))
 	ctx := context.Background()
@@ -1175,30 +1186,18 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 			}
 		}
 
-		// Look up via store
-		var results []store.LookupResult
-		var err error
-		if s.followDelegates {
-			results, err = s.store.LookupFollowDelegate(fullModule, functionName)
-		} else {
-			results, err = s.store.LookupFunction(fullModule, functionName)
+		kind := NameKindCallable
+		if tf.InTypespec(lineNum) {
+			kind = NameKindType
 		}
+		results, err := s.LookupName(fullModule, functionName, NameLookupOptions{
+			Kind:            kind,
+			FollowDelegates: s.followDelegates,
+			External:        fullModule != extractEnclosingModuleFromTokens(tf.source, tf.tokens, lineNum),
+		})
 		if err == nil && len(results) > 0 {
-			s.debugf("Definition: found %d result(s) in store for %s.%s", len(results), fullModule, functionName)
-			hits := byKindForContext(tf, lineNum, results)
-			// An imported call (e.g. `field` from `use Ecto.Schema`) reaches
-			// only the public definitions of the module it came from.
-			if fullModule != extractEnclosingModuleFromTokens(tf.source, tf.tokens, lineNum) {
-				hits = filterOutPrivate(hits)
-			}
-			return storeResultsToLocations(hits), nil
-		}
-
-		// fullModule may not directly define the function — try its use chain
-		// (e.g. `import MyApp.Factory` where MyApp.Factory uses ExMachina).
-		if results := s.lookupThroughUseOf(fullModule, functionName); len(results) > 0 {
-			s.debugf("Definition: found %d result(s) via use chain of %s for %s", len(results), fullModule, functionName)
-			return storeResultsToLocations(byKindForContext(tf, lineNum, results)), nil
+			s.debugf("Definition: found %d semantic result(s) for %s.%s", len(results), fullModule, functionName)
+			return nameLocationsToProtocol(results), nil
 		}
 
 		// Fallback for use-chain inline defs (not stored as module definitions)
@@ -1227,33 +1226,23 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 	s.debugf("Definition: qualified call resolved %q -> %q", moduleRef, fullModule)
 
 	if functionName != "" {
-		var results []store.LookupResult
-		var err error
-		if s.followDelegates {
-			results, err = s.store.LookupFollowDelegate(fullModule, functionName)
-		} else {
-			results, err = s.store.LookupFunction(fullModule, functionName)
+		kind := NameKindCallable
+		if tf.InTypespec(lineNum) {
+			kind = NameKindType
 		}
-		if err == nil && len(results) > 0 {
-			s.debugf("Definition: found %d result(s) in store for %s.%s", len(results), fullModule, functionName)
-			hits := byKindForContext(tf, lineNum, results)
-			// A remote call reaches only the public definitions of the target.
-			if fullModule != extractEnclosingModuleFromTokens(tf.source, tf.tokens, lineNum) {
-				hits = filterOutPrivate(hits)
-			}
-			return storeResultsToLocations(hits), nil
+		results, err := s.LookupName(fullModule, functionName, NameLookupOptions{
+			Kind:             kind,
+			FollowDelegates:  s.followDelegates,
+			External:         fullModule != extractEnclosingModuleFromTokens(tf.source, tf.tokens, lineNum),
+			FallbackToModule: true,
+		})
+		if err != nil {
+			return nil, nil
 		}
-		// Not directly defined — the function may have been injected by a
-		// `use` macro in fullModule's source (e.g. Oban.Worker injects `new`).
-		if results := s.lookupThroughUseOf(fullModule, functionName); len(results) > 0 {
-			s.debugf("Definition: found %d result(s) via use chain of %s for %s", len(results), fullModule, functionName)
-			return storeResultsToLocations(results), nil
-		}
-		s.debugf("Definition: no indexed or use-chain definition for %s.%s; falling back to module source", fullModule, functionName)
+		return nameLocationsToProtocol(results), nil
 	}
 
-	// Fall back to module (fullModule already resolved via nesting above)
-	results, err := s.store.LookupModule(fullModule)
+	results, err := s.LookupName(fullModule, "", NameLookupOptions{})
 	if err != nil {
 		s.debugf("Definition: module fallback lookup failed for %s: %v", fullModule, err)
 		return nil, nil
@@ -1263,7 +1252,18 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		return nil, nil
 	}
 	s.debugf("Definition: module fallback for %s.%s -> %s:%d (%d result(s))", fullModule, functionName, results[0].FilePath, results[0].Line, len(results))
-	return storeResultsToLocations(results), nil
+	return nameLocationsToProtocol(results), nil
+}
+
+func nameLocationsToProtocol(results []NameLocation) []protocol.Location {
+	locations := make([]protocol.Location, 0, len(results))
+	for _, result := range results {
+		locations = append(locations, protocol.Location{
+			URI:   uri.File(result.FilePath),
+			Range: lineRange(result.Line - 1),
+		})
+	}
+	return locations
 }
 
 func storeResultsToLocations(results []store.LookupResult) []protocol.Location {
@@ -2488,6 +2488,10 @@ func (s *Server) parseUsingFile(filePath, moduleName string) *usingCacheEntry {
 // fullModule's source file. This handles qualified calls like M.func() where
 // func is not defined directly in M but is injected by a macro M uses.
 func (s *Server) lookupThroughUseOf(fullModule, functionName string) []store.LookupResult {
+	return s.lookupThroughUseOfWithFollow(fullModule, functionName, s.followDelegates)
+}
+
+func (s *Server) lookupThroughUseOfWithFollow(fullModule, functionName string, followDelegates bool) []store.LookupResult {
 	modResults, err := s.store.LookupModule(fullModule)
 	if err != nil || len(modResults) == 0 {
 		return nil
@@ -2496,7 +2500,7 @@ func (s *Server) lookupThroughUseOf(fullModule, functionName string) []store.Loo
 	if !ok {
 		return nil
 	}
-	return s.lookupThroughUse(fileText, functionName, ExtractAliases(fileText))
+	return s.lookupThroughUseWithFollow(fileText, functionName, ExtractAliases(fileText), followDelegates)
 }
 
 // lookupThroughUse searches for functionName in definitions injected by `use`
@@ -2504,11 +2508,15 @@ func (s *Server) lookupThroughUseOf(fullModule, functionName string) []store.Loo
 // priority over imported ones. Later `use` declarations shadow earlier ones.
 // Transitive use chains (use inside __using__ body) are followed recursively.
 func (s *Server) lookupThroughUse(text, functionName string, aliases map[string]string) []store.LookupResult {
+	return s.lookupThroughUseWithFollow(text, functionName, aliases, s.followDelegates)
+}
+
+func (s *Server) lookupThroughUseWithFollow(text, functionName string, aliases map[string]string, followDelegates bool) []store.LookupResult {
 	useCalls := ExtractUsesWithOpts(text, aliases)
 	visited := make(map[string]bool)
 
 	for i := len(useCalls) - 1; i >= 0; i-- {
-		if result := s.lookupInUsingEntryFor(useCalls[i].Module, functionName, useCalls[i].dispatchAtom(), useCalls[i].Opts, visited); result != nil {
+		if result := s.lookupInUsingEntryForWithFollow(useCalls[i].Module, functionName, useCalls[i].dispatchAtom(), useCalls[i].Opts, visited, followDelegates); result != nil {
 			return result
 		}
 	}
@@ -2520,7 +2528,7 @@ func (s *Server) lookupThroughUse(text, functionName string, aliases map[string]
 // consumerOpts are the keyword args from the `use Module, key: Val` call and
 // are used to resolve dynamic imports like `import unquote(mod)`.
 func (s *Server) lookupInUsingEntry(moduleName, functionName string, consumerOpts map[string]string, visited map[string]bool) []store.LookupResult {
-	return s.lookupInUsingEntryFor(moduleName, functionName, "", consumerOpts, visited)
+	return s.lookupInUsingEntryForWithFollow(moduleName, functionName, "", consumerOpts, visited, s.followDelegates)
 }
 
 // bodyFor picks the injected body for a `use` call. An ordinary __using__ has a
@@ -2553,6 +2561,10 @@ func usingVisitKey(moduleName, which string) string {
 // lookupInUsingEntryFor is lookupInUsingEntry with the dispatch atom from the
 // `use` site (empty for an ordinary `use Module`).
 func (s *Server) lookupInUsingEntryFor(moduleName, functionName, which string, consumerOpts map[string]string, visited map[string]bool) []store.LookupResult {
+	return s.lookupInUsingEntryForWithFollow(moduleName, functionName, which, consumerOpts, visited, s.followDelegates)
+}
+
+func (s *Server) lookupInUsingEntryForWithFollow(moduleName, functionName, which string, consumerOpts map[string]string, visited map[string]bool, followDelegates bool) []store.LookupResult {
 	visitKey := usingVisitKey(moduleName, which)
 	if visited[visitKey] {
 		return nil
@@ -2581,7 +2593,7 @@ func (s *Server) lookupInUsingEntryFor(moduleName, functionName, which string, c
 	for j := len(body.imports) - 1; j >= 0; j-- {
 		var results []store.LookupResult
 		var err error
-		if s.followDelegates {
+		if followDelegates {
 			results, err = s.store.LookupFollowDelegate(body.imports[j], functionName)
 			results = publicOnly(results)
 		} else {
@@ -2606,7 +2618,7 @@ func (s *Server) lookupInUsingEntryFor(moduleName, functionName, which string, c
 		case "import":
 			var results []store.LookupResult
 			var err error
-			if s.followDelegates {
+			if followDelegates {
 				results, err = s.store.LookupFollowDelegate(mod, functionName)
 				results = publicOnly(results)
 			} else {
@@ -2616,7 +2628,7 @@ func (s *Server) lookupInUsingEntryFor(moduleName, functionName, which string, c
 				return results
 			}
 		case "use":
-			if result := s.lookupInUsingEntry(mod, functionName, nil, visited); result != nil {
+			if result := s.lookupInUsingEntryForWithFollow(mod, functionName, "", nil, visited, followDelegates); result != nil {
 				return result
 			}
 		}
@@ -2625,7 +2637,7 @@ func (s *Server) lookupInUsingEntryFor(moduleName, functionName, which string, c
 	// Transitive uses: use Module inside the __using__ body (double-use chains)
 	for k := len(body.transCalls) - 1; k >= 0; k-- {
 		call := body.transCalls[k]
-		if result := s.lookupInUsingEntryFor(call.Module, functionName, call.dispatchAtom(), call.Opts, visited); result != nil {
+		if result := s.lookupInUsingEntryForWithFollow(call.Module, functionName, call.dispatchAtom(), call.Opts, visited, followDelegates); result != nil {
 			return result
 		}
 	}
@@ -2633,7 +2645,7 @@ func (s *Server) lookupInUsingEntryFor(moduleName, functionName, which string, c
 		if body.hasTransCall(body.transUses[k]) {
 			continue
 		}
-		if result := s.lookupInUsingEntry(body.transUses[k], functionName, nil, visited); result != nil {
+		if result := s.lookupInUsingEntryForWithFollow(body.transUses[k], functionName, "", nil, visited, followDelegates); result != nil {
 			return result
 		}
 	}
@@ -3224,7 +3236,10 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 	scanRefStream := func(tf *TokenizedFile, tokens []parser.Token, line int, module, function string, interp bool) []refOccurrence {
 		n := len(tokens)
 		var occurrences []refOccurrence
-		for i := 0; i < n; i++ {
+		// Both streams are in byte order, so their lines never decrease and the
+		// first token on the line can be found without walking the file.
+		start := sort.Search(n, func(k int) bool { return tokens[k].Line >= line })
+		for i := start; i < n; i++ {
 			if tokens[i].Line > line {
 				break
 			}
@@ -3305,9 +3320,45 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 		return parser.ResolveModuleRef(call.moduleExpr, aliases, current)
 	}
 	for _, ia := range aliases {
+		// Candidates come first: only a file holding one can yield a result, and
+		// an injector is typically used by far more files than contain the name.
+		// Tokenizing just those files is what keeps a hot target affordable.
+		var functionRefs []store.ReferenceResult
+		var prefixRefs []store.ModuleReferenceResult
+		candidateFiles := make(map[string]bool)
+		if functionName != "" {
+			refs, err := s.store.LookupReferences(ia.shortName, functionName)
+			if err != nil {
+				continue
+			}
+			functionRefs = refs
+			for _, r := range refs {
+				candidateFiles[r.FilePath] = true
+			}
+		} else {
+			// The short name stands in for ia.module, so `Repo.Migrations` under
+			// an injected `alias MyApp.Repo` names `MyApp.Repo.Migrations`.
+			refs, err := s.store.LookupReferencesByPrefix(ia.shortName)
+			if err != nil {
+				continue
+			}
+			for _, r := range refs {
+				if moduleSitesOnly && r.Kind != "alias" && r.Kind != "import" && r.Kind != "use" && r.Kind != "require" {
+					continue
+				}
+				prefixRefs = append(prefixRefs, r)
+				candidateFiles[r.FilePath] = true
+			}
+		}
+		if len(candidateFiles) == 0 {
+			continue
+		}
+
 		// Exact lexical module scopes whose `use` brings this alias in. Keeping
 		// the line also prevents an earlier bare name in the same module from
-		// being mistaken for an alias that is introduced later.
+		// being mistaken for an alias that is introduced later. Sites are read
+		// only in candidate files, which depend on nothing but the short name
+		// within one call, so the cache key stays sound.
 		consumers := make(map[string][]useSite)
 		for _, inj := range ia.injectors {
 			cacheKey := inj + "\x00" + ia.shortName + "\x00" + ia.module
@@ -3315,7 +3366,7 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 			if !ok {
 				if refs, err := s.store.LookupReferences(inj, ""); err == nil {
 					for _, r := range refs {
-						if r.Kind != "use" {
+						if r.Kind != "use" || !candidateFiles[r.FilePath] {
 							continue
 						}
 						tf, exists := tokenizedAt(r.FilePath)
@@ -3374,11 +3425,7 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 		}
 
 		if functionName != "" {
-			refs, err := s.store.LookupReferences(ia.shortName, functionName)
-			if err != nil {
-				continue
-			}
-			for _, r := range refs {
+			for _, r := range functionRefs {
 				columns := consumerColumns(r.FilePath, r.Line, ia.shortName, functionName)
 				if len(columns) == 0 {
 					continue
@@ -3397,16 +3444,7 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 			continue
 		}
 
-		// The short name stands in for ia.module, so `Repo.Migrations` under
-		// an injected `alias MyApp.Repo` names `MyApp.Repo.Migrations`.
-		refs, err := s.store.LookupReferencesByPrefix(ia.shortName)
-		if err != nil {
-			continue
-		}
-		for _, r := range refs {
-			if moduleSitesOnly && r.Kind != "alias" && r.Kind != "import" && r.Kind != "use" && r.Kind != "require" {
-				continue
-			}
+		for _, r := range prefixRefs {
 			columns := consumerColumns(r.FilePath, r.Line, r.Module, "")
 			if len(columns) == 0 {
 				continue
@@ -5301,19 +5339,11 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 		moduleName := tf.FirstDefmodule()
 		if moduleName != "" {
 			s.debugf("References: __using__ in module %s — looking up use sites", moduleName)
-			allRefs, err := s.store.LookupReferences(moduleName, "")
+			allRefs, err := s.ReferenceNames(moduleName, "__using__", NameReferenceOptions{ExcludeStdlib: true})
 			if err != nil {
 				return nil, nil
 			}
-			var locations []protocol.Location
-			for _, r := range allRefs {
-				if r.Kind == "use" {
-					locations = append(locations, protocol.Location{
-						URI:   uri.File(r.FilePath),
-						Range: lineRange(r.Line - 1),
-					})
-				}
-			}
+			locations := nameLocationsToProtocol(allRefs)
 			s.debugf("References: returning %d use sites", len(locations))
 			return locations, nil
 		}
@@ -5442,129 +5472,30 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 		}
 	}
 
-	// Run direct lookup and (if needed) the static use-chain injector scan.
-	// The static scan is expensive but necessary when the function comes from
-	// a static __using__ import rather than a dynamic opt binding.
-	type injectorResult struct {
-		injectors []string
-		elapsed   time.Duration
+	kind := NameKindCallable
+	if functionName == "" {
+		kind = NameKindAny
+	} else if tf.InTypespec(lineNum) {
+		kind = NameKindType
 	}
-	var injectorCh chan injectorResult
-	if functionName != "" && len(injectors) == 0 {
-		// Only run the expensive scan if the fast opt-binding check found nothing
-		injectorCh = make(chan injectorResult, 1)
-		go func() {
-			tInj := s.debugNow()
-			inj := s.findModulesWhoseUsingImports(fullModule)
-			injectorCh <- injectorResult{inj, time.Since(tInj)}
-		}()
-	}
-
-	tStep := s.debugNow()
-	refResults, err := s.store.LookupReferences(fullModule, functionName)
+	semantic, err := s.ReferenceNames(fullModule, functionName, NameReferenceOptions{
+		Kind:               kind,
+		FollowDelegates:    s.followDelegates,
+		IncludeDeclaration: params.Context.IncludeDeclaration,
+		ExcludeStdlib:      true,
+		InjectorModules:    injectors,
+		GeneratedProvider:  generatedProvider,
+	})
 	if err != nil {
-		s.debugf("References: store error: %v", err)
+		s.debugf("References: semantic lookup error: %v", err)
 		return nil, nil
 	}
-	if s.debug {
-		s.debugf("References: direct lookup: %d results (%s)", len(refResults), time.Since(tStep).Round(time.Microsecond))
-	}
 
-	// Sites written through an alias that a __using__ block injects. The file
-	// holding them declares no alias of its own, so the index has them under
-	// the bare short name and the lookup above cannot see them. The injecting
-	// module is found from the module's own references, so this costs one
-	// small query when nothing in the project injects the module.
-	moduleKindRefs := refResults
-	if functionName != "" {
-		moduleKindRefs, err = s.store.LookupReferences(fullModule, "")
-		if err != nil {
-			moduleKindRefs = nil
-		}
-	}
-	if injected := s.injectedAliasReferences(fullModule, functionName, moduleKindRefs); len(injected) > 0 {
-		s.debugf("References: via injected alias: +%d results", len(injected))
-		refResults = append(refResults, injected...)
-	}
-
-	if injectorCh != nil {
-		ir := <-injectorCh
-		if s.debug {
-			s.debugf("References: use-chain injectors for %s: %v (%s)", fullModule, ir.injectors, ir.elapsed.Round(time.Microsecond))
-		}
-		injectors = append(injectors, ir.injectors...)
-	}
-
-	for _, mod := range injectors {
-		transitive, err := s.store.LookupReferences(mod, functionName)
-		if err == nil {
-			if generatedProvider != "" {
-				transitive = s.filterGeneratedProviderReferences(generatedProvider, functionName, transitive)
-			}
-			refResults = append(refResults, transitive...)
-			s.debugf("References: transitive via %s: +%d results", mod, len(transitive))
-		}
-	}
-
-	// Scan definition files for bare intra-module calls (not indexed in store)
-	if functionName != "" {
-		tStep = s.debugNow()
-		refResults = append(refResults, s.findBareCallRefs(fullModule, functionName)...)
-		if s.debug {
-			s.debugf("References: bare call scan (%s)", time.Since(tStep).Round(time.Microsecond))
-		}
-	}
-
-	// Follow defdelegate in reverse: if other modules delegate this function
-	// to fullModule, include refs to those delegating modules too.
-	if functionName != "" && s.followDelegates {
-		tStep = s.debugNow()
-		delegates, err := s.store.LookupDelegatesTo(fullModule, functionName)
-		if err == nil {
-			for _, del := range delegates {
-				// The facade function name may differ from the target if as: is used
-				facadeFunc := del.Function
-				delegateRefs, err := s.store.LookupReferences(del.Module, facadeFunc)
-				if err == nil {
-					refResults = append(refResults, delegateRefs...)
-					s.debugf("References: via delegate %s.%s: +%d results", del.Module, facadeFunc, len(delegateRefs))
-				}
-				refResults = append(refResults, s.findBareCallRefs(del.Module, facadeFunc)...)
-			}
-		}
-		if s.debug {
-			s.debugf("References: delegate follow (%s)", time.Since(tStep).Round(time.Microsecond))
-		}
-	}
-
-	// A name written in a typespec refers to a type, and the same name written
-	// anywhere else refers to a function, even where a module declares both —
-	// `Ecto.Schema` has `@type schema` and `defmacro schema/2`. Keep whichever
-	// kind the cursor is asking about. Module-level lookups (no function name)
-	// are left alone: alias/import/use sites are references to the module
-	// whatever line they sit on.
-	if functionName != "" {
-		wantTypespec := tf.InTypespec(lineNum)
-		kept := refResults[:0]
-		for _, r := range refResults {
-			if (r.Kind == "typespec") == wantTypespec {
-				kept = append(kept, r)
-			}
-		}
-		if s.debug {
-			s.debugf("References: typespec filter (want=%v): %d of %d kept", wantTypespec, len(kept), len(refResults))
-		}
-		refResults = kept
-	}
-
-	// Deduplicate by file+line (multiple injector modules may attribute the same call)
 	type refKey struct {
 		filePath string
 		line     int
 	}
-	seen := make(map[refKey]struct{}, len(refResults))
-
-	// Filter out stdlib paths
+	seen := make(map[refKey]struct{}, len(semantic))
 	var locations []protocol.Location
 
 	// Bare uses of a type in the file being edited, which no indexed ref and
@@ -5580,10 +5511,7 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 			locations = append(locations, l)
 		}
 	}
-	for _, r := range refResults {
-		if s.isStdlibPath(r.FilePath) {
-			continue
-		}
+	for _, r := range semantic {
 		k := refKey{r.FilePath, r.Line}
 		if _, ok := seen[k]; ok {
 			continue
@@ -5593,31 +5521,6 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 			URI:   uri.File(r.FilePath),
 			Range: lineRange(r.Line - 1),
 		})
-	}
-
-	// Include declaration if requested
-	if params.Context.IncludeDeclaration {
-		defResults, err := s.store.LookupFunction(fullModule, functionName)
-		if (err != nil || len(defResults) == 0) && len(generatedInjectors) > 0 {
-			defResults = s.generatedDefinitionResults(fullModule)
-			err = nil
-		}
-		if err == nil {
-			defResults = byKindForContext(tf, lineNum, defResults)
-			for _, r := range defResults {
-				if s.isStdlibPath(r.FilePath) {
-					continue
-				}
-				k := refKey{r.FilePath, r.Line}
-				if _, ok := seen[k]; ok {
-					continue
-				}
-				locations = append(locations, protocol.Location{
-					URI:   uri.File(r.FilePath),
-					Range: lineRange(r.Line - 1),
-				})
-			}
-		}
 	}
 
 	s.debugf("References: returning %d locations", len(locations))

@@ -263,3 +263,102 @@ func writeBE32(buf *bytes.Buffer, value uint32) {
 	binary.BigEndian.PutUint32(field[:], value)
 	buf.Write(field[:])
 }
+
+// monorepoFixture lays out a workspace like tiger's: the workspace root is not a
+// Mix project and has no _build, apps/main compiles everything, and
+// libs/remote-library is a path dependency whose application is `remote`.
+func monorepoFixture(t *testing.T) (*Server, string) {
+	t.Helper()
+	server, cleanup := setupTestServer(t)
+	t.Cleanup(cleanup)
+	root := server.projectRoot
+	writeFile := func(relative, content string) {
+		t.Helper()
+		path := filepath.Join(root, relative)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeFile("apps/main/mix.exs", "defmodule Main.MixProject do\n  def project, do: [app: :main, deps: [{:remote, path: \"../../libs/remote-library\"}]]\nend\n")
+	writeFile("libs/remote-library/mix.exs", "defmodule Remote.MixProject do\n  @app :remote\n  def project, do: [app: @app]\nend\n")
+	indexFile(t, server.store, root, "libs/remote-library/lib/remote/thing.ex", "defmodule Remote.Thing do\n  defmacro __using__(_), do: nil\nend\n")
+	return server, root
+}
+
+func writeBeamAt(t *testing.T, ebin, module string, modified time.Time, exports ...beamExport) {
+	t.Helper()
+	if err := os.MkdirAll(ebin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(ebin, "Elixir."+module+".beam")
+	if err := os.WriteFile(path, minimalBeam(exports...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, modified, modified); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A library with no _build of its own is found in the build that compiles it as
+// a path dependency, both for its own modules and for a generated module
+// beneath one of them.
+func TestGeneratedFunctionsFromLibraryCompiledByAnotherProject(t *testing.T) {
+	server, root := monorepoFixture(t)
+	ebin := filepath.Join(root, "apps/main/_build/dev/lib/remote/ebin")
+	writeBeamAt(t, ebin, "Remote.Thing", time.Now(), beamExport{"generated_fn", 1})
+	writeBeamAt(t, ebin, "Remote.Thing.Helpers", time.Now(), beamExport{"helper_path", 2})
+
+	if _, found := server.generatedSymbol("Remote.Thing", "", "generated_fn"); !found {
+		t.Error("generated function of a library compiled by another project was not found")
+	}
+	if _, found := server.generatedSymbol("Remote.Thing.Helpers", "", "helper_path"); !found {
+		t.Error("generated module beneath a library module was not found")
+	}
+}
+
+// When a library is also compiled on its own, the most recently compiled BEAM
+// wins, whichever build holds it.
+func TestGeneratedFunctionsPreferMostRecentBuild(t *testing.T) {
+	older, newer := time.Now().Add(-time.Hour), time.Now()
+	for _, tc := range []struct {
+		name             string
+		consumer, ownLib time.Time
+		want, notWant    string
+	}{
+		{"consumer compiled last", newer, older, "consumer_fn", "standalone_fn"},
+		{"library compiled last", older, newer, "standalone_fn", "consumer_fn"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server, root := monorepoFixture(t)
+			if err := os.MkdirAll(filepath.Join(root, "libs/remote-library/_build"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			writeBeamAt(t, filepath.Join(root, "apps/main/_build/dev/lib/remote/ebin"), "Remote.Thing", tc.consumer, beamExport{"consumer_fn", 0})
+			writeBeamAt(t, filepath.Join(root, "libs/remote-library/_build/dev/lib/remote/ebin"), "Remote.Thing", tc.ownLib, beamExport{"standalone_fn", 0})
+
+			if _, found := server.generatedSymbol("Remote.Thing", "", tc.want); !found {
+				t.Errorf("%s from the newest build was not found", tc.want)
+			}
+			if _, found := server.generatedSymbol("Remote.Thing", "", tc.notWant); found {
+				t.Errorf("%s from the older build was used", tc.notWant)
+			}
+		})
+	}
+}
+
+func TestParseMixApp(t *testing.T) {
+	for source, want := range map[string]string{
+		"def project, do: [app: :remote, version: \"0.1.0\"]":      "remote",
+		"@app :fields_inventory\ndef project, do: [app: @app]":     "fields_inventory",
+		"def project, do: [app: @app]":                             "",
+		"def project, do: [version: \"0.1.0\"]":                    "",
+		"def project do\n  [\n    app:   :ex_jsf_logic,\n  ]\nend": "ex_jsf_logic",
+	} {
+		if got := parseMixApp([]byte(source)); got != want {
+			t.Errorf("parseMixApp(%q) = %q, want %q", source, got, want)
+		}
+	}
+}

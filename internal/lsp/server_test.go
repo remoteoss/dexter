@@ -8320,3 +8320,14 @@ end`
 		t.Errorf("jumped to line %d, want line 1", locs[0].Range.Start.Line)
 	}
 }
+
+// The daemon's headless service never receives initialize, so DEXTER_DEBUG has
+// to take effect when the server is constructed.
+func TestDebugEnvironmentAppliesWithoutInitialize(t *testing.T) {
+	for value, want := range map[string]bool{"true": true, "": false, "1": false} {
+		t.Setenv("DEXTER_DEBUG", value)
+		if got := NewServerWithOptions(nil, t.TempDir(), ServerOptions{}).debug; got != want {
+			t.Errorf("DEXTER_DEBUG=%q: debug = %v, want %v", value, got, want)
+		}
+	}
+}

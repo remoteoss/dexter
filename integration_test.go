@@ -506,6 +506,106 @@ func TestIntegration_InitForce(t *testing.T) {
 	}
 }
 
+func TestIntegration_ReindexDeletedPath(t *testing.T) {
+	binary := buildDexter(t)
+	root := scaffoldProject(t)
+	runDexter(t, binary, root, "init", root)
+
+	deleted := filepath.Join(root, "lib", "my_app", "repo.ex")
+	if err := os.Remove(deleted); err != nil {
+		t.Fatal(err)
+	}
+	runDexter(t, binary, root, "reindex", deleted)
+
+	cmd := exec.Command(binary, "lookup", "--strict", "MyApp.Repo")
+	cmd.Dir = root
+	cmd.Env = append(os.Environ(), "PWD="+root)
+	if out, err := cmd.CombinedOutput(); err == nil {
+		t.Fatalf("deleted module still resolves:\n%s", out)
+	}
+}
+
+// Deleting a whole directory and reindexing it prunes every file under it.
+func TestIntegration_ReindexDeletedDirectory(t *testing.T) {
+	binary := buildDexter(t)
+	root := scaffoldProject(t)
+	runDexter(t, binary, root, "init", root)
+
+	deleted := filepath.Join(root, "lib", "my_app")
+	if err := os.RemoveAll(deleted); err != nil {
+		t.Fatal(err)
+	}
+	runDexter(t, binary, root, "reindex", deleted)
+
+	cmd := exec.Command(binary, "lookup", "--strict", "MyApp.Repo")
+	cmd.Dir = root
+	cmd.Env = append(os.Environ(), "PWD="+root)
+	if out, err := cmd.CombinedOutput(); err == nil {
+		t.Fatalf("module in deleted directory still resolves:\n%s", out)
+	}
+}
+
+// A mistyped reindex path is not an error, since the index already matches the
+// disk there, but the CLI says it found nothing instead of claiming a reindex.
+func TestIntegration_ReindexMistypedPathSaysNothingThere(t *testing.T) {
+	binary := buildDexter(t)
+	root := scaffoldProject(t)
+	runDexter(t, binary, root, "init", root)
+
+	out := runDexter(t, binary, root, "reindex", filepath.Join(root, "lib", "my_ap"))
+	if !strings.Contains(out, "Nothing to reindex at") || strings.Contains(out, "Reindexed") {
+		t.Fatalf("reindex of a mistyped path = %q, want a nothing-there note", out)
+	}
+}
+
+func TestIntegration_CLIUsesSemanticNavigation(t *testing.T) {
+	binary := buildDexter(t)
+	root := scaffoldProject(t)
+	files := map[string]string{
+		"lib/shared_lib/provider.ex": `defmodule SharedLib.Provider do
+  defmacro __using__(_) do
+    quote do
+      def injected(value), do: value
+    end
+  end
+end`,
+		"lib/shared_lib/macros.ex": `defmodule SharedLib.Macros do
+  defmacro tagged(value), do: value
+end`,
+		"lib/shared_lib/injector.ex": `defmodule SharedLib.Injector do
+  defmacro __using__(_) do
+    quote do
+      import SharedLib.Macros
+    end
+  end
+end`,
+		"lib/my_app/consumer.ex": `defmodule MyApp.Consumer do
+  use SharedLib.Provider
+  use SharedLib.Injector
+  tagged(:value)
+end`,
+	}
+	for relative, contents := range files {
+		path := filepath.Join(root, relative)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runDexter(t, binary, root, "init", root)
+
+	lookup := runDexter(t, binary, root, "lookup", "--strict", "MyApp.Consumer", "injected")
+	if !strings.Contains(lookup, "provider.ex:4") {
+		t.Fatalf("semantic lookup did not follow use chain:\n%s", lookup)
+	}
+	references := runDexter(t, binary, root, "references", "SharedLib.Macros", "tagged")
+	if !strings.Contains(references, "consumer.ex:4") {
+		t.Fatalf("semantic references did not follow use chain:\n%s", references)
+	}
+}
+
 func TestIntegration_InitExistingIndexKeepsDaemonRunning(t *testing.T) {
 	binary := buildDexter(t)
 	root := scaffoldProject(t)

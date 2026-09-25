@@ -380,26 +380,6 @@ func (s *changeSubscriber) send(c Change) {
 // no client connection or editor document overlay.
 func (r *Runtime) LanguageServices() *lsp.Server { return r.core }
 
-// Lookup performs the current CLI's name-based lookup against the daemon-owned
-// store. Richer operations should be added to the shared language-service API,
-// not implemented in protocol adapters.
-func (r *Runtime) Lookup(module, function string, followDelegates bool) ([]store.LookupResult, error) {
-	if function == "" {
-		return r.store.LookupModule(module)
-	}
-	if followDelegates {
-		return r.store.LookupFollowDelegate(module, function)
-	}
-	return r.store.LookupFunction(module, function)
-}
-
-// References performs the store-level references query used by the current
-// CLI. The MCP work can extend this through LanguageServices without changing
-// daemon ownership.
-func (r *Runtime) References(module, function string) ([]store.ReferenceResult, error) {
-	return r.store.LookupReferences(module, function)
-}
-
 // ReconcileFile implements lsp.WorkspaceEvents. It is intentionally
 // non-blocking for editor notifications; bursts are coalesced by path.
 func (r *Runtime) ReconcileFile(path string) {
@@ -451,6 +431,12 @@ func (r *Runtime) Reindex(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// Indexes reports whether path is an indexed file or a directory holding one.
+// It is a read, so it does not wait behind queued mutations.
+func (r *Runtime) Indexes(path string) (bool, error) {
+	return r.store.HasPath(path)
 }
 
 // ReindexPath reconciles one file and waits for it, schedules a full pass for a

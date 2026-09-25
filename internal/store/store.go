@@ -86,7 +86,7 @@ func FindProjectRoot(path string, extraMarkers ...string) string {
 	for _, marker := range markers {
 		dir := path
 		for {
-			if _, err := os.Stat(filepath.Join(dir, marker)); err == nil {
+			if validProjectMarker(filepath.Join(dir, marker), marker) {
 				return dir
 			}
 			parent := filepath.Dir(dir)
@@ -97,6 +97,20 @@ func FindProjectRoot(path string, extraMarkers ...string) string {
 		}
 	}
 	return path
+}
+
+func validProjectMarker(path, marker string) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	switch marker {
+	case ".git":
+		// Linked worktrees and submodules use a regular .git file.
+		return info.IsDir() || info.Mode().IsRegular()
+	default:
+		return info.Mode().IsRegular()
+	}
 }
 
 func Open(projectRoot string) (*Store, error) {
@@ -796,6 +810,24 @@ func (s *Store) ListFilePaths() ([]string, error) {
 		paths = append(paths, path)
 	}
 	return paths, rows.Err()
+}
+
+// HasPath reports whether path is an indexed file or a directory holding one.
+// The range on the unique path index finds a descendant without listing every
+// file: sep+1 is the first byte after the separator, so [prefix, upper) spans
+// exactly the paths under the directory.
+func (s *Store) HasPath(path string) (bool, error) {
+	prefix := path + string(os.PathSeparator)
+	upper := path + string(rune(os.PathSeparator+1))
+	var found int
+	err := s.db.QueryRow(
+		"SELECT 1 FROM files WHERE path = ? OR (path >= ? AND path < ?) LIMIT 1",
+		path, prefix, upper,
+	).Scan(&found)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 func (s *Store) RemoveFile(path string) error {

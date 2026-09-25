@@ -223,7 +223,23 @@ func resolvePath(args []string, index int) (string, error) {
 }
 
 func findProjectRoot(path string) string {
+	return findProjectRootWithMissing(path, false)
+}
+
+// findProjectRootWithMissing is findProjectRoot for a target that may have been
+// deleted. The search starts from the nearest ancestor that still exists: the
+// missing path itself can hold no marker, and returning it as the root would
+// name a workspace that is not there.
+func findProjectRootWithMissing(path string, allowMissing bool) string {
 	info, err := os.Stat(path)
+	for allowMissing && os.IsNotExist(err) {
+		parent := filepath.Dir(path)
+		if parent == path {
+			break
+		}
+		path = parent
+		info, err = os.Stat(path)
+	}
 	if err != nil {
 		fatal(err)
 	}
@@ -241,7 +257,7 @@ func findProjectRoot(path string) string {
 
 func findMarkerBefore(path, marker, stop string) string {
 	for dir := path; !sameDir(dir, stop); dir = filepath.Dir(dir) {
-		if _, err := os.Stat(filepath.Join(dir, marker)); err == nil {
+		if info, err := os.Stat(filepath.Join(dir, marker)); err == nil && info.Mode().IsRegular() {
 			return dir
 		}
 		parent := filepath.Dir(dir)
@@ -254,24 +270,27 @@ func findMarkerBefore(path, marker, stop string) string {
 
 // projectMarkers are the cheap signals that a directory is, or carries, a
 // Dexter workspace. They match what store.FindProjectRoot trusts, and an
-// existing `.dexter` directory counts so that a deliberate --force run is only
-// ever needed once.
+// a Dexter marker means an actual database, not an empty directory left by an
+// interrupted operation.
 func looksLikeProjectRoot(dir string) bool {
-	for _, marker := range []string{"mix.exs", ".git", ".dexter", ".dexter.db"} {
-		if _, err := os.Stat(filepath.Join(dir, marker)); err == nil {
-			return true
-		}
-	}
-	return false
+	return regularFile(filepath.Join(dir, "mix.exs")) ||
+		gitMarker(filepath.Join(dir, ".git")) ||
+		regularFile(store.DBPath(dir)) ||
+		regularFile(store.LegacyDBPath(dir))
 }
 
 func hasDexterMarker(dir string) bool {
-	for _, marker := range []string{".dexter", ".dexter.db"} {
-		if _, err := os.Stat(filepath.Join(dir, marker)); err == nil {
-			return true
-		}
-	}
-	return false
+	return regularFile(store.DBPath(dir)) || regularFile(store.LegacyDBPath(dir))
+}
+
+func regularFile(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular()
+}
+
+func gitMarker(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && (info.IsDir() || info.Mode().IsRegular())
 }
 
 // requireProjectRoot refuses to treat a directory that shows no sign of being
@@ -279,8 +298,7 @@ func hasDexterMarker(dir string) bool {
 // than the intent to index one: a `dexter lookup` in the home directory would
 // otherwise spend minutes of CPU building a database over every file the user
 // owns, and would do it silently. -y/--yes is the way through, and it is
-// needed only once because the `.dexter` directory it creates is itself a
-// marker.
+// needed only once because the database it creates is itself a marker.
 func requireProjectRoot(dir string, allowNonProject bool) {
 	if allowNonProject {
 		return
@@ -294,7 +312,7 @@ func requireProjectRoot(dir string, allowNonProject bool) {
 	if looksLikeProjectRoot(dir) {
 		return
 	}
-	fatal(fmt.Errorf("refusing to use %s as a workspace: no mix.exs, .git, or .dexter found, so it does not look like an Elixir project\nhint: run from a project, pass --root <path>, or pass -y/--yes to index it anyway", dir))
+	fatal(fmt.Errorf("refusing to use %s as a workspace: no mix.exs, .git, or Dexter database found, so it does not look like an Elixir project\nhint: run from a project, pass --root <path>, or pass -y/--yes to index it anyway", dir))
 }
 
 // warnProjectRoot is the LSP's version of the same check. An editor, unlike a
@@ -313,7 +331,7 @@ func warnProjectRoot(dir string) {
 	if looksLikeProjectRoot(dir) {
 		return
 	}
-	log.Printf("Warning: %s does not look like an Elixir project (no mix.exs, .git, or .dexter); indexing it because the editor asked. Set --root <path> if that is the wrong directory.", dir)
+	log.Printf("Warning: %s does not look like an Elixir project (no mix.exs, .git, or Dexter database); indexing it because the editor asked. Set --root <path> if that is the wrong directory.", dir)
 }
 
 // sameDir reports whether two paths name the same directory. Stat is the
@@ -426,7 +444,7 @@ func cmdInit(projectRoot string, force bool, allowNonProject bool, profile bool)
 }
 
 func cmdReindex(target string, allowNonProject bool) {
-	projectRoot := findProjectRoot(target)
+	projectRoot := findProjectRootWithMissing(target, true)
 	requireProjectRoot(projectRoot, allowNonProject)
 	client, err := daemon.Ensure(context.Background(), projectRoot)
 	if err != nil {
@@ -439,9 +457,12 @@ func cmdReindex(target string, allowNonProject bool) {
 	if err := client.Call(callCtx, daemon.MethodReindex, daemon.ReindexParams{Target: target}, &result); err != nil {
 		fatal(err)
 	}
-	if target == projectRoot {
+	switch {
+	case result.Missing:
+		fmt.Fprintf(os.Stderr, "Nothing to reindex at %s: it does not exist and nothing is indexed there\n", target)
+	case target == projectRoot:
 		fmt.Fprintf(os.Stderr, "Reindexed workspace (%s)\n", result.Elapsed)
-	} else {
+	default:
 		fmt.Fprintf(os.Stderr, "Reindexed %s (%s)\n", target, result.Elapsed)
 	}
 }
