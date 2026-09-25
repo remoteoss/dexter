@@ -8,11 +8,32 @@ Dexter is a fast Elixir LSP server. It indexes module and function definitions f
 - `internal/indexer/` — the cold build: walk and stat on all cores, parse on all cores, then one bulk transaction with the indexes dropped. `dexter init` and the LSP server (when it finds an empty index) both call `FullBuild`. `Options.InProcess` marks the server, which shares the database with live readers and so cannot use the connection-wide bulk pragmas.
 - `internal/parser/` — Elixir parser backed by a hand-rolled tokenizer (`tokenizer.go`). The tokenizer produces a flat token stream (handling heredocs, sigils, strings, comments as opaque tokens; the code inside a `#{}` interpolation is tokenized as well, into the separate `TokenResult.Interp` stream — see below) and `parser_tokenized.go` walks it to extract defmodule, def, defp, defmacro, defdelegate, defguard, defprotocol, defimpl, @type, @callback, alias, import, use, and Module.function references. Handles module nesting, alias resolution for defdelegate targets, and multi-line expressions natively via bracket depth tracking.
 - `internal/beam/` — bounded, bounds-checked readers for the BEAM container, export table, Elixir Docs chunk, and persisted module attributes. These readers extract generated callables and DSL-provider metadata without starting the Erlang VM.
-- `internal/store/` — SQLite layer. Tables: `files` (path + mtime), `definitions` (module, function, kind, line, file_path, delegate_to, delegate_as), `refs` (module, function, line, file_path, kind).
+- `internal/store/` — SQLite layer. Tables: `files` (path + mtime), `definitions` (module, function, kind, line, file id, delegate target), `refs` (module, function, line, file id, kind), `call_symbols` (interned module/function/arity identities), and `call_edges` (deduplicated caller/callee relationships owned by source file).
 - `internal/lsp/` — LSP server. `server.go` handles all LSP methods. `elixir.go` contains pure functions for cursor expression extraction, alias/import/use extraction (tokenizer-based), and use-chain parsing. `rename.go` has rename helpers. `hover.go` has hover formatting. `documents.go` is an in-memory open-buffer store.
 - `internal/workspace/` — the protocol-independent owner of one workspace: the store, the shared `lsp.IndexCoordinator`, the headless language-service instance, stdlib discovery, the native and Git watchers, and the single mutation queue every index change enters. `runtime.go` is the lifecycle and the queue; `watch.go` defines the recursive watcher abstraction, with an FSEvents backend on macOS and an fsnotify backend elsewhere or as fallback.
 - `internal/daemon/` — the per-workspace daemon and its local transport: endpoint and lock derivation (`endpoint.go`), handshake and framing (`protocol.go`), connection handling and the built-in control methods (`server.go`), the client and the stdio proxies (`client.go`), the adapter registries (`registry.go`), and the per-platform ownership lock. `docs/daemon.md` has the ownership, lifecycle, and extension contract.
 - `internal/treesitter/` — Tree-sitter integration for scope-aware variable rename and go-to-references.
+
+## Persisted call graph
+
+`call_edges` stores relationships that the source syntax proves during the
+normal parser pass: qualified calls, confirmed local calls, captures,
+delegates, and default-argument wrappers. Exact and unknown arities remain
+separate identities. Edges belong to their source file, so incremental indexing
+can replace them without scanning the rest of the graph.
+
+Imported and `use`-injected bare calls are resolved at query time rather than
+persisted. Dexter's language-service resolver already applies local precedence,
+explicit imports, static and option-driven `__using__` imports, inline injected
+definitions, atom dispatch, and transitive use chains. Persisting those results
+would either fan one ambiguous source call out to several providers or require
+reindexing every consumer when an injector changes. A semantic graph consumer
+must combine persisted edges with that shared resolver; broad rows in `refs`
+are reference candidates and must not be treated as call edges.
+
+The persisted graph is source evidence, not a complete runtime graph. Dynamic
+dispatch, calls through values, and generated code need compiled or runtime
+evidence when a consumer requires them.
 
 
 ## String interpolation (`TokenResult.Interp`)
@@ -192,11 +213,13 @@ The cold index is bound by the single SQLite writer, not by parsing. On a 70k-fi
 Consequences that are easy to undo by accident:
 
 - **Refs are deduplicated in the parser** (`dedupeRefs`), not in the store. Refs are line-granular, so `@spec f(String.t(), String.t())` produces identical rows; ~60k of them on a large monorepo. Identical rows cannot change a result — no query counts refs, and the References handler dedupes by file+line — so the parse workers drop them before they reach the writer.
+- **Call edges are also deduplicated in parser workers.** They live separately from line-level references and use interned function ids, so the two directional indexes do not repeat module and function strings for every edge. The file id remains part of the edge primary key so incremental reindex and removal can delete a file's contribution without affecting the same edge from another file.
 - **The bulk path batches inserts** into multi-row `INSERT`s (`multiRowInsert`, 900 bound parameters per statement, which is under even the legacy `SQLITE_MAX_VARIABLE_NUMBER` of 999). Incremental reindex keeps the row-at-a-time path, where a file's `DELETE` must stay ordered ahead of its `INSERT`s.
 - **Prefix queries use a range, never `LIKE`.** `LIKE` is case-insensitive by default, so SQLite cannot turn `module LIKE 'Prefix.%'` into an index range and scans all refs. `module >= 'Prefix.' AND module < 'Prefix/'` ('/' is '.'+1) uses `idx_refs_module_function` and turns that scan into a range search: on a 3.9M-row index, 11-14x faster with a warm page cache and ~190x faster cold.
-- **`idx_refs_function_kind` was retired.** No query leads with `function`; the two that filter on function/kind both lead with `file_path`. It cost 80 MB and a share of every index rebuild. Check `EXPLAIN QUERY PLAN` before adding an index here — index build time is ~40% of a cold index.
+- **`idx_refs_function_kind` was retired.** No query leads with `function`; the two that filter on function/kind both lead with `file_id`. It cost 80 MB and a share of every index rebuild. Check `EXPLAIN QUERY PLAN` before adding an index here — index build time is ~40% of a cold index.
 
-The largest remaining win is interning `file_path`: every ref row stores a ~122-character absolute path, but there are only ~69k distinct paths, so the column and `idx_refs_file_path` together account for well over half the database.
+File paths are interned in `files`; definitions, references, and call edges store
+only `file_id`. This keeps repeated absolute paths out of the hot row tables.
 
 ## Key design decisions
 

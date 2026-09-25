@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/remoteoss/dexter/internal/parser"
 	"github.com/remoteoss/dexter/internal/store"
 	"github.com/remoteoss/dexter/internal/version"
 )
@@ -79,6 +80,9 @@ end`)
 	if stats.References == 0 {
 		t.Error("References = 0, want the SharedLib.Worker.perform call")
 	}
+	if stats.CallEdges != 1 {
+		t.Errorf("CallEdges = %d, want 1", stats.CallEdges)
+	}
 
 	results, err := s.LookupFunction("MyApp.Accounts", "create_user")
 	if err != nil || len(results) == 0 {
@@ -88,6 +92,10 @@ end`)
 	refs, err := s.LookupReferences("SharedLib.Worker", "perform")
 	if err != nil || len(refs) == 0 {
 		t.Fatalf("call site not indexed: %v", err)
+	}
+	callers, err := s.LookupCallers(parser.FunctionID{Module: "SharedLib.Worker", Function: "perform", Arity: 1})
+	if err != nil || len(callers) != 1 {
+		t.Fatalf("caller edge not indexed: callers=%v err=%v", callers, err)
 	}
 }
 
@@ -141,6 +149,8 @@ func TestFullBuild_RestoresIndexes(t *testing.T) {
 		"idx_definitions_using",
 		"idx_refs_module_function",
 		"idx_refs_file_id",
+		"idx_call_edges_caller",
+		"idx_call_edges_callee",
 	} {
 		found := false
 		for _, name := range names {

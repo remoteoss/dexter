@@ -130,6 +130,101 @@ end
 	}
 }
 
+func TestIndexAndLookupCallEdges(t *testing.T) {
+	s, dir := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	path := writeElixirFile(t, dir, "lib/worker.ex", `defmodule MyApp.Worker do
+  def run(value), do: SharedLib.Service.fetch(value)
+end
+`)
+	defs, refs, calls, err := parser.ParseFileWithCalls(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IndexFileWithRefsAndCalls(path, defs, refs, calls); err != nil {
+		t.Fatal(err)
+	}
+
+	caller := parser.FunctionID{Module: "MyApp.Worker", Function: "run", Arity: 1}
+	callee := parser.FunctionID{Module: "SharedLib.Service", Function: "fetch", Arity: 1}
+	callees, err := s.LookupCallees(caller)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(callees) != 1 || callees[0].Function != callee || callees[0].Kind != "call" {
+		t.Fatalf("LookupCallees = %+v, want %v", callees, callee)
+	}
+	callers, err := s.LookupCallers(callee)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(callers) != 1 || callers[0].Function != caller || callers[0].Kind != "call" {
+		t.Fatalf("LookupCallers = %+v, want %v", callers, caller)
+	}
+
+	if err := os.WriteFile(path, []byte(`defmodule MyApp.Worker do
+  def run(value), do: SharedLib.Other.fetch(value)
+end
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	defs, refs, calls, err = parser.ParseFileWithCalls(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IndexFileWithRefsAndCalls(path, defs, refs, calls); err != nil {
+		t.Fatal(err)
+	}
+	callers, err = s.LookupCallers(callee)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(callers) != 0 {
+		t.Fatalf("stale callers after reindex: %+v", callers)
+	}
+	var staleSymbols int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM call_symbols WHERE module = 'SharedLib.Service'").Scan(&staleSymbols); err != nil {
+		t.Fatal(err)
+	}
+	if staleSymbols != 0 {
+		t.Fatalf("reindex retained %d orphaned call symbols", staleSymbols)
+	}
+}
+
+func TestLookupCallersKeepsUnknownAritySeparate(t *testing.T) {
+	s, dir := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	path := writeElixirFile(t, dir, "lib/worker.ex", `defmodule MyApp.Worker do
+  def run(value), do: SharedLib.Service.fetch value
+end
+`)
+	defs, refs, calls, err := parser.ParseFileWithCalls(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IndexFileWithRefsAndCalls(path, defs, refs, calls); err != nil {
+		t.Fatal(err)
+	}
+
+	callers, err := s.LookupCallers(parser.FunctionID{Module: "SharedLib.Service", Function: "fetch", Arity: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(callers) != 0 {
+		t.Fatalf("exact LookupCallers included unknown-arity edges: %+v", callers)
+	}
+	callers, err = s.LookupCallers(parser.FunctionID{Module: "SharedLib.Service", Function: "fetch", Arity: parser.UnknownArity})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := parser.FunctionID{Module: "MyApp.Worker", Function: "run", Arity: 1}
+	if len(callers) != 1 || callers[0].Function != want {
+		t.Fatalf("unknown LookupCallers = %+v, want %v", callers, want)
+	}
+}
+
 func TestLookupPublicFunctionUsesAllowlist(t *testing.T) {
 	s, dir := setupTestStore(t)
 	defer func() { _ = s.Close() }()
@@ -1405,6 +1500,18 @@ func genRows(path string, defCount, refCount int) ([]parser.Definition, []parser
 	return defs, refs
 }
 
+func genCalls(count int) []parser.CallEdge {
+	calls := make([]parser.CallEdge, 0, count)
+	for i := 0; i < count; i++ {
+		calls = append(calls, parser.CallEdge{
+			Caller: parser.FunctionID{Module: "MyApp.Gen", Function: "fn" + strconv.Itoa(i), Arity: i % 4},
+			Callee: parser.FunctionID{Module: "SharedLib.Worker", Function: "call" + strconv.Itoa(i), Arity: i % 3},
+			Kind:   "call",
+		})
+	}
+	return calls
+}
+
 // TestBulkInsertMatchesRowAtATime pins the multi-row INSERT path in
 // BeginBulkInsert to the row-at-a-time path in BeginBatch. The bulk path
 // buffers rows and flushes them in chunks, so a boundary or flush bug would
@@ -1412,7 +1519,7 @@ func genRows(path string, defCount, refCount int) ([]parser.Definition, []parser
 func TestBulkInsertMatchesRowAtATime(t *testing.T) {
 	// 250 defs = 2 full chunks of 100 + 50 pending; 425 refs = 2 full chunks of
 	// 180 + 65 pending. Both remainders exercise flushPending.
-	const defCount, refCount = 250, 425
+	const defCount, refCount, callCount = 250, 425, 250
 
 	read := func(s *Store, path string) (int, []ReferenceResult) {
 		t.Helper()
@@ -1430,11 +1537,12 @@ func TestBulkInsertMatchesRowAtATime(t *testing.T) {
 	bulkStore, bulkDir := setupTestStore(t)
 	bulkPath := makeFile(t, bulkDir, "gen.ex")
 	bd, br := genRows(bulkPath, defCount, refCount)
+	bc := genCalls(callCount)
 	batch, err := bulkStore.BeginBulkInsert()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := batch.IndexFileWithMtimeAndRefs(bulkPath, 1, bd, br); err != nil {
+	if err := batch.IndexFileWithMtimeRefsAndCalls(bulkPath, 1, bd, br, bc); err != nil {
 		t.Fatal(err)
 	}
 	if err := batch.Commit(); err != nil {
@@ -1444,11 +1552,12 @@ func TestBulkInsertMatchesRowAtATime(t *testing.T) {
 	rowStore, rowDir := setupTestStore(t)
 	rowPath := makeFile(t, rowDir, "gen.ex")
 	rd, rr := genRows(rowPath, defCount, refCount)
+	rc := genCalls(callCount)
 	rowBatch, err := rowStore.BeginBatch()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := rowBatch.IndexFileWithMtimeAndRefs(rowPath, 1, rd, rr); err != nil {
+	if err := rowBatch.IndexFileWithMtimeRefsAndCalls(rowPath, 1, rd, rr, rc); err != nil {
 		t.Fatal(err)
 	}
 	if err := rowBatch.Commit(); err != nil {
@@ -1477,6 +1586,18 @@ func TestBulkInsertMatchesRowAtATime(t *testing.T) {
 	}
 	if total != refCount {
 		t.Errorf("bulk refs total = %d, want %d", total, refCount)
+	}
+	if err := bulkStore.db.QueryRow("SELECT COUNT(*) FROM call_edges").Scan(&total); err != nil {
+		t.Fatal(err)
+	}
+	if total != callCount {
+		t.Errorf("bulk call edges total = %d, want %d", total, callCount)
+	}
+	if err := rowStore.db.QueryRow("SELECT COUNT(*) FROM call_edges").Scan(&total); err != nil {
+		t.Fatal(err)
+	}
+	if total != callCount {
+		t.Errorf("row call edges total = %d, want %d", total, callCount)
 	}
 }
 
@@ -1673,6 +1794,55 @@ func TestReferencesUsesCoveringIndex(t *testing.T) {
 	}
 }
 
+func TestCallEdgesUseCoveringIndexes(t *testing.T) {
+	s, _ := setupTestStore(t)
+
+	for _, tt := range []struct {
+		name  string
+		query string
+		args  []interface{}
+		index string
+	}{
+		{
+			name:  "callees",
+			query: "EXPLAIN QUERY PLAN SELECT s.module, s.function, s.arity, e.kind FROM call_edges e JOIN call_symbols s ON s.id = e.callee_id WHERE e.caller_id = ?",
+			args:  []interface{}{1},
+			index: "idx_call_edges_caller",
+		},
+		{
+			name:  "callers",
+			query: "EXPLAIN QUERY PLAN SELECT s.module, s.function, s.arity, e.kind FROM call_edges e JOIN call_symbols s ON s.id = e.caller_id WHERE e.callee_id = ?",
+			args:  []interface{}{1},
+			index: "idx_call_edges_callee",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			rows, err := s.db.Query(tt.query, tt.args...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = rows.Close() }()
+			var plan strings.Builder
+			for rows.Next() {
+				var id, parent, notUsed int
+				var detail string
+				if err := rows.Scan(&id, &parent, &notUsed, &detail); err != nil {
+					t.Fatal(err)
+				}
+				plan.WriteString(detail)
+				plan.WriteByte('\n')
+			}
+			got := plan.String()
+			if !strings.Contains(got, "COVERING INDEX "+tt.index) {
+				t.Errorf("query does not use covering index %s:\n%s", tt.index, got)
+			}
+			if strings.Contains(got, "SCAN call_edges") || strings.Contains(got, "TEMP B-TREE") {
+				t.Errorf("call edge query performs avoidable work:\n%s", got)
+			}
+		})
+	}
+}
+
 // TestReindexKeepsFileID guards the id that definitions and refs point at. The
 // files row is upserted rather than replaced: INSERT OR REPLACE would delete the
 // old row and allocate a new id, silently detaching every row for that file.
@@ -1683,11 +1853,11 @@ func TestReindexKeepsFileID(t *testing.T) {
 end
 `)
 
-	defs, refs, err := parser.ParseFile(path)
+	defs, refs, calls, err := parser.ParseFileWithCalls(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.IndexFileWithRefs(path, defs, refs); err != nil {
+	if err := s.IndexFileWithRefsAndCalls(path, defs, refs, calls); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1703,7 +1873,7 @@ end
 		t.Helper()
 		var n int
 		if err := s.db.QueryRow(
-			"SELECT (SELECT COUNT(*) FROM definitions WHERE file_id NOT IN (SELECT id FROM files)) + (SELECT COUNT(*) FROM refs WHERE file_id NOT IN (SELECT id FROM files))",
+			"SELECT (SELECT COUNT(*) FROM definitions WHERE file_id NOT IN (SELECT id FROM files)) + (SELECT COUNT(*) FROM refs WHERE file_id NOT IN (SELECT id FROM files)) + (SELECT COUNT(*) FROM call_edges WHERE file_id NOT IN (SELECT id FROM files))",
 		).Scan(&n); err != nil {
 			t.Fatal(err)
 		}
@@ -1713,7 +1883,7 @@ end
 	first := fileID()
 
 	// Reindex the same path, as a save would.
-	if err := s.IndexFileWithRefs(path, defs, refs); err != nil {
+	if err := s.IndexFileWithRefsAndCalls(path, defs, refs, calls); err != nil {
 		t.Fatal(err)
 	}
 	if second := fileID(); second != first {
@@ -1737,7 +1907,7 @@ end
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := batch.IndexFileWithMtimeAndRefs(path, 42, defs, refs); err != nil {
+	if err := batch.IndexFileWithMtimeRefsAndCalls(path, 42, defs, refs, calls); err != nil {
 		t.Fatal(err)
 	}
 	if err := batch.Commit(); err != nil {
@@ -1760,11 +1930,11 @@ func TestRemoveFileClearsRows(t *testing.T) {
   def run(id), do: MyApp.Accounts.get_user(id)
 end
 `)
-	defs, refs, err := parser.ParseFile(path)
+	defs, refs, calls, err := parser.ParseFileWithCalls(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.IndexFileWithRefs(path, defs, refs); err != nil {
+	if err := s.IndexFileWithRefsAndCalls(path, defs, refs, calls); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.RemoveFile(path); err != nil {
@@ -1773,7 +1943,7 @@ end
 
 	var remaining int
 	if err := s.db.QueryRow(
-		"SELECT (SELECT COUNT(*) FROM definitions) + (SELECT COUNT(*) FROM refs) + (SELECT COUNT(*) FROM files)",
+		"SELECT (SELECT COUNT(*) FROM definitions) + (SELECT COUNT(*) FROM refs) + (SELECT COUNT(*) FROM call_symbols) + (SELECT COUNT(*) FROM call_edges) + (SELECT COUNT(*) FROM files)",
 	).Scan(&remaining); err != nil {
 		t.Fatal(err)
 	}

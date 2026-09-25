@@ -53,6 +53,21 @@ func BenchmarkParseText(b *testing.B) {
 	}
 }
 
+func BenchmarkParseTextWithCalls(b *testing.B) {
+	loadBenchFiles(b)
+	for _, f := range benchFiles {
+		b.Run(f.name, func(b *testing.B) {
+			text := string(f.data)
+			b.SetBytes(int64(len(f.data)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_, _, _, _ = ParseTextWithCalls("bench.ex", text)
+			}
+		})
+	}
+}
+
 func BenchmarkTokenize(b *testing.B) {
 	loadBenchFiles(b)
 	for _, f := range benchFiles {
@@ -102,10 +117,22 @@ func BenchmarkParseTextAllFiles(b *testing.B) {
 
 	b.Run("all_testdata", func(b *testing.B) {
 		b.SetBytes(totalBytes)
+		b.ReportAllocs()
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			for _, f := range allFiles {
 				_, _, _ = ParseText(f.name, string(f.data))
+			}
+		}
+	})
+
+	b.Run("all_testdata_with_calls", func(b *testing.B) {
+		b.SetBytes(totalBytes)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			for _, f := range allFiles {
+				_, _, _, _ = ParseTextWithCalls(f.name, string(f.data))
 			}
 		}
 	})
