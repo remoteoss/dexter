@@ -144,6 +144,7 @@ type Server struct {
 	explicitRoot    bool // true when projectRoot was provided via CLI, not inferred from Initialize
 	initialized     bool
 	client          protocol.Client
+	clientLog       *clientLog // forwards this session's log lines to its editor
 	followDelegates bool
 	debug           bool
 	mixBin          string // resolved path to the mix binary
@@ -159,6 +160,8 @@ type Server struct {
 	usingCacheMu   sync.RWMutex
 	generatedCache *generatedFunctionCache
 	beamLibs       *beamLibIndexCache // build root → compiled application directories
+	buildRoots     *buildRootCache    // compiled Mix projects in the workspace
+	mixApps        *mixAppCache       // mix.exs → application name
 	ebinIndexes    *ebinIndexCache    // ebin dir → modules compiled into it
 
 	depsCache   map[string]bool // dir → whether files in that dir are deps
@@ -184,7 +187,9 @@ type Server struct {
 
 func (s *Server) debugf(format string, args ...interface{}) {
 	if s.debug {
-		log.Printf("[debug] "+format, args...)
+		line := "[debug] " + fmt.Sprintf(format, args...)
+		log.Print(line)
+		s.clientLog.send(line)
 	}
 }
 
@@ -224,6 +229,8 @@ func NewServerWithOptions(s *store.Store, projectRoot string, opts ServerOptions
 		usingCache:         make(map[string]*usingCacheEntry),
 		generatedCache:     newGeneratedFunctionCache(),
 		beamLibs:           newBeamLibIndexCache(),
+		buildRoots:         &buildRootCache{},
+		mixApps:            &mixAppCache{apps: make(map[string]mixAppEntry)},
 		ebinIndexes:        newEbinIndexCache(),
 		depsCache:          make(map[string]bool),
 		index:              index,
@@ -265,6 +272,7 @@ func ServeStream(server *Server, rwc io.ReadWriteCloser) error {
 	conn := jsonrpc2.NewConn(stream)
 	server.client = protocol.ClientDispatcher(conn, logger)
 	server.conn = conn
+	server.clientLog = startClientLog(server.client, conn.Done())
 
 	handler := server.renameHandler(protocol.ServerHandler(server, nil))
 	ctx := context.Background()
