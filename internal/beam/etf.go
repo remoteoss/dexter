@@ -66,6 +66,10 @@ type etfReader struct {
 	buf   []byte
 	pos   int
 	depth int
+
+	// maxDepth overrides maxETFDepth for terms that legitimately nest deeper,
+	// such as the clause ASTs in a Dbgi chunk. Zero keeps the default.
+	maxDepth int
 }
 
 func (r *etfReader) remaining() int { return len(r.buf) - r.pos }
@@ -298,7 +302,11 @@ func (r *etfReader) binarySpan() (start, length int, err error) {
 
 // skip advances past one term of any shape without allocating for it.
 func (r *etfReader) skip() error {
-	if r.depth >= maxETFDepth {
+	limit := r.maxDepth
+	if limit == 0 {
+		limit = maxETFDepth
+	}
+	if r.depth >= limit {
 		return errTooDeep
 	}
 	tag, err := r.u8()

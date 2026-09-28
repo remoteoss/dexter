@@ -374,6 +374,7 @@ type testBEAMOptions struct {
 	exports   [][3]uint32
 	docs      []byte
 	attrs     []byte
+	dbgi      []byte // written compressed, as the compiler writes it
 }
 
 func writeTestBEAM(t *testing.T, path string, docs []byte) {
@@ -389,25 +390,11 @@ func writeTestBEAMOpts(t *testing.T, path string, opts testBEAMOptions) {
 	t.Helper()
 	var size [4]byte
 
-	var raw bytes.Buffer
-	raw.WriteByte(etfVersion)
+	var raw []byte
 	if len(opts.docs) > 0 {
-		raw.WriteByte(tagCompressed)
-		var uncompressed bytes.Buffer
-		uncompressed.Write(opts.docs)
-		binary.BigEndian.PutUint32(size[:], uint32(uncompressed.Len()))
-		raw.Write(size[:])
-		var zw bytes.Buffer
-		compressor := zlib.NewWriter(&zw)
-		if _, err := compressor.Write(uncompressed.Bytes()); err != nil {
-			t.Fatal(err)
-		}
-		if err := compressor.Close(); err != nil {
-			t.Fatal(err)
-		}
-		raw.Write(zw.Bytes())
+		raw = compressedTestTerm(t, opts.docs)
 	} else {
-		raw.WriteByte(tagNil)
+		raw = []byte{etfVersion, tagNil}
 	}
 
 	var atoms bytes.Buffer
@@ -443,7 +430,10 @@ func writeTestBEAMOpts(t *testing.T, path string, opts testBEAMOptions) {
 	if len(opts.attrs) > 0 {
 		writeTestChunk(&chunks, "Attr", opts.attrs)
 	}
-	writeTestChunk(&chunks, "Docs", raw.Bytes())
+	writeTestChunk(&chunks, "Docs", raw)
+	if len(opts.dbgi) > 0 {
+		writeTestChunk(&chunks, "Dbgi", compressedTestTerm(t, opts.dbgi))
+	}
 
 	var file bytes.Buffer
 	file.WriteString("FOR1")
@@ -454,6 +444,25 @@ func writeTestBEAMOpts(t *testing.T, path string, opts testBEAMOptions) {
 	if err := os.WriteFile(path, file.Bytes(), 0o600); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// compressedTestTerm wraps an encoded term as a versioned COMPRESSED_TERM, the
+// form Elixir writes its Docs and Dbgi chunks in.
+func compressedTestTerm(t *testing.T, term []byte) []byte {
+	t.Helper()
+	var size [4]byte
+	raw := []byte{etfVersion, tagCompressed}
+	binary.BigEndian.PutUint32(size[:], uint32(len(term)))
+	raw = append(raw, size[:]...)
+	var zw bytes.Buffer
+	compressor := zlib.NewWriter(&zw)
+	if _, err := compressor.Write(term); err != nil {
+		t.Fatal(err)
+	}
+	if err := compressor.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return append(raw, zw.Bytes()...)
 }
 
 func writeTestChunk(chunks *bytes.Buffer, name string, data []byte) {

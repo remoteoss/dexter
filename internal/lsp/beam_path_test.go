@@ -157,17 +157,23 @@ type testAttr struct {
 // makes a compiled module record facts its source does not state, which is the
 // only way a framework's macro provider can be discovered.
 func minimalBeamWithAttrs(attrs []testAttr, docs string, exports ...beamExport) []byte {
-	return buildTestBeam(attrs, docs, exports...)
+	return buildTestBeam(attrs, docs, nil, exports...)
 }
 
 // minimalBeamWithDocs is minimalBeam plus a Docs chunk whose inflated payload is
 // docs. ReadDocBody inflates that payload and slices it, so a test can put one
 // function's prose at a known offset without encoding a real docs_v1 term.
 func minimalBeamWithDocs(docs string, exports ...beamExport) []byte {
-	return buildTestBeam(nil, docs, exports...)
+	return buildTestBeam(nil, docs, nil, exports...)
 }
 
-func buildTestBeam(attrs []testAttr, docs string, exports ...beamExport) []byte {
+// minimalBeamWithDbgi adds a Dbgi chunk holding the encoded debug info term,
+// which is where a compiled module records the line of each definition.
+func minimalBeamWithDbgi(dbgi []byte, exports ...beamExport) []byte {
+	return buildTestBeam(nil, "", dbgi, exports...)
+}
+
+func buildTestBeam(attrs []testAttr, docs string, dbgi []byte, exports ...beamExport) []byte {
 	names := make([]string, 0, len(exports)+1)
 	names = append(names, "Elixir.Minimal")
 	for _, export := range exports {
@@ -197,6 +203,10 @@ func buildTestBeam(attrs []testAttr, docs string, exports ...beamExport) []byte 
 	}
 	if len(attrs) > 0 {
 		writeBeamChunk(&chunks, "Attr", attrChunk(attrs))
+	}
+	if len(dbgi) > 0 {
+		// Uncompressed, like docsChunk; the reader accepts both forms.
+		writeBeamChunk(&chunks, "Dbgi", append([]byte{131}, dbgi...))
 	}
 
 	var file bytes.Buffer

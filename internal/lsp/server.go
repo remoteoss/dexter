@@ -1159,11 +1159,11 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		s.debugf("Definition: resolved bare %q -> %q", functionName, fullModule)
 		if fullModule == "" {
 			currentModule := s.store.LookupEnclosingModule(uriToPath(protocol.DocumentURI(docURI)), lineNum+1)
-			if provider, _, found := s.generatedSymbolInScope(currentModule, func() []string {
+			if provider, functions, found := s.generatedSymbolInScope(currentModule, func() []string {
 				return s.enclosingBlockPath(docURI, lineNum, col)
 			}, functionName); found {
-				if results := s.generatedDefinitionResults(provider.module); len(results) > 0 {
-					s.debugf("Definition: generated bare %q provider=%s", functionName, provider.module)
+				if results, precise := s.generatedDefinitionResultsFor(provider.module, provider.beamPath, functions); len(results) > 0 {
+					s.debugf("Definition: generated bare %q provider=%s precise=%t", functionName, provider.module, precise)
 					return storeResultsToLocations(results), nil
 				}
 			}
@@ -1207,11 +1207,11 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		}
 
 		currentModule = s.store.LookupEnclosingModule(uriToPath(protocol.DocumentURI(docURI)), lineNum+1)
-		if provider, _, found := s.generatedSymbolInScope(currentModule, func() []string {
+		if provider, functions, found := s.generatedSymbolInScope(currentModule, func() []string {
 			return s.enclosingBlockPath(docURI, lineNum, col)
 		}, functionName); found {
-			if results := s.generatedDefinitionResults(provider.module); len(results) > 0 {
-				s.debugf("Definition: generated fallback for bare %q provider=%s", functionName, provider.module)
+			if results, precise := s.generatedDefinitionResultsFor(provider.module, provider.beamPath, functions); len(results) > 0 {
+				s.debugf("Definition: generated fallback for bare %q provider=%s precise=%t", functionName, provider.module, precise)
 				return storeResultsToLocations(results), nil
 			}
 		}
@@ -7102,7 +7102,7 @@ func (s *Server) PrepareCallHierarchy(ctx context.Context, params *protocol.Call
 		if len(generatedFunctions) == 0 {
 			return nil, nil
 		}
-		defResults = s.generatedDefinitionResults(fullModule)
+		defResults, _ = s.generatedDefinitionResultsFor(fullModule, "", generatedFunctions)
 		if len(defResults) == 0 {
 			return nil, nil
 		}
