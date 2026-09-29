@@ -147,6 +147,7 @@ type Server struct {
 	clientLog       *clientLog // forwards this session's log lines to its editor
 	followDelegates bool
 	debug           bool
+	definitionStyle string // "all" (default) or "first": controls multi-head definition results
 	mixBin          string // resolved path to the mix binary
 
 	beams  map[string]*beamProcess // build root → persistent BEAM process
@@ -221,6 +222,7 @@ func NewServerWithOptions(s *store.Store, projectRoot string, opts ServerOptions
 		projectRoot:     projectRoot,
 		explicitRoot:    projectRoot != "",
 		followDelegates: true,
+		definitionStyle: "all",
 		// Read here as well as in Initialize: the daemon's headless service
 		// answers CLI and MCP calls and never receives an initialize request.
 		debug:              os.Getenv("DEXTER_DEBUG") == "true",
@@ -800,6 +802,11 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 		if v, ok := opts["maxTransientDocuments"].(float64); ok {
 			s.docs.SetMaxTransient(int(v))
 		}
+		if v, ok := opts["definitionStyle"].(string); ok {
+			if v == "all" || v == "first" {
+				s.definitionStyle = v
+			}
+		}
 	}
 	if os.Getenv("DEXTER_DEBUG") == "true" {
 		s.debug = true
@@ -1124,6 +1131,7 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 
 	expr := tf.ResolveModuleExpr(exprCtx.Expr(), lineNum)
 	moduleRef, functionName := ExtractModuleAndFunction(expr)
+	callArity := tf.ArityAtCallsite(lineNum, exprCtx.ExprStart, exprCtx.ExprEnd)
 
 	if moduleRef != "" {
 		if aliasParent, inBlock := tf.ExtractAliasBlockParent(lineNum); inBlock {
@@ -1133,7 +1141,7 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 
 	aliases := tf.ExtractAliasesInScope(lineNum)
 	s.mergeAliasesFromUseTokenized(tf, aliases)
-	s.debugf("Definition: expr=%q module=%q function=%q", expr, moduleRef, functionName)
+	s.debugf("Definition: expr=%q module=%q function=%q arity=%d", expr, moduleRef, functionName, callArity)
 
 	// Bare identifier — check variable first (cheap tree-sitter lookup), then functions
 	if moduleRef == "" {
@@ -1174,15 +1182,16 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		// Current module — return buffer location directly (works before indexing).
 		// In a typespec the bare name is the type, everywhere else the function.
 		if fullModule == currentModule {
-			find := tf.FindFunctionDefinition
-			if tf.InTypespec(lineNum) {
-				find = tf.FindTypeDefinition
-			}
-			if line, found := find(functionName); found {
-				return []protocol.Location{{
-					URI:   params.TextDocument.URI,
-					Range: lineRange(line - 1),
-				}}, nil
+			lines := tf.FindDefinitionLines(functionName, callArity, tf.InTypespec(lineNum))
+			if len(lines) > 0 {
+				locations := make([]protocol.Location, 0, len(lines))
+				for _, line := range lines {
+					locations = append(locations, protocol.Location{
+						URI:   params.TextDocument.URI,
+						Range: lineRange(line - 1),
+					})
+				}
+				return s.applyDefinitionStyle(locations), nil
 			}
 		}
 
@@ -1194,16 +1203,18 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 			Kind:            kind,
 			FollowDelegates: s.followDelegates,
 			External:        fullModule != extractEnclosingModuleFromTokens(tf.source, tf.tokens, lineNum),
+			Arity:           callArity,
+			ExactArity:      callArity >= 0,
 		})
 		if err == nil && len(results) > 0 {
 			s.debugf("Definition: found %d semantic result(s) for %s.%s", len(results), fullModule, functionName)
-			return nameLocationsToProtocol(results), nil
+			return s.applyDefinitionStyle(nameLocationsToProtocol(results)), nil
 		}
 
 		// Fallback for use-chain inline defs (not stored as module definitions)
-		if results := s.lookupThroughUse(text, functionName, aliases); len(results) > 0 {
+		if results := s.lookupThroughUseWithFollow(text, functionName, aliases, s.followDelegates, callArity); len(results) > 0 {
 			s.debugf("Definition: found %d result(s) via current file use chain for %s", len(results), functionName)
-			return storeResultsToLocations(byKindForContext(tf, lineNum, results)), nil
+			return s.applyDefinitionStyle(storeResultsToLocations(byKindForContext(tf, lineNum, results))), nil
 		}
 
 		currentModule = s.store.LookupEnclosingModule(uriToPath(protocol.DocumentURI(docURI)), lineNum+1)
@@ -1235,11 +1246,13 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 			FollowDelegates:  s.followDelegates,
 			External:         fullModule != extractEnclosingModuleFromTokens(tf.source, tf.tokens, lineNum),
 			FallbackToModule: true,
+			Arity:            callArity,
+			ExactArity:       callArity >= 0,
 		})
 		if err != nil {
 			return nil, nil
 		}
-		return nameLocationsToProtocol(results), nil
+		return s.applyDefinitionStyle(nameLocationsToProtocol(results)), nil
 	}
 
 	results, err := s.LookupName(fullModule, "", NameLookupOptions{})
@@ -1262,6 +1275,13 @@ func nameLocationsToProtocol(results []NameLocation) []protocol.Location {
 			URI:   uri.File(result.FilePath),
 			Range: lineRange(result.Line - 1),
 		})
+	}
+	return locations
+}
+
+func (s *Server) applyDefinitionStyle(locations []protocol.Location) []protocol.Location {
+	if s.definitionStyle == "first" && len(locations) > 1 {
+		return locations[:1]
 	}
 	return locations
 }
@@ -2488,10 +2508,10 @@ func (s *Server) parseUsingFile(filePath, moduleName string) *usingCacheEntry {
 // fullModule's source file. This handles qualified calls like M.func() where
 // func is not defined directly in M but is injected by a macro M uses.
 func (s *Server) lookupThroughUseOf(fullModule, functionName string) []store.LookupResult {
-	return s.lookupThroughUseOfWithFollow(fullModule, functionName, s.followDelegates)
+	return s.lookupThroughUseOfWithFollow(fullModule, functionName, s.followDelegates, -1)
 }
 
-func (s *Server) lookupThroughUseOfWithFollow(fullModule, functionName string, followDelegates bool) []store.LookupResult {
+func (s *Server) lookupThroughUseOfWithFollow(fullModule, functionName string, followDelegates bool, arity int) []store.LookupResult {
 	modResults, err := s.store.LookupModule(fullModule)
 	if err != nil || len(modResults) == 0 {
 		return nil
@@ -2500,7 +2520,7 @@ func (s *Server) lookupThroughUseOfWithFollow(fullModule, functionName string, f
 	if !ok {
 		return nil
 	}
-	return s.lookupThroughUseWithFollow(fileText, functionName, ExtractAliases(fileText), followDelegates)
+	return s.lookupThroughUseWithFollow(fileText, functionName, ExtractAliases(fileText), followDelegates, arity)
 }
 
 // lookupThroughUse searches for functionName in definitions injected by `use`
@@ -2508,15 +2528,15 @@ func (s *Server) lookupThroughUseOfWithFollow(fullModule, functionName string, f
 // priority over imported ones. Later `use` declarations shadow earlier ones.
 // Transitive use chains (use inside __using__ body) are followed recursively.
 func (s *Server) lookupThroughUse(text, functionName string, aliases map[string]string) []store.LookupResult {
-	return s.lookupThroughUseWithFollow(text, functionName, aliases, s.followDelegates)
+	return s.lookupThroughUseWithFollow(text, functionName, aliases, s.followDelegates, -1)
 }
 
-func (s *Server) lookupThroughUseWithFollow(text, functionName string, aliases map[string]string, followDelegates bool) []store.LookupResult {
+func (s *Server) lookupThroughUseWithFollow(text, functionName string, aliases map[string]string, followDelegates bool, arity int) []store.LookupResult {
 	useCalls := ExtractUsesWithOpts(text, aliases)
 	visited := make(map[string]bool)
 
 	for i := len(useCalls) - 1; i >= 0; i-- {
-		if result := s.lookupInUsingEntryForWithFollow(useCalls[i].Module, functionName, useCalls[i].dispatchAtom(), useCalls[i].Opts, visited, followDelegates); result != nil {
+		if result := s.lookupInUsingEntryForWithFollow(useCalls[i].Module, functionName, useCalls[i].dispatchAtom(), useCalls[i].Opts, visited, followDelegates, arity); result != nil {
 			return result
 		}
 	}
@@ -2528,7 +2548,7 @@ func (s *Server) lookupThroughUseWithFollow(text, functionName string, aliases m
 // consumerOpts are the keyword args from the `use Module, key: Val` call and
 // are used to resolve dynamic imports like `import unquote(mod)`.
 func (s *Server) lookupInUsingEntry(moduleName, functionName string, consumerOpts map[string]string, visited map[string]bool) []store.LookupResult {
-	return s.lookupInUsingEntryForWithFollow(moduleName, functionName, "", consumerOpts, visited, s.followDelegates)
+	return s.lookupInUsingEntryForWithFollow(moduleName, functionName, "", consumerOpts, visited, s.followDelegates, -1)
 }
 
 // bodyFor picks the injected body for a `use` call. An ordinary __using__ has a
@@ -2561,10 +2581,10 @@ func usingVisitKey(moduleName, which string) string {
 // lookupInUsingEntryFor is lookupInUsingEntry with the dispatch atom from the
 // `use` site (empty for an ordinary `use Module`).
 func (s *Server) lookupInUsingEntryFor(moduleName, functionName, which string, consumerOpts map[string]string, visited map[string]bool) []store.LookupResult {
-	return s.lookupInUsingEntryForWithFollow(moduleName, functionName, which, consumerOpts, visited, s.followDelegates)
+	return s.lookupInUsingEntryForWithFollow(moduleName, functionName, which, consumerOpts, visited, s.followDelegates, -1)
 }
 
-func (s *Server) lookupInUsingEntryForWithFollow(moduleName, functionName, which string, consumerOpts map[string]string, visited map[string]bool, followDelegates bool) []store.LookupResult {
+func (s *Server) lookupInUsingEntryForWithFollow(moduleName, functionName, which string, consumerOpts map[string]string, visited map[string]bool, followDelegates bool, arity int) []store.LookupResult {
 	visitKey := usingVisitKey(moduleName, which)
 	if visited[visitKey] {
 		return nil
@@ -2584,17 +2604,33 @@ func (s *Server) lookupInUsingEntryForWithFollow(moduleName, functionName, which
 	if defs, ok := body.inlineDefs[functionName]; ok {
 		var results []store.LookupResult
 		for _, d := range defs {
-			results = append(results, store.LookupResult{FilePath: entry.filePath, Line: d.line})
+			if arity >= 0 && d.arity != arity {
+				continue
+			}
+			results = append(results, store.LookupResult{
+				FilePath: entry.filePath,
+				Line:     d.line,
+				Kind:     d.kind,
+				Arity:    d.arity,
+			})
 		}
-		return results
+		if len(results) > 0 {
+			return results
+		}
 	}
 
 	// Static imports
 	for j := len(body.imports) - 1; j >= 0; j-- {
 		var results []store.LookupResult
 		var err error
-		if followDelegates {
+		if followDelegates && arity >= 0 {
+			results, err = s.store.LookupFollowDelegateByArity(body.imports[j], functionName, arity)
+			results = publicOnly(results)
+		} else if followDelegates {
 			results, err = s.store.LookupFollowDelegate(body.imports[j], functionName)
+			results = publicOnly(results)
+		} else if arity >= 0 {
+			results, err = s.store.LookupFunctionByArity(body.imports[j], functionName, arity)
 			results = publicOnly(results)
 		} else {
 			results, err = s.store.LookupPublicFunction(body.imports[j], functionName)
@@ -2618,8 +2654,14 @@ func (s *Server) lookupInUsingEntryForWithFollow(moduleName, functionName, which
 		case "import":
 			var results []store.LookupResult
 			var err error
-			if followDelegates {
+			if followDelegates && arity >= 0 {
+				results, err = s.store.LookupFollowDelegateByArity(mod, functionName, arity)
+				results = publicOnly(results)
+			} else if followDelegates {
 				results, err = s.store.LookupFollowDelegate(mod, functionName)
+				results = publicOnly(results)
+			} else if arity >= 0 {
+				results, err = s.store.LookupFunctionByArity(mod, functionName, arity)
 				results = publicOnly(results)
 			} else {
 				results, err = s.store.LookupPublicFunction(mod, functionName)
@@ -2628,7 +2670,7 @@ func (s *Server) lookupInUsingEntryForWithFollow(moduleName, functionName, which
 				return results
 			}
 		case "use":
-			if result := s.lookupInUsingEntryForWithFollow(mod, functionName, "", nil, visited, followDelegates); result != nil {
+			if result := s.lookupInUsingEntryForWithFollow(mod, functionName, "", nil, visited, followDelegates, arity); result != nil {
 				return result
 			}
 		}
@@ -2637,7 +2679,7 @@ func (s *Server) lookupInUsingEntryForWithFollow(moduleName, functionName, which
 	// Transitive uses: use Module inside the __using__ body (double-use chains)
 	for k := len(body.transCalls) - 1; k >= 0; k-- {
 		call := body.transCalls[k]
-		if result := s.lookupInUsingEntryForWithFollow(call.Module, functionName, call.dispatchAtom(), call.Opts, visited, followDelegates); result != nil {
+		if result := s.lookupInUsingEntryForWithFollow(call.Module, functionName, call.dispatchAtom(), call.Opts, visited, followDelegates, arity); result != nil {
 			return result
 		}
 	}
@@ -2645,7 +2687,7 @@ func (s *Server) lookupInUsingEntryForWithFollow(moduleName, functionName, which
 		if body.hasTransCall(body.transUses[k]) {
 			continue
 		}
-		if result := s.lookupInUsingEntryForWithFollow(body.transUses[k], functionName, "", nil, visited, followDelegates); result != nil {
+		if result := s.lookupInUsingEntryForWithFollow(body.transUses[k], functionName, "", nil, visited, followDelegates, arity); result != nil {
 			return result
 		}
 	}

@@ -124,6 +124,18 @@ func (w *TokenWalker) NextSigPos() int {
 	return NextSigToken(w.Tokens, w.N, w.pos)
 }
 
+// PreviousSigPos returns the previous significant token before before, or -1.
+// EOL and comment tokens are skipped.
+func (w *TokenWalker) PreviousSigPos(before int) int {
+	for i := before - 1; i >= 0; i-- {
+		kind := w.Tokens[i].Kind
+		if kind != TokEOL && kind != TokComment {
+			return i
+		}
+	}
+	return -1
+}
+
 // Depth returns the current bracket depth.
 func (w *TokenWalker) Depth() int {
 	return w.depth

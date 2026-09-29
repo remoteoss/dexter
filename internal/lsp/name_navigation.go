@@ -1,6 +1,9 @@
 package lsp
 
-import "github.com/remoteoss/dexter/internal/store"
+import (
+	"github.com/remoteoss/dexter/internal/beam"
+	"github.com/remoteoss/dexter/internal/store"
+)
 
 // NameKind selects which Elixir namespace a canonical name refers to.
 type NameKind uint8
@@ -26,6 +29,8 @@ type NameLookupOptions struct {
 	External         bool
 	FallbackToModule bool
 	ExcludeStdlib    bool
+	Arity            int
+	ExactArity       bool
 	// ExactModule places a generated function only at its own module's
 	// definition. Without it, a module that exists only as a BEAM, such as
 	// Phoenix route helpers, resolves to the nearest lexical parent with source;
@@ -52,8 +57,12 @@ func (s *Server) LookupName(module, function string, opts NameLookupOptions) ([]
 
 	var results []store.LookupResult
 	var err error
-	if opts.FollowDelegates {
+	if opts.FollowDelegates && opts.ExactArity {
+		results, err = s.store.LookupFollowDelegateByArity(module, function, opts.Arity)
+	} else if opts.FollowDelegates {
 		results, err = s.store.LookupFollowDelegate(module, function)
+	} else if opts.ExactArity {
+		results, err = s.store.LookupFunctionByArity(module, function, opts.Arity)
 	} else {
 		results, err = s.store.LookupFunction(module, function)
 	}
@@ -65,10 +74,20 @@ func (s *Server) LookupName(module, function string, opts NameLookupOptions) ([]
 		results = filterOutPrivate(results)
 	}
 	if len(results) == 0 {
-		results = filterLookupKind(s.lookupThroughUseOfWithFollow(module, function, opts.FollowDelegates), opts.Kind)
+		arity := -1
+		if opts.ExactArity {
+			arity = opts.Arity
+		}
+		results = filterLookupKind(s.lookupThroughUseOfWithFollow(module, function, opts.FollowDelegates, arity), opts.Kind)
 	}
 	if len(results) == 0 && opts.Kind != NameKindType {
 		if generated, found := s.generatedSymbol(module, "", function); found && len(generated) > 0 {
+			if opts.ExactArity {
+				generated = filterGeneratedFunctionsByArity(generated, opts.Arity)
+			}
+			if len(generated) == 0 {
+				return nil, nil
+			}
 			if opts.ExactModule {
 				if results, err = s.store.LookupModule(module); err != nil {
 					return nil, err
@@ -89,6 +108,16 @@ func (s *Server) LookupName(module, function string, opts NameLookupOptions) ([]
 		}
 	}
 	return s.lookupLocations(results, opts.ExcludeStdlib), nil
+}
+
+func filterGeneratedFunctionsByArity(functions []beam.Function, arity int) []beam.Function {
+	filtered := make([]beam.Function, 0, len(functions))
+	for _, function := range functions {
+		if function.Arity == arity {
+			filtered = append(filtered, function)
+		}
+	}
+	return filtered
 }
 
 // ReferenceNames finds references after a frontend has resolved a canonical

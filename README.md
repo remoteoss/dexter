@@ -153,6 +153,7 @@ vim.lsp.config('dexter', {
   filetypes = { 'elixir', 'eelixir', 'heex' },
   init_options = {
     followDelegates = true,  -- jump through defdelegate to the target function
+    -- definitionStyle = "all", -- "all" returns all function heads; "first" jumps to the first one
     -- stdlibPath = "",      -- override Elixir stdlib path (auto-detected)
     -- debug = false,        -- verbose logging to stderr (view with :LspLog)
   },
@@ -269,6 +270,21 @@ If Zed shows a *"could not detect Elixir stdlib"* warning on startup — common 
 ```
 
 Equivalently, set the `DEXTER_ELIXIR_LIB_ROOT` environment variable via `lsp.dexter.binary.env`.
+
+To configure other LSP options, such as returning only the first matching function head, add them to the same `initialization_options` object (see [LSP options](#lsp-options)):
+
+```json
+{
+  "lsp": {
+    "dexter": {
+      "initialization_options": {
+        "followDelegates": true,
+        "definitionStyle": "first"
+      }
+    }
+  }
+}
+```
 
 ### Emacs
 
@@ -566,6 +582,7 @@ If the persistent process can't start, dexter falls back to running `mix format`
 Dexter reads `initializationOptions` from your editor configuration:
 
 - **`followDelegates`** (boolean, default: `true`): follow `defdelegate` targets on lookup.
+- **`definitionStyle`** (string, default: `"all"`): controls how many locations are returned when a function has multiple heads (clauses). `"all"` returns every definition site; `"first"` returns only the first one, which makes editors like Zed jump directly instead of showing a picker.
 - **`stdlibPath`** (string): override the Elixir stdlib directory to index. Defaults to auto-detection; use this if your install is non-standard.
 - **`debug`** (boolean, default: `false`): enable verbose logging for this editor session. Logs timing and resolution details for every definition, hover, references, and rename request to your editor's LSP log and to the workspace daemon's log (see [Debugging](#debugging)). Can also be enabled via the `DEXTER_DEBUG=true` environment variable.
 - **`maxTransientDocuments`** (integer, default: `50`): cap on how many lazily-loaded buffers the server retains in memory. When an LSP client (e.g. Claude Code) queries a file it never opened via `didOpen`, dexter reads it from disk and caches it. Editor-owned buffers are unaffected; only disk-loaded entries are subject to LRU eviction. Set to `0` to disable transient caching.

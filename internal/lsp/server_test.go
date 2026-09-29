@@ -245,6 +245,9 @@ func TestServer_InitializationOptions(t *testing.T) {
 		if server.debug {
 			t.Error("debug should default to false")
 		}
+		if server.definitionStyle != "all" {
+			t.Errorf("definitionStyle: got %q, want %q", server.definitionStyle, "all")
+		}
 	})
 
 	// Claude Code plugin template substitution yields strings, not booleans.
@@ -254,12 +257,13 @@ func TestServer_InitializationOptions(t *testing.T) {
 		opts          map[string]interface{}
 		wantFollowDel bool
 		wantDebug     bool
+		wantStyle     string
 	}{
-		{"bool true/false", map[string]interface{}{"followDelegates": false, "debug": true}, false, true},
-		{"string true/false", map[string]interface{}{"followDelegates": "false", "debug": "true"}, false, true},
-		{"string 1/0", map[string]interface{}{"followDelegates": "0", "debug": "1"}, false, true},
-		{"empty string leaves default", map[string]interface{}{"followDelegates": "", "debug": ""}, true, false},
-		{"unsupported type leaves default", map[string]interface{}{"followDelegates": 1, "debug": 0}, true, false},
+		{"bool true/false", map[string]interface{}{"followDelegates": false, "debug": true, "definitionStyle": "first"}, false, true, "first"},
+		{"string true/false", map[string]interface{}{"followDelegates": "false", "debug": "true", "definitionStyle": "all"}, false, true, "all"},
+		{"string 1/0", map[string]interface{}{"followDelegates": "0", "debug": "1"}, false, true, "all"},
+		{"empty string leaves default", map[string]interface{}{"followDelegates": "", "debug": "", "definitionStyle": ""}, true, false, "all"},
+		{"unsupported values leave default", map[string]interface{}{"followDelegates": 1, "debug": 0, "definitionStyle": "bogus"}, true, false, "all"},
 	}
 
 	for _, tc := range cases {
@@ -280,7 +284,300 @@ func TestServer_InitializationOptions(t *testing.T) {
 			if server.debug != tc.wantDebug {
 				t.Errorf("debug: got %v, want %v", server.debug, tc.wantDebug)
 			}
+			if server.definitionStyle != tc.wantStyle {
+				t.Errorf("definitionStyle: got %q, want %q", server.definitionStyle, tc.wantStyle)
+			}
 		})
+	}
+}
+
+func TestServer_ApplyDefinitionStyle(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	locs := []protocol.Location{
+		{URI: "file:///a.ex", Range: lineRange(0)},
+		{URI: "file:///a.ex", Range: lineRange(5)},
+		{URI: "file:///a.ex", Range: lineRange(9)},
+	}
+
+	// Default "all" returns everything
+	got := server.applyDefinitionStyle(locs)
+	if len(got) != 3 {
+		t.Errorf("expected 3 locations with style %q, got %d", "all", len(got))
+	}
+
+	// "first" returns only the first
+	server.definitionStyle = "first"
+	got = server.applyDefinitionStyle(locs)
+	if len(got) != 1 {
+		t.Errorf("expected 1 location with style %q, got %d", "first", len(got))
+	}
+	if got[0].Range.Start.Line != 0 {
+		t.Errorf("expected first location (line 0), got line %d", got[0].Range.Start.Line)
+	}
+
+	// Single location is unaffected by "first"
+	got = server.applyDefinitionStyle(locs[:1])
+	if len(got) != 1 {
+		t.Errorf("expected 1 location with style %q and single input, got %d", "first", len(got))
+	}
+
+	// Empty slice is unaffected
+	got = server.applyDefinitionStyle(nil)
+	if len(got) != 0 {
+		t.Errorf("expected 0 locations for nil input, got %d", len(got))
+	}
+}
+
+// --- Duplicate-location reproductions (issue #38, knoebber's follow-up) ---
+//
+// knoebber reported that Zed's goto-definition opens the references picker even
+// when "the function is defined once in another module", implying Dexter is
+// returning more than one Location in cases where a human sees a single
+// definition. These tests pin the scenarios we suspect: each asserts exactly 1
+// Location from Definition(). A failure here means the handler is returning
+// duplicates for a single-definition call and likely reproduces the bug.
+
+// Sanity baseline: one def, one caller — must be a single Location.
+func TestDefinition_SingleDef_ReturnsOneLocation(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/math.ex", `defmodule MyApp.Math do
+  def add(a, b), do: a + b
+end
+`)
+
+	callerPath := filepath.Join(server.projectRoot, "lib", "caller.ex")
+	callerContent := `defmodule MyApp.Caller do
+  def run, do: MyApp.Math.add(1, 2)
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/caller.ex", callerContent)
+	callerURI := "file://" + callerPath
+	server.docs.Set(callerURI, callerContent)
+
+	// Cursor on "add" in MyApp.Math.add(1, 2)
+	locs := definitionAt(t, server, callerURI, 1, 25)
+	if len(locs) != 1 {
+		t.Fatalf("expected exactly 1 location for single def, got %d: %+v", len(locs), locs)
+	}
+}
+
+// Multi-arity: def foo/1 and def foo/2 both defined once each. A call to foo/1
+// should only return the foo/1 line — but LookupFunction ignores arity, so we
+// expect this to currently return 2 locations (the bug).
+func TestDefinition_MultiArity_ReturnsOneLocation(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/math.ex", `defmodule MyApp.Math do
+  def square(x), do: x * x
+
+  def square(x, factor), do: (x * x) * factor
+end
+`)
+
+	callerPath := filepath.Join(server.projectRoot, "lib", "caller.ex")
+	callerContent := `defmodule MyApp.Caller do
+  def run, do: MyApp.Math.square(3)
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/caller.ex", callerContent)
+	callerURI := "file://" + callerPath
+	server.docs.Set(callerURI, callerContent)
+
+	// Cursor on "square" in MyApp.Math.square(3)
+	locs := definitionAt(t, server, callerURI, 1, 28)
+	if len(locs) != 1 {
+		t.Fatalf("expected exactly 1 location for square/1 call, got %d — "+
+			"LookupFunction is not filtering by arity: %+v", len(locs), locs)
+	}
+}
+
+func TestDefinition_CurrentModuleBareCallUsesArityAndStyle(t *testing.T) {
+	t.Run("selects matching arity", func(t *testing.T) {
+		server, cleanup := setupTestServer(t)
+		defer cleanup()
+
+		content := `defmodule MyApp.Current do
+  def calculate(value), do: value
+  def calculate(left, right), do: left + right
+  def run, do: calculate(1, 2)
+end
+`
+		path := filepath.Join(server.projectRoot, "lib", "current.ex")
+		indexFile(t, server.store, server.projectRoot, "lib/current.ex", content)
+		uri := "file://" + path
+		server.docs.Set(uri, content)
+
+		locs := definitionAt(t, server, uri, 3, 17)
+		if len(locs) != 1 || locs[0].Range.Start.Line != 2 {
+			t.Fatalf("expected calculate/2 on line 2, got %+v", locs)
+		}
+	})
+
+	t.Run("returns all same-arity heads by default", func(t *testing.T) {
+		server, cleanup := setupTestServer(t)
+		defer cleanup()
+
+		content := `defmodule MyApp.Current do
+  def calculate(:first), do: 1
+  def calculate(:second), do: 2
+  def run, do: calculate(:first)
+end
+`
+		path := filepath.Join(server.projectRoot, "lib", "current.ex")
+		indexFile(t, server.store, server.projectRoot, "lib/current.ex", content)
+		uri := "file://" + path
+		server.docs.Set(uri, content)
+
+		locs := definitionAt(t, server, uri, 3, 17)
+		if len(locs) != 2 {
+			t.Fatalf("expected both calculate/1 heads, got %+v", locs)
+		}
+	})
+}
+
+func TestDefinition_UseChainSelectsProviderByArity(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/one.ex", `defmodule SharedLib.One do
+  def execute(value), do: value
+end
+`)
+	indexFile(t, server.store, server.projectRoot, "lib/two.ex", `defmodule SharedLib.Two do
+  def execute(left, right), do: {left, right}
+end
+`)
+	indexFile(t, server.store, server.projectRoot, "lib/injector.ex", `defmodule SharedLib.Injector do
+  defmacro __using__(_opts) do
+    quote do
+      import SharedLib.One
+      import SharedLib.Two
+    end
+  end
+end
+`)
+
+	callerPath := filepath.Join(server.projectRoot, "lib", "consumer.ex")
+	callerContent := `defmodule MyApp.Consumer do
+  use SharedLib.Injector
+  def run, do: execute(:value)
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/consumer.ex", callerContent)
+	callerURI := "file://" + callerPath
+	server.docs.Set(callerURI, callerContent)
+
+	locs := definitionAt(t, server, callerURI, 2, 16)
+	if len(locs) != 1 || !strings.HasSuffix(string(locs[0].URI), "/lib/one.ex") {
+		t.Fatalf("expected SharedLib.One.execute/1, got %+v", locs)
+	}
+}
+
+func TestDefinition_KeywordTailCountsAsOneArgument(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/repo.ex", `defmodule SharedLib.Repo do
+  def insert(changeset, opts), do: {changeset, opts}
+  def insert(changeset, opts, metadata), do: {changeset, opts, metadata}
+end
+`)
+
+	callerPath := filepath.Join(server.projectRoot, "lib", "caller.ex")
+	callerContent := `defmodule MyApp.Caller do
+  def run(changeset), do: SharedLib.Repo.insert(changeset, returning: true, on_conflict: :replace)
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/caller.ex", callerContent)
+	callerURI := "file://" + callerPath
+	server.docs.Set(callerURI, callerContent)
+
+	locs := definitionAt(t, server, callerURI, 1, 44)
+	if len(locs) != 1 {
+		t.Fatalf("expected exactly 1 location for insert/2, got %d: %+v", len(locs), locs)
+	}
+	if got := locs[0].Range.Start.Line; got != 1 {
+		t.Fatalf("expected keyword tail to resolve insert/2 on line 1, got line %d", got)
+	}
+}
+
+// defdelegate + def with the same name in the same module. The caller writes
+// Mod.do_thing(x); the human reads this as "one definition" (the delegate) but
+// LookupFollowDelegate returns both the defdelegate line and the def line
+// because allDelegates is false.
+func TestDefinition_DelegateAndDefSameName_ReturnsOneLocation(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/worker.ex", `defmodule MyApp.Worker do
+  def call(attrs), do: {:ok, attrs}
+end
+`)
+
+	indexFile(t, server.store, server.projectRoot, "lib/api.ex", `defmodule MyApp.Api do
+  defdelegate do_thing(x), to: MyApp.Worker, as: :call
+
+  def do_thing(x, y), do: {x, y}
+end
+`)
+
+	callerPath := filepath.Join(server.projectRoot, "lib", "caller.ex")
+	callerContent := `defmodule MyApp.Caller do
+  def run, do: MyApp.Api.do_thing("hello")
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/caller.ex", callerContent)
+	callerURI := "file://" + callerPath
+	server.docs.Set(callerURI, callerContent)
+
+	// Cursor on "do_thing" in MyApp.Api.do_thing("hello")
+	locs := definitionAt(t, server, callerURI, 1, 27)
+	if len(locs) != 1 {
+		t.Fatalf("expected exactly 1 location for delegate-then-def call, got %d — "+
+			"LookupFollowDelegate returns both the defdelegate and def rows: %+v", len(locs), locs)
+	}
+}
+
+// Multiple heads of the same arity — the original PR #39 scenario. This is
+// *not* a bug; it's what Jesse called "a feature". The test documents the
+// current behavior: all heads returned with style="all", only first with
+// style="first".
+func TestDefinition_MultipleHeadsSameArity_StyleControlled(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", `defmodule MyApp.Accounts do
+  def fetch_user(%{id: id}), do: id
+  def fetch_user(email) when is_binary(email), do: email
+  def fetch_user(id) when is_integer(id), do: id
+end
+`)
+
+	callerPath := filepath.Join(server.projectRoot, "lib", "caller.ex")
+	callerContent := `defmodule MyApp.Caller do
+  def run, do: MyApp.Accounts.fetch_user("nick@example.com")
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/caller.ex", callerContent)
+	callerURI := "file://" + callerPath
+	server.docs.Set(callerURI, callerContent)
+
+	// Cursor on "fetch_user" in MyApp.Accounts.fetch_user("...")
+	locs := definitionAt(t, server, callerURI, 1, 32)
+	if len(locs) < 2 {
+		t.Fatalf("expected multiple locations for 3 function heads with style=all, got %d", len(locs))
+	}
+
+	// With style="first", caller should see only the first head.
+	server.definitionStyle = "first"
+	locs = definitionAt(t, server, callerURI, 1, 32)
+	if len(locs) != 1 {
+		t.Fatalf("expected exactly 1 location with definitionStyle=first, got %d", len(locs))
 	}
 }
 

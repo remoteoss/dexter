@@ -437,6 +437,78 @@ func TestExpressionAtCursor_ExprBounds(t *testing.T) {
 	}
 }
 
+func TestArityAtCallsite_KeywordTailCountsAsOneArgument(t *testing.T) {
+	code := "SharedLib.Repo.insert(changeset, returning: true, on_conflict: :replace)"
+	tf := NewTokenizedFile(code)
+	ctx := tf.ExpressionAtCursor(0, strings.Index(code, "insert")+2)
+	if got := tf.ArityAtCallsite(0, ctx.ExprStart, ctx.ExprEnd); got != 2 {
+		t.Fatalf("ArityAtCallsite() = %d, want 2", got)
+	}
+}
+
+func TestArityAtCallsite_ComplexForms(t *testing.T) {
+	tests := []struct {
+		name string
+		code string
+		want int
+	}{
+		{
+			name: "commas in fn body do not add arguments",
+			code: "SharedLib.Worker.run(fn left, right -> {left, right} end)",
+			want: 1,
+		},
+		{
+			name: "trailing do block is a keyword list argument",
+			code: "SharedLib.Worker.run(:value) do\n  :ok\nend",
+			want: 2,
+		},
+		{
+			name: "inline do keyword tail is one argument",
+			code: "SharedLib.Worker.run(:value, do: :ok, else: :error)",
+			want: 2,
+		},
+		{
+			name: "slash without capture is ambiguous",
+			code: "SharedLib.Worker.run / 2",
+			want: -1,
+		},
+		{
+			name: "capture slash supplies arity",
+			code: "&SharedLib.Worker.run/2",
+			want: 2,
+		},
+		{
+			name: "outer block ownership is ambiguous",
+			code: "if SharedLib.Worker.run(:value) do\n  :ok\nend",
+			want: -1,
+		},
+		{
+			name: "parenthesis-free call is ambiguous",
+			code: "SharedLib.Worker.run :value, mode: :fast",
+			want: -1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tf := NewTokenizedFile(tt.code)
+			ctx := tf.ExpressionAtCursor(0, strings.Index(tt.code, "run")+1)
+			if got := tf.ArityAtCallsite(0, ctx.ExprStart, ctx.ExprEnd); got != tt.want {
+				t.Fatalf("ArityAtCallsite() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestArityAtCallsite_InterpolationIsAmbiguous(t *testing.T) {
+	code := `"#{SharedLib.Worker.run(:value)}"`
+	tf := NewTokenizedFile(code)
+	ctx := tf.ExpressionAtCursor(0, strings.Index(code, "run")+1)
+	if got := tf.ArityAtCallsite(0, ctx.ExprStart, ctx.ExprEnd); got != -1 {
+		t.Fatalf("ArityAtCallsite() = %d, want -1", got)
+	}
+}
+
 func TestCursorContext_Expr(t *testing.T) {
 	tests := []struct {
 		mod, fn, want string
