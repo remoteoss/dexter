@@ -2,6 +2,7 @@ package beam
 
 import (
 	"errors"
+	"unicode/utf8"
 )
 
 // ReadSourcePath returns the source file recorded in a BEAM's compile info
@@ -83,8 +84,9 @@ func parseCompileSource(raw []byte) (string, bool) {
 }
 
 // readStringTerm reads a path-shaped term: a binary, a string, or a charlist of
-// small integers. The compiler records :source as a charlist, which is stored as
-// a compact string term; other producers of the same chunk use a binary.
+// codepoints, returned as UTF-8. The compiler records :source as a charlist,
+// stored as a compact string term when every codepoint is below 256 and as a
+// list otherwise; other producers of the same chunk use a binary.
 func (r *etfReader) readStringTerm() (string, error) {
 	tag, err := r.peekTag()
 	if err != nil {
@@ -110,9 +112,14 @@ func (r *etfReader) readStringTerm() (string, error) {
 		if err := r.need(n); err != nil {
 			return "", err
 		}
-		s := string(r.buf[r.pos : r.pos+n])
+		// Each byte is one codepoint below 256, not a UTF-8 byte: a path with
+		// `é` in it stores 0xE9.
+		out := make([]byte, 0, n)
+		for _, b := range r.buf[r.pos : r.pos+n] {
+			out = utf8.AppendRune(out, rune(b))
+		}
 		r.pos += n
-		return s, nil
+		return string(out), nil
 
 	case tagList:
 		count, hasTail, err := r.enterList()
@@ -130,10 +137,10 @@ func (r *etfReader) readStringTerm() (string, error) {
 			if err != nil {
 				return "", err
 			}
-			if n < 0 || n > 255 {
+			if n < 0 || n > utf8.MaxRune || !utf8.ValidRune(rune(n)) {
 				return "", errors.New("charlist element out of range")
 			}
-			out = append(out, byte(n))
+			out = utf8.AppendRune(out, rune(n))
 		}
 		if hasTail {
 			if err := r.skip(); err != nil {

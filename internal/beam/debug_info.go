@@ -11,6 +11,9 @@ import (
 // and still a bounded Go stack on a corrupt file.
 const maxDebugInfoDepth = 2048
 
+// maxPreallocatedSites bounds the definitions slice allocated up front.
+const maxPreallocatedSites = 1024
+
 // FunctionKey names one callable by name and arity.
 type FunctionKey struct {
 	Name  string
@@ -179,7 +182,10 @@ func readDefinitionSites(r *etfReader) ([]definitionSite, error) {
 	if err != nil {
 		return nil, err
 	}
-	sites := make([]definitionSite, 0, count)
+	// A corrupt count is bounded only by the chunk size, which can still ask
+	// for gigabytes of sites before the walk fails. Real modules have far
+	// fewer definitions, so the slice grows past this if it must.
+	sites := make([]definitionSite, 0, min(count, maxPreallocatedSites))
 	for i := int64(0); i < count; i++ {
 		arity, err := r.enterTuple()
 		if err != nil {

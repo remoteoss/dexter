@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -516,6 +517,7 @@ end`, "\n")
 		`define :other, as: :get_room_by_slug`,
 		`:get_room_by_slug`,
 		`define:get_room_by_slug`,
+		`@tag :get_room_by_slug`,
 	} {
 		if lineDeclaresAtom(text, names) {
 			t.Errorf("lineDeclaresAtom(%q) = true, want false", text)
@@ -560,4 +562,152 @@ func TestDefinitionGeneratedFunctionCurrentBEAMKeepsRecordedLine(t *testing.T) {
 	}
 	locations := generatedDefinitionAt(t, server, generatedCallerRel, generatedCallerSource, 4, 10)
 	expectSingleLocation(t, locations, domainPath, 6)
+}
+
+// Lines added above the module move the module line too. The recorded line is
+// compared with it only after following the edit.
+func TestDefinitionGeneratedFunctionFollowsDriftAboveModule(t *testing.T) {
+	server, domainPath := newGeneratedDefinitionFixture(t, generatedDomainRel, lineDefinitions()...)
+	header := strings.Repeat("# header\n", 10)
+	indexFile(t, server.store, server.projectRoot, generatedDomainRel, header+generatedDomainSource)
+	server.docs.Set(string(uri.File(domainPath)), header+generatedDomainSource)
+	locations := generatedDefinitionAt(t, server, generatedCallerRel, generatedCallerSource, 4, 10)
+	expectSingleLocation(t, locations, domainPath, generatedDefineLine+10)
+}
+
+// A file that became shorter than the recorded line is still searched from
+// its end, and a line with nothing left to move to is not returned.
+func TestNearestDeclaringLinePastEndOfFile(t *testing.T) {
+	lines := []string{"defmodule A do", "  define :rename", "end"}
+	if got := nearestDeclaringLine(lines, 19, "rename"); got != 2 {
+		t.Errorf("nearestDeclaringLine past the end = %d, want 2", got)
+	}
+	if got := nearestDeclaringLine(lines, 19, "missing"); got != 19 {
+		t.Errorf("nearestDeclaringLine without a match = %d, want the recorded 19", got)
+	}
+}
+
+func TestDefinitionGeneratedFunctionPastEndOfFileKeepsModuleLine(t *testing.T) {
+	server, domainPath := newGeneratedDefinitionFixture(t, generatedDomainRel, lineDefinitions()...)
+	short := "defmodule MyApp.Chat do\nend\n"
+	indexFile(t, server.store, server.projectRoot, generatedDomainRel, short)
+	server.docs.Set(string(uri.File(domainPath)), short)
+	locations := generatedDefinitionAt(t, server, generatedCallerRel, generatedCallerSource, 4, 10)
+	expectSingleLocation(t, locations, domainPath, 1)
+}
+
+// A `_build` copied from another checkout records that checkout's path, which
+// usually still exists. The copy in this project wins; a path outside the
+// project is used only when the project has no copy, as for a `path:`
+// dependency.
+func TestLookupNameSourcelessGeneratedModulePrefersThisCheckout(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		localCopy bool
+	}{
+		{"other checkout", true},
+		{"path dependency", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server, _ := newGeneratedDefinitionFixture(t, generatedDomainRel, stampedDefinitions()...)
+			outside := filepath.Join(t.TempDir(), "other_checkout", "lib", "shared_lib", "dsl.ex")
+			local := filepath.Join(server.projectRoot, "lib", "shared_lib", "dsl.ex")
+			paths := []string{outside}
+			if tc.localCopy {
+				paths = append(paths, local)
+			}
+			for _, path := range paths {
+				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte("defmodule SharedLib.Dsl do\nend\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			writeGeneratedBeam(t, server, sourcelessModule, testBeamChunks{
+				source: outside,
+				docs:   docsTerm(docsEntry{name: "build", arity: 1, anno: 42}),
+			}, beamExport{"build", 1})
+
+			want := outside
+			if tc.localCopy {
+				want = local
+			}
+			locations, err := server.LookupName(sourcelessModule, "build", NameLookupOptions{ExactModule: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(locations) != 1 || locations[0].FilePath != want || locations[0].Line != 42 {
+				t.Fatalf("expected %s:42, got %#v", want, locations)
+			}
+		})
+	}
+}
+
+func TestSourceRebaseCandidates(t *testing.T) {
+	root := filepath.FromSlash("/work/copy")
+	for _, tc := range []struct {
+		name, recorded, want string
+	}{
+		{"moved umbrella app", "/work/orig/apps/gen_lib/lib/gen_lib.ex", "/work/copy/apps/gen_lib/lib/gen_lib.ex"},
+		{"moved project", "/work/orig/lib/my_app/chat.ex", "/work/copy/lib/my_app/chat.ex"},
+		{"dependency built elsewhere", "/build/agent/deps/spark/lib/spark/dsl/extension.ex", "/work/copy/deps/spark/lib/spark/dsl/extension.ex"},
+		{"dependency built in its own repository", "/build/spark/lib/spark/dsl/extension.ex", "/work/copy/deps/spark/lib/spark/dsl/extension.ex"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sourceRebaseCandidates(filepath.FromSlash(tc.recorded), root)
+			if !slices.Contains(got, filepath.FromSlash(tc.want)) {
+				t.Errorf("candidates = %v, want %s among them", got, tc.want)
+			}
+		})
+	}
+	// A bare file name must not match a file at the project root.
+	if got := sourceRebaseCandidates(filepath.FromSlash("/elsewhere/mix.exs"), root); slices.Contains(got, filepath.Join(root, "mix.exs")) {
+		t.Errorf("candidates = %v, must not include the root's mix.exs", got)
+	}
+}
+
+// An example in a @moduledoc is not a declaration, even when it is nearer.
+func TestNearestDeclaringLineSkipsHeredocs(t *testing.T) {
+	lines := blankHeredocs(strings.Split(`defmodule MyApp.Chat do
+  @moduledoc """
+  Example:
+
+      define :get_room_by_slug
+  """
+
+  resources do
+    define :get_room_by_slug
+  end
+end`, "\n"))
+	if got := nearestDeclaringLine(lines, 4, "get_room_by_slug!"); got != 9 {
+		t.Errorf("nearestDeclaringLine = %d, want 9, past the @moduledoc example", got)
+	}
+}
+
+// A file that a request read from disk, without opening it, is only a cache.
+// If the file then changes and is compiled again, the cache is old text, not
+// unsaved edits, and a current BEAM's line must not be corrected against it.
+func TestDefinitionGeneratedFunctionIgnoresCachedFile(t *testing.T) {
+	server, domainPath := newGeneratedDefinitionFixture(t, generatedDomainRel, lineDefinitions()...)
+	if _, ok := server.docs.GetOrLoad(string(uri.File(domainPath))); !ok {
+		t.Fatal("GetOrLoad did not cache the file")
+	}
+	edited := strings.Replace(generatedDomainSource, "  resources do\n", "  resources do\n    # added\n", 1)
+	if err := os.WriteFile(domainPath, []byte(edited), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	indexFile(t, server.store, server.projectRoot, generatedDomainRel, edited)
+	// Compiled after the edit: the define is now on line 9, and the BEAM says so.
+	const generator = "deps/ash/lib/ash/code_interface.ex"
+	writeGeneratedBeam(t, server, "MyApp.Chat", testBeamChunks{dbgi: dbgiTerm(domainPath, generatedDomainRel,
+		dbgiDefinition{name: "get_room_by_slug!", arity: 1, line: generatedDefineLine + 1, keepFile: generator, keepLine: 1112},
+	)}, beamExport{"get_room_by_slug!", 1})
+	future := time.Now().Add(time.Hour)
+	beamPath := filepath.Join(server.projectRoot, "_build", "dev", "lib", "my_app", "ebin", "Elixir.MyApp.Chat.beam")
+	if err := os.Chtimes(beamPath, future, future); err != nil {
+		t.Fatal(err)
+	}
+	locations := generatedDefinitionAt(t, server, generatedCallerRel, generatedCallerSource, 4, 10)
+	expectSingleLocation(t, locations, domainPath, generatedDefineLine+1)
 }

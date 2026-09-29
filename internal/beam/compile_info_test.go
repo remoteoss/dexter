@@ -113,3 +113,33 @@ func TestReadSourcePath(t *testing.T) {
 		t.Errorf("ReadSourcePath without CInf = %q, want no source", got)
 	}
 }
+
+// Erlang records :source as codepoints. A path with `é` is stored as a string
+// term whose byte is 0xE9, and one with `日本` as a list, because 26085 does not
+// fit in a byte. Both must come back as UTF-8.
+func TestParseCompileSourceUnicode(t *testing.T) {
+	const want = "/home/zoë/日本/lib/app.ex"
+	codepoints := []rune(want)
+	list := compileInfoTerm(t, func(w *etfTestWriter, _ string) {
+		w.listHeader(len(codepoints))
+		for _, c := range codepoints {
+			w.smallInt(int(c))
+		}
+		w.nil()
+	})
+	if got, ok := parseCompileSource(list); !ok || got != want {
+		t.Errorf("list: source = %q, %v; want %q", got, ok, want)
+	}
+
+	const latin = "/home/zoë/lib/app.ex"
+	short := compileInfoTerm(t, func(w *etfTestWriter, _ string) {
+		var bytes []byte
+		for _, c := range latin {
+			bytes = append(bytes, byte(c))
+		}
+		w.string(string(bytes))
+	})
+	if got, ok := parseCompileSource(short); !ok || got != latin {
+		t.Errorf("string term: source = %q, %v; want %q", got, ok, latin)
+	}
+}

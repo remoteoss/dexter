@@ -386,3 +386,19 @@ end
 		t.Errorf("documented = %+v, want %d functions", documented, len(want))
 	}
 }
+
+// A corrupt definitions count must fail the parse, not allocate for it first.
+func TestParseDebugInfoHugeDefinitionCount(t *testing.T) {
+	var w etfTestWriter
+	w.smallTuple(3)
+	w.atom("debug_info_v1")
+	w.atom("elixir_erl")
+	w.smallTuple(3)
+	w.atom("elixir_v1")
+	w.mapHeader(1)
+	w.atom("definitions")
+	w.listHeader(1 << 30)
+	if _, err := parseDebugInfo(w.buf); err == nil {
+		t.Fatal("parseDebugInfo accepted a truncated definitions list")
+	}
+}
