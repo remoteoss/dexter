@@ -366,4 +366,23 @@ end
 			t.Errorf("%s/0 line = %d, want %d (all: %v)", name, got, line, info.Lines)
 		}
 	}
+
+	// The Docs anno is the fallback for a module without debug info, and the
+	// compile info says which file it is in.
+	source, ok := ReadSourcePath(filepath.Join(dir, "Elixir.MyApp.Accounts.beam"))
+	if !ok || !strings.HasSuffix(filepath.ToSlash(source), "/accounts.ex") {
+		t.Errorf("ReadSourcePath = %q, %v; want the compiled source", source, ok)
+	}
+	documented, err := ReadDocumentedFunctions(filepath.Join(dir, "Elixir.MyApp.Accounts.beam"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, function := range documented {
+		if line, ok := want[function.Name]; ok && function.Line != line {
+			t.Errorf("%s/0 Docs line = %d, want %d", function.Name, function.Line, line)
+		}
+	}
+	if len(documented) != len(want) {
+		t.Errorf("documented = %+v, want %d functions", documented, len(want))
+	}
 }

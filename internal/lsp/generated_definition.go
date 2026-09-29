@@ -1,0 +1,207 @@
+package lsp
+
+import (
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/remoteoss/dexter/internal/beam"
+	"github.com/remoteoss/dexter/internal/store"
+)
+
+// generatedDefinitionSources is what a compiled module records about where its
+// functions were defined.
+type generatedDefinitionSources struct {
+	// debugInfo holds the definition lines from the Dbgi chunk. It is empty for
+	// a module compiled without debug info, and for Erlang modules.
+	debugInfo beam.DebugInfo
+
+	// compileSource is the source path from the CInf chunk: the file the module
+	// was compiled from, as it was spelled on the machine that compiled it.
+	compileSource string
+}
+
+// generatedDefinitionSourcesFor returns a compiled module's definition sources.
+// They are read once per BEAM, and a failed read is memoized as empty: a module
+// compiled without debug info will not grow it until rebuilt.
+func (s *Server) generatedDefinitionSourcesFor(module, beamPath string) (generatedDefinitionSources, bool) {
+	// Resolving first validates the entry and yields the BEAM path.
+	_ = s.generatedFunctionsFor(module, beamPath)
+
+	entry, ok := s.generatedCache.get(module)
+	if !ok || entry.beamPath == "" {
+		return generatedDefinitionSources{}, false
+	}
+	if !entry.definitionSourcesResolved {
+		started := s.debugNow()
+		info, err := beam.ReadDefinitionLines(entry.beamPath)
+		source, _ := beam.ReadSourcePath(entry.beamPath)
+		if !started.IsZero() {
+			s.debugf("Generated BEAM definition sources: module=%s definitions=%d error=%v source=%q total=%s", module, len(info.Lines), err, source, time.Since(started).Round(time.Microsecond))
+		}
+		entry.definitionSources = generatedDefinitionSources{debugInfo: info, compileSource: source}
+		entry.definitionSourcesResolved = true
+		s.generatedCache.put(module, entry)
+	}
+	return entry.definitionSources, true
+}
+
+// generatedDefinitionResultsFor is where navigation sends a generated function.
+// It starts from generatedDefinitionResults, the closest source-backed module,
+// and moves to the function's own line when the compiled module records one in
+// that module's source: for a function a DSL declared, that is the line that
+// declared it. precise reports whether it did.
+//
+// A module with no source row of its own, such as a Spark entity module, may
+// still record a line in the file it was compiled from, which is usually a
+// framework file under deps. That file is tried after the indexed ones.
+//
+// A recorded line is used only when it belongs to the file being opened and
+// falls after the module's own line, since a line at or before it says nothing
+// the module result does not. The BEAM may be older than the source. Dexter
+// cannot compile the project, and a line from the last compile is usually
+// right and at worst a few lines off, which is still closer than the module
+// line. Anything else keeps the module result.
+func (s *Server) generatedDefinitionResultsFor(module, beamPath string, functions []beam.Function) (results []store.LookupResult, precise bool) {
+	results = s.generatedDefinitionResults(module)
+	if len(functions) == 0 {
+		return results, false
+	}
+	sources, ok := s.generatedDefinitionSourcesFor(module, beamPath)
+	if !ok {
+		return results, false
+	}
+	for _, result := range results {
+		if !sources.describe(result.FilePath, s.projectRoot) {
+			continue
+		}
+		if lines := generatedFunctionLines(module, result.FilePath, result.Line, sources, functions); len(lines) > 0 {
+			return lines, true
+		}
+		return results, false
+	}
+	if own, err := s.store.LookupModule(module); err == nil && len(own) == 0 {
+		if source := s.compiledSourceFile(sources.compileSource); source != "" {
+			if lines := generatedFunctionLines(module, source, 1, sources, functions); len(lines) > 0 {
+				return lines, true
+			}
+		}
+	}
+	return results, false
+}
+
+// generatedFunctionLines returns a result for each distinct line after
+// afterLine that the compiled module records for functions in file.
+//
+// The Dbgi line is preferred because it also honors `@file`. The Docs chunk
+// annotation is the fallback: it is the same line for a def a macro expanded,
+// and a module compiled without debug info still has it.
+func generatedFunctionLines(module, file string, afterLine int, sources generatedDefinitionSources, functions []beam.Function) []store.LookupResult {
+	useDebugInfo := len(sources.debugInfo.Lines) > 0
+	var lines []store.LookupResult
+	for _, function := range functions {
+		line := function.Line
+		if useDebugInfo {
+			line = sources.debugInfo.Lines[beam.FunctionKey{Name: function.Name, Arity: function.Arity}]
+		}
+		if line <= afterLine || slices.ContainsFunc(lines, func(r store.LookupResult) bool { return r.Line == line }) {
+			continue
+		}
+		lines = append(lines, store.LookupResult{
+			Module:   module,
+			FilePath: file,
+			Line:     line,
+			Kind:     function.Kind,
+			Arity:    function.Arity,
+		})
+	}
+	return lines
+}
+
+// describe reports whether the recorded lines belong to path. When the module
+// has debug info, its file names are the test; otherwise the compile info's.
+func (sources generatedDefinitionSources) describe(path, projectRoot string) bool {
+	if len(sources.debugInfo.Lines) > 0 {
+		return debugInfoDescribesFile(sources.debugInfo, path)
+	}
+	if sources.compileSource == "" {
+		return false
+	}
+	return sources.compileSource == path || slices.Contains(sourceRebaseCandidates(sources.compileSource, projectRoot), path)
+}
+
+// debugInfoDescribesFile reports whether debug info was compiled from path.
+// The absolute path is compared first; the relative one covers a project that
+// has moved or is reached through a symlink since it was compiled.
+func debugInfoDescribesFile(info beam.DebugInfo, path string) bool {
+	if info.File != "" && info.File == path {
+		return true
+	}
+	relative := filepath.ToSlash(info.RelativeFile)
+	if relative == "" || filepath.IsAbs(info.RelativeFile) {
+		return false
+	}
+	return strings.HasSuffix(filepath.ToSlash(path), "/"+relative)
+}
+
+// compiledSourceFile maps a source path from compile info onto this checkout.
+//
+// The path was recorded wherever the artifact was built, which for a dependency
+// is often a different directory: a `_build` copied between checkouts, a Docker
+// build, a vendored artifact. When it does not exist here, only the tail below
+// the application's own lib directory is stable.
+//
+// The application is read from the recorded path, not from the BEAM path. A
+// generated module can live in one application while its source lives in
+// another: Spark creates Ash's entity modules, so the artifact sits in ash's
+// ebin while the file that generated it is under spark.
+func (s *Server) compiledSourceFile(recorded string) string {
+	if recorded == "" {
+		return ""
+	}
+	if regularFileExists(recorded) {
+		return recorded
+	}
+	for _, candidate := range sourceRebaseCandidates(recorded, s.projectRoot) {
+		if regularFileExists(candidate) {
+			return candidate
+		}
+	}
+	return ""
+}
+
+// sourceRebaseCandidates lists the plausible on-disk locations for a recorded
+// source path. Every Mix layout is offered, because the artifact does not record
+// which one it was: `lib/<app>/...` is the application's own repository,
+// `deps/<app>/lib/<app>/...` is a dependency, and `deps/<app>/...` is the older
+// vendored shape.
+func sourceRebaseCandidates(recorded, projectRoot string) []string {
+	if projectRoot == "" {
+		return nil
+	}
+	slash := filepath.ToSlash(recorded)
+	idx := strings.LastIndex(slash, "/lib/")
+	if idx < 0 {
+		return nil
+	}
+	parts := strings.SplitN(slash[idx+len("/lib/"):], "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return nil
+	}
+	app, tail := parts[0], filepath.FromSlash(parts[1])
+	return []string{
+		filepath.Join(projectRoot, "lib", app, tail),
+		filepath.Join(projectRoot, "deps", app, "lib", app, tail),
+		filepath.Join(projectRoot, "deps", app, tail),
+	}
+}
+
+// regularFileExists reports whether path names a readable regular file.
+// Anything else is treated as absent, so an editor is never sent to a location
+// it cannot open.
+func regularFileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular()
+}

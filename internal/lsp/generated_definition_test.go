@@ -117,9 +117,17 @@ func dbgiTerm(file, relativeFile string, definitions ...dbgiDefinition) []byte {
 }
 
 // newGeneratedDefinitionFixture indexes the domain and its caller, and writes
-// the domain's BEAM with the given debug info. The source is backdated so the
-// BEAM is the newer of the two, as it is right after `mix compile`.
+// the domain's BEAM with the given debug info.
 func newGeneratedDefinitionFixture(t *testing.T, relativeFile string, definitions ...dbgiDefinition) (*Server, string) {
+	t.Helper()
+	return newGeneratedDefinitionFixtureWith(t, func(domainPath string) testBeamChunks {
+		return testBeamChunks{dbgi: dbgiTerm(domainPath, relativeFile, definitions...)}
+	})
+}
+
+// newGeneratedDefinitionFixtureWith is newGeneratedDefinitionFixture with the
+// domain BEAM's chunks chosen by the test.
+func newGeneratedDefinitionFixtureWith(t *testing.T, chunks func(domainPath string) testBeamChunks) (*Server, string) {
 	t.Helper()
 	server, cleanup := setupTestServer(t)
 	t.Cleanup(cleanup)
@@ -127,25 +135,73 @@ func newGeneratedDefinitionFixture(t *testing.T, relativeFile string, definition
 	indexFile(t, server.store, server.projectRoot, generatedDomainRel, generatedDomainSource)
 	indexFile(t, server.store, server.projectRoot, generatedCallerRel, generatedCallerSource)
 	domainPath := filepath.Join(server.projectRoot, generatedDomainRel)
-	past := time.Now().Add(-time.Hour)
-	if err := os.Chtimes(domainPath, past, past); err != nil {
-		t.Fatal(err)
-	}
-
-	ebin := filepath.Join(server.projectRoot, "_build", "dev", "lib", "my_app", "ebin")
-	if err := os.MkdirAll(ebin, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	beam := minimalBeamWithDbgi(dbgiTerm(domainPath, relativeFile, definitions...),
+	writeGeneratedBeam(t, server, "MyApp.Chat", chunks(domainPath),
 		beamExport{"run_local", 0},
 		beamExport{"list_rooms", 0},
 		beamExport{"get_room_by_slug!", 1},
 		beamExport{"get_room_by_slug!", 2},
 	)
-	if err := os.WriteFile(filepath.Join(ebin, "Elixir.MyApp.Chat.beam"), beam, 0o644); err != nil {
+	return server, domainPath
+}
+
+func writeGeneratedBeam(t *testing.T, server *Server, module string, chunks testBeamChunks, exports ...beamExport) {
+	t.Helper()
+	ebin := filepath.Join(server.projectRoot, "_build", "dev", "lib", "my_app", "ebin")
+	if err := os.MkdirAll(ebin, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	return server, domainPath
+	if err := os.WriteFile(filepath.Join(ebin, "Elixir."+module+".beam"), buildTestBeam(chunks, exports...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// docsEntry is one function in a synthetic docs_v1 term.
+type docsEntry struct {
+	name  string
+	arity int
+	anno  int
+}
+
+// docsTerm encodes the docs_v1 term the compiler writes in the Docs chunk. Each
+// entry's anno is the line its def was expanded at.
+func docsTerm(entries ...docsEntry) string {
+	var out []byte
+	tuple := func(arity int) { out = append(out, 104, byte(arity)) }
+	atom := func(name string) { out = append(out, etfAtom(name)...) }
+	emptyMap := func() { out = append(out, 116, 0, 0, 0, 0) }
+	integer := func(value int) {
+		out = append(out, 98)
+		out = binary.BigEndian.AppendUint32(out, uint32(value))
+	}
+	bin := func(text string) {
+		out = append(out, 109)
+		out = binary.BigEndian.AppendUint32(out, uint32(len(text)))
+		out = append(out, text...)
+	}
+
+	tuple(7)
+	atom("docs_v1")
+	integer(1)
+	atom("elixir")
+	bin("text/markdown")
+	atom("none")
+	emptyMap()
+	out = append(out, etfListHeader(len(entries))...)
+	for _, entry := range entries {
+		tuple(5)
+		tuple(3)
+		atom("function")
+		atom(entry.name)
+		integer(entry.arity)
+		integer(entry.anno)
+		out = append(out, etfListHeader(1)...)
+		bin(entry.name + "()")
+		out = append(out, 106)
+		atom("none")
+		emptyMap()
+	}
+	out = append(out, 106)
+	return string(out)
 }
 
 // stampedDefinitions is what a generator writes when it stamps each function
@@ -265,16 +321,103 @@ func TestDefinitionGeneratedFunctionForeignLocationKeepsModuleLine(t *testing.T)
 	expectSingleLocation(t, locations, domainPath, generatedModuleLine)
 }
 
-// A BEAM older than its source describes lines that may have moved. The
-// function still exists, so the module is still the answer, but not the line.
-func TestDefinitionGeneratedFunctionStaleBEAMKeepsModuleLine(t *testing.T) {
+// Dexter cannot compile the project, so a BEAM older than its source is the
+// usual state while editing. Its line is from the last compile, which is
+// still closer than the module line.
+func TestDefinitionGeneratedFunctionStaleBEAMUsesRecordedLine(t *testing.T) {
 	server, domainPath := newGeneratedDefinitionFixture(t, generatedDomainRel, stampedDefinitions()...)
 	future := time.Now().Add(time.Hour)
 	if err := os.Chtimes(domainPath, future, future); err != nil {
 		t.Fatal(err)
 	}
 	locations := generatedDefinitionAt(t, server, generatedCallerRel, generatedCallerSource, 4, 10)
+	expectSingleLocation(t, locations, domainPath, generatedDefineLine)
+}
+
+// A module compiled without debug info still has its Docs chunk, whose anno is
+// the line the def was expanded at. The compile info says which file that line
+// is in.
+func TestDefinitionGeneratedFunctionUsesDocsLineWithoutDebugInfo(t *testing.T) {
+	server, domainPath := newGeneratedDefinitionFixtureWith(t, func(domainPath string) testBeamChunks {
+		return testBeamChunks{
+			docs:   docsTerm(docsEntry{name: "get_room_by_slug!", arity: 1, anno: generatedDefineLine}),
+			source: domainPath,
+		}
+	})
+	locations := generatedDefinitionAt(t, server, generatedCallerRel, generatedCallerSource, 4, 10)
+	expectSingleLocation(t, locations, domainPath, generatedDefineLine)
+}
+
+// Without compile info, a Docs anno does not say which file it is in.
+func TestDefinitionGeneratedFunctionDocsLineWithoutSourceKeepsModuleLine(t *testing.T) {
+	server, domainPath := newGeneratedDefinitionFixtureWith(t, func(string) testBeamChunks {
+		return testBeamChunks{docs: docsTerm(docsEntry{name: "get_room_by_slug!", arity: 1, anno: generatedDefineLine})}
+	})
+	locations := generatedDefinitionAt(t, server, generatedCallerRel, generatedCallerSource, 4, 10)
 	expectSingleLocation(t, locations, domainPath, generatedModuleLine)
+}
+
+// sourcelessModule is a generated module with no source row, as Spark creates
+// for each DSL entity. It was compiled from a framework file on another machine.
+const (
+	sourcelessModule   = "MyApp.Chat.Define"
+	sourcelessRecorded = "/build/agent/deps/shared_lib/lib/shared_lib/dsl/extension.ex"
+)
+
+// The recorded path does not exist here, so it is rebased onto the project's
+// deps, where the same file is.
+func TestLookupNameSourcelessGeneratedModuleUsesCompiledSource(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		chunks testBeamChunks
+	}{
+		{"debug info", testBeamChunks{
+			source: sourcelessRecorded,
+			dbgi:   dbgiTerm(sourcelessRecorded, "lib/shared_lib/dsl/extension.ex", dbgiDefinition{name: "build", arity: 1, line: 42}),
+		}},
+		{"docs", testBeamChunks{
+			source: sourcelessRecorded,
+			docs:   docsTerm(docsEntry{name: "build", arity: 1, anno: 42}),
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server, _ := newGeneratedDefinitionFixture(t, generatedDomainRel, stampedDefinitions()...)
+			source := filepath.Join(server.projectRoot, "deps", "shared_lib", "lib", "shared_lib", "dsl", "extension.ex")
+			if err := os.MkdirAll(filepath.Dir(source), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(source, []byte("defmodule SharedLib.Dsl.Extension do\nend\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			writeGeneratedBeam(t, server, sourcelessModule, tc.chunks, beamExport{"build", 1})
+
+			locations, err := server.LookupName(sourcelessModule, "build", NameLookupOptions{ExactModule: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(locations) != 1 || locations[0].FilePath != source || locations[0].Line != 42 {
+				t.Fatalf("expected %s:42, got %#v", source, locations)
+			}
+		})
+	}
+}
+
+// If the compiled source is not in this checkout, the lexical parent is still
+// the answer.
+func TestLookupNameSourcelessGeneratedModuleMissingSourceKeepsParent(t *testing.T) {
+	server, domainPath := newGeneratedDefinitionFixture(t, generatedDomainRel, stampedDefinitions()...)
+	writeGeneratedBeam(t, server, sourcelessModule, testBeamChunks{
+		source: sourcelessRecorded,
+		docs:   docsTerm(docsEntry{name: "build", arity: 1, anno: 42}),
+	}, beamExport{"build", 1})
+
+	locations, err := server.LookupName(sourcelessModule, "build", NameLookupOptions{FallbackToModule: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(locations) != 1 || locations[0].FilePath != domainPath || locations[0].Line != generatedModuleLine {
+		t.Fatalf("expected %s:%d, got %#v", domainPath, generatedModuleLine, locations)
+	}
 }
 
 // The debug info's line belongs to the file it was compiled from. If that is
@@ -285,10 +428,10 @@ func TestDefinitionGeneratedFunctionOtherSourceKeepsModuleLine(t *testing.T) {
 	)
 	// The absolute path must not match either.
 	beamPath := filepath.Join(server.projectRoot, "_build", "dev", "lib", "my_app", "ebin", "Elixir.MyApp.Chat.beam")
-	beam := minimalBeamWithDbgi(dbgiTerm(filepath.Join(server.projectRoot, "lib/my_app/other_chat.ex"), "lib/my_app/other_chat.ex",
+	beamFile := minimalBeamWithDbgi(dbgiTerm(filepath.Join(server.projectRoot, "lib/my_app/other_chat.ex"), "lib/my_app/other_chat.ex",
 		dbgiDefinition{name: "get_room_by_slug!", arity: 1, line: 1, keepFile: "lib/my_app/other_chat.ex", keepLine: generatedDefineLine}),
 		beamExport{"get_room_by_slug!", 1})
-	if err := os.WriteFile(beamPath, beam, 0o644); err != nil {
+	if err := os.WriteFile(beamPath, beamFile, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	locations := generatedDefinitionAt(t, server, generatedCallerRel, generatedCallerSource, 4, 10)
