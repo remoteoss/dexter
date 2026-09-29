@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -455,4 +456,108 @@ func TestPrepareCallHierarchyGeneratedFunctionUsesDebugInfoLine(t *testing.T) {
 	if len(items) != 1 || uriToPath(items[0].URI) != domainPath || int(items[0].Range.Start.Line) != generatedDefineLine-1 {
 		t.Fatalf("expected the call hierarchy item at %s:%d, got %#v", domainPath, generatedDefineLine, items)
 	}
+}
+
+func TestNearestDeclaringLine(t *testing.T) {
+	lines := strings.Split(`defmodule MyApp.Chat do
+  resources do
+    define :list_rooms, action: :read
+    define :get_room_by_slug, action: :read, get_by: [:slug]
+  end
+
+  def run, do: get_room_by_slug!("lounge")
+  def typed(x :: :get_room_by_slug), do: x
+  def other, do: [key:get_room_by_slug]
+end`, "\n")
+	for _, tc := range []struct {
+		name     string
+		recorded int
+		function string
+		want     int
+	}{
+		{"recorded line still declares it", 4, "get_room_by_slug!", 4},
+		{"declaration moved down", 2, "get_room_by_slug!", 4},
+		{"declaration moved up", 7, "get_room_by_slug!", 4},
+		{"full name as atom", 1, "list_rooms", 3},
+		{"name nowhere keeps the line", 5, "create_room", 5},
+		{"equally near matches keep the line", 3, "tie", 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			text := lines
+			if tc.function == "tie" {
+				text = []string{"define :tie", "", "define :tie"}
+				tc.recorded = 2
+				tc.want = 2
+			}
+			if got := nearestDeclaringLine(text, tc.recorded, tc.function); got != tc.want {
+				t.Errorf("nearestDeclaringLine(%d, %q) = %d, want %d", tc.recorded, tc.function, got, tc.want)
+			}
+		})
+	}
+
+	names := []string{"get_room_by_slug!", "get_room_by_slug"}
+	for _, text := range []string{
+		`    define :get_room_by_slug, action: :read`,
+		`  SharedLib.Interface.define(:get_room_by_slug)`,
+		`define :get_room_by_slug`,
+	} {
+		if !lineDeclaresAtom(text, names) {
+			t.Errorf("lineDeclaresAtom(%q) = false, want true", text)
+		}
+	}
+	// A call, a typespec, a keyword key or value, a longer atom, and an atom
+	// that is not the first argument are not declarations.
+	for _, text := range []string{
+		`get_room_by_slug!("x")`,
+		`def typed(x :: :get_room_by_slug), do: x`,
+		`[key:get_room_by_slug]`,
+		`read action: :get_room_by_slug`,
+		`define :get_room_by_slug_extra`,
+		`define :other, as: :get_room_by_slug`,
+		`:get_room_by_slug`,
+		`define:get_room_by_slug`,
+	} {
+		if lineDeclaresAtom(text, names) {
+			t.Errorf("lineDeclaresAtom(%q) = true, want false", text)
+		}
+	}
+}
+
+// Lines added above the declaration after the compile: the recorded line has
+// drifted, and the current text still says where the declaration is.
+func TestDefinitionGeneratedFunctionFollowsDriftInStaleSource(t *testing.T) {
+	server, domainPath := newGeneratedDefinitionFixture(t, generatedDomainRel, lineDefinitions()...)
+	past := time.Now().Add(-time.Hour)
+	beamPath := filepath.Join(server.projectRoot, "_build", "dev", "lib", "my_app", "ebin", "Elixir.MyApp.Chat.beam")
+	if err := os.Chtimes(beamPath, past, past); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(domainPath, []byte("# one\n# two\n"+generatedDomainSource), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	locations := generatedDefinitionAt(t, server, generatedCallerRel, generatedCallerSource, 4, 10)
+	expectSingleLocation(t, locations, domainPath, generatedDefineLine+2)
+}
+
+// Unsaved edits move lines too, with nothing on disk newer than the BEAM.
+func TestDefinitionGeneratedFunctionFollowsDriftInOpenBuffer(t *testing.T) {
+	server, domainPath := newGeneratedDefinitionFixture(t, generatedDomainRel, lineDefinitions()...)
+	server.docs.Set(string(uri.File(domainPath)), "# one\n"+generatedDomainSource)
+	locations := generatedDefinitionAt(t, server, generatedCallerRel, generatedCallerSource, 4, 10)
+	expectSingleLocation(t, locations, domainPath, generatedDefineLine+1)
+}
+
+// A current BEAM's lines are exact, even when the declaring line does not
+// spell the name and another line does.
+func TestDefinitionGeneratedFunctionCurrentBEAMKeepsRecordedLine(t *testing.T) {
+	server, domainPath := newGeneratedDefinitionFixture(t, generatedDomainRel,
+		dbgiDefinition{name: "get_room_by_slug!", arity: 1, line: 6, keepFile: "deps/ash/lib/ash/code_interface.ex", keepLine: 1112},
+	)
+	future := time.Now().Add(time.Hour)
+	beamPath := filepath.Join(server.projectRoot, "_build", "dev", "lib", "my_app", "ebin", "Elixir.MyApp.Chat.beam")
+	if err := os.Chtimes(beamPath, future, future); err != nil {
+		t.Fatal(err)
+	}
+	locations := generatedDefinitionAt(t, server, generatedCallerRel, generatedCallerSource, 4, 10)
+	expectSingleLocation(t, locations, domainPath, 6)
 }

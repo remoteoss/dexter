@@ -21,6 +21,10 @@ type generatedDefinitionSources struct {
 	// compileSource is the source path from the CInf chunk: the file the module
 	// was compiled from, as it was spelled on the machine that compiled it.
 	compileSource string
+
+	// beamMtime is when the BEAM was written, to tell whether its lines can
+	// have drifted from the source.
+	beamMtime int64
 }
 
 // generatedDefinitionSourcesFor returns a compiled module's definition sources.
@@ -41,7 +45,7 @@ func (s *Server) generatedDefinitionSourcesFor(module, beamPath string) (generat
 		if !started.IsZero() {
 			s.debugf("Generated BEAM definition sources: module=%s definitions=%d error=%v source=%q total=%s", module, len(info.Lines), err, source, time.Since(started).Round(time.Microsecond))
 		}
-		entry.definitionSources = generatedDefinitionSources{debugInfo: info, compileSource: source}
+		entry.definitionSources = generatedDefinitionSources{debugInfo: info, compileSource: source, beamMtime: entry.beamStamp.mtime}
 		entry.definitionSourcesResolved = true
 		s.generatedCache.put(module, entry)
 	}
@@ -63,7 +67,9 @@ func (s *Server) generatedDefinitionSourcesFor(module, beamPath string) (generat
 // the module result does not. The BEAM may be older than the source. Dexter
 // cannot compile the project, and a line from the last compile is usually
 // right and at worst a few lines off, which is still closer than the module
-// line. Anything else keeps the module result.
+// line. When the source has changed since the compile, correctLineDrift moves
+// each line to follow the edit where it can. Anything else keeps the module
+// result.
 func (s *Server) generatedDefinitionResultsFor(module, beamPath string, functions []beam.Function) (results []store.LookupResult, precise bool) {
 	results = s.generatedDefinitionResults(module)
 	if len(functions) == 0 {
@@ -78,14 +84,14 @@ func (s *Server) generatedDefinitionResultsFor(module, beamPath string, function
 			continue
 		}
 		if lines := generatedFunctionLines(module, result.FilePath, result.Line, sources, functions); len(lines) > 0 {
-			return lines, true
+			return s.correctLineDrift(result.FilePath, sources.beamMtime, lines, functions), true
 		}
 		return results, false
 	}
 	if own, err := s.store.LookupModule(module); err == nil && len(own) == 0 {
 		if source := s.compiledSourceFile(sources.compileSource); source != "" {
 			if lines := generatedFunctionLines(module, source, 1, sources, functions); len(lines) > 0 {
-				return lines, true
+				return s.correctLineDrift(source, sources.beamMtime, lines, functions), true
 			}
 		}
 	}
@@ -96,8 +102,9 @@ func (s *Server) generatedDefinitionResultsFor(module, beamPath string, function
 // afterLine that the compiled module records for functions in file.
 //
 // The Dbgi line is preferred because it also honors `@file`. The Docs chunk
-// annotation is the fallback: it is the same line for a def a macro expanded,
-// and a module compiled without debug info still has it.
+// annotation is the fallback, because a module compiled without debug info
+// still has it. It is often the line the def was expanded at, but not always:
+// a generator can give the def one line and its docs another.
 func generatedFunctionLines(module, file string, afterLine int, sources generatedDefinitionSources, functions []beam.Function) []store.LookupResult {
 	useDebugInfo := len(sources.debugInfo.Lines) > 0
 	var lines []store.LookupResult
@@ -118,6 +125,127 @@ func generatedFunctionLines(module, file string, afterLine int, sources generate
 		})
 	}
 	return lines
+}
+
+// correctLineDrift moves recorded lines to follow edits made since the compile.
+//
+// A BEAM older than its source, or a buffer with unsaved changes, can describe
+// lines that have moved. Dexter cannot compile the project, so it looks for
+// the declaration in the current text instead: a call whose first argument is
+// the function's name as an atom, which is how a macro call names what it
+// declares (`define :list_rooms`, `field :email`). The nearest match wins.
+// The recorded line is kept when it still declares the function, when no line
+// does, or when two matches are equally near. A BEAM that is current is never
+// corrected, because its lines are exact even where the declaration does not
+// spell the name.
+func (s *Server) correctLineDrift(path string, beamMtime int64, results []store.LookupResult, functions []beam.Function) []store.LookupResult {
+	text, ok := s.driftedSourceText(path, beamMtime)
+	if !ok {
+		return results
+	}
+	lines := strings.Split(text, "\n")
+	names := make(map[int]string, len(functions))
+	for _, function := range functions {
+		names[function.Arity] = function.Name
+	}
+	out := results[:0]
+	for _, result := range results {
+		if line := nearestDeclaringLine(lines, result.Line, names[result.Arity]); line != result.Line {
+			if slices.ContainsFunc(out, func(r store.LookupResult) bool { return r.Line == line }) {
+				continue
+			}
+			result.Line = line
+		}
+		out = append(out, result)
+	}
+	return out
+}
+
+// driftedSourceText returns the current text of path when it may differ from
+// the text the BEAM was compiled from: the open buffer if it has unsaved
+// changes, or the file if it was written after the BEAM.
+func (s *Server) driftedSourceText(path string, beamMtime int64) (string, bool) {
+	open, isOpen := s.docs.Get(string(pathToURI(path)))
+	source := statFileStamp(path)
+	stale := source.exists && source.mtime > beamMtime
+	if !isOpen && !stale {
+		return "", false
+	}
+	disk, err := os.ReadFile(path)
+	switch {
+	case isOpen && (err != nil || open != string(disk)):
+		return open, true
+	case err == nil && stale:
+		return string(disk), true
+	}
+	return "", false
+}
+
+// nearestDeclaringLine returns the 1-based line nearest to recorded that
+// declares function by name, or recorded when that is ambiguous or not found.
+func nearestDeclaringLine(lines []string, recorded int, function string) int {
+	if function == "" || recorded < 1 {
+		return recorded
+	}
+	names := []string{function}
+	if base := strings.TrimRight(function, "!?"); base != function && base != "" {
+		names = append(names, base)
+	}
+	declares := func(line int) bool {
+		return line >= 1 && line <= len(lines) && lineDeclaresAtom(lines[line-1], names)
+	}
+	if declares(recorded) {
+		return recorded
+	}
+	for distance := 1; distance < len(lines); distance++ {
+		above, below := declares(recorded-distance), declares(recorded+distance)
+		switch {
+		case above && below:
+			return recorded
+		case above:
+			return recorded - distance
+		case below:
+			return recorded + distance
+		}
+	}
+	return recorded
+}
+
+// lineDeclaresAtom reports whether text is a call whose first argument is one
+// of names as an atom: `define :list_rooms`, `field :email, :string`, or
+// `Lib.define(:name)`. That is the shape of a macro call that declares a
+// name. An atom anywhere else, such as a keyword value or a typespec, is not.
+func lineDeclaresAtom(text string, names []string) bool {
+	rest := strings.TrimLeft(text, " \t")
+	callee := 0
+	for callee < len(rest) && (isIdentifierByte(rest[callee]) || rest[callee] == '.') {
+		callee++
+	}
+	if callee == 0 || rest[0] == ':' || (rest[0] >= '0' && rest[0] <= '9') {
+		return false
+	}
+	args := strings.TrimLeft(rest[callee:], " \t")
+	if len(args) == len(rest[callee:]) {
+		// No space after the callee: only a parenthesized call qualifies.
+		if !strings.HasPrefix(args, "(") {
+			return false
+		}
+	}
+	args = strings.TrimLeft(strings.TrimPrefix(args, "("), " \t")
+	for _, name := range names {
+		if strings.HasPrefix(args, ":"+name) {
+			end := 1 + len(name)
+			if end == len(args) || !isIdentifierByte(args[end]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isIdentifierByte(b byte) bool {
+	return b == '_' || b == '!' || b == '?' || b == '@' ||
+		(b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
 }
 
 // describe reports whether the recorded lines belong to path. When the module
