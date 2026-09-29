@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/remoteoss/dexter/internal/beam"
+	"github.com/remoteoss/dexter/internal/parser"
 	"github.com/remoteoss/dexter/internal/store"
 )
 
@@ -75,7 +76,7 @@ func (s *Server) generatedDefinitionSourcesFor(module, beamPath string) (generat
 // each line to follow the edit where it can. Anything else keeps the module
 // result.
 func (s *Server) generatedDefinitionResultsFor(module, beamPath string, functions []beam.Function) (results []store.LookupResult, precise bool) {
-	results = s.generatedDefinitionResults(module)
+	results, owner := s.generatedDefinitionResults(module)
 	if len(functions) == 0 {
 		return results, false
 	}
@@ -83,18 +84,19 @@ func (s *Server) generatedDefinitionResultsFor(module, beamPath string, function
 	if !ok {
 		return results, false
 	}
-	for _, result := range results {
-		if !sources.describe(result.FilePath, s.projectRoot) {
-			continue
-		}
-		if lines := s.recordedLinesIn(module, result.FilePath, result.Line, sources, functions); len(lines) > 0 {
+	if result, found, ambiguous := sources.bestDescribedResult(results); found {
+		if lines := s.recordedLinesIn(module, owner, result.FilePath, result.Line, sources, functions); len(lines) > 0 {
 			return lines, true
 		}
 		return results, false
+	} else if ambiguous {
+		return results, false
 	}
-	if own, err := s.store.LookupModule(module); err == nil && len(own) == 0 {
+	if owner != module {
+		// The generator's file has no module that owns the declaration, so
+		// its lines are not followed through edits there.
 		if source := s.compiledSourceFile(sources.compileSource); source != "" {
-			if lines := s.recordedLinesIn(module, source, 1, sources, functions); len(lines) > 0 {
+			if lines := s.recordedLinesIn(module, "", source, 1, sources, functions); len(lines) > 0 {
 				return lines, true
 			}
 		}
@@ -106,8 +108,8 @@ func (s *Server) generatedDefinitionResultsFor(module, beamPath string, function
 // the compiled module records for functions in file, corrected for edits made
 // since the compile. afterLine is the module's line in the current text, so it
 // is compared after the correction: lines added above the module move both.
-func (s *Server) recordedLinesIn(module, file string, afterLine int, sources generatedDefinitionSources, functions []beam.Function) []store.LookupResult {
-	lines := s.correctLineDrift(file, sources.beamMtime, generatedFunctionLines(module, file, sources, functions), functions)
+func (s *Server) recordedLinesIn(module, owner, file string, afterLine int, sources generatedDefinitionSources, functions []beam.Function) []store.LookupResult {
+	lines := s.correctLineDrift(file, owner, sources.beamMtime, generatedFunctionLines(module, file, sources, functions), functions)
 	return slices.DeleteFunc(lines, func(r store.LookupResult) bool { return r.Line <= afterLine })
 }
 
@@ -146,25 +148,33 @@ func generatedFunctionLines(module, file string, sources generatedDefinitionSour
 // lines that have moved. Dexter cannot compile the project, so it looks for
 // the declaration in the current text instead: a call whose first argument is
 // the function's name as an atom, which is how a macro call names what it
-// declares (`define :list_rooms`, `field :email`). The nearest match wins.
+// declares (`define :list_rooms`, `field :email`), in the body of owner, the
+// module whose source holds the declarations. A match in another module of the
+// same file is never taken, and without an owner no line is moved. The nearest
+// match wins.
 // The recorded line is kept when it still declares the function, when no line
 // does, or when two matches are equally near. A line past the end of the
 // current text, with no declaration to move to, is dropped. A BEAM that is
 // current is never corrected, because its lines are exact even where the
 // declaration does not spell the name.
-func (s *Server) correctLineDrift(path string, beamMtime int64, results []store.LookupResult, functions []beam.Function) []store.LookupResult {
+func (s *Server) correctLineDrift(path, owner string, beamMtime int64, results []store.LookupResult, functions []beam.Function) []store.LookupResult {
 	text, ok := s.driftedSourceText(path, beamMtime)
 	if !ok {
 		return results
 	}
 	lines := blankHeredocs(strings.Split(text, "\n"))
+	inOwner := func(int) bool { return false }
+	if owner != "" {
+		owners := moduleOwnersByLine([]byte(text), len(lines))
+		inOwner = func(line int) bool { return owners[line] == owner }
+	}
 	names := make(map[int]string, len(functions))
 	for _, function := range functions {
 		names[function.Arity] = function.Name
 	}
 	out := results[:0]
 	for _, result := range results {
-		line := nearestDeclaringLine(lines, result.Line, names[result.Arity])
+		line := nearestDeclaringLine(lines, result.Line, names[result.Arity], inOwner)
 		if line > len(lines) || slices.ContainsFunc(out, func(r store.LookupResult) bool { return r.Line == line }) {
 			continue
 		}
@@ -222,8 +232,9 @@ func blankHeredocs(lines []string) []string {
 }
 
 // nearestDeclaringLine returns the 1-based line nearest to recorded that
-// declares function by name, or recorded when that is ambiguous or not found.
-func nearestDeclaringLine(lines []string, recorded int, function string) int {
+// declares function by name and that accept allows, or recorded when that is
+// ambiguous or not found. A nil accept allows every line.
+func nearestDeclaringLine(lines []string, recorded int, function string, accept func(line int) bool) int {
 	if function == "" || recorded < 1 {
 		return recorded
 	}
@@ -232,7 +243,7 @@ func nearestDeclaringLine(lines []string, recorded int, function string) int {
 		names = append(names, base)
 	}
 	declares := func(line int) bool {
-		return line >= 1 && line <= len(lines) && lineDeclaresAtom(lines[line-1], names)
+		return line >= 1 && line <= len(lines) && (accept == nil || accept(line)) && lineDeclaresAtom(lines[line-1], names)
 	}
 	if declares(recorded) {
 		return recorded
@@ -289,30 +300,137 @@ func isIdentifierByte(b byte) bool {
 		(b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
 }
 
-// describe reports whether the recorded lines belong to path. When the module
-// has debug info, its file names are the test; otherwise the compile info's.
-func (sources generatedDefinitionSources) describe(path, projectRoot string) bool {
-	if len(sources.debugInfo.Lines) > 0 {
-		return debugInfoDescribesFile(sources.debugInfo, path)
+// bestDescribedResult returns the result whose file the recorded lines belong
+// to. Usually there is one row, but a module name defined in two files (two
+// umbrella apps, say) has two, and a moved project matches neither exactly.
+// The row that matches the recorded path most specifically wins. If two match
+// equally, ambiguous is set, because a line from one file means nothing in the
+// other.
+func (sources generatedDefinitionSources) bestDescribedResult(results []store.LookupResult) (best store.LookupResult, found, ambiguous bool) {
+	bestScore := 0
+	for _, result := range results {
+		score := sources.describe(result.FilePath)
+		switch {
+		case score == 0:
+		case score > bestScore:
+			best, bestScore, ambiguous = result, score, false
+		case score == bestScore && result.FilePath != best.FilePath:
+			ambiguous = true
+		}
 	}
-	if sources.compileSource == "" {
-		return false
+	if ambiguous {
+		return store.LookupResult{}, false, true
 	}
-	return sources.compileSource == path || slices.Contains(sourceRebaseCandidates(sources.compileSource, projectRoot), path)
+	return best, bestScore > 0, false
 }
 
-// debugInfoDescribesFile reports whether debug info was compiled from path.
-// The absolute path is compared first; the relative one covers a project that
-// has moved or is reached through a symlink since it was compiled.
-func debugInfoDescribesFile(info beam.DebugInfo, path string) bool {
-	if info.File != "" && info.File == path {
-		return true
+// describe scores how specifically the recorded source names path: zero when
+// it does not, highest for the same absolute path. When the module has debug
+// info, its file names are the test; otherwise the compile info's.
+func (sources generatedDefinitionSources) describe(path string) int {
+	if len(sources.debugInfo.Lines) > 0 {
+		return recordedPathMatch(sources.debugInfo.File, sources.debugInfo.RelativeFile, path)
 	}
-	relative := filepath.ToSlash(info.RelativeFile)
-	if relative == "" || filepath.IsAbs(info.RelativeFile) {
-		return false
+	return recordedPathMatch(sources.compileSource, "", path)
+}
+
+// exactPathMatch is the score for a recorded absolute path equal to the path.
+const exactPathMatch = 1 << 20
+
+// recordedPathMatch scores how specifically a recorded source path names path.
+// The same absolute path is best. Otherwise the two are compared from their
+// ends, which covers a project that has moved, was copied, or is reached
+// through a symlink since it was compiled: each shared trailing component
+// counts, and at least a directory and the file name must be shared. relative,
+// the path relative to the compiler's working directory, counts its own
+// components when it is a suffix of path.
+func recordedPathMatch(recorded, relative, path string) int {
+	if recorded != "" && recorded == path {
+		return exactPathMatch
 	}
-	return strings.HasSuffix(filepath.ToSlash(path), "/"+relative)
+	score := 0
+	if recorded != "" {
+		if shared := sharedTrailingComponents(recorded, path); shared >= 2 {
+			score = shared
+		}
+	}
+	if relative != "" && !filepath.IsAbs(relative) {
+		slash := filepath.ToSlash(relative)
+		if strings.HasSuffix(filepath.ToSlash(path), "/"+slash) {
+			score = max(score, strings.Count(slash, "/")+1)
+		}
+	}
+	return score
+}
+
+// sharedTrailingComponents counts the path components a and b share at their
+// ends.
+func sharedTrailingComponents(a, b string) int {
+	as := strings.Split(filepath.ToSlash(a), "/")
+	bs := strings.Split(filepath.ToSlash(b), "/")
+	shared := 0
+	for shared < len(as) && shared < len(bs) {
+		component := as[len(as)-1-shared]
+		if component == "" || component != bs[len(bs)-1-shared] {
+			break
+		}
+		shared++
+	}
+	return shared
+}
+
+// moduleOwnersByLine returns, for each 1-based line of source, the innermost
+// module whose body holds it, found with the tokenizer so that strings,
+// heredocs and comments do not count. Index 0 is unused.
+func moduleOwnersByLine(source []byte, lineCount int) []string {
+	owners := make([]string, lineCount+1)
+	tokens := parser.Tokenize(source)
+	type frame struct {
+		name  string
+		depth int
+	}
+	var stack []frame
+	depth := 0
+	current := func() string {
+		if len(stack) == 0 {
+			return ""
+		}
+		return stack[len(stack)-1].name
+	}
+	filled := 0
+	fill := func(through int) {
+		for filled < through && filled < lineCount {
+			filled++
+			owners[filled] = current()
+		}
+	}
+	for i := 0; i < len(tokens); i++ {
+		token := tokens[i]
+		// A line belongs to the module that is open at its first token.
+		fill(token.Line)
+		switch token.Kind {
+		case parser.TokDo, parser.TokFn:
+			parser.TrackBlockDepth(token.Kind, &depth)
+		case parser.TokEnd:
+			before := depth
+			parser.TrackBlockDepth(token.Kind, &depth)
+			if len(stack) > 0 && stack[len(stack)-1].depth == before {
+				stack = stack[:len(stack)-1]
+			}
+		case parser.TokDefmodule, parser.TokDefprotocol, parser.TokDefimpl:
+			name, next, hasDo := tokParseModuleDef(source, tokens, i+1, current())
+			if name == "" {
+				continue
+			}
+			if hasDo {
+				depth++
+				stack = append(stack, frame{name: name, depth: depth})
+			}
+			i = next - 1
+		}
+	}
+	fill(lineCount)
+	return owners
 }
 
 // compiledSourceFile maps a source path from compile info onto this checkout.

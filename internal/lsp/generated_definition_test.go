@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/remoteoss/dexter/internal/beam"
+	"github.com/remoteoss/dexter/internal/store"
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
 )
@@ -490,7 +492,7 @@ end`, "\n")
 				tc.recorded = 2
 				tc.want = 2
 			}
-			if got := nearestDeclaringLine(text, tc.recorded, tc.function); got != tc.want {
+			if got := nearestDeclaringLine(text, tc.recorded, tc.function, nil); got != tc.want {
 				t.Errorf("nearestDeclaringLine(%d, %q) = %d, want %d", tc.recorded, tc.function, got, tc.want)
 			}
 		})
@@ -579,10 +581,10 @@ func TestDefinitionGeneratedFunctionFollowsDriftAboveModule(t *testing.T) {
 // its end, and a line with nothing left to move to is not returned.
 func TestNearestDeclaringLinePastEndOfFile(t *testing.T) {
 	lines := []string{"defmodule A do", "  define :rename", "end"}
-	if got := nearestDeclaringLine(lines, 19, "rename"); got != 2 {
+	if got := nearestDeclaringLine(lines, 19, "rename", nil); got != 2 {
 		t.Errorf("nearestDeclaringLine past the end = %d, want 2", got)
 	}
-	if got := nearestDeclaringLine(lines, 19, "missing"); got != 19 {
+	if got := nearestDeclaringLine(lines, 19, "missing", nil); got != 19 {
 		t.Errorf("nearestDeclaringLine without a match = %d, want the recorded 19", got)
 	}
 }
@@ -680,7 +682,7 @@ func TestNearestDeclaringLineSkipsHeredocs(t *testing.T) {
     define :get_room_by_slug
   end
 end`, "\n"))
-	if got := nearestDeclaringLine(lines, 4, "get_room_by_slug!"); got != 9 {
+	if got := nearestDeclaringLine(lines, 4, "get_room_by_slug!", nil); got != 9 {
 		t.Errorf("nearestDeclaringLine = %d, want 9, past the @moduledoc example", got)
 	}
 }
@@ -710,4 +712,96 @@ func TestDefinitionGeneratedFunctionIgnoresCachedFile(t *testing.T) {
 	}
 	locations := generatedDefinitionAt(t, server, generatedCallerRel, generatedCallerSource, 4, 10)
 	expectSingleLocation(t, locations, domainPath, generatedDefineLine+1)
+}
+
+// Another module in the same file can declare the same name. After an edit it
+// can be nearer to the recorded line than the real declaration, but a line in
+// another module is never the answer.
+func TestDefinitionGeneratedFunctionDriftStaysInItsModule(t *testing.T) {
+	server, domainPath := newGeneratedDefinitionFixture(t, generatedDomainRel, lineDefinitions()...)
+	sibling := `defmodule MyApp.Archive do
+  use SharedLib.Domain
+
+  resources do
+    resource MyApp.Archive.Room do
+      define :get_room_by_slug, action: :read
+    end
+  end
+end
+
+`
+	// The recorded line is 8. The sibling's define is now line 6, two away;
+	// this module's define is line 18, ten away.
+	edited := sibling + generatedDomainSource
+	indexFile(t, server.store, server.projectRoot, generatedDomainRel, edited)
+	server.docs.Set(string(uri.File(domainPath)), edited)
+	locations := generatedDefinitionAt(t, server, generatedCallerRel, generatedCallerSource, 4, 10)
+	expectSingleLocation(t, locations, domainPath, generatedDefineLine+10)
+}
+
+func TestModuleOwnersByLine(t *testing.T) {
+	source := `defmodule A do
+  @moduledoc """
+  defmodule NotAModule do
+  """
+  defmodule Inner do
+    def x, do: :ok
+  end
+
+  def y, do: "end"
+end
+
+defmodule B do
+end
+`
+	owners := moduleOwnersByLine([]byte(source), strings.Count(source, "\n")+1)
+	for line, want := range map[int]string{1: "", 2: "A", 3: "A", 5: "A", 6: "A.Inner", 7: "A.Inner", 9: "A", 10: "A", 11: "", 13: "B"} {
+		if owners[line] != want {
+			t.Errorf("line %d owner = %q, want %q", line, owners[line], want)
+		}
+	}
+}
+
+// A module defined in two files, as two umbrella apps can, has two rows. The
+// recorded path decides between them; when it cannot, no line is trusted.
+func TestBestDescribedResult(t *testing.T) {
+	a := store.LookupResult{FilePath: "/new/apps/a/lib/dup.ex", Line: 1}
+	b := store.LookupResult{FilePath: "/new/apps/b/lib/dup.ex", Line: 1}
+	lines := map[beam.FunctionKey]int{{Name: "f", Arity: 0}: 5}
+	for _, tc := range []struct {
+		name          string
+		info          beam.DebugInfo
+		want          string
+		wantAmbiguous bool
+	}{
+		{"exact path", beam.DebugInfo{File: b.FilePath, RelativeFile: "lib/dup.ex", Lines: lines}, b.FilePath, false},
+		{"moved umbrella", beam.DebugInfo{File: "/old/apps/b/lib/dup.ex", RelativeFile: "lib/dup.ex", Lines: lines}, b.FilePath, false},
+		{"only the relative path", beam.DebugInfo{RelativeFile: "lib/dup.ex", Lines: lines}, "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sources := generatedDefinitionSources{debugInfo: tc.info}
+			got, found, ambiguous := sources.bestDescribedResult([]store.LookupResult{a, b})
+			if ambiguous != tc.wantAmbiguous || found != (tc.want != "") || (found && got.FilePath != tc.want) {
+				t.Errorf("bestDescribedResult = %s, found=%v, ambiguous=%v; want %q, ambiguous=%v", got.FilePath, found, ambiguous, tc.want, tc.wantAmbiguous)
+			}
+		})
+	}
+}
+
+// The declaration was deleted, and a module below declares the same name. The
+// only declaration left is in another module, so the recorded line stays.
+func TestDefinitionGeneratedFunctionDriftIgnoresModuleBelow(t *testing.T) {
+	server, domainPath := newGeneratedDefinitionFixture(t, generatedDomainRel, lineDefinitions()...)
+	withoutDefine := strings.Replace(generatedDomainSource, "      define :get_room_by_slug, action: :read, get_by: [:slug]\n", "", 1)
+	edited := withoutDefine + `
+defmodule MyApp.Archive do
+  resources do
+    define :get_room_by_slug, action: :read
+  end
+end
+`
+	indexFile(t, server.store, server.projectRoot, generatedDomainRel, edited)
+	server.docs.Set(string(uri.File(domainPath)), edited)
+	locations := generatedDefinitionAt(t, server, generatedCallerRel, generatedCallerSource, 4, 10)
+	expectSingleLocation(t, locations, domainPath, generatedDefineLine)
 }

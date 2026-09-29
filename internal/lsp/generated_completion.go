@@ -699,11 +699,12 @@ func generatedFunctionsNamed(functions []beam.Function, name string) []beam.Func
 // generatedDefinitionResults returns the closest source-backed module for a
 // generated provider. Generated nested modules have no source row, so walking
 // their lexical parents yields a stable artifact-level destination without
-// knowing which framework created them.
-func (s *Server) generatedDefinitionResults(module string) []store.LookupResult {
+// knowing which framework created them. owner is the module those results
+// belong to: module itself, or the lexical parent that was found.
+func (s *Server) generatedDefinitionResults(module string) (results []store.LookupResult, owner string) {
 	for candidate := module; candidate != ""; {
 		if results, err := s.store.LookupModule(candidate); err == nil && len(results) > 0 {
-			return results
+			return results, candidate
 		}
 		dot := strings.LastIndexByte(candidate, '.')
 		if dot < 0 {
@@ -711,7 +712,7 @@ func (s *Server) generatedDefinitionResults(module string) []store.LookupResult 
 		}
 		candidate = candidate[:dot]
 	}
-	return nil
+	return nil, ""
 }
 
 // filterGeneratedProviderReferences removes the conservative false positives
