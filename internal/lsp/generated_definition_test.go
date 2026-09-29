@@ -390,7 +390,7 @@ func TestLookupNameSourcelessGeneratedModuleUsesCompiledSource(t *testing.T) {
 			if err := os.MkdirAll(filepath.Dir(source), 0o755); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.WriteFile(source, []byte("defmodule SharedLib.Dsl.Extension do\nend\n"), 0o644); err != nil {
+			if err := os.WriteFile(source, []byte("defmodule SharedLib.Dsl.Extension do\n"+strings.Repeat("\n", 50)+"end\n"), 0o644); err != nil {
 				t.Fatal(err)
 			}
 			writeGeneratedBeam(t, server, sourcelessModule, tc.chunks, beamExport{"build", 1})
@@ -622,7 +622,7 @@ func TestLookupNameSourcelessGeneratedModulePrefersThisCheckout(t *testing.T) {
 				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 					t.Fatal(err)
 				}
-				if err := os.WriteFile(path, []byte("defmodule SharedLib.Dsl do\nend\n"), 0o644); err != nil {
+				if err := os.WriteFile(path, []byte("defmodule SharedLib.Dsl do\n"+strings.Repeat("\n", 50)+"end\n"), 0o644); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -804,4 +804,19 @@ end
 	server.docs.Set(string(uri.File(domainPath)), edited)
 	locations := generatedDefinitionAt(t, server, generatedCallerRel, generatedCallerSource, 4, 10)
 	expectSingleLocation(t, locations, domainPath, generatedDefineLine)
+}
+
+// A generator can give a def any line, such as `quote line: 99`. Even from a
+// current BEAM, a line past the end of the file is not a place to go.
+func TestDefinitionGeneratedFunctionLinePastEndOfFileKeepsModuleLine(t *testing.T) {
+	server, domainPath := newGeneratedDefinitionFixture(t, generatedDomainRel,
+		dbgiDefinition{name: "get_room_by_slug!", arity: 1, line: 99, keepFile: "deps/shared_lib/lib/interface.ex", keepLine: 1112},
+	)
+	future := time.Now().Add(time.Hour)
+	beamPath := filepath.Join(server.projectRoot, "_build", "dev", "lib", "my_app", "ebin", "Elixir.MyApp.Chat.beam")
+	if err := os.Chtimes(beamPath, future, future); err != nil {
+		t.Fatal(err)
+	}
+	locations := generatedDefinitionAt(t, server, generatedCallerRel, generatedCallerSource, 4, 10)
+	expectSingleLocation(t, locations, domainPath, generatedModuleLine)
 }

@@ -1,6 +1,7 @@
 package lsp
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"slices"
@@ -108,9 +109,26 @@ func (s *Server) generatedDefinitionResultsFor(module, beamPath string, function
 // the compiled module records for functions in file, corrected for edits made
 // since the compile. afterLine is the module's line in the current text, so it
 // is compared after the correction: lines added above the module move both.
+//
+// A generator can give a def any line (`quote line: 99`), so a line past the
+// end of the current text is dropped too: it is not a place to send an editor.
 func (s *Server) recordedLinesIn(module, owner, file string, afterLine int, sources generatedDefinitionSources, functions []beam.Function) []store.LookupResult {
 	lines := s.correctLineDrift(file, owner, sources.beamMtime, generatedFunctionLines(module, file, sources, functions), functions)
-	return slices.DeleteFunc(lines, func(r store.LookupResult) bool { return r.Line <= afterLine })
+	lastLine := s.currentLineCount(file)
+	return slices.DeleteFunc(lines, func(r store.LookupResult) bool { return r.Line <= afterLine || r.Line > lastLine })
+}
+
+// currentLineCount returns how many lines path has now: in the open buffer if
+// there is one, otherwise on disk. It is zero when the file cannot be read.
+func (s *Server) currentLineCount(path string) int {
+	if text, ok := s.docs.GetIfOpen(string(pathToURI(path))); ok {
+		return strings.Count(text, "\n") + 1
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	return bytes.Count(data, []byte("\n")) + 1
 }
 
 // generatedFunctionLines returns a result for each distinct line that the
