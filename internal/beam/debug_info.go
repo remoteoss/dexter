@@ -42,11 +42,6 @@ type DebugInfo struct {
 	// adds one clause per call, such as `route :get, "/a"`. Definitions with
 	// one line are absent; Lines has it.
 	Clauses map[FunctionKey][]int
-
-	// Anchors maps every definition, private ones included, to its :line as
-	// compiled. Comparing these with the same definitions in the current
-	// source shows how far the source has moved since the compile.
-	Anchors map[FunctionKey]int
 }
 
 // ReadDefinitionLines reads the line of every public definition from an Elixir
@@ -84,7 +79,6 @@ var errNoElixirDebugInfo = errors.New("no Elixir debug info")
 // relative_file, so they cannot be resolved while walking.
 type definitionSite struct {
 	key         FunctionKey
-	public      bool
 	line        int
 	keepFile    string
 	keepLine    int
@@ -182,16 +176,7 @@ func parseDebugInfo(buf []byte) (info DebugInfo, err error) {
 	}
 
 	info.Lines = make(map[FunctionKey]int, len(sites))
-	info.Anchors = make(map[FunctionKey]int, len(sites))
 	for _, site := range sites {
-		if site.line > 0 {
-			if _, seen := info.Anchors[site.key]; !seen {
-				info.Anchors[site.key] = site.line
-			}
-		}
-		if !site.public {
-			continue
-		}
 		line := site.line
 		stamped := site.keepFile != "" && site.keepLine > 0 &&
 			(site.keepFile == info.RelativeFile || site.keepFile == info.File)
@@ -214,9 +199,9 @@ func parseDebugInfo(buf []byte) (info DebugInfo, err error) {
 }
 
 // readDefinitionSites reads the definitions list, whose entries are
-// {{name, arity}, kind, meta, clauses}. Private definitions are kept only as
-// anchors: generated functions are found through the export table, so only
-// public ones can be asked about.
+// {{name, arity}, kind, meta, clauses}. Private definitions are skipped:
+// generated functions are found through the export table, so only public ones
+// can be asked about.
 func readDefinitionSites(r *etfReader) ([]definitionSite, error) {
 	count, hasTail, err := r.enterList()
 	if err != nil {
@@ -254,14 +239,16 @@ func readDefinitionSites(r *etfReader) ([]definitionSite, error) {
 		if err != nil {
 			return nil, err
 		}
-		site := definitionSite{key: FunctionKey{Name: name, Arity: functionArity}, public: kind == "def" || kind == "defmacro"}
+		site := definitionSite{key: FunctionKey{Name: name, Arity: functionArity}}
 		if err := readDefinitionMeta(r, &site); err != nil {
 			return nil, err
 		}
 		if site.clauseLines, err = readClauseLines(r); err != nil {
 			return nil, err
 		}
-		sites = append(sites, site)
+		if kind == "def" || kind == "defmacro" {
+			sites = append(sites, site)
+		}
 	}
 	if hasTail {
 		if err := r.skip(); err != nil {

@@ -7,7 +7,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"go.lsp.dev/uri"
 )
@@ -135,18 +134,6 @@ const compiledUserSource = `defmodule Weird.User do
 end
 `
 
-const compiledAnchoredSource = `defmodule Weird.Anchored do
-  def before_loop, do: :before
-
-  for name <- [:looped] do
-    def unquote(name)(), do: unquote(name)
-  end
-
-  defp after_loop, do: :after
-  def use_after, do: after_loop()
-end
-`
-
 const compiledCallerSource = `defmodule Weird.Caller do
   import Weird.User, only: [active?: 1]
 
@@ -165,7 +152,6 @@ const compiledCallerSource = `defmodule Weird.Caller do
     Weird.User.stamped()
     Weird.User.loop_b()
     Weird.User.Nested.nested?(%{})
-    Weird.Anchored.looped()
     active?(%{})
     f = &Weird.User.two_level/0
     f.()
@@ -174,10 +160,9 @@ end
 `
 
 const (
-	compiledDslRel      = "lib/weird/dsl.ex"
-	compiledUserRel     = "lib/weird/user.ex"
-	compiledAnchoredRel = "lib/weird/anchored.ex"
-	compiledCallerRel   = "lib/weird/caller.ex"
+	compiledDslRel    = "lib/weird/dsl.ex"
+	compiledUserRel   = "lib/weird/user.ex"
+	compiledCallerRel = "lib/weird/caller.ex"
 )
 
 // compiledFixture is the compiled DSL project and the server that indexed it.
@@ -204,10 +189,9 @@ end
 		t.Fatal(err)
 	}
 	for rel, source := range map[string]string{
-		compiledDslRel:      compiledDslSource,
-		compiledUserRel:     compiledUserSource,
-		compiledAnchoredRel: compiledAnchoredSource,
-		compiledCallerRel:   compiledCallerSource,
+		compiledDslRel:    compiledDslSource,
+		compiledUserRel:   compiledUserSource,
+		compiledCallerRel: compiledCallerSource,
 		"lib/weird/target.ex": `defmodule Weird.Target do
   def double(value), do: value * 2
 end
@@ -223,16 +207,10 @@ end
 	return &compiledFixture{server: server, t: t}
 }
 
-// saveLater saves and indexes an edit as if it were made a while after the
-// compile. A BEAM's mtime has whole seconds, so an edit in the same second as
-// the compile counts as compiled.
+// saveLater saves and indexes an edit made after the compile.
 func (f *compiledFixture) saveLater(rel, source string) {
 	f.t.Helper()
 	indexFile(f.t, f.server.store, f.server.projectRoot, rel, source)
-	later := time.Now().Add(5 * time.Second)
-	if err := os.Chtimes(filepath.Join(f.server.projectRoot, rel), later, later); err != nil {
-		f.t.Fatal(err)
-	}
 }
 
 // lineOf returns the 1-based line of the nth occurrence of needle in source.
@@ -320,21 +298,20 @@ func TestDefinition_GeneratedFunctionsFromCompiler(t *testing.T) {
 	})
 }
 
-// Dexter cannot compile, so the source usually has edits the BEAM has not
-// seen. Each case edits the source without compiling and checks that the line
-// follows the edit.
-func TestDefinition_GeneratedFunctionsFromCompilerFollowEdits(t *testing.T) {
+// Dexter cannot compile, so the declaring file can have edits the BEAM has not
+// seen. The line from the last compile is still the answer: it is near, and
+// the next compile makes it exact. A line the file no longer has is never
+// returned, and the search for a declaring call reads the current text.
+func TestDefinition_GeneratedFunctionsFromCompilerWithStaleSource(t *testing.T) {
 	f := newCompiledFixture(t, "")
+	compiled := func(needle string) string { return at(compiledUserRel, compiledUserSource, needle, t) }
 
-	t.Run("lines added above the module, saved", func(t *testing.T) {
+	t.Run("lines added above, saved", func(t *testing.T) {
 		edited := "# one\n# two\n# three\n" + compiledUserSource
 		f.saveLater(compiledUserRel, edited)
 		t.Cleanup(func() { indexFile(t, f.server.store, f.server.projectRoot, compiledUserRel, compiledUserSource) })
-		expectDefinition(t, f.definitionOf("two_level(", 1), at(compiledUserRel, edited, "outer :two_level", t))
-		expectDefinition(t, f.definitionOf("loop_b(", 1), at(compiledUserRel, edited, "def unquote(name)()", t))
-		// `plug :match` spells the name; the route clauses do not, and follow
-		// the edit instead of collapsing onto it.
-		expectDefinition(t, f.definitionOf("match(", 1), at(compiledUserRel, edited, "route :get", t), at(compiledUserRel, edited, "route :post", t))
+		expectDefinition(t, f.definitionOf("two_level(", 1), compiled("outer :two_level"))
+		expectDefinition(t, f.definitionOf("match(", 1), compiled("route :get"), compiled("route :post"))
 	})
 
 	t.Run("lines added in an unsaved buffer", func(t *testing.T) {
@@ -342,17 +319,18 @@ func TestDefinition_GeneratedFunctionsFromCompilerFollowEdits(t *testing.T) {
 		userURI := string(uri.File(filepath.Join(f.server.projectRoot, compiledUserRel)))
 		f.server.docs.Set(userURI, edited)
 		t.Cleanup(func() { f.server.docs.Close(userURI) })
-		expectDefinition(t, f.definitionOf("two_level(", 1), at(compiledUserRel, edited, "outer :two_level", t))
+		expectDefinition(t, f.definitionOf("two_level(", 1), compiled("outer :two_level"))
+		// The BEAM records only the module line here, so the declaring call
+		// is searched for, in the text as it is now.
 		expectDefinition(t, f.definitionOf("deferred(", 1), at(compiledUserRel, edited, "later :deferred", t))
 	})
 
-	t.Run("lines added between a source def and a comprehension", func(t *testing.T) {
-		edited := strings.Replace(compiledAnchoredSource, "  for name", "  # one\n  # two\n  for name", 1)
-		f.saveLater(compiledAnchoredRel, edited)
-		t.Cleanup(func() {
-			indexFile(t, f.server.store, f.server.projectRoot, compiledAnchoredRel, compiledAnchoredSource)
-		})
-		expectDefinition(t, f.definitionOf("looped(", 1), at(compiledAnchoredRel, edited, "def unquote(name)()", t))
+	t.Run("file shorter than the recorded line", func(t *testing.T) {
+		edited := "defmodule Weird.User do\n  use Weird.Dsl\n  outer :two_level\nend\n"
+		f.saveLater(compiledUserRel, edited)
+		t.Cleanup(func() { indexFile(t, f.server.store, f.server.projectRoot, compiledUserRel, compiledUserSource) })
+		expectDefinition(t, f.definitionOf("gen_1500(", 1), compiledUserRel+":1")
+		expectDefinition(t, f.definitionOf("two_level(", 1), compiled("outer :two_level"))
 	})
 }
 
