@@ -524,17 +524,32 @@ func parseDocsEntry(r *etfReader) ([]Function, bool, error) {
 }
 
 // readAnnoLine reads the per-entry source annotation. Elixir writes it as a bare
-// line number, but the field is an erl_anno and may hold other shapes (a tuple,
-// or `none`), so anything that is not an integer is consumed and reported as line
-// 0 rather than failing the whole entry. A dropped annotation must never cost the
+// line number, but the field is an erl_anno and may hold other shapes: a
+// {line, column} tuple gives its line, and anything else, such as `none`, is
+// consumed and reported as line 0 rather than failing the whole entry. A dropped annotation must never cost the
 // module its generated functions.
 func readAnnoLine(r *etfReader) (int, error) {
 	tag, err := r.peekTag()
 	if err != nil {
 		return 0, err
 	}
-	if tag == tagSmallInteger || tag == tagInteger {
+	switch tag {
+	case tagSmallInteger, tagInteger:
 		return r.readInt()
+	case tagSmallTuple:
+		// {line, column}, as erl_anno writes a location with a column.
+		arity, err := r.enterTuple()
+		if err != nil {
+			return 0, err
+		}
+		if arity == 0 {
+			return 0, nil
+		}
+		line, err := readAnnoLine(r)
+		if err != nil {
+			return 0, err
+		}
+		return line, r.skipTerms(int64(arity) - 1)
 	}
 	return 0, r.skip()
 }

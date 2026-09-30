@@ -1,7 +1,6 @@
 package lsp
 
 import (
-	"bytes"
 	"os"
 	"path/filepath"
 	"slices"
@@ -86,10 +85,11 @@ func (s *Server) generatedDefinitionResultsFor(module, beamPath string, function
 		return results, false
 	}
 	if result, found, ambiguous := sources.bestDescribedResult(results); found {
-		if lines := s.recordedLinesIn(module, owner, result.FilePath, result.Line, sources, functions); len(lines) > 0 {
+		src := s.currentSourceOf(result.FilePath, sources.beamMtime)
+		if lines := recordedLinesIn(module, owner, result, src, sources, functions); len(lines) > 0 {
 			return lines, true
 		}
-		return results, false
+		return src.currentModuleResults(results, owner), false
 	} else if ambiguous {
 		return results, false
 	}
@@ -97,7 +97,8 @@ func (s *Server) generatedDefinitionResultsFor(module, beamPath string, function
 		// The generator's file has no module that owns the declaration, so
 		// its lines are not followed through edits there.
 		if source := s.compiledSourceFile(sources.compileSource); source != "" {
-			if lines := s.recordedLinesIn(module, "", source, 1, sources, functions); len(lines) > 0 {
+			src := s.currentSourceOf(source, sources.beamMtime)
+			if lines := recordedLinesIn(module, "", store.LookupResult{FilePath: source, Line: 1}, src, sources, functions); len(lines) > 0 {
 				return lines, true
 			}
 		}
@@ -105,34 +106,74 @@ func (s *Server) generatedDefinitionResultsFor(module, beamPath string, function
 	return results, false
 }
 
-// recordedLinesIn returns a result for each distinct line after afterLine that
-// the compiled module records for functions in file, corrected for edits made
-// since the compile. afterLine is the module's line in the current text, so it
-// is compared after the correction: lines added above the module move both.
-//
-// A generator can give a def any line (`quote line: 99`), so a line past the
-// end of the current text is dropped too: it is not a place to send an editor.
-func (s *Server) recordedLinesIn(module, owner, file string, afterLine int, sources generatedDefinitionSources, functions []beam.Function) []store.LookupResult {
-	lines := s.correctLineDrift(file, owner, sources.beamMtime, generatedFunctionLines(module, file, sources, functions), functions)
-	lastLine := s.currentLineCount(file)
-	return slices.DeleteFunc(lines, func(r store.LookupResult) bool { return r.Line <= afterLine || r.Line > lastLine })
+// generatedModuleLocation is where a module that exists only as a BEAM is
+// defined: the file it was compiled from, at the line the compiler recorded
+// for the module, such as a Module.create call. It is empty when the BEAM does
+// not record both, or the line is not in the file.
+func (s *Server) generatedModuleLocation(module string) []store.LookupResult {
+	if len(s.generatedFunctionsForModule(module)) == 0 {
+		return nil
+	}
+	sources, ok := s.generatedDefinitionSourcesFor(module, "")
+	if !ok || sources.debugInfo.ModuleLine < 1 {
+		return nil
+	}
+	source := s.compiledSourceFile(sources.compileSource)
+	if source == "" {
+		return nil
+	}
+	if src := s.currentSourceOf(source, sources.beamMtime); src == nil || sources.debugInfo.ModuleLine > len(src.lines) {
+		return nil
+	}
+	return []store.LookupResult{{Module: module, FilePath: source, Line: sources.debugInfo.ModuleLine, Kind: "module"}}
 }
 
-// currentLineCount returns how many lines path has now: in the open buffer if
-// there is one, otherwise on disk. It is zero when the file cannot be read.
-func (s *Server) currentLineCount(path string) int {
-	if text, ok := s.docs.GetIfOpen(string(pathToURI(path))); ok {
-		return strings.Count(text, "\n") + 1
+// recordedLinesIn returns a result for each distinct line in result's file
+// that the compiled module records for functions, corrected for edits made
+// since the compile, and after the module's own line.
+//
+// The module's line is taken from the current text when it has changed, so
+// that it is compared after the correction: lines added above the module move
+// both. A generator can give a def any line (`quote line: 99`), so a line past
+// the end of the current text is dropped too.
+//
+// When nothing is left, which is the case for a def a @before_compile hook
+// made at the module line, the module's body is searched for the call that
+// declared the function: the one call whose first argument is its name as an
+// atom (`later :deferred`). Only a single match counts.
+func recordedLinesIn(module, owner string, result store.LookupResult, src *currentSource, sources generatedDefinitionSources, functions []beam.Function) []store.LookupResult {
+	if src == nil {
+		return nil
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0
+	moduleLine := result.Line
+	if line, ok := src.moduleLine(owner); ok && src.changed {
+		moduleLine = line
 	}
-	return bytes.Count(data, []byte("\n")) + 1
+	// A line at or before the module's line as compiled says nothing the
+	// module result does not, so it is dropped before any correction can move
+	// it somewhere that only looks meaningful.
+	compiledModuleLine := result.Line
+	if owner == module && sources.debugInfo.ModuleLine > 0 {
+		compiledModuleLine = sources.debugInfo.ModuleLine
+	}
+	lines := slices.DeleteFunc(generatedFunctionLines(module, result.FilePath, sources, functions), func(r store.LookupResult) bool { return r.Line <= compiledModuleLine })
+	if src.changed {
+		lines = src.correctDrift(module, owner, lines, sources, functions)
+	}
+	lines = slices.DeleteFunc(lines, func(r store.LookupResult) bool { return r.Line <= moduleLine || r.Line > len(src.lines) })
+	if len(lines) > 0 || owner == "" {
+		return lines
+	}
+	if line, ok := src.uniqueDeclaration(owner, functions); ok && line > moduleLine {
+		return []store.LookupResult{{Module: module, FilePath: result.FilePath, Line: line, Kind: functions[0].Kind, Arity: functions[0].Arity}}
+	}
+	return nil
 }
 
 // generatedFunctionLines returns a result for each distinct line that the
-// compiled module records for functions in file.
+// compiled module records for functions in file: one per clause when the
+// clauses were made at different lines, as a DSL that adds a clause per call
+// does.
 //
 // The Dbgi line is preferred because it also honors `@file`. The Docs chunk
 // annotation is the fallback, because a module compiled without debug info
@@ -142,58 +183,175 @@ func generatedFunctionLines(module, file string, sources generatedDefinitionSour
 	useDebugInfo := len(sources.debugInfo.Lines) > 0
 	var lines []store.LookupResult
 	for _, function := range functions {
-		line := function.Line
+		key := beam.FunctionKey{Name: function.Name, Arity: function.Arity}
+		recorded := []int{function.Line}
 		if useDebugInfo {
-			line = sources.debugInfo.Lines[beam.FunctionKey{Name: function.Name, Arity: function.Arity}]
+			recorded = []int{sources.debugInfo.Lines[key]}
+			if clauses := sources.debugInfo.Clauses[key]; len(clauses) > 0 {
+				recorded = clauses
+			}
 		}
-		if line <= 0 || slices.ContainsFunc(lines, func(r store.LookupResult) bool { return r.Line == line }) {
-			continue
+		for _, line := range recorded {
+			if line <= 0 || slices.ContainsFunc(lines, func(r store.LookupResult) bool { return r.Line == line }) {
+				continue
+			}
+			lines = append(lines, store.LookupResult{
+				Module:   module,
+				FilePath: file,
+				Line:     line,
+				Kind:     function.Kind,
+				Arity:    function.Arity,
+			})
 		}
-		lines = append(lines, store.LookupResult{
-			Module:   module,
-			FilePath: file,
-			Line:     line,
-			Kind:     function.Kind,
-			Arity:    function.Arity,
-		})
 	}
 	return lines
 }
 
-// correctLineDrift moves recorded lines to follow edits made since the compile.
-//
-// A BEAM older than its source, or a buffer with unsaved changes, can describe
-// lines that have moved. Dexter cannot compile the project, so it looks for
-// the declaration in the current text instead: a call whose first argument is
-// the function's name as an atom, which is how a macro call names what it
-// declares (`define :list_rooms`, `field :email`), in the body of owner, the
-// module whose source holds the declarations. A match in another module of the
-// same file is never taken, and without an owner no line is moved. The nearest
-// match wins.
-// The recorded line is kept when it still declares the function, when no line
-// does, or when two matches are equally near. A line past the end of the
-// current text, with no declaration to move to, is dropped. A BEAM that is
-// current is never corrected, because its lines are exact even where the
-// declaration does not spell the name.
-func (s *Server) correctLineDrift(path, owner string, beamMtime int64, results []store.LookupResult, functions []beam.Function) []store.LookupResult {
-	text, ok := s.driftedSourceText(path, beamMtime)
+// currentSource is a file's text as it is now, in the open buffer if there is
+// one and otherwise on disk, with what navigation derives from it computed on
+// first use.
+type currentSource struct {
+	path string
+	text string
+	// lines is text split into lines, with the lines inside heredocs blanked.
+	lines []string
+	// changed reports that the text may differ from the text the BEAM was
+	// compiled from: the buffer has unsaved changes, or the file was written
+	// after the BEAM.
+	changed bool
+
+	owners []string
+	defs   []parser.Definition
+	parsed bool
+
+	// compiled returns the debug info of another module's BEAM, so that the
+	// other modules in this file can serve as anchors. It may be nil.
+	compiled func(module string) (beam.DebugInfo, bool)
+}
+
+// currentSourceOf returns path's current text, or nil if it cannot be read.
+// Only a buffer open in the editor counts: a file that another request cached
+// is not unsaved edits.
+func (s *Server) currentSourceOf(path string, beamMtime int64) *currentSource {
+	open, isOpen := s.docs.GetIfOpen(string(pathToURI(path)))
+	disk, err := os.ReadFile(path)
+	src := &currentSource{path: path, compiled: func(module string) (beam.DebugInfo, bool) {
+		sources, ok := s.generatedDefinitionSourcesFor(module, "")
+		return sources.debugInfo, ok && len(sources.debugInfo.Anchors) > 0
+	}}
+	switch {
+	case isOpen:
+		src.text = open
+		src.changed = err != nil || open != string(disk)
+	case err == nil:
+		src.text = string(disk)
+	default:
+		return nil
+	}
+	if stamp := statFileStamp(path); stamp.exists && newerBySecond(stamp.mtime, beamMtime) {
+		src.changed = true
+	}
+	src.lines = blankHeredocs(strings.Split(src.text, "\n"))
+	return src
+}
+
+// newerBySecond reports whether mtime is in a later second than beamMtime. A
+// compiled BEAM's mtime has whole seconds while a source file's does not, so a
+// file saved and compiled within one second would otherwise look newer than
+// its BEAM. An edit in the same second as the compile counts as compiled, which
+// only means its lines are not corrected.
+func newerBySecond(mtime, beamMtime int64) bool {
+	return mtime/int64(time.Second) > beamMtime/int64(time.Second)
+}
+
+// ownerAt returns the innermost module whose body holds the 1-based line.
+func (src *currentSource) ownerAt(line int) string {
+	if src.owners == nil {
+		src.owners = moduleOwnersByLine([]byte(src.text), len(src.lines))
+	}
+	if line < 1 || line >= len(src.owners) {
+		return ""
+	}
+	return src.owners[line]
+}
+
+// definitions returns the definitions the parser finds in the current text.
+func (src *currentSource) definitions() []parser.Definition {
+	if !src.parsed {
+		src.parsed = true
+		src.defs, _, _ = parser.ParseText(src.path, src.text)
+	}
+	return src.defs
+}
+
+// moduleLine returns the line of module's defmodule in the current text.
+func (src *currentSource) moduleLine(module string) (int, bool) {
+	if module == "" {
+		return 0, false
+	}
+	for _, def := range src.definitions() {
+		if def.Module == module && def.Function == "" {
+			return def.Line, true
+		}
+	}
+	return 0, false
+}
+
+// currentModuleResults moves the module results in this file to owner's line
+// in the current text, which differs from the index while a buffer has unsaved
+// changes.
+func (src *currentSource) currentModuleResults(results []store.LookupResult, owner string) []store.LookupResult {
+	if src == nil || !src.changed {
+		return results
+	}
+	line, ok := src.moduleLine(owner)
 	if !ok {
 		return results
 	}
-	lines := blankHeredocs(strings.Split(text, "\n"))
-	inOwner := func(int) bool { return false }
-	if owner != "" {
-		owners := moduleOwnersByLine([]byte(text), len(lines))
-		inOwner = func(line int) bool { return owners[line] == owner }
+	out := slices.Clone(results)
+	for i := range out {
+		if out[i].FilePath == src.path {
+			out[i].Line = line
+		}
+	}
+	return out
+}
+
+// correctDrift moves recorded lines to follow edits made since the compile.
+//
+// Dexter cannot compile the project, so it reads the current text instead,
+// and only the body of owner, the module whose source holds the declarations:
+// a sibling module in the same file never matches, and without an owner no
+// line is moved. Two signals are used, most exact first:
+//
+//   - A call whose first argument is the function's name as an atom, which is
+//     how a macro call names what it declares (`define :list_rooms`,
+//     `field :email`). The nearest wins; the recorded line is kept when it
+//     still declares the function, and two equally near matches count as none.
+//   - Otherwise, the definitions the source still has on either side. The
+//     compiled module records their old lines and the current text has their
+//     new ones, so the difference is how far this part of the file moved (see
+//     anchoredLine).
+//
+// A line with neither signal is kept as recorded.
+func (src *currentSource) correctDrift(module, owner string, results []store.LookupResult, sources generatedDefinitionSources, functions []beam.Function) []store.LookupResult {
+	if owner == "" {
+		return results
 	}
 	names := make(map[int]string, len(functions))
 	for _, function := range functions {
 		names[function.Arity] = function.Name
 	}
+	inOwner := func(line int) bool { return src.ownerAt(line) == owner }
 	out := results[:0]
 	for _, result := range results {
-		line := nearestDeclaringLine(lines, result.Line, names[result.Arity], inOwner)
-		if line > len(lines) || slices.ContainsFunc(out, func(r store.LookupResult) bool { return r.Line == line }) {
+		line, found := nearestDeclaringLine(src.lines, result.Line, names[result.Arity], inOwner)
+		if !found {
+			if moved, ok := src.anchoredLine(module, owner, result.Line, sources.debugInfo); ok {
+				line = moved
+			}
+		}
+		if slices.ContainsFunc(out, func(r store.LookupResult) bool { return r.Line == line }) {
 			continue
 		}
 		result.Line = line
@@ -202,24 +360,149 @@ func (s *Server) correctLineDrift(path, owner string, beamMtime int64, results [
 	return out
 }
 
-// driftedSourceText returns the current text of path when it may differ from
-// the text the BEAM was compiled from: the open buffer if it has unsaved
-// changes, or the file if it was written after the BEAM.
-func (s *Server) driftedSourceText(path string, beamMtime int64) (string, bool) {
-	open, isOpen := s.docs.GetIfOpen(string(pathToURI(path)))
-	source := statFileStamp(path)
-	stale := source.exists && source.mtime > beamMtime
-	if !isOpen && !stale {
-		return "", false
+// anchoredLine places recorded in the current text by the nearest
+// definitions above and below it that a compiled module and the current text
+// both have: the defs and the module lines of every module in the file whose
+// BEAM was compiled from it.
+//
+// When both anchors moved by the same amount, the line moved with them. When
+// they moved by different amounts, the edit was between them. Then the line is
+// placed only when every generated def between the anchors can be matched to a
+// line in owner that defines a function with an unquoted name
+// (`def unquote(name)()`), one to one and in order: the shape a comprehension
+// leaves. Otherwise it is not placed.
+func (src *currentSource) anchoredLine(module, owner string, recorded int, info beam.DebugInfo) (int, bool) {
+	// Lines move for the whole file, so every module defined in it can serve
+	// as an anchor, not only this one: a nested module's line counts as much
+	// as a def. Another module's BEAM is used only when it was compiled from
+	// this file.
+	type moduleKey struct {
+		module string
+		key    beam.FunctionKey
 	}
-	disk, err := os.ReadFile(path)
-	switch {
-	case isOpen && (err != nil || open != string(disk)):
-		return open, true
-	case err == nil && stale:
-		return string(disk), true
+	current := make(map[moduleKey]int)
+	moduleLines := make(map[string]int)
+	for _, def := range src.definitions() {
+		if def.Function == "" {
+			if _, seen := moduleLines[def.Module]; !seen {
+				moduleLines[def.Module] = def.Line
+			}
+			continue
+		}
+		key := moduleKey{def.Module, beam.FunctionKey{Name: def.Function, Arity: def.Arity}}
+		if line, seen := current[key]; !seen || def.Line < line {
+			current[key] = def.Line
+		}
 	}
-	return "", false
+	compiled := map[string]beam.DebugInfo{module: info}
+	if src.compiled != nil {
+		for other := range moduleLines {
+			if other == module {
+				continue
+			}
+			if otherInfo, ok := src.compiled(other); ok && recordedPathMatch(otherInfo.File, otherInfo.RelativeFile, src.path) > 0 {
+				compiled[other] = otherInfo
+			}
+		}
+	}
+
+	type anchor struct{ old, now int }
+	var above, below *anchor
+	consider := func(old, now int) {
+		switch {
+		case old < recorded && (above == nil || old > above.old):
+			above = &anchor{old, now}
+		case old > recorded && (below == nil || old < below.old):
+			below = &anchor{old, now}
+		}
+	}
+	for name, moduleInfo := range compiled {
+		for key, old := range moduleInfo.Anchors {
+			if now, ok := current[moduleKey{name, key}]; ok {
+				consider(old, now)
+			}
+		}
+		if now, ok := moduleLines[name]; ok && moduleInfo.ModuleLine > 0 {
+			consider(moduleInfo.ModuleLine, now)
+		}
+	}
+	if above != nil && below != nil && above.now-above.old == below.now-below.old {
+		return recorded + above.now - above.old, true
+	}
+
+	// The edit was between the anchors. A def a comprehension generates has
+	// no name to search for, but its line is a `def unquote(...)`: if the
+	// compiled module's generated defs between the anchors have as many
+	// distinct lines as the current text has such defs there, they are the
+	// same defs in the same order.
+	oldFrom, oldTo, newFrom, newTo := 1, int(^uint(0)>>1), 1, len(src.lines)
+	if above != nil {
+		oldFrom, newFrom = above.old+1, above.now+1
+	}
+	if below != nil {
+		oldTo, newTo = below.old-1, below.now-1
+	}
+	var generated []int
+	for key, old := range info.Anchors {
+		if _, inSource := current[moduleKey{module, key}]; !inSource && old >= oldFrom && old <= oldTo && !slices.Contains(generated, old) {
+			generated = append(generated, old)
+		}
+	}
+	var unquoted []int
+	for line := newFrom; line <= newTo; line++ {
+		if lineDefinesUnquotedName(src.lines[line-1]) && src.ownerAt(line) == owner {
+			unquoted = append(unquoted, line)
+		}
+	}
+	if len(generated) == 0 || len(generated) != len(unquoted) {
+		return 0, false
+	}
+	slices.Sort(generated)
+	index := slices.Index(generated, recorded)
+	if index < 0 {
+		return 0, false
+	}
+	return unquoted[index], true
+}
+
+// lineDefinesUnquotedName reports whether text starts a def, defp, defmacro,
+// or defmacrop whose name is unquoted.
+func lineDefinesUnquotedName(text string) bool {
+	rest := strings.TrimLeft(text, " \t")
+	for _, keyword := range []string{"def ", "defp ", "defmacro ", "defmacrop "} {
+		if after, ok := strings.CutPrefix(rest, keyword); ok {
+			return strings.HasPrefix(strings.TrimLeft(after, " \t"), "unquote(")
+		}
+	}
+	return false
+}
+
+// uniqueDeclaration returns the one line in owner's body that declares one of
+// functions by name, if exactly one does.
+func (src *currentSource) uniqueDeclaration(owner string, functions []beam.Function) (int, bool) {
+	names := declarationNames(functions[0].Name)
+	found := 0
+	for line := 1; line <= len(src.lines); line++ {
+		if !lineDeclaresAtom(src.lines[line-1], names) || src.ownerAt(line) != owner {
+			continue
+		}
+		if found != 0 {
+			return 0, false
+		}
+		found = line
+	}
+	return found, found != 0
+}
+
+// declarationNames is the names a declaring call can spell for function: the
+// name itself, and without a trailing `!` or `?`, as `define :get` makes
+// `get!` and `flag :active` makes `active?`.
+func declarationNames(function string) []string {
+	names := []string{function}
+	if base := strings.TrimRight(function, "!?"); base != function && base != "" {
+		names = append(names, base)
+	}
+	return names
 }
 
 // blankHeredocs replaces the lines inside heredocs with empty lines, so that
@@ -250,34 +533,32 @@ func blankHeredocs(lines []string) []string {
 }
 
 // nearestDeclaringLine returns the 1-based line nearest to recorded that
-// declares function by name and that accept allows, or recorded when that is
-// ambiguous or not found. A nil accept allows every line.
-func nearestDeclaringLine(lines []string, recorded int, function string, accept func(line int) bool) int {
+// declares function by name and that accept allows. found is false, and the
+// line is recorded, when no line does or two are equally near. A nil accept
+// allows every line.
+func nearestDeclaringLine(lines []string, recorded int, function string, accept func(line int) bool) (line int, found bool) {
 	if function == "" || recorded < 1 {
-		return recorded
+		return recorded, false
 	}
-	names := []string{function}
-	if base := strings.TrimRight(function, "!?"); base != function && base != "" {
-		names = append(names, base)
-	}
+	names := declarationNames(function)
 	declares := func(line int) bool {
 		return line >= 1 && line <= len(lines) && (accept == nil || accept(line)) && lineDeclaresAtom(lines[line-1], names)
 	}
 	if declares(recorded) {
-		return recorded
+		return recorded, true
 	}
 	for distance := 1; recorded-distance >= 1 || recorded+distance <= len(lines); distance++ {
 		above, below := declares(recorded-distance), declares(recorded+distance)
 		switch {
 		case above && below:
-			return recorded
+			return recorded, false
 		case above:
-			return recorded - distance
+			return recorded - distance, true
 		case below:
-			return recorded + distance
+			return recorded + distance, true
 		}
 	}
-	return recorded
+	return recorded, false
 }
 
 // lineDeclaresAtom reports whether text is a call whose first argument is one

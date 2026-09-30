@@ -3639,6 +3639,14 @@ func (s *Server) resolveBareFunctionModuleWithOrigin(filePath, text string, tf *
 		return "Kernel", false
 	}
 
+	// An imported module can export a function that a macro generated, which
+	// only its BEAM knows about.
+	for _, mod := range imports {
+		if _, found := s.generatedSymbol(mod, "", functionName); found {
+			return mod, false
+		}
+	}
+
 	// Slow fallback: function may be injected into an imported module via its
 	// own use chain (e.g. MyApp.Factory uses ExMachina, which injects `insert`).
 	for _, mod := range imports {

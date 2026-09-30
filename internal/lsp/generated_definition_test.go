@@ -3,6 +3,7 @@ package lsp
 import (
 	"context"
 	"encoding/binary"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -300,8 +301,9 @@ func TestLookupNameGeneratedFunctionUsesDebugInfoLine(t *testing.T) {
 	}
 }
 
-// Without a recorded line, a strict lookup still answers with the module.
-func TestLookupNameStrictGeneratedFunctionWithoutLineKeepsModule(t *testing.T) {
+// Without a recorded line, the call that declared the function is found in
+// the module, and a strict lookup takes it: it is the function's own place.
+func TestLookupNameStrictGeneratedFunctionWithoutLineFindsDeclaration(t *testing.T) {
 	server, domainPath := newGeneratedDefinitionFixture(t, generatedDomainRel,
 		dbgiDefinition{name: "get_room_by_slug!", arity: 1, line: 1, keepFile: "deps/shared_lib/lib/interface.ex", keepLine: 1112},
 	)
@@ -309,20 +311,20 @@ func TestLookupNameStrictGeneratedFunctionWithoutLineKeepsModule(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(locations) != 1 || locations[0].FilePath != domainPath || locations[0].Line != generatedModuleLine {
-		t.Fatalf("expected %s:%d, got %#v", domainPath, generatedModuleLine, locations)
+	if len(locations) != 1 || locations[0].FilePath != domainPath || locations[0].Line != generatedDefineLine {
+		t.Fatalf("expected %s:%d, got %#v", domainPath, generatedDefineLine, locations)
 	}
 }
 
 // A library's `quote location: :keep` names the library's own file. That is
 // the generator, not the declaration, and :line only says where the
-// before-compile hook ran, which is no better than the module itself.
-func TestDefinitionGeneratedFunctionForeignLocationKeepsModuleLine(t *testing.T) {
+// before-compile hook ran. The module's body still has the declaring call.
+func TestDefinitionGeneratedFunctionForeignLocationFindsDeclaration(t *testing.T) {
 	server, domainPath := newGeneratedDefinitionFixture(t, generatedDomainRel,
 		dbgiDefinition{name: "get_room_by_slug!", arity: 1, line: 1, keepFile: "deps/shared_lib/lib/interface.ex", keepLine: 1112},
 	)
 	locations := generatedDefinitionAt(t, server, generatedCallerRel, generatedCallerSource, 4, 10)
-	expectSingleLocation(t, locations, domainPath, generatedModuleLine)
+	expectSingleLocation(t, locations, domainPath, generatedDefineLine)
 }
 
 // Dexter cannot compile the project, so a BEAM older than its source is the
@@ -492,7 +494,7 @@ end`, "\n")
 				tc.recorded = 2
 				tc.want = 2
 			}
-			if got := nearestDeclaringLine(text, tc.recorded, tc.function, nil); got != tc.want {
+			if got, _ := nearestDeclaringLine(text, tc.recorded, tc.function, nil); got != tc.want {
 				t.Errorf("nearestDeclaringLine(%d, %q) = %d, want %d", tc.recorded, tc.function, got, tc.want)
 			}
 		})
@@ -581,10 +583,10 @@ func TestDefinitionGeneratedFunctionFollowsDriftAboveModule(t *testing.T) {
 // its end, and a line with nothing left to move to is not returned.
 func TestNearestDeclaringLinePastEndOfFile(t *testing.T) {
 	lines := []string{"defmodule A do", "  define :rename", "end"}
-	if got := nearestDeclaringLine(lines, 19, "rename", nil); got != 2 {
+	if got, _ := nearestDeclaringLine(lines, 19, "rename", nil); got != 2 {
 		t.Errorf("nearestDeclaringLine past the end = %d, want 2", got)
 	}
-	if got := nearestDeclaringLine(lines, 19, "missing", nil); got != 19 {
+	if got, _ := nearestDeclaringLine(lines, 19, "missing", nil); got != 19 {
 		t.Errorf("nearestDeclaringLine without a match = %d, want the recorded 19", got)
 	}
 }
@@ -682,7 +684,7 @@ func TestNearestDeclaringLineSkipsHeredocs(t *testing.T) {
     define :get_room_by_slug
   end
 end`, "\n"))
-	if got := nearestDeclaringLine(lines, 4, "get_room_by_slug!", nil); got != 9 {
+	if got, _ := nearestDeclaringLine(lines, 4, "get_room_by_slug!", nil); got != 9 {
 		t.Errorf("nearestDeclaringLine = %d, want 9, past the @moduledoc example", got)
 	}
 }
@@ -807,8 +809,9 @@ end
 }
 
 // A generator can give a def any line, such as `quote line: 99`. Even from a
-// current BEAM, a line past the end of the file is not a place to go.
-func TestDefinitionGeneratedFunctionLinePastEndOfFileKeepsModuleLine(t *testing.T) {
+// current BEAM, a line past the end of the file is not a place to go; the
+// declaring call is.
+func TestDefinitionGeneratedFunctionLinePastEndOfFileFindsDeclaration(t *testing.T) {
 	server, domainPath := newGeneratedDefinitionFixture(t, generatedDomainRel,
 		dbgiDefinition{name: "get_room_by_slug!", arity: 1, line: 99, keepFile: "deps/shared_lib/lib/interface.ex", keepLine: 1112},
 	)
@@ -818,5 +821,100 @@ func TestDefinitionGeneratedFunctionLinePastEndOfFileKeepsModuleLine(t *testing.
 		t.Fatal(err)
 	}
 	locations := generatedDefinitionAt(t, server, generatedCallerRel, generatedCallerSource, 4, 10)
-	expectSingleLocation(t, locations, domainPath, generatedModuleLine)
+	expectSingleLocation(t, locations, domainPath, generatedDefineLine)
+}
+
+// With no line from the BEAM and no call that declares the name, the module
+// is still the answer. Two declaring calls are no better than none.
+func TestDefinitionGeneratedFunctionWithoutDeclarationKeepsModuleLine(t *testing.T) {
+	for _, tc := range []struct {
+		name, source string
+	}{
+		{"no declaring call", strings.Replace(generatedDomainSource, "      define :get_room_by_slug, action: :read, get_by: [:slug]\n", "", 1)},
+		{"two declaring calls", strings.Replace(generatedDomainSource, "      define :list_rooms, action: :read\n", "      define :get_room_by_slug, action: :read\n", 1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server, domainPath := newGeneratedDefinitionFixture(t, generatedDomainRel,
+				dbgiDefinition{name: "get_room_by_slug!", arity: 1, line: 1, keepFile: "deps/shared_lib/lib/interface.ex", keepLine: 1112},
+			)
+			indexFile(t, server.store, server.projectRoot, generatedDomainRel, tc.source)
+			locations := generatedDefinitionAt(t, server, generatedCallerRel, generatedCallerSource, 4, 10)
+			expectSingleLocation(t, locations, domainPath, generatedModuleLine)
+		})
+	}
+}
+
+func TestLineDefinesUnquotedName(t *testing.T) {
+	for text, want := range map[string]bool{
+		"    def unquote(name)(), do: name":    true,
+		"  defp unquote(fun)(x) do":            true,
+		"  defmacro unquote(name)(opts)":       true,
+		"  def named(), do: :ok":               false,
+		"  # def unquote(name)()":              false,
+		"  quote do: def(unquote(name)(), do:": false,
+	} {
+		if got := lineDefinesUnquotedName(text); got != want {
+			t.Errorf("lineDefinesUnquotedName(%q) = %v, want %v", text, got, want)
+		}
+	}
+}
+
+// The compiled module records where its source defs were; the current text
+// says where they are now. Anchors that moved together move the line; anchors
+// that did not locate a single `def unquote` between them, or nothing.
+func TestAnchoredLine(t *testing.T) {
+	info := beam.DebugInfo{
+		ModuleLine: 1,
+		Anchors: map[beam.FunctionKey]int{
+			{Name: "before_loop", Arity: 0}: 2,
+			{Name: "looped", Arity: 0}:      5,
+			{Name: "after_loop", Arity: 0}:  8,
+		},
+	}
+	compiled := "defmodule A do\n  def before_loop, do: 1\n\n  for n <- [:looped] do\n    def unquote(n)(), do: n\n  end\n\n  defp after_loop, do: 2\nend\n"
+	for _, tc := range []struct {
+		name, text string
+		want       int
+		wantOK     bool
+	}{
+		{"moved together", "# x\n# y\n" + compiled, 7, true},
+		{"edit between, one unquoted def", strings.Replace(compiled, "  for n", "  # x\n  for n", 1), 6, true},
+		{"edit between, a generated def with no unquoted line", strings.Replace(compiled, "  for n", "  # x\n  for n", 1), 0, false},
+		{"edit between, two unquoted defs", strings.Replace(compiled, "  for n", "  for m <- [:b] do\n    def unquote(m)(), do: m\n  end\n  for n", 1), 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := &currentSource{path: "a.ex", text: tc.text, lines: blankHeredocs(strings.Split(tc.text, "\n")), changed: true}
+			compiledInfo := info
+			if strings.HasPrefix(tc.name, "edit between, a generated def") {
+				// A DSL call also generated a def between the anchors; the one
+				// unquoted line cannot stand for both.
+				compiledInfo.Anchors = maps.Clone(info.Anchors)
+				compiledInfo.Anchors[beam.FunctionKey{Name: "from_dsl", Arity: 0}] = 3
+			}
+			got, ok := src.anchoredLine("A", "A", 5, compiledInfo)
+			if got != tc.want || ok != tc.wantOK {
+				t.Errorf("anchoredLine = %d, %v; want %d, %v", got, ok, tc.want, tc.wantOK)
+			}
+		})
+	}
+}
+
+// A BEAM's mtime has whole seconds, so a source saved in the same second as the
+// compile is not newer than its BEAM.
+func TestNewerBySecond(t *testing.T) {
+	const second = int64(time.Second)
+	beam := 100 * second
+	for _, tc := range []struct {
+		mtime int64
+		want  bool
+	}{
+		{beam, false},
+		{beam + second/2, false},
+		{beam + second, true},
+		{beam - 1, false},
+	} {
+		if got := newerBySecond(tc.mtime, beam); got != tc.want {
+			t.Errorf("newerBySecond(%d, %d) = %v, want %v", tc.mtime, beam, got, tc.want)
+		}
+	}
 }

@@ -3,6 +3,7 @@ package beam
 import (
 	"errors"
 	"fmt"
+	"slices"
 )
 
 // maxDebugInfoDepth bounds recursion while stepping over clause bodies. Each
@@ -28,9 +29,24 @@ type DebugInfo struct {
 	File         string
 	RelativeFile string
 
+	// ModuleLine is the line of the module itself in File: its defmodule, or
+	// wherever Module.create was called. Zero if the chunk has none.
+	ModuleLine int
+
 	// Lines maps each public function and macro to its line in File. Entries
 	// without a usable line are absent.
 	Lines map[FunctionKey]int
+
+	// Clauses holds the line of each clause for a public definition whose
+	// clauses were made at more than one line, in clause order: a DSL that
+	// adds one clause per call, such as `route :get, "/a"`. Definitions with
+	// one line are absent; Lines has it.
+	Clauses map[FunctionKey][]int
+
+	// Anchors maps every definition, private ones included, to its :line as
+	// compiled. Comparing these with the same definitions in the current
+	// source shows how far the source has moved since the compile.
+	Anchors map[FunctionKey]int
 }
 
 // ReadDefinitionLines reads the line of every public definition from an Elixir
@@ -67,10 +83,12 @@ var errNoElixirDebugInfo = errors.New("no Elixir debug info")
 // source path is known: small maps put definitions ahead of file and
 // relative_file, so they cannot be resolved while walking.
 type definitionSite struct {
-	key      FunctionKey
-	line     int
-	keepFile string
-	keepLine int
+	key         FunctionKey
+	public      bool
+	line        int
+	keepFile    string
+	keepLine    int
+	clauseLines []int
 }
 
 // parseDebugInfo walks {:debug_info_v1, :elixir_erl, {:elixir_v1, map, specs}}.
@@ -148,6 +166,10 @@ func parseDebugInfo(buf []byte) (info DebugInfo, err error) {
 			if info.RelativeFile, err = readOptionalBinary(r); err != nil {
 				return DebugInfo{}, err
 			}
+		case "anno":
+			if info.ModuleLine, err = readAnnoLine(r); err != nil {
+				return DebugInfo{}, err
+			}
 		default:
 			if err := r.skip(); err != nil {
 				return DebugInfo{}, err
@@ -160,23 +182,41 @@ func parseDebugInfo(buf []byte) (info DebugInfo, err error) {
 	}
 
 	info.Lines = make(map[FunctionKey]int, len(sites))
+	info.Anchors = make(map[FunctionKey]int, len(sites))
 	for _, site := range sites {
+		if site.line > 0 {
+			if _, seen := info.Anchors[site.key]; !seen {
+				info.Anchors[site.key] = site.line
+			}
+		}
+		if !site.public {
+			continue
+		}
 		line := site.line
-		if site.keepFile != "" && site.keepLine > 0 &&
-			(site.keepFile == info.RelativeFile || site.keepFile == info.File) {
+		stamped := site.keepFile != "" && site.keepLine > 0 &&
+			(site.keepFile == info.RelativeFile || site.keepFile == info.File)
+		if stamped {
 			line = site.keepLine
 		}
 		if line > 0 {
 			info.Lines[site.key] = line
+		}
+		// A stamped def names its own line; its clauses' lines are the
+		// generator's, so only an unstamped def's clauses are kept.
+		if !stamped && len(site.clauseLines) > 1 {
+			if info.Clauses == nil {
+				info.Clauses = make(map[FunctionKey][]int)
+			}
+			info.Clauses[site.key] = site.clauseLines
 		}
 	}
 	return info, nil
 }
 
 // readDefinitionSites reads the definitions list, whose entries are
-// {{name, arity}, kind, meta, clauses}. Private definitions are skipped:
-// generated functions are found through the export table, so only public ones
-// can be asked about.
+// {{name, arity}, kind, meta, clauses}. Private definitions are kept only as
+// anchors: generated functions are found through the export table, so only
+// public ones can be asked about.
 func readDefinitionSites(r *etfReader) ([]definitionSite, error) {
 	count, hasTail, err := r.enterList()
 	if err != nil {
@@ -214,16 +254,14 @@ func readDefinitionSites(r *etfReader) ([]definitionSite, error) {
 		if err != nil {
 			return nil, err
 		}
-		site := definitionSite{key: FunctionKey{Name: name, Arity: functionArity}}
+		site := definitionSite{key: FunctionKey{Name: name, Arity: functionArity}, public: kind == "def" || kind == "defmacro"}
 		if err := readDefinitionMeta(r, &site); err != nil {
 			return nil, err
 		}
-		if err := r.skip(); err != nil { // clauses
+		if site.clauseLines, err = readClauseLines(r); err != nil {
 			return nil, err
 		}
-		if kind == "def" || kind == "defmacro" {
-			sites = append(sites, site)
-		}
+		sites = append(sites, site)
 	}
 	if hasTail {
 		if err := r.skip(); err != nil {
@@ -231,6 +269,58 @@ func readDefinitionSites(r *etfReader) ([]definitionSite, error) {
 		}
 	}
 	return sites, nil
+}
+
+// readClauseLines reads the distinct :line of each {meta, args, guards, body}
+// clause, in order, and steps over everything else without allocating. A value
+// that is not a list is skipped.
+func readClauseLines(r *etfReader) ([]int, error) {
+	if tag, err := r.peekTag(); err != nil {
+		return nil, err
+	} else if tag != tagList && tag != tagNil {
+		return nil, r.skip()
+	}
+	count, hasTail, err := r.enterList()
+	if err != nil {
+		return nil, err
+	}
+	var lines []int
+	for i := int64(0); i < count; i++ {
+		if tag, err := r.peekTag(); err != nil {
+			return nil, err
+		} else if tag != tagSmallTuple {
+			if err := r.skip(); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		arity, err := r.enterTuple()
+		if err != nil {
+			return nil, err
+		}
+		if arity != 4 {
+			if err := r.skipTerms(int64(arity)); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		var clause definitionSite
+		if err := readDefinitionMeta(r, &clause); err != nil {
+			return nil, err
+		}
+		if err := r.skipTerms(3); err != nil { // args, guards, body
+			return nil, err
+		}
+		if clause.line > 0 && !slices.Contains(lines, clause.line) {
+			lines = append(lines, clause.line)
+		}
+	}
+	if hasTail {
+		if err := r.skip(); err != nil {
+			return nil, err
+		}
+	}
+	return lines, nil
 }
 
 // readDefinitionMeta reads :line and a `file: {path, line}` entry from a
