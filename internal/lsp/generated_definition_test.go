@@ -891,7 +891,7 @@ func TestAnchoredLine(t *testing.T) {
 				compiledInfo.Anchors = maps.Clone(info.Anchors)
 				compiledInfo.Anchors[beam.FunctionKey{Name: "from_dsl", Arity: 0}] = 3
 			}
-			got, ok := src.anchoredLine("A", "A", 5, compiledInfo)
+			got, ok := src.anchoredLine("A", "A", 5, compiledInfo, nil)
 			if got != tc.want || ok != tc.wantOK {
 				t.Errorf("anchoredLine = %d, %v; want %d, %v", got, ok, tc.want, tc.wantOK)
 			}
@@ -917,4 +917,24 @@ func TestNewerBySecond(t *testing.T) {
 			t.Errorf("newerBySecond(%d, %d) = %v, want %v", tc.mtime, beam, got, tc.want)
 		}
 	}
+}
+
+// Lines removed above the module in an unsaved buffer move the declaration
+// above the module line the index still has. The module line of the current
+// text is the one that counts.
+func TestDefinitionGeneratedFunctionLinesRemovedAboveModule(t *testing.T) {
+	header := strings.Repeat("# header\n", 10)
+	server, domainPath := newGeneratedDefinitionFixture(t, generatedDomainRel,
+		dbgiDefinition{name: "get_room_by_slug!", arity: 1, line: generatedDefineLine + 10, keepFile: "deps/ash/lib/ash/code_interface.ex", keepLine: 1112},
+	)
+	// The index and the BEAM have the header: the module is at 12, the define at 18.
+	indexFile(t, server.store, server.projectRoot, generatedDomainRel, header+generatedDomainSource)
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(domainPath, past, past); err != nil {
+		t.Fatal(err)
+	}
+	// The buffer does not: the define is at 8, before the index's module line.
+	server.docs.Set(string(uri.File(domainPath)), generatedDomainSource)
+	locations := generatedDefinitionAt(t, server, generatedCallerRel, generatedCallerSource, 4, 10)
+	expectSingleLocation(t, locations, domainPath, generatedDefineLine)
 }

@@ -47,6 +47,14 @@ const compiledDslSource = `defmodule Weird.Dsl do
     quote do: def(match(unquote(verb), unquote(path)), do: {unquote(verb), unquote(path)})
   end
 
+  defmacro plug(_name), do: nil
+
+  defmacro keep_route(name, verb) do
+    quote bind_quoted: [name: name, verb: verb], location: :keep do
+      def unquote(name)(unquote(verb)), do: unquote(verb)
+    end
+  end
+
   defmacro with_default(name), do: quote(do: def(unquote(name)(value \\ 1), do: value))
 
   defmacro elsewhere(name) do
@@ -96,8 +104,13 @@ const compiledUserSource = `defmodule Weird.User do
 
   pinned :pinned_fun
 
+  plug :match
+
   route :get, "/a"
   route :post, "/b"
+
+  keep_route :handle, :get
+  keep_route :handle, :post
 
   with_default :defaulted
 
@@ -143,6 +156,7 @@ const compiledCallerSource = `defmodule Weird.Caller do
     Weird.User.deferred()
     Weird.User.pinned_fun()
     Weird.User.match(:get, "/a")
+    Weird.User.handle(:get)
     Weird.User.defaulted(2)
     Weird.Elsewhere.Remote.run()
     Weird.User.double(2)
@@ -277,6 +291,7 @@ func TestDefinition_GeneratedFunctionsFromCompiler(t *testing.T) {
 		{"@before_compile hook", "deferred(", 1, []string{user("later :deferred")}},
 		{"line past the end of the file", "pinned_fun(", 1, []string{user("pinned :pinned_fun")}},
 		{"one clause per call", "match(", 1, []string{user(`route :get`), user(`route :post`)}},
+		{"one location: :keep clause per call", "handle(", 1, []string{user("keep_route :handle, :get"), user("keep_route :handle, :post")}},
 		{"default arguments", "defaulted(", 1, []string{user("with_default :defaulted")}},
 		{"module from Module.create", "run()", 1, []string{user("elsewhere :remote")}},
 		{"generated defdelegate", "double(", 1, []string{user("delegate :double")}},
@@ -317,6 +332,9 @@ func TestDefinition_GeneratedFunctionsFromCompilerFollowEdits(t *testing.T) {
 		t.Cleanup(func() { indexFile(t, f.server.store, f.server.projectRoot, compiledUserRel, compiledUserSource) })
 		expectDefinition(t, f.definitionOf("two_level(", 1), at(compiledUserRel, edited, "outer :two_level", t))
 		expectDefinition(t, f.definitionOf("loop_b(", 1), at(compiledUserRel, edited, "def unquote(name)()", t))
+		// `plug :match` spells the name; the route clauses do not, and follow
+		// the edit instead of collapsing onto it.
+		expectDefinition(t, f.definitionOf("match(", 1), at(compiledUserRel, edited, "route :get", t), at(compiledUserRel, edited, "route :post", t))
 	})
 
 	t.Run("lines added in an unsaved buffer", func(t *testing.T) {

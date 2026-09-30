@@ -322,16 +322,17 @@ func (src *currentSource) currentModuleResults(results []store.LookupResult, own
 // Dexter cannot compile the project, so it reads the current text instead,
 // and only the body of owner, the module whose source holds the declarations:
 // a sibling module in the same file never matches, and without an owner no
-// line is moved. Two signals are used, most exact first:
+// line is moved. The signals, most exact first (see anchoredLine):
 //
+//   - The definitions the source still has on either side. The compiled
+//     module records their old lines and the current text has their new ones;
+//     when both moved by the same amount, so did this line.
 //   - A call whose first argument is the function's name as an atom, which is
 //     how a macro call names what it declares (`define :list_rooms`,
 //     `field :email`). The nearest wins; the recorded line is kept when it
 //     still declares the function, and two equally near matches count as none.
-//   - Otherwise, the definitions the source still has on either side. The
-//     compiled module records their old lines and the current text has their
-//     new ones, so the difference is how far this part of the file moved (see
-//     anchoredLine).
+//     It is not used for a function whose clauses several calls made.
+//   - A one-to-one match of generated defs to `def unquote(...)` lines.
 //
 // A line with neither signal is kept as recorded.
 func (src *currentSource) correctDrift(module, owner string, results []store.LookupResult, sources generatedDefinitionSources, functions []beam.Function) []store.LookupResult {
@@ -343,13 +344,24 @@ func (src *currentSource) correctDrift(module, owner string, results []store.Loo
 		names[function.Arity] = function.Name
 	}
 	inOwner := func(line int) bool { return src.ownerAt(line) == owner }
+	clauses := make(map[int]int, len(results))
+	for _, result := range results {
+		clauses[result.Arity]++
+	}
 	out := results[:0]
 	for _, result := range results {
-		line, found := nearestDeclaringLine(src.lines, result.Line, names[result.Arity], inOwner)
-		if !found {
-			if moved, ok := src.anchoredLine(module, owner, result.Line, sources.debugInfo); ok {
-				line = moved
+		byName := func() (int, bool) {
+			// Clauses made by several calls come from calls that do not spell
+			// the function's name (`get "/a"` makes a `match/2` clause), so a
+			// call that does, such as `plug :match`, is not one of them.
+			if clauses[result.Arity] > 1 {
+				return 0, false
 			}
+			return nearestDeclaringLine(src.lines, result.Line, names[result.Arity], inOwner)
+		}
+		line := result.Line
+		if moved, ok := src.anchoredLine(module, owner, result.Line, sources.debugInfo, byName); ok {
+			line = moved
 		}
 		if slices.ContainsFunc(out, func(r store.LookupResult) bool { return r.Line == line }) {
 			continue
@@ -365,13 +377,14 @@ func (src *currentSource) correctDrift(module, owner string, results []store.Loo
 // both have: the defs and the module lines of every module in the file whose
 // BEAM was compiled from it.
 //
-// When both anchors moved by the same amount, the line moved with them. When
-// they moved by different amounts, the edit was between them. Then the line is
-// placed only when every generated def between the anchors can be matched to a
-// line in owner that defines a function with an unquoted name
+// When both anchors moved by the same amount, the line moved with them.
+// Otherwise byName, if given, may place it by a call that declares the
+// function. Failing that, the edit was between the anchors, and the line is
+// placed only when every generated def between them can be matched to a line
+// in owner that defines a function with an unquoted name
 // (`def unquote(name)()`), one to one and in order: the shape a comprehension
 // leaves. Otherwise it is not placed.
-func (src *currentSource) anchoredLine(module, owner string, recorded int, info beam.DebugInfo) (int, bool) {
+func (src *currentSource) anchoredLine(module, owner string, recorded int, info beam.DebugInfo, byName func() (int, bool)) (int, bool) {
 	// Lines move for the whole file, so every module defined in it can serve
 	// as an anchor, not only this one: a nested module's line counts as much
 	// as a def. Another module's BEAM is used only when it was compiled from
@@ -428,6 +441,11 @@ func (src *currentSource) anchoredLine(module, owner string, recorded int, info 
 	}
 	if above != nil && below != nil && above.now-above.old == below.now-below.old {
 		return recorded + above.now - above.old, true
+	}
+	if byName != nil {
+		if line, ok := byName(); ok {
+			return line, true
+		}
 	}
 
 	// The edit was between the anchors. A def a comprehension generates has
