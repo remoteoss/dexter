@@ -48,6 +48,14 @@ const compiledDslSource = `defmodule Weird.Dsl do
 
   defmacro plug(_name), do: nil
 
+  defmacro helper(name) do
+    quote bind_quoted: [name: name] do
+      defmodule Module.concat(__MODULE__, Macro.camelize(Atom.to_string(name))) do
+        def run, do: :helper
+      end
+    end
+  end
+
   defmacro keep_route(name, verb) do
     quote bind_quoted: [name: name, verb: verb], location: :keep do
       def unquote(name)(unquote(verb)), do: unquote(verb)
@@ -123,6 +131,8 @@ const compiledUserSource = `defmodule Weird.User do
 
   stamped_field :stamped
 
+  helper :audit
+
   for name <- [:loop_a, :loop_b] do
     def unquote(name)(), do: unquote(name)
   end
@@ -151,6 +161,7 @@ const compiledCallerSource = `defmodule Weird.Caller do
     Weird.User.kept()
     Weird.User.stamped()
     Weird.User.loop_b()
+    Weird.User.Audit.run()
     Weird.User.Nested.nested?(%{})
     active?(%{})
     f = &Weird.User.two_level/0
@@ -278,6 +289,8 @@ func TestDefinition_GeneratedFunctionsFromCompiler(t *testing.T) {
 		{"@file stamp", "stamped(", 1, []string{user("stamped_field :stamped")}},
 		{"comprehension", "loop_b(", 1, []string{user("def unquote(name)()")}},
 		{"nested module", "nested?(", 1, []string{user("flag :nested")}},
+		{"function of a module a macro nested", "run()", 2, []string{user("helper :audit")}},
+		{"name of a module a macro nested", "Audit.run", 1, []string{user("helper :audit")}},
 		{"bare call through import", "active?(%{})", 2, []string{user("flag :active")}},
 		{"capture", "two_level/0", 1, []string{user("outer :two_level")}},
 	} {
@@ -314,6 +327,17 @@ func TestDefinition_GeneratedFunctionsFromCompilerWithStaleSource(t *testing.T) 
 		expectDefinition(t, f.definitionOf("match(", 1), compiled("route :get"), compiled("route :post"))
 	})
 
+	// The index then has the module below the recorded lines. The module
+	// line they are compared with comes from the same compile as they do,
+	// also for a module a macro nested in it.
+	t.Run("many lines added above, saved", func(t *testing.T) {
+		edited := strings.Repeat("# header\n", 40) + compiledUserSource
+		f.saveLater(compiledUserRel, edited)
+		t.Cleanup(func() { indexFile(t, f.server.store, f.server.projectRoot, compiledUserRel, compiledUserSource) })
+		expectDefinition(t, f.definitionOf("two_level(", 1), compiled("outer :two_level"))
+		expectDefinition(t, f.definitionOf("run()", 2), compiled("helper :audit"))
+	})
+
 	t.Run("lines added in an unsaved buffer", func(t *testing.T) {
 		edited := strings.Replace(compiledUserSource, "  outer :two_level\n", "  # one\n  # two\n  outer :two_level\n", 1)
 		userURI := string(uri.File(filepath.Join(f.server.projectRoot, compiledUserRel)))
@@ -326,10 +350,13 @@ func TestDefinition_GeneratedFunctionsFromCompilerWithStaleSource(t *testing.T) 
 	})
 
 	t.Run("file shorter than the recorded line", func(t *testing.T) {
-		edited := "defmodule Weird.User do\n  use Weird.Dsl\n  outer :two_level\nend\n"
+		edited := "defmodule Weird.User do\n  use Weird.Dsl\n  plug :match\n  outer :two_level\nend\n"
 		f.saveLater(compiledUserRel, edited)
 		t.Cleanup(func() { indexFile(t, f.server.store, f.server.projectRoot, compiledUserRel, compiledUserSource) })
 		expectDefinition(t, f.definitionOf("gen_1500(", 1), compiledUserRel+":1")
+		// The route clauses are gone; `plug :match` spells the name but is not
+		// where a clause was declared.
+		expectDefinition(t, f.definitionOf("match(", 1), compiledUserRel+":1")
 		expectDefinition(t, f.definitionOf("two_level(", 1), compiled("outer :two_level"))
 	})
 }

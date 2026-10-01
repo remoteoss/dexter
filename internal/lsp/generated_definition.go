@@ -78,6 +78,7 @@ func (s *Server) generatedDefinitionResultsFor(module, beamPath string, function
 		return results, false
 	}
 	if result, found, ambiguous := sources.bestDescribedResult(results); found {
+		result.Line = s.compiledModuleLine(module, owner, result.Line, sources)
 		if lines := recordedLinesIn(module, owner, result, s.currentSourceOf(result.FilePath), sources, functions); len(lines) > 0 {
 			return lines, true
 		}
@@ -93,6 +94,25 @@ func (s *Server) generatedDefinitionResultsFor(module, beamPath string, function
 		}
 	}
 	return results, false
+}
+
+// compiledModuleLine returns owner's line as the BEAM that holds it recorded
+// it, so that it compares with the recorded function lines, which are from a
+// compile too: the index has the line in the current text, which an edit since
+// the compile has moved. The BEAM is module's own when owner is module, and
+// the parent's when module is a generated module nested in it. The index's
+// line is the fallback when neither BEAM records one.
+func (s *Server) compiledModuleLine(module, owner string, indexed int, sources generatedDefinitionSources) int {
+	if owner == module {
+		if line := sources.debugInfo.ModuleLine; line > 0 {
+			return line
+		}
+		return indexed
+	}
+	if ownerSources, ok := s.generatedDefinitionSourcesFor(owner, ""); ok && ownerSources.debugInfo.ModuleLine > 0 {
+		return ownerSources.debugInfo.ModuleLine
+	}
+	return indexed
 }
 
 // generatedModuleLocation is where a module that exists only as a BEAM is
@@ -120,9 +140,9 @@ func (s *Server) generatedModuleLocation(module string) []store.LookupResult {
 // recordedLinesIn returns a result for each distinct line in result's file
 // that the compiled module records for functions, after the module's own line.
 //
-// Both lines come from the same compile: the module's line is the one the BEAM
-// records when it has one, and the index's otherwise. So the comparison holds
-// even when the file has changed since. A line past the end of the current
+// result.Line is the module's line from the same compile as the function lines
+// (see compiledModuleLine), so the comparison holds even when the file has
+// changed since. A line past the end of the current
 // text is dropped, because a generator can give a def any line
 // (`quote line: 99`) and an edit can remove lines: an editor is never sent to
 // a line the file does not have.
@@ -135,14 +155,15 @@ func recordedLinesIn(module, owner string, result store.LookupResult, src *curre
 	if src == nil {
 		return nil
 	}
-	moduleLine := result.Line
-	if owner == module && sources.debugInfo.ModuleLine > 0 {
-		moduleLine = sources.debugInfo.ModuleLine
-	}
-	lines := slices.DeleteFunc(generatedFunctionLines(module, result.FilePath, sources, functions), func(r store.LookupResult) bool {
-		return r.Line <= moduleLine || r.Line > len(src.lines)
+	recorded := generatedFunctionLines(module, result.FilePath, sources, functions)
+	// Clauses made at several lines come from calls that do not spell the
+	// function's name (`get "/a"` makes a `match/2` clause), so a call that
+	// does, such as `plug :match`, is not where they were declared.
+	severalClauses := len(recorded) > len(functions)
+	lines := slices.DeleteFunc(recorded, func(r store.LookupResult) bool {
+		return r.Line <= result.Line || r.Line > len(src.lines)
 	})
-	if len(lines) > 0 || owner == "" {
+	if len(lines) > 0 || owner == "" || severalClauses {
 		return lines
 	}
 	if line, ok := src.uniqueDeclaration(owner, functions); ok {
