@@ -622,6 +622,26 @@ end
 	}
 }
 
+// A declaring call whose argument opens a heredoc still declares its name;
+// only the heredoc's body is blanked.
+func TestUniqueDeclarationKeepsCallThatOpensHeredoc(t *testing.T) {
+	text := `defmodule MyApp.Chat do
+  resources do
+    define :get_room_by_slug, description: """
+    define :list_rooms
+    """
+  end
+end
+`
+	src := &currentSource{text: text, lines: blankHeredocs(strings.Split(text, "\n"))}
+	if got, ok := src.uniqueDeclaration("MyApp.Chat", []beam.Function{{Name: "get_room_by_slug!", Arity: 1}}); !ok || got != 3 {
+		t.Errorf("uniqueDeclaration(get_room_by_slug!) = %d, %v; want 3, the call that opens the heredoc", got, ok)
+	}
+	if got, ok := src.uniqueDeclaration("MyApp.Chat", []beam.Function{{Name: "list_rooms", Arity: 0}}); ok {
+		t.Errorf("uniqueDeclaration(list_rooms) = %d; want none, the only match is inside the heredoc", got)
+	}
+}
+
 // A file that a request read from disk, without opening it, is only a cache.
 // If the file then changes and is compiled again, the cache is old text, not
 // unsaved edits, and a current BEAM's line must not be corrected against it.

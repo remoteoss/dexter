@@ -275,12 +275,15 @@ func declarationNames(function string) []string {
 
 // blankHeredocs replaces the lines inside heredocs with empty lines, so that
 // an example in a @moduledoc or @doc, such as `define :foo`, is not taken for
-// a declaration. Line numbers do not change.
+// a declaration. The line that opens a heredoc keeps its text before the
+// delimiter, as `define :foo, description: """` still declares foo. Line
+// numbers do not change.
 func blankHeredocs(lines []string) []string {
 	out := make([]string, len(lines))
 	var open string
 	for i, line := range lines {
 		inside := open != ""
+		opened := -1
 		for _, delimiter := range []string{`"""`, "'''"} {
 			if open != "" && open != delimiter {
 				continue
@@ -288,13 +291,17 @@ func blankHeredocs(lines []string) []string {
 			if strings.Count(line, delimiter)%2 == 1 {
 				if open == "" {
 					open = delimiter
+					opened = strings.LastIndex(line, delimiter)
 				} else {
 					open = ""
 				}
 			}
 		}
-		if !inside && open == "" {
+		switch {
+		case !inside && open == "":
 			out[i] = line
+		case !inside && opened >= 0:
+			out[i] = line[:opened]
 		}
 	}
 	return out
