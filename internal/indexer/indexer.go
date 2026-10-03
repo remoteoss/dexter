@@ -48,6 +48,12 @@ type Options struct {
 	// accumulates should still not assume single-threaded access from any other
 	// caller.
 	Warn func(format string, args ...interface{})
+
+	// FileError is called, after Warn, for each file that could not be read or
+	// parsed. Optional. The LSP server uses it to tell the user how many files
+	// are missing from the index. It is called from every parse worker, so it
+	// must be safe for concurrent use.
+	FileError func(path string, err error)
 }
 
 // serialWarn returns a callback that forwards to Warn under a mutex. Options is
@@ -190,6 +196,9 @@ func FullBuild(s *store.Store, projectRoot string, opts Options) (Stats, error) 
 				defs, refs, err := parser.ParseFile(f.path)
 				if err != nil {
 					warn("%s: %v", f.path, err)
+					if opts.FileError != nil {
+						opts.FileError(f.path, err)
+					}
 					continue
 				}
 				parseNanos.Add(int64(time.Since(t0)))

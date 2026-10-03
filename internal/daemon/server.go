@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/remoteoss/dexter/internal/lsp"
+	"github.com/remoteoss/dexter/internal/notify"
 	"github.com/remoteoss/dexter/internal/version"
 	"github.com/remoteoss/dexter/internal/workspace"
 )
@@ -96,6 +97,29 @@ type WorkspaceStatus struct {
 	Definitions          int             `json:"definitions"`
 	References           int             `json:"references"`
 	Sessions             []SessionStatus `json:"sessions,omitempty"`
+	// Conditions are the failures and degraded states that are active now,
+	// the same ones that attached editors see.
+	Conditions []Note `json:"conditions,omitempty"`
+}
+
+// Note is one active condition of the workspace, for a frontend that cannot
+// show LSP messages. Key names the condition (for example "index.rebuild");
+// Severity is "error", "warning", or "info".
+type Note struct {
+	Key      string `json:"key,omitempty"`
+	Severity string `json:"severity"`
+	Message  string `json:"message"`
+}
+
+func notesFrom(conditions []notify.Condition) []Note {
+	if len(conditions) == 0 {
+		return nil
+	}
+	out := make([]Note, len(conditions))
+	for i, c := range conditions {
+		out[i] = Note{Key: c.Key, Severity: c.Severity.String(), Message: c.Message}
+	}
+	return out
 }
 
 // StatusParams optionally waits for the initial reconciliation before
@@ -120,18 +144,21 @@ type LookupParams struct {
 }
 
 // LookupResult travels in the location encoding described at locationsWire.
+// Notes are the active conditions of the index, such as a rebuild, so that a
+// result from an incomplete index is not taken as complete.
 type LookupResult struct {
 	Locations []lsp.NameLocation
 	Ready     bool
+	Notes     []Note
 }
 
 func (r LookupResult) MarshalJSON() ([]byte, error) {
-	return marshalLocations(r.Locations, r.Ready)
+	return marshalLocations(r.Locations, r.Ready, r.Notes)
 }
 
 func (r *LookupResult) UnmarshalJSON(data []byte) error {
 	var err error
-	r.Locations, r.Ready, err = unmarshalLocations(data)
+	r.Locations, r.Ready, r.Notes, err = unmarshalLocations(data)
 	return err
 }
 
@@ -146,15 +173,16 @@ type ReferencesParams struct {
 type ReferencesResult struct {
 	Locations []lsp.NameLocation
 	Ready     bool
+	Notes     []Note
 }
 
 func (r ReferencesResult) MarshalJSON() ([]byte, error) {
-	return marshalLocations(r.Locations, r.Ready)
+	return marshalLocations(r.Locations, r.Ready, r.Notes)
 }
 
 func (r *ReferencesResult) UnmarshalJSON(data []byte) error {
 	var err error
-	r.Locations, r.Ready, err = unmarshalLocations(data)
+	r.Locations, r.Ready, r.Notes, err = unmarshalLocations(data)
 	return err
 }
 
@@ -167,6 +195,7 @@ type locationsWire struct {
 	Files     []string       `json:"files"`
 	Locations []locationWire `json:"locations"`
 	Ready     bool           `json:"ready"`
+	Notes     []Note         `json:"notes,omitempty"`
 }
 
 type locationWire struct {
@@ -177,11 +206,12 @@ type locationWire struct {
 	Declaration bool   `json:"declaration,omitempty"`
 }
 
-func marshalLocations(locations []lsp.NameLocation, ready bool) ([]byte, error) {
+func marshalLocations(locations []lsp.NameLocation, ready bool, notes []Note) ([]byte, error) {
 	wire := locationsWire{
 		Files:     []string{},
 		Locations: make([]locationWire, len(locations)),
 		Ready:     ready,
+		Notes:     notes,
 	}
 	fileIndex := make(map[string]int)
 	for i, location := range locations {
@@ -202,15 +232,15 @@ func marshalLocations(locations []lsp.NameLocation, ready bool) ([]byte, error) 
 	return json.Marshal(wire)
 }
 
-func unmarshalLocations(data []byte) ([]lsp.NameLocation, bool, error) {
+func unmarshalLocations(data []byte) ([]lsp.NameLocation, bool, []Note, error) {
 	var wire locationsWire
 	if err := json.Unmarshal(data, &wire); err != nil {
-		return nil, false, err
+		return nil, false, nil, err
 	}
 	locations := make([]lsp.NameLocation, len(wire.Locations))
 	for i, location := range wire.Locations {
 		if location.File < 0 || location.File >= len(wire.Files) {
-			return nil, false, fmt.Errorf("location %d names file %d of %d", i, location.File, len(wire.Files))
+			return nil, false, nil, fmt.Errorf("location %d names file %d of %d", i, location.File, len(wire.Files))
 		}
 		locations[i] = lsp.NameLocation{
 			FilePath:      wire.Files[location.File],
@@ -220,7 +250,7 @@ func unmarshalLocations(data []byte) ([]lsp.NameLocation, bool, error) {
 			IsDeclaration: location.Declaration,
 		}
 	}
-	return locations, wire.Ready, nil
+	return locations, wire.Ready, wire.Notes, nil
 }
 
 type ReindexParams struct {
@@ -234,6 +264,8 @@ type ReindexResult struct {
 	// already matches the disk, and the watcher may simply have pruned a
 	// deleted file first. A mistyped path is the usual cause.
 	Missing bool `json:"missing,omitempty"`
+	// Notes are the active conditions of the index after the reindex.
+	Notes []Note `json:"notes,omitempty"`
 }
 
 // WatchParams subscribes a connection to coalesced index mutations.
@@ -838,6 +870,7 @@ func (s *server) handleRequest(c *conn, mc MethodContext, req request) (any, err
 			Root: st.Root, Ready: st.Ready, Watching: st.Watching, StdlibRoot: st.StdlibRoot,
 			IndexVersion: st.IndexVersion, ExpectedIndexVersion: st.ExpectedIndexVersion,
 			Files: st.Files, Definitions: st.Definitions, References: st.References,
+			Conditions: notesFrom(s.runtime.Reporter().Conditions()),
 		}
 		for _, sess := range s.runtime.Sessions() {
 			out.Sessions = append(out.Sessions, SessionStatus{
@@ -861,7 +894,7 @@ func (s *server) handleRequest(c *conn, mc MethodContext, req request) (any, err
 		if err != nil {
 			return nil, err
 		}
-		return LookupResult{Locations: locations, Ready: s.runtime.IsReady()}, err
+		return LookupResult{Locations: locations, Ready: s.runtime.IsReady(), Notes: notesFrom(s.runtime.IndexConditions())}, err
 	case MethodReferences:
 		var params ReferencesParams
 		if err := json.Unmarshal(req.Params, &params); err != nil {
@@ -875,7 +908,7 @@ func (s *server) handleRequest(c *conn, mc MethodContext, req request) (any, err
 		if err != nil {
 			return nil, err
 		}
-		return ReferencesResult{Locations: locations, Ready: s.runtime.IsReady()}, err
+		return ReferencesResult{Locations: locations, Ready: s.runtime.IsReady(), Notes: notesFrom(s.runtime.IndexConditions())}, err
 	case MethodReindex:
 		var params ReindexParams
 		if err := json.Unmarshal(req.Params, &params); err != nil {
@@ -897,7 +930,7 @@ func (s *server) handleRequest(c *conn, mc MethodContext, req request) (any, err
 			}
 			err = s.runtime.ReindexPath(mc.Context, params.Target)
 		}
-		return ReindexResult{Elapsed: time.Since(start).Round(time.Millisecond), Missing: missing}, err
+		return ReindexResult{Elapsed: time.Since(start).Round(time.Millisecond), Missing: missing, Notes: notesFrom(s.runtime.IndexConditions())}, err
 	case MethodWatch:
 		var params WatchParams
 		if len(req.Params) > 0 {

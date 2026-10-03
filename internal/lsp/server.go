@@ -32,6 +32,7 @@ import (
 
 	"github.com/remoteoss/dexter/internal/beam"
 	"github.com/remoteoss/dexter/internal/indexer"
+	"github.com/remoteoss/dexter/internal/notify"
 	"github.com/remoteoss/dexter/internal/parser"
 	"github.com/remoteoss/dexter/internal/stdlib"
 	"github.com/remoteoss/dexter/internal/store"
@@ -103,6 +104,14 @@ type IndexCoordinator struct {
 	unavailable bool // guarded by writes
 
 	backgroundWork sync.WaitGroup
+
+	// reporter tells every attached editor about failures, degraded states,
+	// and long work. It is shared like the store: one workspace, one set of
+	// conditions.
+	reporter *notify.Reporter
+	failures fileFailures
+	// firstBuildReported makes the first-build report once per workspace.
+	firstBuildReported atomic.Bool
 }
 
 func (c *IndexCoordinator) setStdlibRoot(root string) (string, bool) {
@@ -124,7 +133,7 @@ func (c *IndexCoordinator) getStdlibRoot() string {
 
 // NewIndexCoordinator returns write coordination for one workspace store.
 func NewIndexCoordinator() *IndexCoordinator {
-	return &IndexCoordinator{}
+	return &IndexCoordinator{reporter: notify.New()}
 }
 
 // ServerOptions configures a Server attached to a daemon-owned workspace.
@@ -178,11 +187,14 @@ type Server struct {
 	// negotiation can set it without touching every call site.
 	positionEncoding PositionEncoding
 
-	index               *IndexCoordinator
-	workspaceEvents     WorkspaceEvents
-	manageWorkspace     bool
-	notifiedOTPMismatch sync.Once // prevents repeated OTP mismatch warnings
-	closeOnce           sync.Once
+	index           *IndexCoordinator
+	workspaceEvents WorkspaceEvents
+	manageWorkspace bool
+	closeOnce       sync.Once
+
+	workDoneProgress bool         // client supports window/workDoneProgress/create
+	mixMissing       bool         // Initialize found no mix binary for this session
+	detachReporter   atomic.Value // func(); set when the client sent initialized
 }
 
 func (s *Server) debugf(format string, args ...interface{}) {
@@ -279,6 +291,7 @@ func ServeStream(server *Server, rwc io.ReadWriteCloser) error {
 
 	conn.Go(ctx, handler)
 	<-conn.Done()
+	server.detachFromReporter()
 	if err := conn.Err(); err != nil && !isStreamClosed(err) {
 		return err
 	}
@@ -441,17 +454,20 @@ func underTop(root, dir string, tops map[string]struct{}) bool {
 	return false
 }
 
-// showError reports a problem the user has to act on. The caller logs as well,
-// so a client without window/showMessage support still leaves a trace.
-func (s *Server) showError(message string) {
-	if s.client == nil {
-		return
+// notifySession logs a report about this editor's own request and shows it
+// to this editor only. Workspace states go through the shared reporter.
+func (s *Server) notifySession(sev notify.Severity, message string) {
+	prefix := map[notify.Severity]string{notify.Error: "Error: ", notify.Warning: "Warning: "}[sev]
+	log.Printf("%s%s", prefix, strings.TrimPrefix(message, "Dexter: "))
+	if s.client != nil {
+		notify.Show(context.Background(), s.client, sev, message)
 	}
-	if err := s.client.ShowMessage(context.Background(), &protocol.ShowMessageParams{
-		Type:    protocol.MessageTypeError,
-		Message: message,
-	}); err != nil {
-		log.Printf("ShowMessage: %v", err)
+}
+
+// detachFromReporter stops sending workspace reports to this editor.
+func (s *Server) detachFromReporter() {
+	if detach, ok := s.detachReporter.Load().(func()); ok {
+		detach()
 	}
 }
 
@@ -490,6 +506,7 @@ func (s *Server) fullBuild() (stats indexer.Stats, ran bool, err error) {
 		Warn: func(format string, args ...interface{}) {
 			log.Printf("Warning: "+format, args...)
 		},
+		FileError: s.index.failures.fail,
 	})
 	if errors.Is(err, indexer.ErrUnindexed) {
 		s.index.unavailable = true
@@ -505,6 +522,7 @@ func (s *Server) indexOneFile(path string) {
 		return
 	}
 	s.indexOneFileLocked(path)
+	s.index.reportFileFailures()
 }
 
 // indexOneFileLocked is indexOneFile for callers already holding indexWrites.
@@ -518,11 +536,15 @@ func (s *Server) indexOneFileLocked(path string) {
 	defs, refs, err := parser.ParseFile(path)
 	if err != nil {
 		log.Printf("Error parsing %s: %v", path, err)
+		s.index.failures.fail(path, err)
 		return
 	}
 	if err := s.store.IndexFileWithRefs(path, defs, refs); err != nil {
 		log.Printf("Error indexing %s: %v", path, err)
+		s.index.failures.fail(path, err)
+		return
 	}
+	s.index.failures.ok(path)
 }
 
 // backgroundReindex runs in the background. If the index is empty it does a
@@ -544,17 +566,11 @@ func (s *Server) startBackgroundReindex() <-chan struct{} {
 		reindexed := 0
 		coldStart := s.store.IsEmpty()
 		fullBuilt := false
+		var buildTask *notify.Task
+		progress := reconcileProgress{reporter: s.index.reporter}
 
 		if coldStart {
-			log.Printf("No index found, building from scratch...")
-			if s.client != nil {
-				if err := s.client.ShowMessage(context.Background(), &protocol.ShowMessageParams{
-					Type:    protocol.MessageTypeInfo,
-					Message: "Dexter: building index for the first time, go-to-definition will be available shortly...",
-				}); err != nil {
-					log.Printf("ShowMessage: %v", err)
-				}
-			}
+			buildTask = s.beginIndexBuild()
 
 			stats, ran, err := s.fullBuild()
 			switch {
@@ -567,8 +583,7 @@ func (s *Server) startBackgroundReindex() <-chan struct{} {
 				// index version unset, so the next editor start rebuilds from
 				// scratch through cmdInit — in a process with no live readers,
 				// where deleting the database is safe.
-				log.Printf("Error: SQL indexes could not be restored after the bulk build: %v", err)
-				s.showError("Dexter: the index could not be completed. Run `dexter init --force` in your project root and restart your editor. If it happens again, please report it.")
+				s.indexBuildFailedUnindexed(buildTask, err)
 				// Collapse any committed data in the WAL rather than leaving it at
 				// its high-water mark for the rest of the process.
 				if err := s.store.Checkpoint(); err != nil {
@@ -579,7 +594,7 @@ func (s *Server) startBackgroundReindex() <-chan struct{} {
 				// The incremental walk below needs nothing to be true of the
 				// database, so it is the safe thing to fall back to. It is
 				// slower, not wrong.
-				log.Printf("Warning: full index build failed, falling back to incremental: %v", err)
+				s.indexBuildFellBack(err)
 			case !ran:
 				// Something wrote to the index between the check above and the
 				// build's lock. Nothing was built, and the incremental path
@@ -615,6 +630,10 @@ func (s *Server) startBackgroundReindex() <-chan struct{} {
 
 				defs, refs, err := parser.ParseFile(path)
 				if err != nil {
+					if !errors.Is(err, fs.ErrNotExist) {
+						log.Printf("Warning: reindex %s: %v", path, err)
+					}
+					s.index.failures.fail(path, err)
 					return nil
 				}
 				if !indexRefs {
@@ -622,8 +641,14 @@ func (s *Server) startBackgroundReindex() <-chan struct{} {
 				}
 				if err := s.store.IndexFileWithRefs(path, defs, refs); err != nil {
 					log.Printf("Warning: reindex %s: %v", path, err)
+					s.index.failures.fail(path, err)
+				} else {
+					s.index.failures.ok(path)
 				}
 				reindexed++
+				if !coldStart {
+					progress.file()
+				}
 				return nil
 			})
 		}
@@ -639,6 +664,7 @@ func (s *Server) startBackgroundReindex() <-chan struct{} {
 			s.index.writes.RLock()
 			if s.index.unavailable {
 				s.index.writes.RUnlock()
+				buildTask.End("")
 				return
 			}
 			// Index stdlib first (definitions only).
@@ -650,6 +676,7 @@ func (s *Server) startBackgroundReindex() <-chan struct{} {
 			s.index.writes.RUnlock()
 
 			s.pruneMissingFiles(seen)
+			s.index.failures.retain(seen)
 		}
 
 		// Collapse the WAL back to disk now that the (potentially large) reindex
@@ -665,15 +692,8 @@ func (s *Server) startBackgroundReindex() <-chan struct{} {
 
 		elapsed := time.Since(start).Round(time.Millisecond)
 		log.Printf("Background reindex: %d files updated (%s)", reindexed, elapsed)
-
-		if coldStart && s.client != nil {
-			if err := s.client.ShowMessage(context.Background(), &protocol.ShowMessageParams{
-				Type:    protocol.MessageTypeInfo,
-				Message: fmt.Sprintf("Dexter: index built (%d files in %s)", reindexed, elapsed),
-			}); err != nil {
-				log.Printf("ShowMessage: %v", err)
-			}
-		}
+		progress.end(elapsed)
+		s.finishReindex(buildTask, reindexed, elapsed)
 	}()
 	return done
 }
@@ -709,7 +729,15 @@ func (s *Server) RemoveFiles(paths []string) {
 	}
 	if err := s.store.RemoveFiles(paths); err != nil {
 		log.Printf("Error removing %d files from index: %v", len(paths), err)
+		for _, path := range paths {
+			s.index.failures.fail(path, err)
+		}
+	} else {
+		for _, path := range paths {
+			s.index.failures.removed(path)
+		}
 	}
+	s.index.reportFileFailures()
 }
 
 // RemoveFilesUnderRoot removes indexed files below root as one workspace
@@ -768,19 +796,16 @@ func (s *Server) watchGitHead() {
 	}()
 }
 
-// notifyOTPMismatch checks stderr output for an OTP version mismatch and
-// sends a one-time warning to the editor so the user doesn't have to dig
-// through logs.
-func (s *Server) notifyOTPMismatch(stderr string) {
-	if s.client == nil || !strings.Contains(stderr, "requires a more recent Erlang/OTP") {
-		return
+// notifyOTPMismatch checks stderr output for an OTP version mismatch and, when
+// it finds one, makes it a condition of the project at root, so every editor
+// shows it once and the user does not have to dig through logs. It reports
+// whether it found one.
+func (s *Server) notifyOTPMismatch(root, stderr string) bool {
+	if !strings.Contains(stderr, "requires a more recent Erlang/OTP") {
+		return false
 	}
-	s.notifiedOTPMismatch.Do(func() {
-		_ = s.client.ShowMessage(context.Background(), &protocol.ShowMessageParams{
-			Type:    protocol.MessageTypeError,
-			Message: "Dexter: Elixir/OTP version mismatch - your Elixir install for this project was compiled for a newer OTP version than what is running. Update your Erlang to match, or switch to an Elixir build that targets your current OTP (e.g. elixir@...-otp-27).",
-		})
-	})
+	s.index.reporter.Set(condOTP+":"+root, notify.Error, fmt.Sprintf("Dexter: Elixir/OTP version mismatch in %s: the Elixir install for this project was compiled for a newer OTP version than the one that runs, so formatting does not work. Update Erlang to match, or switch to an Elixir build that targets your current OTP (for example elixir@...-otp-27).", root))
+	return true
 }
 
 // === LSP Lifecycle ===
@@ -875,15 +900,8 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 			s.mixBin = mixBin
 			log.Printf("Mix binary at: %s", mixBin)
 		}
-	} else {
-		log.Printf("Could not detect Elixir stdlib (set stdlibPath in initializationOptions or DEXTER_ELIXIR_LIB_ROOT)")
-		if s.client != nil {
-			_ = s.client.ShowMessage(context.Background(), &protocol.ShowMessageParams{
-				Type:    protocol.MessageTypeWarning,
-				Message: "Dexter: could not detect Elixir stdlib - stdlib modules (Enum, String, etc.) won't resolve. Verify the Elixir version in your .tool-versions or mise.toml is installed (e.g. `mise install`), or set DEXTER_ELIXIR_LIB_ROOT.",
-			})
-		}
 	}
+	s.ReportStdlib()
 
 	// Fallback: the PATH, then the standard version-manager locations and a
 	// login shell, because an editor-launched process often never ran the mise
@@ -895,9 +913,11 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 		} else if p, ok := stdlib.FindViaLoginShell("mix"); ok {
 			s.mixBin = p
 			log.Printf("Mix binary at: %s (login shell)", p)
-		} else {
-			log.Printf("Could not find mix binary — formatting will not work")
 		}
+	}
+	s.mixMissing = s.mixBin == ""
+	if s.mixMissing {
+		log.Printf("Warning: %s", strings.TrimPrefix(mixMissingMessage, "Dexter: "))
 	}
 
 	if !s.initialized && s.manageWorkspace {
@@ -909,6 +929,7 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 	if params.Capabilities.Window != nil && params.Capabilities.Window.ShowDocument != nil {
 		s.showDocumentSupported = params.Capabilities.Window.ShowDocument.Support
 	}
+	s.workDoneProgress = params.Capabilities.Window != nil && params.Capabilities.Window.WorkDoneProgress
 	// Resource operations only exist inside documentChanges, so advertising
 	// them implies documentChanges support. Neovim, for one, lists
 	// resourceOperations without setting the separate documentChanges flag.
@@ -968,6 +989,20 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 }
 
 func (s *Server) Initialized(ctx context.Context, params *protocol.InitializedParams) error {
+	// Workspace reports start now, not in Initialize: before the initialize
+	// response, a server must not send requests such as
+	// window/workDoneProgress/create. The reporter replays what started
+	// earlier, so nothing is lost.
+	if s.client != nil {
+		detach := s.index.reporter.Attach(s.client, s.workDoneProgress)
+		if previous, ok := s.detachReporter.Swap(detach).(func()); ok {
+			previous()
+		}
+		if s.mixMissing {
+			notify.Show(ctx, s.client, notify.Warning, mixMissingMessage)
+		}
+	}
+
 	// Registered for daemon-backed sessions too. The workspace's native watcher
 	// deliberately skips deps/ — one watch per dependency directory would cost
 	// thousands of descriptors — while the editor's glob covers it, along with
@@ -1005,6 +1040,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // call it even when a client disconnects without the protocol shutdown request.
 func (s *Server) CloseSession() {
 	s.closeOnce.Do(func() {
+		s.detachFromReporter()
 		s.closeBeams()
 		s.docs.CloseAll()
 	})
@@ -5930,6 +5966,7 @@ func (s *Server) renameModuleEdits(oldModule, newModule string) (*WorkspaceEdit,
 	movedFiles, clientRenames := mr.moveConventionalFiles(fileCache)
 	openChanges := mr.applyEdits(fileCache, movedFiles)
 	mr.reindex(fileCache, movedFiles, clientRenames)
+	s.reportRenameFailures(&mr.failures)
 
 	if len(clientRenames) == 0 {
 		return &WorkspaceEdit{Changes: openChanges}, nil
@@ -5988,6 +6025,7 @@ type moduleRename struct {
 	tokenReplacements map[string]string // old token → new token
 	allModuleDefs     []store.LookupResult
 	sitesByFile       map[string][]moduleEditSite
+	failures          renameFailures // files the rename could not change
 }
 
 type moduleEditSite struct {
@@ -6404,15 +6442,18 @@ func (mr *moduleRename) moveConventionalFiles(fileCache map[string]moduleFileInf
 
 		if err := os.MkdirAll(filepath.Dir(newPath), 0755); err != nil {
 			log.Printf("Rename: cannot create dir for %s: %v", newPath, err)
+			mr.failures.add(r.FilePath, err)
 			continue
 		}
 		if err := os.WriteFile(newPath, []byte(content), 0644); err != nil {
 			log.Printf("Rename: cannot write %s: %v", newPath, err)
+			mr.failures.add(r.FilePath, err)
 			continue
 		}
 
 		if err := os.Remove(r.FilePath); err != nil {
 			log.Printf("Rename: cannot remove %s: %v", r.FilePath, err)
+			mr.failures.add(r.FilePath, err)
 		}
 		mr.server.debugf("Rename: %s → %s", r.FilePath, newPath)
 		movedFiles[r.FilePath] = newPath
@@ -6470,6 +6511,7 @@ func (mr *moduleRename) applyEdits(fileCache map[string]moduleFileInfo, movedFil
 				updatedLines := mr.applyEditsToLines(fi.lines, sites)
 				if err := os.WriteFile(fp, []byte(strings.Join(updatedLines, "\n")), 0644); err != nil {
 					log.Printf("Rename: cannot write %s: %v", fp, err)
+					mr.failures.add(fp, err)
 				}
 			}()
 		}
@@ -6624,6 +6666,7 @@ func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string) *
 	var wg sync.WaitGroup
 	var reindexPaths []string
 	var openReindexes []textReindex
+	var failures renameFailures
 
 	for fp, fileSites := range sitesByFile {
 		fi, ok := fileCache[fp]
@@ -6667,12 +6710,14 @@ func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string) *
 				defer wg.Done()
 				if err := os.WriteFile(fp, []byte(strings.Join(updatedLines, "\n")), 0644); err != nil {
 					log.Printf("Rename: cannot write %s: %v", fp, err)
+					failures.add(fp, err)
 				}
 			}()
 			reindexPaths = append(reindexPaths, fp)
 		}
 	}
 	wg.Wait()
+	s.reportRenameFailures(&failures)
 
 	s.reindexAfterRename(nil, reindexPaths, openReindexes)
 

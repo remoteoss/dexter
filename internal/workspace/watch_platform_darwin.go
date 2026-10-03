@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -47,10 +46,13 @@ func startPlatformWatcher(root string, callbacks WatchCallbacks) (watchBackend, 
 	if err == nil {
 		return watcher, "fsevents", nil
 	}
-	log.Printf("Warning: macOS FSEvents unavailable for %s: %v; using fsnotify", root, err)
+	// The runtime tells the user, through Watcher.Fallback.
 	fallback, fallbackErr := startFSNotifyWatcher(root, callbacks)
 	if fallbackErr != nil {
 		return nil, "", errors.Join(fmt.Errorf("start FSEvents: %w", err), fmt.Errorf("start fsnotify: %w", fallbackErr))
+	}
+	if w, ok := fallback.(*fsnotifyWatcher); ok {
+		w.fallbackReason = fmt.Errorf("macOS FSEvents: %w", err)
 	}
 	return fallback, "fsnotify", nil
 }

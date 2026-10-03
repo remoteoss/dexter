@@ -48,10 +48,10 @@ func TestLSP_ColdStartBuildsInServer(t *testing.T) {
 	// proxy's stderr is included too: if a rebuild ever moves back into the
 	// frontend, the mismatch assertion below still catches it there.
 	logs := stderr.String() + daemonLogs(t, root)
-	if strings.Contains(logs, "Index version mismatch") {
+	if strings.Contains(logs, "Rebuilding it now") {
 		t.Errorf("cold LSP startup rebuilt through cmdInit before serving:\n%s", logs)
 	}
-	if !strings.Contains(logs, "No index found, building from scratch") {
+	if !strings.Contains(logs, "building the index for the first time") {
 		t.Errorf("cold LSP startup did not use the server's background build:\n%s", logs)
 	}
 }
@@ -76,8 +76,8 @@ func TestLSP_RootFlagServesWorkspaceFromAnotherDirectory(t *testing.T) {
 
 // TestLSP_WarnsOnNonProjectRoot covers the editor side of the not-a-project
 // guard: an editor is authoritative about what the user opened, so the LSP
-// warns and serves rather than refusing, and the warning reaches the server log
-// an editor collects.
+// warns and serves rather than refusing. The warning is shown in the editor,
+// not only written to a log that nobody reads.
 func TestLSP_WarnsOnNonProjectRoot(t *testing.T) {
 	binary := buildDexter(t)
 	root := t.TempDir()
@@ -88,15 +88,12 @@ func TestLSP_WarnsOnNonProjectRoot(t *testing.T) {
 	}
 	defer client.Close()
 
-	// The warning is written by the child before the handshake completes, but
-	// the parent's stderr copy goroutine may not have landed it yet when Start
-	// returns, so wait for it rather than sampling once.
-	deadline := time.Now().Add(5 * time.Second)
-	for !strings.Contains(stderr.String(), "does not look like an Elixir project") {
-		if time.Now().After(deadline) {
-			t.Fatalf("serving a non-project root logged no warning:\n%s", stderr.String())
-		}
-		time.Sleep(10 * time.Millisecond)
+	shown, err := client.WaitShown("does not look like an Elixir project", 10*time.Second)
+	if err != nil {
+		t.Fatalf("serving a non-project root showed no warning: %v\n%s", err, stderr.String())
+	}
+	if shown.Type != 2 {
+		t.Errorf("warning has message type %d, want 2 (Warning)", shown.Type)
 	}
 }
 

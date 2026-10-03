@@ -55,6 +55,7 @@ a store that has no rows.
 | Any new store query | Add an index if the query will run on hot paths (definition, hover, references) |
 | `internal/beam` ETF tag handling | The ERTS external term format spec. One wrong field width desynchronises every later term in the chunk (`EXPORT_EXT` carries its arity as an integer term, `NEW_FUN_EXT` as a raw byte) |
 | `internal/workspace/runtime.go` (mutation queue, readiness, subscribers) | `internal/lsp` write coordination (`IndexCoordinator`), `watch.go` event filtering, failed-watch retries and one-shot coverage reconciliation, `workspace/watch` subscribers, and the `Close` ordering: watchers stop before the queue drains, and the queue drains before the store checkpoints |
+| A new failure or degraded state | Report it through the workspace `notify.Reporter` (`IndexCoordinator.Reporter()`): a condition key with `Set`, and `Clear` with a message when it stops. A log line alone is not seen in an editor. Report only on state changes, never per file or per request. See "Telling the user" in `docs/architecture.md` |
 | `internal/daemon` (protocol, registries, endpoint) | `ContractVersion`, the reserved method and kind names in `registry.go`, `client.go` multiplexing (one reader, ids matched to callers, notifications interleaved), and `docs/daemon.md`. Socket paths must stay short: `sockaddr_un` is capped near 104 bytes |
 
 ## Token walking

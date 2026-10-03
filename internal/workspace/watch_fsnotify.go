@@ -36,7 +36,14 @@ type fsnotifyWatcher struct {
 
 	mu     sync.Mutex
 	failed map[string]struct{}
+
+	// fallbackReason is why the platform's preferred watcher could not start,
+	// when this one runs in its place. It is set before the watcher is
+	// returned and not changed after.
+	fallbackReason error
 }
+
+func (w *fsnotifyWatcher) fallback() error { return w.fallbackReason }
 
 var watchRetryInterval = 5 * time.Second
 

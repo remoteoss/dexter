@@ -14,6 +14,7 @@ import (
 
 	"github.com/remoteoss/dexter/internal/daemon"
 	"github.com/remoteoss/dexter/internal/indexer"
+	"github.com/remoteoss/dexter/internal/lsp"
 	"github.com/remoteoss/dexter/internal/stdlib"
 	"github.com/remoteoss/dexter/internal/store"
 	"github.com/remoteoss/dexter/internal/version"
@@ -247,7 +248,7 @@ func findProjectRootWithMissing(path string, allowMissing bool) string {
 		path = filepath.Dir(path)
 	}
 	root := store.FindProjectRoot(path, "mix.exs")
-	if home, homeErr := os.UserHomeDir(); homeErr == nil && sameDir(root, home) {
+	if home, homeErr := os.UserHomeDir(); homeErr == nil && store.SameDir(root, home) {
 		if mixRoot := findMarkerBefore(path, "mix.exs", home); mixRoot != "" {
 			return mixRoot
 		}
@@ -256,7 +257,7 @@ func findProjectRootWithMissing(path string, allowMissing bool) string {
 }
 
 func findMarkerBefore(path, marker, stop string) string {
-	for dir := path; !sameDir(dir, stop); dir = filepath.Dir(dir) {
+	for dir := path; !store.SameDir(dir, stop); dir = filepath.Dir(dir) {
 		if info, err := os.Stat(filepath.Join(dir, marker)); err == nil && info.Mode().IsRegular() {
 			return dir
 		}
@@ -266,31 +267,6 @@ func findMarkerBefore(path, marker, stop string) string {
 		}
 	}
 	return ""
-}
-
-// projectMarkers are the cheap signals that a directory is, or carries, a
-// Dexter workspace. They match what store.FindProjectRoot trusts, and an
-// a Dexter marker means an actual database, not an empty directory left by an
-// interrupted operation.
-func looksLikeProjectRoot(dir string) bool {
-	return regularFile(filepath.Join(dir, "mix.exs")) ||
-		gitMarker(filepath.Join(dir, ".git")) ||
-		regularFile(store.DBPath(dir)) ||
-		regularFile(store.LegacyDBPath(dir))
-}
-
-func hasDexterMarker(dir string) bool {
-	return regularFile(store.DBPath(dir)) || regularFile(store.LegacyDBPath(dir))
-}
-
-func regularFile(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && info.Mode().IsRegular()
-}
-
-func gitMarker(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && (info.IsDir() || info.Mode().IsRegular())
 }
 
 // requireProjectRoot refuses to treat a directory that shows no sign of being
@@ -303,47 +279,16 @@ func requireProjectRoot(dir string, allowNonProject bool) {
 	if allowNonProject {
 		return
 	}
-	if home, err := os.UserHomeDir(); err == nil && sameDir(dir, home) {
-		if hasDexterMarker(dir) {
+	if store.IsHomeDir(dir) {
+		if store.HasIndex(dir) {
 			return
 		}
 		fatal(fmt.Errorf("refusing to use %s as a workspace: it is your home directory, not a project\nhint: run from a project, pass --root <path>, or pass -y/--yes if you really mean it", dir))
 	}
-	if looksLikeProjectRoot(dir) {
+	if store.LooksLikeProject(dir) {
 		return
 	}
 	fatal(fmt.Errorf("refusing to use %s as a workspace: no mix.exs, .git, or Dexter database found, so it does not look like an Elixir project\nhint: run from a project, pass --root <path>, or pass -y/--yes to index it anyway", dir))
-}
-
-// warnProjectRoot is the LSP's version of the same check. An editor, unlike a
-// shell command, is authoritative about what the user opened, and refusing to
-// start would leave them with no language server and only a log line to
-// explain it — so this warns loudly and serves the directory anyway. The warning
-// is written to stderr, which every LSP client keeps in its server log.
-func warnProjectRoot(dir string) {
-	if home, err := os.UserHomeDir(); err == nil && sameDir(dir, home) {
-		if hasDexterMarker(dir) {
-			return
-		}
-		log.Printf("Warning: %s is your home directory, not a project; indexing it because the editor asked. Set --root <path> in the editor's dexter command if that is wrong.", dir)
-		return
-	}
-	if looksLikeProjectRoot(dir) {
-		return
-	}
-	log.Printf("Warning: %s does not look like an Elixir project (no mix.exs, .git, or Dexter database); indexing it because the editor asked. Set --root <path> if that is the wrong directory.", dir)
-}
-
-// sameDir reports whether two paths name the same directory. Stat is the
-// authority so a symlinked spelling (or a case-insensitive filesystem) cannot
-// sneak a home directory past the check.
-func sameDir(a, b string) bool {
-	ai, aErr := os.Stat(a)
-	bi, bErr := os.Stat(b)
-	if aErr != nil || bErr != nil {
-		return filepath.Clean(a) == filepath.Clean(b)
-	}
-	return os.SameFile(ai, bi)
 }
 
 // defaultIdleTimeout resolves the daemon idle timeout. DEXTER_DAEMON_IDLE_TIMEOUT
@@ -457,6 +402,7 @@ func cmdReindex(target string, allowNonProject bool) {
 	if err := client.Call(callCtx, daemon.MethodReindex, daemon.ReindexParams{Target: target}, &result); err != nil {
 		fatal(err)
 	}
+	printIndexNotes(result.Notes, queryOptions{})
 	switch {
 	case result.Missing:
 		fmt.Fprintf(os.Stderr, "Nothing to reindex at %s: it does not exist and nothing is indexed there\n", target)
@@ -484,8 +430,9 @@ func cmdLookup(projectRoot string, module string, function string, strict bool, 
 	}, &result); err != nil {
 		fatal(err)
 	}
+	printIndexNotes(result.Notes, opts)
 	if len(result.Locations) == 0 {
-		warnIfIndexBuilding(result.Ready, opts)
+		warnIfIndexBuilding(result.Ready, result.Notes, opts)
 		if strict {
 			os.Exit(1)
 		}
@@ -511,8 +458,9 @@ func cmdReferences(projectRoot string, module string, function string, opts quer
 	}, &result); err != nil {
 		fatal(err)
 	}
+	printIndexNotes(result.Notes, opts)
 	if len(result.Locations) == 0 {
-		warnIfIndexBuilding(result.Ready, opts)
+		warnIfIndexBuilding(result.Ready, result.Notes, opts)
 		fmt.Fprintf(os.Stderr, "No references found for %s", module)
 		if function != "" {
 			fmt.Fprintf(os.Stderr, ".%s", function)
@@ -667,9 +615,13 @@ func cmdStopIncompatible(ctx context.Context, root string, e *daemon.Incompatibl
 // the index, watchers, and language caches are shared with every other
 // frontend. The daemon starts on demand: it belongs to the workspace, not to
 // this editor, the CLI, or any other frontend that happens to reach it first.
+//
+// The daemon checks the root and tells the editor when it does not look like a
+// project. When the proxy cannot attach at all, ProxyLSP has already told the
+// editor why, as the answer to its initialize request; fatal only repeats it on
+// stderr for the editor's log.
 func cmdLSP(projectRoot string) {
 	projectRoot = findProjectRoot(projectRoot)
-	warnProjectRoot(projectRoot)
 	log.SetOutput(os.Stderr)
 	log.Printf("Dexter LSP proxy v%s starting (root: %s, daemon log: %s)", version.Version, projectRoot, daemonLogPath(projectRoot))
 	if err := daemon.ProxyLSP(context.Background(), projectRoot, os.Stdin, os.Stdout); err != nil {
@@ -716,11 +668,35 @@ func (o queryOptions) waitReadyMs() int {
 // control protocol never see it: every response carries `ready`, which is the
 // programmatic way to make the same decision, and the daemon logs any request
 // that actually blocked on the build.
-func warnIfIndexBuilding(ready bool, opts queryOptions) {
+func warnIfIndexBuilding(ready bool, notes []daemon.Note, opts queryOptions) {
 	if ready || opts.quiet || envFlag("DEXTER_QUIET") {
 		return
 	}
+	for _, note := range notes {
+		switch note.Key {
+		case lsp.CondIndexRebuild, lsp.CondIndexUnavailable, lsp.CondIndexFallback:
+			return // printIndexNotes already said why the index is incomplete
+		}
+	}
 	fmt.Fprintln(os.Stderr, "note: the workspace index is still building; re-run shortly for complete results")
+}
+
+// printIndexNotes states on stderr that the index is being rebuilt or cannot
+// be used, the same conditions an editor shows, so that an incomplete answer is
+// not taken as complete. An error is printed even with --quiet: the answer is
+// wrong without it. Info notes are left out; warnIfIndexBuilding covers a
+// first build.
+func printIndexNotes(notes []daemon.Note, opts queryOptions) {
+	quiet := opts.quiet || envFlag("DEXTER_QUIET")
+	for _, note := range notes {
+		message := strings.TrimPrefix(note.Message, "Dexter: ")
+		switch {
+		case note.Severity == "error":
+			fmt.Fprintf(os.Stderr, "error: %s\n", message)
+		case note.Severity == "warning" && !quiet:
+			fmt.Fprintf(os.Stderr, "note: %s\n", message)
+		}
+	}
 }
 
 func formatInt(n int) string {

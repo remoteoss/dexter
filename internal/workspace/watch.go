@@ -42,6 +42,24 @@ func (w *Watcher) Degraded() bool { return w.backend.Degraded() }
 
 func (w *Watcher) Kind() string { return w.kind }
 
+// FailedDirectories lists the directories that the watcher cannot watch now,
+// sorted. Only a per-directory backend can have them.
+func (w *Watcher) FailedDirectories() []string {
+	if b, ok := w.backend.(interface{ failedDirectories() []string }); ok {
+		return b.failedDirectories()
+	}
+	return nil
+}
+
+// Fallback reports why the preferred backend of the platform could not start,
+// or nil when it runs.
+func (w *Watcher) Fallback() error {
+	if b, ok := w.backend.(interface{ fallback() error }); ok {
+		return b.fallback()
+	}
+	return nil
+}
+
 func skipWatchDir(name string) bool {
 	switch name {
 	case "_build", ".git", "node_modules", "deps", ".dexter":

@@ -33,9 +33,10 @@ type Endpoint struct {
 	// for a project reached through one: on macOS a temp dir is /var/... to the
 	// editor and /private/var/... after EvalSymlinks.
 	Root string
-	// Identity is the symlink-resolved path. It decides which daemon owns the
-	// physical workspace; the handshake then rejects a different Root spelling
-	// because path-keyed answers cannot safely mix aliases.
+	// Identity is the symlink-resolved path, in the case the file system
+	// stores it. It decides which daemon owns the physical workspace; the
+	// handshake then rejects a different Root spelling because path-keyed
+	// answers cannot safely mix aliases.
 	Identity string
 	Socket   string
 	Lock     string
@@ -52,7 +53,7 @@ func ResolveEndpoint(root string) (Endpoint, error) {
 	}
 	identity := abs
 	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
-		identity = resolved
+		identity = diskSpelling(resolved)
 	}
 	digest := sha256.Sum256([]byte(identity))
 	key := hex.EncodeToString(digest[:16])

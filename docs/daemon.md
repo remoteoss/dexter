@@ -55,7 +55,11 @@ another process holds would let a second daemon take ownership of the same index
 Every connection starts with a small versioned handshake carrying the workspace
 *identity*, the connection kind, and the frontend's `ContractVersion`. Identity
 is the symlink-resolved root, and it decides which daemon owns the physical
-workspace. The root the daemon *indexes* keeps the spelling its starter used,
+workspace. On macOS it also takes the case that the file system stores
+(`F_GETPATH`), because the default file system ignores case and
+`filepath.EvalSymlinks` keeps the case the caller typed: without it,
+`~/Code/app` and `~/code/app` would get two locks and two daemons that build
+one index at the same time. The root the daemon *indexes* keeps the spelling its starter used,
 because stored paths are matched against the URIs an editor sends: canonicalizing
 them would break every path-keyed lookup for a project reached through a symlink
 (on macOS a temp dir is `/var/...` to the editor and `/private/var/...` after
@@ -88,7 +92,10 @@ sending each path once:
 ```
 
 `file` indexes `files`, and the locations keep their result order. `kind`,
-`arity`, and `declaration` are omitted when empty, zero, or false.
+`arity`, and `declaration` are omitted when empty, zero, or false. A result
+from an index that is being rebuilt or cannot be used also carries
+`"notes":[{"severity":"warning","message":"..."}]`, the same text an editor
+shows; the field is omitted when no index condition is active.
 
 ## The restart contract
 
@@ -113,6 +120,14 @@ On a mismatch the newer side wins, and the daemon does the moving:
   those on their own terms or not at all.
 - With nobody to notice, the idle timeout is the fallback: the daemon exits on
   its own and the next frontend starts the current build.
+
+A `dexter lsp` proxy that cannot attach for any of these reasons, or for any
+other startup error, does not only print to stderr: it reads the editor's
+`initialize` request, sends `window/showMessage` (Error) with the explanation
+and the fix, answers `initialize` with JSON-RPC error -32603 that carries the
+same text, and exits. An editor that is older than the daemon is told to
+restart from the current binary; a daemon that cannot be replaced, a root
+spelling mismatch, and a workspace held by `dexter init` get their own fix.
 
 ## Ownership and crash recovery
 
@@ -211,6 +226,10 @@ once when coverage is lost, retries only failed registrations, and reconciles
 after each restored subtree to catch changes made during its gap. Failure to
 create the native watcher is retried the same way. There is no periodic full-tree
 reindex, so a persistent kernel watch limit does not cause recurring CPU spikes.
+Each of these states (no native watching, the fsnotify fallback, directories
+that cannot be watched) is a condition in the workspace reporter: every attached
+editor sees it, an editor that attaches later receives it, and the user is told
+when coverage comes back. See "Telling the user" in `docs/architecture.md`.
 
 ## Lifecycle
 
@@ -265,7 +284,7 @@ Built-in control surface:
 |---|---|
 | `daemon/status` | pid, version, protocol, readiness, client count, uptime, registered frontends |
 | `daemon/shutdown` | exit when no other client is attached; refuse otherwise |
-| `workspace/status` | readiness, watcher state, stdlib root, index version and size, attached sessions; `waitReadyMs` turns it into an index barrier |
+| `workspace/status` | readiness, watcher state, stdlib root, index version and size, attached sessions, active failure and degraded conditions; `waitReadyMs` turns it into an index barrier |
 | `workspace/lookup` | module/function lookup with the CLI's non-strict module fallback |
 | `workspace/references` | semantic references through the shared language service |
 | `workspace/reindex` | whole workspace or one path, returning after the barrier |
