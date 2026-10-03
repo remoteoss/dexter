@@ -25,6 +25,13 @@ type testDefinition struct {
 // the way the Elixir compiler writes a Dbgi chunk. Each definition carries a
 // clause body so the reader has to step over real AST shapes to reach the next.
 func buildDebugInfoTerm(file, relativeFile string, definitions ...testDefinition) []byte {
+	return buildDebugInfoTermWithModuleLine(file, relativeFile, "", 0, definitions...)
+}
+
+// buildDebugInfoTermWithModuleLine also writes the module's own line under
+// moduleKey: "anno" as Elixir 1.18 and later do, or "line" as earlier
+// versions do. An empty key writes none.
+func buildDebugInfoTermWithModuleLine(file, relativeFile, moduleKey string, moduleLine int, definitions ...testDefinition) []byte {
 	var w etfTestWriter
 	w.smallTuple(3)
 	w.atom("debug_info_v1")
@@ -35,7 +42,11 @@ func buildDebugInfoTerm(file, relativeFile string, definitions ...testDefinition
 	// Keys in the order ERTS sorts a small map's atom keys, which puts
 	// definitions before file and relative_file: the reader must not depend on
 	// having seen the file first.
-	w.mapHeader(4)
+	if moduleKey != "" {
+		w.mapHeader(5)
+	} else {
+		w.mapHeader(4)
+	}
 	w.atom("attributes")
 	w.nil()
 	w.atom("definitions")
@@ -103,6 +114,10 @@ func buildDebugInfoTerm(file, relativeFile string, definitions ...testDefinition
 	w.binary(file)
 	w.atom("relative_file")
 	w.binary(relativeFile)
+	if moduleKey != "" {
+		w.atom(moduleKey)
+		w.smallInt(moduleLine)
+	}
 
 	w.nil() // specs
 	return w.buf
@@ -139,6 +154,48 @@ func TestReadDefinitionLinesPrefersOwnFileLocation(t *testing.T) {
 	for _, arity := range []int{1, 2} {
 		if got := info.Lines[FunctionKey{Name: "get_user!", Arity: arity}]; got != 7 {
 			t.Errorf("get_user!/%d line = %d, want 7", arity, got)
+		}
+	}
+}
+
+// Elixir 1.17 and earlier record the module's line under :line, and later
+// versions under :anno.
+func TestReadDefinitionLinesModuleLineKeys(t *testing.T) {
+	for _, key := range []string{"anno", "line"} {
+		t.Run(key, func(t *testing.T) {
+			beamPath := filepath.Join(t.TempDir(), "Elixir.MyApp.Accounts.beam")
+			writeDebugInfoBEAM(t, beamPath, buildDebugInfoTermWithModuleLine(
+				"/src/my_app/lib/my_app/accounts.ex", "lib/my_app/accounts.ex", key, 3,
+				testDefinition{name: "get_user", arity: 1, kind: "def", line: 5},
+			))
+			info, err := ReadDefinitionLines(beamPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.ModuleLine != 3 {
+				t.Errorf("ModuleLine = %d, want 3", info.ModuleLine)
+			}
+		})
+	}
+}
+
+// A location in the module's own file at or before the module's line is a
+// `location: :keep` quote in a macro defined above the module, not a stamp
+// that names where the module asked for the function, so :line is used.
+func TestReadDefinitionLinesOwnFileLocationBeforeModule(t *testing.T) {
+	beamPath := filepath.Join(t.TempDir(), "Elixir.MyApp.Accounts.beam")
+	writeDebugInfoBEAM(t, beamPath, buildDebugInfoTermWithModuleLine(
+		"/src/my_app/lib/my_app/accounts.ex", "lib/my_app/accounts.ex", "anno", 9,
+		testDefinition{name: "kept", arity: 0, kind: "def", line: 12, keepFile: "lib/my_app/accounts.ex", keepLine: 4},
+		testDefinition{name: "stamped", arity: 0, kind: "def", line: 9, keepFile: "lib/my_app/accounts.ex", keepLine: 14},
+	))
+	info, err := ReadDefinitionLines(beamPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]int{"kept": 12, "stamped": 14} {
+		if got := info.Lines[FunctionKey{Name: name, Arity: 0}]; got != want {
+			t.Errorf("%s/0 line = %d, want %d", name, got, want)
 		}
 	}
 }
@@ -384,6 +441,48 @@ end
 	}
 	if len(documented) != len(want) {
 		t.Errorf("documented = %+v, want %d functions", documented, len(want))
+	}
+}
+
+// A macro defined above its caller in the same file, with `location: :keep`,
+// records that file and the line inside the macro. The call is the answer.
+func TestReadDefinitionLinesSameFileKeepFromElixirCompiler(t *testing.T) {
+	elixirc, err := exec.LookPath("elixirc")
+	if err != nil {
+		t.Skip("elixirc not installed")
+	}
+	dir := t.TempDir()
+	source := `defmodule Same.Dsl do
+  defmacro kept(name) do
+    quote location: :keep do
+      def unquote(name)(), do: :kept
+    end
+  end
+end
+
+defmodule Same.User do
+  require Same.Dsl
+
+  Same.Dsl.kept(:one)
+end
+`
+	if err := os.WriteFile(filepath.Join(dir, "same.ex"), []byte(source), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(elixirc, "-o", dir, "same.ex")
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("elixirc: %v\n%s", err, out)
+	}
+	info, err := ReadDefinitionLines(filepath.Join(dir, "Elixir.Same.User.beam"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.ModuleLine != 9 {
+		t.Errorf("ModuleLine = %d, want 9", info.ModuleLine)
+	}
+	if got := info.Lines[FunctionKey{Name: "one", Arity: 0}]; got != 12 {
+		t.Errorf("one/0 line = %d, want 12, the call (all: %v)", got, info.Lines)
 	}
 }
 

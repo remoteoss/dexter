@@ -2,6 +2,7 @@ package beam
 
 import (
 	"bytes"
+	"compress/gzip"
 	"compress/zlib"
 	"encoding/binary"
 	"os"
@@ -194,6 +195,59 @@ func TestReadExports(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("export %d = %#v, want %#v", i, got[i], want[i])
 		}
+	}
+}
+
+// A module compiled with the `compressed` option is a gzip stream around the
+// container. Its exports read the same, and a compressed file that does not
+// hold a container is still rejected.
+func TestReadExportsCompressedBEAM(t *testing.T) {
+	dir := t.TempDir()
+	plain := filepath.Join(dir, "plain.beam")
+	writeTestBEAM(t, plain, buildDocsTerm())
+	data, err := os.ReadFile(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gzipped := func(data []byte) []byte {
+		var buf bytes.Buffer
+		zw := gzip.NewWriter(&buf)
+		if _, err := zw.Write(data); err != nil {
+			t.Fatal(err)
+		}
+		if err := zw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return buf.Bytes()
+	}
+
+	compressed := filepath.Join(dir, "Elixir.Example.beam")
+	if err := os.WriteFile(compressed, gzipped(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	want, err := ReadExports(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadExports(compressed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("compressed exports = %#v, want %#v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("compressed export %d = %#v, want %#v", i, got[i], want[i])
+		}
+	}
+
+	notBEAM := filepath.Join(dir, "not.beam")
+	if err := os.WriteFile(notBEAM, gzipped([]byte("this is not a BEAM container")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadExports(notBEAM); err == nil {
+		t.Fatal("ReadExports accepted a compressed file that holds no BEAM container")
 	}
 }
 

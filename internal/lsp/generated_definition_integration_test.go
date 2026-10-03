@@ -49,6 +49,12 @@ const compiledDslSource = `defmodule Weird.Dsl do
   defmacro plug(_name), do: nil
   defmacro action(_name), do: nil
 
+  defmacro on(event) do
+    quote do
+      def handle_event(unquote(event)), do: unquote(event)
+    end
+  end
+
   defmacro helper(name) do
     quote bind_quoted: [name: name] do
       defmodule Module.concat(__MODULE__, Macro.camelize(Atom.to_string(name))) do
@@ -125,6 +131,9 @@ const compiledUserSource = `defmodule Weird.User do
   action :submit
   later :submit
 
+  on :click
+  on :hover
+
   pinned :pinned_fun
 
   plug :match
@@ -170,6 +179,7 @@ const compiledCallerSource = `defmodule Weird.Caller do
     Weird.User.active?(%{})
     Weird.User.deferred()
     Weird.User.submit()
+    Weird.User.handle_event(:click)
     Weird.User.pinned_fun()
     Weird.User.match(:get, "/a")
     Weird.User.handle(:get)
@@ -299,6 +309,7 @@ func TestDefinition_GeneratedFunctionsFromCompiler(t *testing.T) {
 		{"predicate from an atom", "active?(%{})", 1, []string{user("flag :active")}},
 		{"@before_compile hook", "deferred(", 1, []string{user("later :deferred")}},
 		{"declaring call next to a same-named call", "submit(", 1, []string{user("later :submit")}},
+		{"def in a macro's quote", "handle_event(", 1, []string{user("on :click"), user("on :hover")}},
 		{"line past the end of the file", "pinned_fun(", 1, []string{user("pinned :pinned_fun")}},
 		{"one clause per call", "match(", 1, []string{user(`route :get`), user(`route :post`)}},
 		{"one location: :keep clause per call", "handle(", 1, []string{user("keep_route :handle, :get"), user("keep_route :handle, :post")}},

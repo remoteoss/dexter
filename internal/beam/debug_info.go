@@ -30,7 +30,8 @@ type DebugInfo struct {
 	RelativeFile string
 
 	// ModuleLine is the line of the module itself in File: its defmodule, or
-	// wherever Module.create was called. Zero if the chunk has none.
+	// wherever Module.create was called. It is the map's anno, or its line
+	// before Elixir 1.18. Zero if the chunk has none.
 	ModuleLine int
 
 	// Lines maps each public function and macro to its line in File. Entries
@@ -52,9 +53,10 @@ type DebugInfo struct {
 // own file that was being compiled when the def was produced: the macro call,
 // or wherever a before-compile hook ran. A `file: {path, line}` entry, left by
 // `@file` or by `quote location: :keep`, names a more specific place. When that
-// path is the module's own source it is where the code asked for the function;
-// when it is some other file it is the generator's own implementation, which is
-// not what a reader of the module is looking for, so :line is used instead.
+// path is the module's own source and the line is after the module's own, it
+// is where the code asked for the function. Otherwise it is the generator's own
+// implementation, in another file or in a macro defined above the module, which
+// is not what a reader of the module is looking for, so :line is used instead.
 //
 // Everything here is standard compiler output. No framework is recognized by
 // name: a generator that wants its functions to navigate to the line that
@@ -136,6 +138,7 @@ func parseDebugInfo(buf []byte) (info DebugInfo, err error) {
 		return DebugInfo{}, err
 	}
 	var sites []definitionSite
+	var legacyModuleLine int
 	for i := int64(0); i < pairs; i++ {
 		var key string
 		if tag, err := r.peekTag(); err != nil {
@@ -164,6 +167,12 @@ func parseDebugInfo(buf []byte) (info DebugInfo, err error) {
 			if info.ModuleLine, err = readAnnoLine(r); err != nil {
 				return DebugInfo{}, err
 			}
+		case "line":
+			// Elixir 1.17 and earlier record the module's line here, as a
+			// bare line, and have no anno.
+			if legacyModuleLine, err = readAnnoLine(r); err != nil {
+				return DebugInfo{}, err
+			}
 		default:
 			if err := r.skip(); err != nil {
 				return DebugInfo{}, err
@@ -175,11 +184,20 @@ func parseDebugInfo(buf []byte) (info DebugInfo, err error) {
 		return DebugInfo{}, err
 	}
 
+	if info.ModuleLine == 0 {
+		info.ModuleLine = legacyModuleLine
+	}
+
 	info.Lines = make(map[FunctionKey]int, len(sites))
 	for _, site := range sites {
 		line := site.line
+		// A location at or before the module's own line cannot be where the
+		// module asked for the function. It is a `location: :keep` quote in a
+		// macro defined above the module in the same file, so :line, the
+		// call, is used.
 		stamped := site.keepFile != "" && site.keepLine > 0 &&
-			(site.keepFile == info.RelativeFile || site.keepFile == info.File)
+			(site.keepFile == info.RelativeFile || site.keepFile == info.File) &&
+			(info.ModuleLine == 0 || site.keepLine > info.ModuleLine)
 		if stamped {
 			line = site.keepLine
 		}

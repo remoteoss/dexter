@@ -18,6 +18,24 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 
 	var moduleStack []moduleFrame
 	depth := 0
+
+	// A def inside a macro's quote is code the macro generates in its caller,
+	// not a function of the macro's module, so it is not indexed as one. The
+	// compiled caller's BEAM records where it was declared. `__using__` is the
+	// exception: what it injects is resolved through its body, and kept.
+	// macroBodies holds the depth inside each open do-block of such a macro,
+	// innermost last. quoteDepth is the depth inside an open `quote do` block
+	// in one, or zero. quoteLine is the line of an inline `quote do:`.
+	var macroBodies []int
+	quoteDepth, quoteLine := 0, 0
+	leaveBlocks := func() {
+		if quoteDepth > depth {
+			quoteDepth = 0
+		}
+		for len(macroBodies) > 0 && macroBodies[len(macroBodies)-1] > depth {
+			macroBodies = macroBodies[:len(macroBodies)-1]
+		}
+	}
 	aliases := map[string]string{}
 	injectors := map[string]bool{}
 
@@ -218,6 +236,7 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 					aliases = frame.savedAliases
 					injectors = frame.savedInjectors
 				}
+				leaveBlocks()
 			}
 		}
 	}
@@ -254,6 +273,7 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 				aliases = frame.savedAliases
 				injectors = frame.savedInjectors
 			}
+			leaveBlocks()
 			i++
 			continue
 
@@ -306,6 +326,16 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 				var delegateTo, delegateAs string
 				if kind == "defdelegate" {
 					delegateTo, delegateAs = scanDelegateOpts(pj)
+				}
+
+				if (kind == "defmacro" || kind == "defmacrop") && funcName != "__using__" && opensDoBlock(tokens, n, pj) {
+					// The do on this line is counted when the line is walked
+					// below, so the body is one deeper than here.
+					macroBodies = append(macroBodies, depth+1)
+				}
+				if (quoteDepth > 0 && depth >= quoteDepth) || quoteLine == defLine {
+					i = j
+					goto extractRefsForLine
 				}
 
 				minArity := maxArity - defaultCount
@@ -636,6 +666,15 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 			continue
 
 		case TokIdent:
+			if len(macroBodies) > 0 && quoteDepth == 0 && tokenText(tok) == "quote" {
+				switch form, line := quoteForm(source, tokens, n, i+1); form {
+				case quoteBlock:
+					// Counted when the walk reaches the do.
+					quoteDepth = depth + 1
+				case quoteInline:
+					quoteLine = line
+				}
+			}
 			cm := currentModule()
 			if cm != "" && len(injectors) > 0 {
 				isStatementStart := i == 0 || tokens[i-1].Kind == TokEOL || tokens[i-1].Kind == TokComment
@@ -1013,4 +1052,66 @@ func FixParamNames(names []string) []string {
 		}
 	}
 	return names
+}
+
+// opensDoBlock reports whether the declaration whose head ends before tokens[from]
+// opens a do-block on its line, rather than taking `, do:` or having no body.
+func opensDoBlock(tokens []Token, n, from int) bool {
+	for k := from; k < n; k++ {
+		switch tokens[k].Kind {
+		case TokDo:
+			return true
+		case TokComma, TokEOL, TokEOF:
+			return false
+		}
+	}
+	return false
+}
+
+type quoteShape int
+
+const (
+	quoteNone quoteShape = iota
+	quoteBlock
+	quoteInline
+)
+
+// quoteForm reads what follows a `quote` identifier: options such as
+// `location: :keep` or `bind_quoted: [...]`, which may span lines inside
+// brackets, then either a do-block or an inline `do:`. For the inline form it
+// also returns the line of the `do:`.
+func quoteForm(source []byte, tokens []Token, n, from int) (quoteShape, int) {
+	balance := 0
+	// A trailing comma carries the options on to the next line.
+	continued := false
+	for k := from; k < n; k++ {
+		kind := tokens[k].Kind
+		switch kind {
+		case TokOpenParen, TokOpenBracket, TokOpenBrace:
+			balance++
+		case TokCloseParen, TokCloseBracket, TokCloseBrace:
+			balance--
+			if balance < 0 {
+				return quoteNone, 0
+			}
+		case TokDo:
+			if balance == 0 {
+				return quoteBlock, 0
+			}
+		case TokIdent:
+			if TokenText(source, tokens[k]) == "do" && k+1 < n && tokens[k+1].Kind == TokColon {
+				return quoteInline, tokens[k].Line
+			}
+		case TokEOL:
+			if balance == 0 && !continued {
+				return quoteNone, 0
+			}
+		case TokEOF:
+			return quoteNone, 0
+		}
+		if kind != TokEOL && kind != TokComment {
+			continued = kind == TokComma
+		}
+	}
+	return quoteNone, 0
 }

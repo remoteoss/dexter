@@ -4,6 +4,7 @@ package beam
 
 import (
 	"bytes"
+	"compress/gzip"
 	"compress/zlib"
 	"encoding/binary"
 	"errors"
@@ -137,11 +138,26 @@ func readChunks(path string, wanted ...string) (map[string][]byte, error) {
 	if _, err := io.ReadFull(f, header[:]); err != nil {
 		return nil, err
 	}
+	// A module compiled with the `compressed` option, as some Erlang
+	// dependencies are, is a gzip stream around the usual container.
+	var r io.ReaderAt = f
+	size := info.Size()
+	if header[0] == 0x1f && header[1] == 0x8b {
+		data, err := gunzipBEAM(f)
+		if err != nil {
+			return nil, err
+		}
+		if len(data) < 12 {
+			return nil, fmt.Errorf("invalid BEAM size %d", len(data))
+		}
+		r, size = bytes.NewReader(data), int64(len(data))
+		copy(header[:], data)
+	}
 	if string(header[:4]) != "FOR1" || string(header[8:]) != "BEAM" {
 		return nil, errors.New("invalid BEAM header")
 	}
 	declared := int64(binary.BigEndian.Uint32(header[4:8])) + 8
-	if declared > info.Size() {
+	if declared > size {
 		return nil, errors.New("truncated BEAM container")
 	}
 
@@ -153,7 +169,7 @@ func readChunks(path string, wanted ...string) (map[string][]byte, error) {
 
 	for offset := int64(12); offset+8 <= declared && len(found) < len(pending); {
 		var chunkHeader [8]byte
-		if _, err := f.ReadAt(chunkHeader[:], offset); err != nil {
+		if _, err := r.ReadAt(chunkHeader[:], offset); err != nil {
 			return nil, err
 		}
 		length := int64(binary.BigEndian.Uint32(chunkHeader[4:8]))
@@ -169,7 +185,7 @@ func readChunks(path string, wanted ...string) (map[string][]byte, error) {
 				return nil, fmt.Errorf("%s chunk too large: %d", name, length)
 			}
 			data := make([]byte, length)
-			if _, err := f.ReadAt(data, dataOffset); err != nil {
+			if _, err := r.ReadAt(data, dataOffset); err != nil {
 				return nil, err
 			}
 			found[name] = data
@@ -177,6 +193,28 @@ func readChunks(path string, wanted ...string) (map[string][]byte, error) {
 		offset = dataOffset + ((length + 3) &^ 3)
 	}
 	return found, nil
+}
+
+// gunzipBEAM decompresses a compressed BEAM from its start. The output is
+// bounded like an uncompressed file, so a small file cannot expand into an
+// unbounded allocation.
+func gunzipBEAM(f *os.File) ([]byte, error) {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	zr, err := gzip.NewReader(f)
+	if err != nil {
+		return nil, fmt.Errorf("decompress BEAM: %w", err)
+	}
+	defer func() { _ = zr.Close() }()
+	data, err := io.ReadAll(io.LimitReader(zr, maxBEAMSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("decompress BEAM: %w", err)
+	}
+	if len(data) > maxBEAMSize {
+		return nil, errors.New("decompressed BEAM too large")
+	}
+	return data, nil
 }
 
 func readChunk(path, wanted string) ([]byte, error) {
