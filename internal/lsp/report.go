@@ -266,22 +266,76 @@ func (s *Server) ReportStdlib() {
 // report goes to that editor only.
 const mixMissingMessage = "Dexter: could not find the `mix` binary, so formatting does not work in this editor. Install the Elixir version of this project (for example `mise install`) or put mix on the PATH of the editor, then restart the editor."
 
-// reportFormatWorks clears the formatter conditions of one Mix project after a
-// format succeeded there. The conditions are kept for each project: in an
-// umbrella or a monorepo, one project can fail to format while another works,
-// and a success in one must not clear, or set again, the report of the other.
-func (s *Server) reportFormatWorks(mixRoot, buildRoot string) {
+// otpMismatchRetry is how long a build root whose BEAM failed with an OTP
+// mismatch uses mix format before Dexter tries the BEAM again, when nothing
+// that can fix the mismatch changed first. A variable so tests can shrink it.
+var otpMismatchRetry = 10 * time.Minute
+
+// otpMismatch remembers a BEAM that failed with an OTP mismatch.
+type otpMismatch struct {
+	at    time.Time
+	stamp string
+}
+
+// otpStamp identifies what can fix an OTP mismatch for a build root: the
+// Elixir and mix binaries, and the _build directory.
+func (s *Server) otpStamp(buildRoot string) string {
+	elixir := filepath.Join(filepath.Dir(s.mixBin), "elixir")
+	return fmt.Sprint(statFileStamp(elixir), statFileStamp(s.mixBin), statFileStamp(filepath.Join(buildRoot, "_build")))
+}
+
+// beamOTPMismatch records that the BEAM of buildRoot failed with an OTP
+// mismatch, and tells the user one time. Formatting still works through mix
+// format, so it is a degraded state, not a failure.
+func (s *Server) beamOTPMismatch(buildRoot string) {
+	s.beamMu.Lock()
+	if s.otpMismatches == nil {
+		s.otpMismatches = make(map[string]otpMismatch)
+	}
+	s.otpMismatches[buildRoot] = otpMismatch{at: time.Now(), stamp: s.otpStamp(buildRoot)}
+	s.beamMu.Unlock()
+	s.index.reporter.Set(condOTP+":"+buildRoot, notify.Warning, fmt.Sprintf(
+		"Dexter: Elixir/OTP version mismatch in %s: the Elixir install of this project was compiled for a newer OTP version than the one that runs, so the fast persistent formatter cannot start. Formatting still works through the slower `mix format` fallback. To fix it, update Erlang to match, or switch to an Elixir build that targets your current OTP (for example elixir@...-otp-27). Dexter tries the fast formatter again when the Elixir install or the _build directory changes, or after %s.",
+		buildRoot, otpMismatchRetry))
+}
+
+// otpMismatchHolds reports whether the BEAM of buildRoot failed with an OTP
+// mismatch that nothing has fixed since. The caller holds beamMu.
+func (s *Server) otpMismatchHolds(buildRoot string) bool {
+	m, ok := s.otpMismatches[buildRoot]
+	if !ok {
+		return false
+	}
+	if time.Since(m.at) < otpMismatchRetry && m.stamp == s.otpStamp(buildRoot) {
+		return true
+	}
+	delete(s.otpMismatches, buildRoot)
+	return false
+}
+
+// reportBeamFormatWorks clears the formatter conditions after the persistent
+// BEAM formatted a file. Only this ends an OTP mismatch of the build root: a
+// mix format fallback works around the mismatch and does not fix it.
+//
+// Conditions are kept for each project: in an umbrella or a monorepo, one
+// project can fail to format while another works, and a success in one must
+// not clear, or set again, the report of the other.
+func (s *Server) reportBeamFormatWorks(mixRoot, buildRoot string) {
 	r := s.index.reporter
-	cleared := r.Clear(condFormatter+":"+mixRoot, "")
-	if r.Clear(condOTP+":"+mixRoot, "") {
-		cleared = true
+	formatter := r.Clear(condFormatter+":"+mixRoot, "")
+	if r.Clear(condOTP+":"+buildRoot, "") {
+		r.Notify(notify.Info, fmt.Sprintf("Dexter: the fast persistent formatter works again in %s.", buildRoot))
+		return
 	}
-	if buildRoot != mixRoot && r.Clear(condOTP+":"+buildRoot, "") {
-		cleared = true
-	}
-	if cleared {
+	if formatter {
 		r.Notify(notify.Info, fmt.Sprintf("Dexter: formatting works again in %s.", mixRoot))
 	}
+}
+
+// reportMixFormatWorks clears the report that formatting does not work in
+// mixRoot after a mix format succeeded there.
+func (s *Server) reportMixFormatWorks(mixRoot string) {
+	s.index.reporter.Clear(condFormatter+":"+mixRoot, fmt.Sprintf("Dexter: formatting works again in %s.", mixRoot))
 }
 
 // reportFormatFailure tells the user that formatting cannot run in one Mix
@@ -289,6 +343,11 @@ func (s *Server) reportFormatWorks(mixRoot, buildRoot string) {
 // already shows as a diagnostic, or mix reports it.
 func (s *Server) reportFormatFailure(mixRoot string, err error, stderr string) {
 	if isUserCodeFormatError(stderr) {
+		return
+	}
+	if isOTPMismatch(stderr) {
+		s.index.reporter.Set(condFormatter+":"+mixRoot, notify.Error, fmt.Sprintf(
+			"Dexter: formatting does not work in %s: Elixir/OTP version mismatch. The Elixir install of this project was compiled for a newer OTP version than the one that runs. Update Erlang to match, or switch to an Elixir build that targets your current OTP (for example elixir@...-otp-27).", mixRoot))
 		return
 	}
 	detail := err.Error()

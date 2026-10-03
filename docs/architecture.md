@@ -249,7 +249,8 @@ What is reported, and what stays in the log only:
 | Directories that cannot be watched | `watcher.coverage` | Warning | yes |
 | The workspace has no Elixir standard library (read from the root that all sessions share, not from what one session found) | `stdlib` | Warning | yes |
 | `mix` not found for one session | (this editor only) | Warning | — |
-| `mix format` cannot run, or Elixir/OTP mismatch, in one Mix project | `formatter:<mix root>`, `formatter.otp:<root>` | Warning, Error | yes ("formatting works again in <mix root>") |
+| `mix format` cannot run in one Mix project | `formatter:<mix root>` | Warning (Error for an OTP mismatch) | yes ("formatting works again in <mix root>") |
+| The persistent formatter BEAM fails with an Elixir/OTP mismatch; formatting goes on through `mix format` | `formatter.otp:<build root>` | Warning | only when the BEAM formats again ("the fast persistent formatter works again"); a `mix format` success does not clear it. The build root does not start a BEAM again until the Elixir or mix binary or `_build` changes, or for 10 minutes |
 | A rename that could not change some files | (this editor only) | Error | — |
 
 A syntax error in the user's code is not a formatter failure: it is a diagnostic. WAL checkpoint warnings, fsnotify transient errors, the per-directory watch errors (they are in the aggregate), BEAM formatter restarts that fall back to `mix format`, and requests that waited for the first build stay in the log.

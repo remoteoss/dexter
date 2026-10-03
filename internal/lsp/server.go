@@ -160,6 +160,9 @@ type Server struct {
 
 	beams  map[string]*beamProcess // build root → persistent BEAM process
 	beamMu sync.Mutex
+	// otpMismatches are the build roots whose BEAM failed with an OTP
+	// mismatch, guarded by beamMu. See otpMismatchHolds.
+	otpMismatches map[string]otpMismatch
 
 	erlangBuildRoots   map[string]*erlangBuildRootState // build root → runtime resolution state
 	erlangRuntimeCache map[string]*erlangRuntimeCache   // runtime key → cached OTP modules/exports
@@ -796,16 +799,10 @@ func (s *Server) watchGitHead() {
 	}()
 }
 
-// notifyOTPMismatch checks stderr output for an OTP version mismatch and, when
-// it finds one, makes it a condition of the project at root, so every editor
-// shows it once and the user does not have to dig through logs. It reports
-// whether it found one.
-func (s *Server) notifyOTPMismatch(root, stderr string) bool {
-	if !strings.Contains(stderr, "requires a more recent Erlang/OTP") {
-		return false
-	}
-	s.index.reporter.Set(condOTP+":"+root, notify.Error, fmt.Sprintf("Dexter: Elixir/OTP version mismatch in %s: the Elixir install for this project was compiled for a newer OTP version than the one that runs, so formatting does not work. Update Erlang to match, or switch to an Elixir build that targets your current OTP (for example elixir@...-otp-27).", root))
-	return true
+// isOTPMismatch reports whether BEAM or mix output says that the Elixir install
+// was compiled for a newer OTP than the one that runs.
+func isOTPMismatch(stderr string) bool {
+	return strings.Contains(stderr, "requires a more recent Erlang/OTP")
 }
 
 // === LSP Lifecycle ===

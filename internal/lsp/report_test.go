@@ -320,7 +320,7 @@ func TestFormatterFailuresAreKeptForEachProject(t *testing.T) {
 		}
 	}
 	format := func(mixRoot string) error {
-		_, err := server.formatWithMixFormat(context.Background(), mixRoot, mixRoot, filepath.Join(mixRoot, "lib", "a.ex"), "x\n")
+		_, err := server.formatWithMixFormat(context.Background(), mixRoot, filepath.Join(mixRoot, "lib", "a.ex"), "x\n")
 		return err
 	}
 
@@ -348,13 +348,11 @@ func TestFormatterFailuresAreKeptForEachProject(t *testing.T) {
 	}
 
 	// A later success in the broken project is what clears its report.
-	server.reportFormatWorks(broken, broken)
+	server.reportMixFormatWorks(broken)
 	client.WaitMessage(t, reportWait, protocol.MessageTypeInfo, "Dexter: formatting works again in "+broken+".")
 
-	if !server.notifyOTPMismatch(good, "** (UndefinedFunctionError) requires a more recent Erlang/OTP") {
-		t.Fatal("OTP mismatch was not recognized")
-	}
-	client.WaitMessage(t, reportWait, protocol.MessageTypeError, "Elixir/OTP version mismatch in "+good)
+	server.beamOTPMismatch(good)
+	client.WaitMessage(t, reportWait, protocol.MessageTypeWarning, "Elixir/OTP version mismatch in "+good)
 	other := filepath.Join(server.projectRoot, "apps", "other")
 	if err := os.MkdirAll(other, 0o755); err != nil {
 		t.Fatal(err)

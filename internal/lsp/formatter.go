@@ -691,6 +691,10 @@ func (bp *beamProcess) closeWithReason(reason string) {
 	_ = bp.cmd.process.Kill()
 }
 
+// startBeam starts the persistent BEAM for a build root. A variable so tests
+// can start a fake one.
+var startBeam = (*Server).startBeamProcess
+
 // startBeamProcess launches a BEAM process for the given build root and returns
 // immediately. The returned process may not be ready yet — callers must check
 // bp.Ready() before sending requests.
@@ -753,7 +757,9 @@ func (s *Server) startBeamProcess(buildRoot string) (*beamProcess, error) {
 			if bp.startErr != nil {
 				_ = cmd.Process.Kill()
 				<-done
-				s.notifyOTPMismatch(buildRoot, stderrBuf.String())
+				if isOTPMismatch(stderrBuf.String()) {
+					s.beamOTPMismatch(buildRoot)
+				}
 			}
 		case <-time.After(beamStuckTimeout):
 			bp.finishStartup(fmt.Errorf("BEAM startup timed out"))
@@ -803,8 +809,14 @@ func (s *Server) getBeamProcess(ctx context.Context, buildRoot string) *beamProc
 	if s.mixBin == "" {
 		return nil
 	}
+	if s.otpMismatchHolds(buildRoot) {
+		// The BEAM fails the same way until the Elixir install or the build
+		// changes. Starting it on each save is a slow, failed spawn; the
+		// caller falls back to mix format.
+		return nil
+	}
 
-	bp, err := s.startBeamProcess(buildRoot)
+	bp, err := startBeam(s, buildRoot)
 	if err != nil {
 		log.Printf("BEAM: failed to start for %s: %v", buildRoot, err)
 		return nil
@@ -852,14 +864,14 @@ func (s *Server) formatContent(ctx context.Context, mixRoot, path, content strin
 	bp := s.getBeamProcess(ctx, buildRoot)
 	if bp == nil {
 		log.Printf("Formatting: BEAM process unavailable, falling back to mix format")
-		return s.formatWithMixFormat(ctx, mixRoot, buildRoot, path, content)
+		return s.formatWithMixFormat(ctx, mixRoot, path, content)
 	}
 	if bp.formatterConfigChanged(formatterExs) {
 		s.evictBeam(bp, fmt.Sprintf("formatter config changed: %s", formatterExs))
 		bp = s.getBeamProcess(ctx, buildRoot)
 		if bp == nil {
 			log.Printf("Formatting: BEAM process unavailable after formatter config change, falling back to mix format")
-			return s.formatWithMixFormat(ctx, mixRoot, buildRoot, path, content)
+			return s.formatWithMixFormat(ctx, mixRoot, path, content)
 		}
 		_ = bp.formatterConfigChanged(formatterExs)
 	}
@@ -870,7 +882,7 @@ func (s *Server) formatContent(ctx context.Context, mixRoot, path, content strin
 		if bp.startErr != nil {
 			s.evictBeam(bp, fmt.Sprintf("formatContent: startup finished with error: %v", bp.startErr))
 			log.Printf("Formatting: BEAM process failed to start, falling back to mix format: %v", bp.startErr)
-			return s.formatWithMixFormat(ctx, mixRoot, buildRoot, path, content)
+			return s.formatWithMixFormat(ctx, mixRoot, path, content)
 		}
 	default:
 		// Not ready yet — decide based on how long it's been starting
@@ -879,11 +891,11 @@ func (s *Server) formatContent(ctx context.Context, mixRoot, path, content strin
 		case age > beamStuckTimeout:
 			log.Printf("Formatting: BEAM process stuck (started %s ago), restarting", age.Truncate(time.Second))
 			s.evictBeam(bp, fmt.Sprintf("formatContent: startup exceeded %s without becoming ready", beamStuckTimeout))
-			return s.formatWithMixFormat(ctx, mixRoot, buildRoot, path, content)
+			return s.formatWithMixFormat(ctx, mixRoot, path, content)
 
 		case age > beamWaitTimeout:
 			log.Printf("Formatting: BEAM process not ready after %s, falling back to mix format", age.Truncate(time.Millisecond))
-			return s.formatWithMixFormat(ctx, mixRoot, buildRoot, path, content)
+			return s.formatWithMixFormat(ctx, mixRoot, path, content)
 
 		default:
 			if err := bp.Ready(ctx); err != nil {
@@ -892,7 +904,7 @@ func (s *Server) formatContent(ctx context.Context, mixRoot, path, content strin
 				}
 				s.evictBeam(bp, fmt.Sprintf("formatContent: Ready failed: %v", err))
 				log.Printf("Formatting: BEAM process failed to start, falling back to mix format: %v", err)
-				return s.formatWithMixFormat(ctx, mixRoot, buildRoot, path, content)
+				return s.formatWithMixFormat(ctx, mixRoot, path, content)
 			}
 		}
 	}
@@ -917,7 +929,7 @@ func (s *Server) formatContent(ctx context.Context, mixRoot, path, content strin
 	}
 
 	log.Printf("Formatting: %s (%s, persistent)", path, time.Since(start))
-	s.reportFormatWorks(mixRoot, buildRoot)
+	s.reportBeamFormatWorks(mixRoot, buildRoot)
 	return result, nil
 }
 
@@ -946,10 +958,10 @@ func (s *Server) evictBeam(bp *beamProcess, reason string) {
 	bp.closeWithReason("evicted: " + reason)
 }
 
-// formatWithMixFormat runs `mix format` in mixRoot. buildRoot is the build root
-// of the file, whose BEAM formatter can have reported an OTP mismatch; a
-// success clears that report too.
-func (s *Server) formatWithMixFormat(ctx context.Context, mixRoot, buildRoot, path, content string) (string, error) {
+// formatWithMixFormat runs `mix format` in mixRoot. It is the fallback when the
+// persistent BEAM cannot serve, so its success says nothing about the BEAM: it
+// clears only the report that formatting does not work in mixRoot.
+func (s *Server) formatWithMixFormat(ctx context.Context, mixRoot, path, content string) (string, error) {
 	if s.mixBin == "" {
 		return "", fmt.Errorf("mix binary not found")
 	}
@@ -961,13 +973,13 @@ func (s *Server) formatWithMixFormat(ctx context.Context, mixRoot, buildRoot, pa
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		log.Printf("Formatting: mix format failed for %s (%s): %v\n%s", path, time.Since(start), err, stderr.String())
-		if ctx.Err() == nil && !s.notifyOTPMismatch(mixRoot, stderr.String()) {
+		if ctx.Err() == nil {
 			s.reportFormatFailure(mixRoot, err, stderr.String())
 		}
 		return "", err
 	}
 	log.Printf("Formatting: %s (%s, mix format)", path, time.Since(start))
-	s.reportFormatWorks(mixRoot, buildRoot)
+	s.reportMixFormatWorks(mixRoot)
 	return stdout.String(), nil
 }
 
