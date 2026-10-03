@@ -47,11 +47,24 @@ const compiledDslSource = `defmodule Weird.Dsl do
   end
 
   defmacro plug(_name), do: nil
+  defmacro action(_name), do: nil
 
   defmacro helper(name) do
     quote bind_quoted: [name: name] do
       defmodule Module.concat(__MODULE__, Macro.camelize(Atom.to_string(name))) do
         def run, do: :helper
+      end
+    end
+  end
+
+  # The module name is computed here, so the compiler records no line for
+  # the module itself.
+  defmacro named_helper(name) do
+    module = Module.concat(__CALLER__.module, Macro.camelize(Atom.to_string(name)))
+
+    quote do
+      defmodule unquote(module) do
+        def run, do: :named
       end
     end
   end
@@ -109,6 +122,9 @@ const compiledUserSource = `defmodule Weird.User do
 
   later :deferred
 
+  action :submit
+  later :submit
+
   pinned :pinned_fun
 
   plug :match
@@ -133,6 +149,8 @@ const compiledUserSource = `defmodule Weird.User do
 
   helper :audit
 
+  named_helper :report
+
   for name <- [:loop_a, :loop_b] do
     def unquote(name)(), do: unquote(name)
   end
@@ -151,6 +169,7 @@ const compiledCallerSource = `defmodule Weird.Caller do
     Weird.User.two_level()
     Weird.User.active?(%{})
     Weird.User.deferred()
+    Weird.User.submit()
     Weird.User.pinned_fun()
     Weird.User.match(:get, "/a")
     Weird.User.handle(:get)
@@ -162,6 +181,7 @@ const compiledCallerSource = `defmodule Weird.Caller do
     Weird.User.stamped()
     Weird.User.loop_b()
     Weird.User.Audit.run()
+    Weird.User.Report.run()
     Weird.User.Nested.nested?(%{})
     active?(%{})
     f = &Weird.User.two_level/0
@@ -278,6 +298,7 @@ func TestDefinition_GeneratedFunctionsFromCompiler(t *testing.T) {
 		{"macro that calls a macro", "two_level(", 1, []string{user("outer :two_level")}},
 		{"predicate from an atom", "active?(%{})", 1, []string{user("flag :active")}},
 		{"@before_compile hook", "deferred(", 1, []string{user("later :deferred")}},
+		{"declaring call next to a same-named call", "submit(", 1, []string{user("later :submit")}},
 		{"line past the end of the file", "pinned_fun(", 1, []string{user("pinned :pinned_fun")}},
 		{"one clause per call", "match(", 1, []string{user(`route :get`), user(`route :post`)}},
 		{"one location: :keep clause per call", "handle(", 1, []string{user("keep_route :handle, :get"), user("keep_route :handle, :post")}},
@@ -291,6 +312,8 @@ func TestDefinition_GeneratedFunctionsFromCompiler(t *testing.T) {
 		{"nested module", "nested?(", 1, []string{user("flag :nested")}},
 		{"function of a module a macro nested", "run()", 2, []string{user("helper :audit")}},
 		{"name of a module a macro nested", "Audit.run", 1, []string{user("helper :audit")}},
+		{"function of a module a macro named", "run()", 3, []string{user("named_helper :report")}},
+		{"name of a module a macro named", "Report.run", 1, []string{user("named_helper :report")}},
 		{"bare call through import", "active?(%{})", 2, []string{user("flag :active")}},
 		{"capture", "two_level/0", 1, []string{user("outer :two_level")}},
 	} {

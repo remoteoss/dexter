@@ -79,7 +79,8 @@ func (s *Server) generatedDefinitionResultsFor(module, beamPath string, function
 	}
 	if result, found, ambiguous := sources.bestDescribedResult(results); found {
 		result.Line = s.compiledModuleLine(module, owner, result.Line, sources)
-		if lines := recordedLinesIn(module, owner, result, s.currentSourceOf(result.FilePath), sources, functions); len(lines) > 0 {
+		generated := s.generatedFunctionsFor(module, beamPath)
+		if lines := recordedLinesIn(module, owner, result, s.currentSourceOf(result.FilePath), sources, functions, generated); len(lines) > 0 {
 			return lines, true
 		}
 		return results, false
@@ -88,7 +89,7 @@ func (s *Server) generatedDefinitionResultsFor(module, beamPath string, function
 	}
 	if owner != module {
 		if source := s.compiledSourceFile(sources.compileSource); source != "" {
-			if lines := recordedLinesIn(module, "", store.LookupResult{FilePath: source, Line: 1}, s.currentSourceOf(source), sources, functions); len(lines) > 0 {
+			if lines := recordedLinesIn(module, "", store.LookupResult{FilePath: source, Line: 1}, s.currentSourceOf(source), sources, functions, nil); len(lines) > 0 {
 				return lines, true
 			}
 		}
@@ -118,23 +119,44 @@ func (s *Server) compiledModuleLine(module, owner string, indexed int, sources g
 // generatedModuleLocation is where a module that exists only as a BEAM is
 // defined: the file it was compiled from, at the line the compiler recorded
 // for the module, such as a Module.create call. It is empty when the BEAM does
-// not record both, or the line is not in the file.
+// not record a line, or the line is not in the file.
 func (s *Server) generatedModuleLocation(module string) []store.LookupResult {
 	if len(s.generatedFunctionsForModule(module)) == 0 {
 		return nil
 	}
 	sources, ok := s.generatedDefinitionSourcesFor(module, "")
-	if !ok || sources.debugInfo.ModuleLine < 1 {
+	if !ok {
+		return nil
+	}
+	line := recordedModuleLine(sources.debugInfo)
+	if line < 1 {
 		return nil
 	}
 	source := s.compiledSourceFile(sources.compileSource)
 	if source == "" {
 		return nil
 	}
-	if src := s.currentSourceOf(source); src == nil || sources.debugInfo.ModuleLine > len(src.lines) {
+	if src := s.currentSourceOf(source); src == nil || line > len(src.lines) {
 		return nil
 	}
-	return []store.LookupResult{{Module: module, FilePath: source, Line: sources.debugInfo.ModuleLine, Kind: "module"}}
+	return []store.LookupResult{{Module: module, FilePath: source, Line: line, Kind: "module"}}
+}
+
+// recordedModuleLine is the module's recorded line or, when the compiler
+// recorded none, its first function's. A macro that expands
+// `defmodule unquote(name)` with a name it computed leaves the module line at
+// zero, but each def in the body still has the line of the call that made it.
+func recordedModuleLine(info beam.DebugInfo) int {
+	if info.ModuleLine > 0 {
+		return info.ModuleLine
+	}
+	first := 0
+	for _, line := range info.Lines {
+		if line > 0 && (first == 0 || line < first) {
+			first = line
+		}
+	}
+	return first
 }
 
 // recordedLinesIn returns a result for each distinct line in result's file
@@ -149,9 +171,10 @@ func (s *Server) generatedModuleLocation(module string) []store.LookupResult {
 //
 // When nothing is left, which is the case for a def a @before_compile hook
 // made at the module line, the module's body is searched for the call that
-// declared the function: the one call whose first argument is its name as an
-// atom (`later :deferred`). Only a single match counts.
-func recordedLinesIn(module, owner string, result store.LookupResult, src *currentSource, sources generatedDefinitionSources, functions []beam.Function) []store.LookupResult {
+// declared the function: a call whose first argument is its name as an atom
+// (`later :deferred`). See declaration for how one of several is chosen;
+// generated is every function the module's BEAM adds to its source.
+func recordedLinesIn(module, owner string, result store.LookupResult, src *currentSource, sources generatedDefinitionSources, functions, generated []beam.Function) []store.LookupResult {
 	if src == nil {
 		return nil
 	}
@@ -166,7 +189,7 @@ func recordedLinesIn(module, owner string, result store.LookupResult, src *curre
 	if len(lines) > 0 || owner == "" || severalClauses {
 		return lines
 	}
-	if line, ok := src.uniqueDeclaration(owner, functions); ok {
+	if line, ok := src.declaration(owner, functions, generated); ok {
 		return []store.LookupResult{{Module: module, FilePath: result.FilePath, Line: line, Kind: functions[0].Kind, Arity: functions[0].Arity}}
 	}
 	return nil
@@ -244,22 +267,63 @@ func (src *currentSource) ownerAt(line int) string {
 	return src.owners[line]
 }
 
-// uniqueDeclaration returns the one line in owner's body that declares one of
-// functions by name, if exactly one does. A sibling module in the same file
-// that declares the same name does not count.
-func (src *currentSource) uniqueDeclaration(owner string, functions []beam.Function) (int, bool) {
+// declaration returns the line in owner's body of the call that declared one
+// of functions by name. A sibling module in the same file that declares the
+// same name does not count.
+//
+// When one call spells the name, it is the answer. When several do, as
+// `update :publish` and `define :publish` can, the macro that generated the
+// function is taken to be the one whose calls name the most of the module's
+// generated functions: `define` names every function it made, while an action
+// names only its own. A tie gives no answer.
+func (src *currentSource) declaration(owner string, functions, generated []beam.Function) (int, bool) {
 	names := declarationNames(functions[0].Name)
-	found := 0
+	type match struct {
+		line   int
+		callee string
+	}
+	var matches []match
 	for line := 1; line <= len(src.lines); line++ {
-		if !lineDeclaresAtom(src.lines[line-1], names) || src.ownerAt(line) != owner {
+		callee, atom, ok := declaringCall(src.lines[line-1])
+		if !ok || !slices.Contains(names, atom) || src.ownerAt(line) != owner {
 			continue
 		}
-		if found != 0 {
-			return 0, false
-		}
-		found = line
+		matches = append(matches, match{line: line, callee: callee})
 	}
-	return found, found != 0
+	switch len(matches) {
+	case 0:
+		return 0, false
+	case 1:
+		return matches[0].line, true
+	}
+
+	generatedNames := make(map[string]bool)
+	for _, function := range generated {
+		for _, name := range declarationNames(function.Name) {
+			generatedNames[name] = true
+		}
+	}
+	named := make(map[string]map[string]bool)
+	for _, m := range matches {
+		named[m.callee] = make(map[string]bool)
+	}
+	for line := 1; line <= len(src.lines); line++ {
+		callee, atom, ok := declaringCall(src.lines[line-1])
+		if !ok || named[callee] == nil || !generatedNames[atom] || src.ownerAt(line) != owner {
+			continue
+		}
+		named[callee][atom] = true
+	}
+	best, bestScore, tied := 0, -1, false
+	for _, m := range matches {
+		switch score := len(named[m.callee]); {
+		case score > bestScore:
+			best, bestScore, tied = m.line, score, false
+		case score == bestScore:
+			tied = true
+		}
+	}
+	return best, !tied
 }
 
 // declarationNames is the names a declaring call can spell for function: the
@@ -308,36 +372,47 @@ func blankHeredocs(lines []string) []string {
 }
 
 // lineDeclaresAtom reports whether text is a call whose first argument is one
-// of names as an atom: `define :list_rooms`, `field :email, :string`, or
-// `Lib.define(:name)`. That is the shape of a macro call that declares a
-// name. An atom anywhere else, such as a keyword value or a typespec, is not.
+// of names as an atom (see declaringCall).
 func lineDeclaresAtom(text string, names []string) bool {
+	_, atom, ok := declaringCall(text)
+	return ok && slices.Contains(names, atom)
+}
+
+// declaringCall returns the callee and the first argument of text when text
+// is a call whose first argument is an atom: `define :list_rooms`,
+// `field :email, :string`, or `Lib.define(:name)`. That is the shape of a
+// macro call that declares a name. An atom anywhere else, such as a keyword
+// value or a typespec, is not.
+func declaringCall(text string) (callee, atom string, ok bool) {
 	rest := strings.TrimLeft(text, " \t")
-	callee := 0
-	for callee < len(rest) && (isIdentifierByte(rest[callee]) || rest[callee] == '.') {
-		callee++
+	end := 0
+	for end < len(rest) && (isIdentifierByte(rest[end]) || rest[end] == '.') {
+		end++
 	}
 	// A module attribute such as `@tag :slow` sets a value; it declares nothing.
-	if callee == 0 || rest[0] == ':' || rest[0] == '@' || (rest[0] >= '0' && rest[0] <= '9') {
-		return false
+	if end == 0 || rest[0] == ':' || rest[0] == '@' || (rest[0] >= '0' && rest[0] <= '9') {
+		return "", "", false
 	}
-	args := strings.TrimLeft(rest[callee:], " \t")
-	if len(args) == len(rest[callee:]) {
+	args := strings.TrimLeft(rest[end:], " \t")
+	if len(args) == len(rest[end:]) {
 		// No space after the callee: only a parenthesized call qualifies.
 		if !strings.HasPrefix(args, "(") {
-			return false
+			return "", "", false
 		}
 	}
 	args = strings.TrimLeft(strings.TrimPrefix(args, "("), " \t")
-	for _, name := range names {
-		if strings.HasPrefix(args, ":"+name) {
-			end := 1 + len(name)
-			if end == len(args) || !isIdentifierByte(args[end]) {
-				return true
-			}
-		}
+	if !strings.HasPrefix(args, ":") {
+		return "", "", false
 	}
-	return false
+	// Bytes from 0x80 up are parts of a UTF-8 identifier such as `:café`.
+	atomEnd := 1
+	for atomEnd < len(args) && (isIdentifierByte(args[atomEnd]) || args[atomEnd] >= 0x80) {
+		atomEnd++
+	}
+	if atomEnd == 1 {
+		return "", "", false
+	}
+	return rest[:end], args[1:atomEnd], true
 }
 
 func isIdentifierByte(b byte) bool {

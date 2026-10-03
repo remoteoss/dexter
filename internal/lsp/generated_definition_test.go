@@ -598,7 +598,7 @@ func TestSourceRebaseCandidates(t *testing.T) {
 
 // An example in a @moduledoc is not a declaration, and neither is the same
 // call in a sibling module of the same file.
-func TestUniqueDeclarationSkipsHeredocsAndSiblings(t *testing.T) {
+func TestDeclarationSkipsHeredocsAndSiblings(t *testing.T) {
 	text := `defmodule MyApp.Chat do
   @moduledoc """
   Example:
@@ -617,14 +617,14 @@ end
 `
 	src := &currentSource{text: text, lines: blankHeredocs(strings.Split(text, "\n"))}
 	functions := []beam.Function{{Name: "get_room_by_slug!", Arity: 1}}
-	if got, ok := src.uniqueDeclaration("MyApp.Chat", functions); !ok || got != 9 {
-		t.Errorf("uniqueDeclaration = %d, %v; want 9, the one call in MyApp.Chat's body", got, ok)
+	if got, ok := src.declaration("MyApp.Chat", functions, nil); !ok || got != 9 {
+		t.Errorf("declaration = %d, %v; want 9, the one call in MyApp.Chat's body", got, ok)
 	}
 }
 
 // A declaring call whose argument opens a heredoc still declares its name;
 // only the heredoc's body is blanked.
-func TestUniqueDeclarationKeepsCallThatOpensHeredoc(t *testing.T) {
+func TestDeclarationKeepsCallThatOpensHeredoc(t *testing.T) {
 	text := `defmodule MyApp.Chat do
   resources do
     define :get_room_by_slug, description: """
@@ -634,11 +634,68 @@ func TestUniqueDeclarationKeepsCallThatOpensHeredoc(t *testing.T) {
 end
 `
 	src := &currentSource{text: text, lines: blankHeredocs(strings.Split(text, "\n"))}
-	if got, ok := src.uniqueDeclaration("MyApp.Chat", []beam.Function{{Name: "get_room_by_slug!", Arity: 1}}); !ok || got != 3 {
-		t.Errorf("uniqueDeclaration(get_room_by_slug!) = %d, %v; want 3, the call that opens the heredoc", got, ok)
+	if got, ok := src.declaration("MyApp.Chat", []beam.Function{{Name: "get_room_by_slug!", Arity: 1}}, nil); !ok || got != 3 {
+		t.Errorf("declaration(get_room_by_slug!) = %d, %v; want 3, the call that opens the heredoc", got, ok)
 	}
-	if got, ok := src.uniqueDeclaration("MyApp.Chat", []beam.Function{{Name: "list_rooms", Arity: 0}}); ok {
-		t.Errorf("uniqueDeclaration(list_rooms) = %d; want none, the only match is inside the heredoc", got)
+	if got, ok := src.declaration("MyApp.Chat", []beam.Function{{Name: "list_rooms", Arity: 0}}, nil); ok {
+		t.Errorf("declaration(list_rooms) = %d; want none, the only match is inside the heredoc", got)
+	}
+}
+
+// When several calls spell a function's name, as an action and the code
+// interface that runs it do, the macro whose calls name the most of the
+// module's generated functions declared it. A tie gives no answer.
+func TestDeclarationPrefersMacroThatNamesGeneratedFunctions(t *testing.T) {
+	text := `defmodule MyApp.Article do
+  actions do
+    create :create do
+      accept [:title]
+    end
+
+    update :publish do
+    end
+
+    read :published
+  end
+
+  code_interface do
+    define :create, args: [:title]
+    define :publish
+    define :published
+  end
+
+  later :twice
+  later :twice
+
+  first :tied
+  second :tied
+end
+`
+	src := &currentSource{text: text, lines: blankHeredocs(strings.Split(text, "\n"))}
+	var generated []beam.Function
+	for _, name := range []string{"create", "create!", "publish", "publish!", "published", "published!", "twice", "tied"} {
+		generated = append(generated, beam.Function{Name: name, Arity: 1})
+	}
+	for _, tc := range []struct {
+		name string
+		want int
+	}{
+		{"create", 14},
+		{"publish!", 15},
+		{"published", 16},
+	} {
+		if got, ok := src.declaration("MyApp.Article", []beam.Function{{Name: tc.name, Arity: 1}}, generated); !ok || got != tc.want {
+			t.Errorf("declaration(%s) = %d, %v; want %d, the define call", tc.name, got, ok, tc.want)
+		}
+	}
+	for _, name := range []string{"twice", "tied"} {
+		if got, ok := src.declaration("MyApp.Article", []beam.Function{{Name: name, Arity: 0}}, generated); ok {
+			t.Errorf("declaration(%s) = %d; want none, two calls are equally likely", name, got)
+		}
+	}
+	// Without the module's generated functions, there is nothing to choose by.
+	if got, ok := src.declaration("MyApp.Article", []beam.Function{{Name: "publish", Arity: 1}}, nil); ok {
+		t.Errorf("declaration(publish) without generated functions = %d; want none", got)
 	}
 }
 
