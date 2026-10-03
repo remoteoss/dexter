@@ -758,7 +758,7 @@ func (s *Server) startBeamProcess(buildRoot string) (*beamProcess, error) {
 				_ = cmd.Process.Kill()
 				<-done
 				if isOTPMismatch(stderrBuf.String()) {
-					s.beamOTPMismatch(buildRoot)
+					s.rememberOTPMismatch(buildRoot)
 				}
 			}
 		case <-time.After(beamStuckTimeout):
@@ -864,14 +864,14 @@ func (s *Server) formatContent(ctx context.Context, mixRoot, path, content strin
 	bp := s.getBeamProcess(ctx, buildRoot)
 	if bp == nil {
 		log.Printf("Formatting: BEAM process unavailable, falling back to mix format")
-		return s.formatWithMixFormat(ctx, mixRoot, path, content)
+		return s.formatFallback(ctx, mixRoot, buildRoot, path, content)
 	}
 	if bp.formatterConfigChanged(formatterExs) {
 		s.evictBeam(bp, fmt.Sprintf("formatter config changed: %s", formatterExs))
 		bp = s.getBeamProcess(ctx, buildRoot)
 		if bp == nil {
 			log.Printf("Formatting: BEAM process unavailable after formatter config change, falling back to mix format")
-			return s.formatWithMixFormat(ctx, mixRoot, path, content)
+			return s.formatFallback(ctx, mixRoot, buildRoot, path, content)
 		}
 		_ = bp.formatterConfigChanged(formatterExs)
 	}
@@ -881,8 +881,9 @@ func (s *Server) formatContent(ctx context.Context, mixRoot, path, content strin
 	case <-bp.ready:
 		if bp.startErr != nil {
 			s.evictBeam(bp, fmt.Sprintf("formatContent: startup finished with error: %v", bp.startErr))
+			s.noteBeamStartFailure(bp, buildRoot)
 			log.Printf("Formatting: BEAM process failed to start, falling back to mix format: %v", bp.startErr)
-			return s.formatWithMixFormat(ctx, mixRoot, path, content)
+			return s.formatFallback(ctx, mixRoot, buildRoot, path, content)
 		}
 	default:
 		// Not ready yet — decide based on how long it's been starting
@@ -891,11 +892,11 @@ func (s *Server) formatContent(ctx context.Context, mixRoot, path, content strin
 		case age > beamStuckTimeout:
 			log.Printf("Formatting: BEAM process stuck (started %s ago), restarting", age.Truncate(time.Second))
 			s.evictBeam(bp, fmt.Sprintf("formatContent: startup exceeded %s without becoming ready", beamStuckTimeout))
-			return s.formatWithMixFormat(ctx, mixRoot, path, content)
+			return s.formatFallback(ctx, mixRoot, buildRoot, path, content)
 
 		case age > beamWaitTimeout:
 			log.Printf("Formatting: BEAM process not ready after %s, falling back to mix format", age.Truncate(time.Millisecond))
-			return s.formatWithMixFormat(ctx, mixRoot, path, content)
+			return s.formatFallback(ctx, mixRoot, buildRoot, path, content)
 
 		default:
 			if err := bp.Ready(ctx); err != nil {
@@ -903,8 +904,9 @@ func (s *Server) formatContent(ctx context.Context, mixRoot, path, content strin
 					return "", err
 				}
 				s.evictBeam(bp, fmt.Sprintf("formatContent: Ready failed: %v", err))
+				s.noteBeamStartFailure(bp, buildRoot)
 				log.Printf("Formatting: BEAM process failed to start, falling back to mix format: %v", err)
-				return s.formatWithMixFormat(ctx, mixRoot, path, content)
+				return s.formatFallback(ctx, mixRoot, buildRoot, path, content)
 			}
 		}
 	}
@@ -958,6 +960,32 @@ func (s *Server) evictBeam(bp *beamProcess, reason string) {
 	bp.closeWithReason("evicted: " + reason)
 }
 
+// formatFallback formats with mix format when the persistent BEAM cannot, and
+// then decides what an OTP mismatch of the BEAM means for the user. That is
+// known only now: when mix format works, formatting is only slower; when mix
+// format fails with the same mismatch, formatting does not work, and
+// reportFormatFailure already says so.
+func (s *Server) formatFallback(ctx context.Context, mixRoot, buildRoot, path, content string) (string, error) {
+	out, err := s.formatWithMixFormat(ctx, mixRoot, path, content)
+	if ctx.Err() == nil {
+		s.reportBeamOTP(buildRoot, err)
+	}
+	return out, err
+}
+
+// noteBeamStartFailure records an OTP mismatch of a BEAM that failed to start,
+// before the fallback runs, so that the fallback can report it. The process
+// was just killed; its stderr is complete when it has exited.
+func (s *Server) noteBeamStartFailure(bp *beamProcess, buildRoot string) {
+	select {
+	case <-bp.cmd.done:
+	case <-time.After(2 * time.Second):
+	}
+	if bp.stderr != nil && isOTPMismatch(bp.stderr.String()) {
+		s.rememberOTPMismatch(buildRoot)
+	}
+}
+
 // formatWithMixFormat runs `mix format` in mixRoot. It is the fallback when the
 // persistent BEAM cannot serve, so its success says nothing about the BEAM: it
 // clears only the report that formatting does not work in mixRoot.
@@ -975,6 +1003,9 @@ func (s *Server) formatWithMixFormat(ctx context.Context, mixRoot, path, content
 		log.Printf("Formatting: mix format failed for %s (%s): %v\n%s", path, time.Since(start), err, stderr.String())
 		if ctx.Err() == nil {
 			s.reportFormatFailure(mixRoot, err, stderr.String())
+		}
+		if isOTPMismatch(stderr.String()) {
+			return "", fmt.Errorf("%w: %v", errOTPMismatch, err)
 		}
 		return "", err
 	}

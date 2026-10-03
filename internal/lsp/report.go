@@ -284,19 +284,46 @@ func (s *Server) otpStamp(buildRoot string) string {
 	return fmt.Sprint(statFileStamp(elixir), statFileStamp(s.mixBin), statFileStamp(filepath.Join(buildRoot, "_build")))
 }
 
-// beamOTPMismatch records that the BEAM of buildRoot failed with an OTP
-// mismatch, and tells the user one time. Formatting still works through mix
-// format, so it is a degraded state, not a failure.
-func (s *Server) beamOTPMismatch(buildRoot string) {
+// errOTPMismatch marks a mix format that failed with an OTP mismatch.
+var errOTPMismatch = errors.New("Elixir/OTP version mismatch")
+
+// rememberOTPMismatch records that the BEAM of buildRoot failed with an OTP
+// mismatch, so that it is not started again on each save. It reports nothing:
+// what the mismatch means for the user depends on the mix format fallback,
+// and reportBeamOTP decides that.
+func (s *Server) rememberOTPMismatch(buildRoot string) {
 	s.beamMu.Lock()
+	defer s.beamMu.Unlock()
 	if s.otpMismatches == nil {
 		s.otpMismatches = make(map[string]otpMismatch)
 	}
+	if _, ok := s.otpMismatches[buildRoot]; ok {
+		return
+	}
 	s.otpMismatches[buildRoot] = otpMismatch{at: time.Now(), stamp: s.otpStamp(buildRoot)}
+}
+
+// reportBeamOTP tells the user about an OTP mismatch of the BEAM of buildRoot
+// after a mix format fallback ran with result err. Only one of two
+// conditions may show: when the fallback worked, a Warning that formatting is
+// only slower; when the fallback failed with the same mismatch, the Error from
+// reportFormatFailure alone, so this Warning is cleared without a message.
+// Any other fallback failure, such as a syntax error, changes nothing.
+func (s *Server) reportBeamOTP(buildRoot string, err error) {
+	s.beamMu.Lock()
+	holds := s.otpMismatchHolds(buildRoot)
 	s.beamMu.Unlock()
-	s.index.reporter.Set(condOTP+":"+buildRoot, notify.Warning, fmt.Sprintf(
-		"Dexter: Elixir/OTP version mismatch in %s: the Elixir install of this project was compiled for a newer OTP version than the one that runs, so the fast persistent formatter cannot start. Formatting still works through the slower `mix format` fallback. To fix it, update Erlang to match, or switch to an Elixir build that targets your current OTP (for example elixir@...-otp-27). Dexter tries the fast formatter again when the Elixir install or the _build directory changes, or after %s.",
-		buildRoot, otpMismatchRetry))
+	key := condOTP + ":" + buildRoot
+	switch {
+	case !holds:
+		return
+	case err == nil:
+		s.index.reporter.Set(key, notify.Warning, fmt.Sprintf(
+			"Dexter: Elixir/OTP version mismatch in %s: the Elixir install of this project was compiled for a newer OTP version than the one that runs, so the fast persistent formatter cannot start. Formatting still works through the slower `mix format` fallback. To fix it, update Erlang to match, or switch to an Elixir build that targets your current OTP (for example elixir@...-otp-27). Dexter tries the fast formatter again when the Elixir install or the _build directory changes, or after %s.",
+			buildRoot, otpMismatchRetry))
+	case errors.Is(err, errOTPMismatch):
+		s.index.reporter.Clear(key, "")
+	}
 }
 
 // otpMismatchHolds reports whether the BEAM of buildRoot failed with an OTP

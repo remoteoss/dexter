@@ -20,7 +20,7 @@ const otpMismatchStderr = "** (UndefinedFunctionError) function :erlang.foo/0 is
 
 // otpMismatchProject makes a fake Elixir install whose elixir binary fails
 // with an OTP mismatch and counts its starts, and whose mix formats by echoing
-// its input. It returns the server, its editor, and the path of the start log.
+// its input unless a "mixfails" file exists next to it. It returns the server, its editor, and the path of the start log.
 func otpMismatchProject(t *testing.T) (*Server, *notifytest.Client, string) {
 	t.Helper()
 	server, cleanup := setupTestServer(t)
@@ -29,7 +29,8 @@ func otpMismatchProject(t *testing.T) (*Server, *notifytest.Client, string) {
 	starts := filepath.Join(bin, "starts")
 	scripts := map[string]string{
 		"elixir": "#!/bin/sh\necho start >> " + starts + "\necho '" + otpMismatchStderr + "' >&2\nexit 1\n",
-		"mix":    "#!/bin/sh\ncat\n",
+		// mix fails with the same mismatch while a "mixfails" file exists.
+		"mix": "#!/bin/sh\nif [ -e " + filepath.Join(bin, "mixfails") + " ]; then echo '" + otpMismatchStderr + "' >&2; exit 1; fi\ncat\n",
 	}
 	for name, script := range scripts {
 		if err := os.WriteFile(filepath.Join(bin, name), []byte(script), 0o755); err != nil {
@@ -176,6 +177,60 @@ func TestOTPMismatchClearsWhenTheBeamStarts(t *testing.T) {
 	client.WaitMessage(t, reportWait, protocol.MessageTypeInfo, "Dexter: the fast persistent formatter works again in "+server.projectRoot+".")
 	if server.index.reporter.Active(condOTP + ":" + server.projectRoot) {
 		t.Error("the OTP mismatch is still active after the BEAM formatted")
+	}
+	if n := beamStarts(t, starts); n != 1 {
+		t.Errorf("the failing BEAM started %d times, want 1", n)
+	}
+}
+
+// When mix format fails with the same mismatch as the BEAM, formatting does not
+// work at all. The user must see only that Error, never also the Warning that
+// formatting still works through mix format. When mix works again, the Error
+// ends and the Warning applies, once.
+func TestOTPMismatchInBeamAndMixShowsOnlyTheError(t *testing.T) {
+	server, client, starts := otpMismatchProject(t)
+	mixFails := filepath.Join(filepath.Dir(starts), "mixfails")
+	if err := os.WriteFile(mixFails, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(server.projectRoot, "lib", "a.ex")
+	content := "defmodule A do\nend\n"
+	for i := 0; i < 3; i++ {
+		if _, err := server.formatContent(context.Background(), server.projectRoot, path, content); err == nil {
+			t.Fatal("formatting worked although mix fails")
+		}
+	}
+	client.WaitMessage(t, reportWait, protocol.MessageTypeError, "formatting does not work in "+server.projectRoot+": Elixir/OTP version mismatch")
+	time.Sleep(50 * time.Millisecond)
+	if n := countMessages(client, "still works"); n != 0 {
+		t.Fatalf("the user was told that formatting still works while it does not:\n%s", client.Dump())
+	}
+	var formatterConditions []string
+	for _, c := range server.index.reporter.Conditions() {
+		if strings.HasPrefix(c.Key, condFormatter) {
+			formatterConditions = append(formatterConditions, c.Key)
+		}
+	}
+	if len(formatterConditions) != 1 || formatterConditions[0] != condFormatter+":"+server.projectRoot {
+		t.Fatalf("formatter conditions = %v, want only the Error", formatterConditions)
+	}
+
+	if err := os.Remove(mixFails); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if got := formatOnce(t, server, content); got != content {
+			t.Fatalf("format = %q, want %q", got, content)
+		}
+	}
+	client.WaitMessage(t, reportWait, protocol.MessageTypeInfo, "Dexter: formatting works again in "+server.projectRoot+".")
+	client.WaitMessage(t, reportWait, protocol.MessageTypeWarning, "Formatting still works through the slower `mix format` fallback")
+	time.Sleep(50 * time.Millisecond)
+	if n := countMessages(client, "still works"); n != 1 {
+		t.Errorf("got %d Warnings, want 1:\n%s", n, client.Dump())
+	}
+	if server.index.reporter.Active(condFormatter + ":" + server.projectRoot) {
+		t.Error("the Error is still active after mix format worked")
 	}
 	if n := beamStarts(t, starts); n != 1 {
 		t.Errorf("the failing BEAM started %d times, want 1", n)
