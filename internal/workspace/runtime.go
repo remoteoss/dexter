@@ -612,7 +612,9 @@ func (r *Runtime) reconcilePath(path string) error {
 		// A watcher reports a directory when it turns out to be a nested
 		// worktree. Files indexed from it before its .git file appeared, as cp -r
 		// can do, are removed with one range read of the path index.
-		if path != r.root && parser.IsLinkedWorktree(path) {
+		// A worktree that git is still moving counts too: its .git file can
+		// be empty when the watcher reports it.
+		if path != r.root && parser.GitFile(path).Nested() {
 			under, err := r.store.ListFilePathsUnder(path)
 			if err != nil {
 				return err

@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -194,7 +195,7 @@ func WalkElixirFiles(root string, fn func(path string, d fs.DirEntry) error) err
 		}
 		// A worktree that git is still moving has an empty .git file; it is
 		// skipped like a settled one, as the watchers treat it.
-		if !isRoot && (HasLinkedWorktreeGitFile(dir, entries) || HasUnsettledGitFile(dir, entries)) {
+		if !isRoot && GitFileFromEntries(dir, entries).Nested() {
 			return nil
 		}
 		for _, e := range entries {
@@ -225,43 +226,83 @@ func skipDir(name string) bool {
 	return name == "_build" || name == ".git" || name == "node_modules"
 }
 
-// HasLinkedWorktreeGitFile reports whether dir, whose entries are given, is the
-// top of a linked git worktree. Such a checkout nested inside the project (e.g.
-// Claude Code's .claude/worktrees/) is a full copy of the repository, and
-// indexing it would duplicate every definition. Scanning the entries already
-// read costs no syscall; only a directory that has a .git file pays one read.
-func HasLinkedWorktreeGitFile(dir string, entries []fs.DirEntry) bool {
-	for _, e := range entries {
-		if e.Name() == ".git" {
-			return !e.IsDir() && isLinkedWorktreeGitFile(filepath.Join(dir, ".git"))
-		}
-	}
-	return false
+// openGitFile opens a .git file for reading. Tests replace it to count the
+// reads and to serve the states git leaves while it writes the file.
+var openGitFile = func(path string) (io.ReadCloser, error) { return os.Open(path) }
+
+// GitFileState is what a directory's .git entry says about the directory.
+type GitFileState int
+
+const (
+	// NoGitFile: the directory has no .git file. A .git directory, as in a
+	// repository's own root or an old-style submodule, also counts as none.
+	NoGitFile GitFileState = iota
+	// PlainGitFile: a .git file that names a git directory that is not a
+	// linked worktree's, such as a submodule's. The directory is indexed.
+	PlainGitFile
+	// WorktreeGitFile: the top of a linked git worktree. Such a checkout nested
+	// inside the project (e.g. Claude Code's .claude/worktrees/) is a full copy
+	// of the repository, and indexing it would duplicate every definition.
+	WorktreeGitFile
+	// UnsettledGitFile: a .git file that names no git directory yet. Newer
+	// git (2.48 and later) renames a worktree on `git worktree move` and then
+	// writes its .git file again in place, so for a moment the file is empty.
+	// Such a directory is treated as a worktree and checked again later.
+	UnsettledGitFile
+)
+
+// Nested reports whether a walk must leave the directory out: a worktree,
+// or what may be one that git has not finished writing.
+func (s GitFileState) Nested() bool {
+	return s == WorktreeGitFile || s == UnsettledGitFile
 }
 
-// UnsettledGitFile reports whether dir holds a .git file that names no git
-// directory yet. git rewrites a worktree's .git file in place when it moves the
-// worktree, so for a moment after the rename the file is empty, and a directory
-// that is a worktree looks like a plain one. Such a directory is checked again
-// once git is done, rather than indexed.
-func UnsettledGitFile(dir string) bool {
-	info, err := os.Lstat(filepath.Join(dir, ".git"))
+// GitFile classifies dir by its .git entry. The file is read once and every
+// check uses that read: two reads can see two states while git writes the
+// file (empty, then complete), and then answer neither "worktree" nor
+// "unsettled" for a worktree.
+func GitFile(dir string) GitFileState {
+	path := filepath.Join(dir, ".git")
+	info, err := os.Lstat(path)
 	if err != nil || !info.Mode().IsRegular() {
-		return false
+		return NoGitFile
 	}
-	_, ok := gitdirFromFile(filepath.Join(dir, ".git"))
-	return !ok
+	return gitFileState(path)
 }
 
-// HasUnsettledGitFile is UnsettledGitFile for a directory whose entries are
-// already read, so a directory without a .git file costs no syscall.
-func HasUnsettledGitFile(dir string, entries []fs.DirEntry) bool {
+// GitFileFromEntries is GitFile for a directory whose entries are already
+// read: a directory without a .git file costs no syscall, and one with a .git
+// file pays one read.
+func GitFileFromEntries(dir string, entries []fs.DirEntry) GitFileState {
 	for _, e := range entries {
 		if e.Name() == ".git" {
-			return !e.IsDir() && UnsettledGitFile(dir)
+			if e.IsDir() {
+				return NoGitFile
+			}
+			return gitFileState(filepath.Join(dir, ".git"))
 		}
 	}
-	return false
+	return NoGitFile
+}
+
+func gitFileState(path string) GitFileState {
+	gitdir, ok := gitdirFromFile(path)
+	if !ok {
+		// A file that cannot be read, or that names no git directory, is
+		// what git leaves while it writes the file.
+		return UnsettledGitFile
+	}
+	if linkedWorktreeGitdir(path, gitdir) {
+		return WorktreeGitFile
+	}
+	return PlainGitFile
+}
+
+// HasLinkedWorktreeGitFile reports whether dir, whose entries are given, is the
+// top of a linked git worktree. Scanning the entries already read costs no
+// syscall; only a directory that has a .git file pays one read.
+func HasLinkedWorktreeGitFile(dir string, entries []fs.DirEntry) bool {
+	return GitFileFromEntries(dir, entries) == WorktreeGitFile
 }
 
 // isLinkedWorktreeGitFile reports whether the .git file at path belongs to a
@@ -269,9 +310,12 @@ func HasUnsettledGitFile(dir string, entries []fs.DirEntry) bool {
 // any other directory. Only a directory that has a .git file pays for this check.
 func isLinkedWorktreeGitFile(path string) bool {
 	gitdir, ok := gitdirFromFile(path)
-	if !ok {
-		return false
-	}
+	return ok && linkedWorktreeGitdir(path, gitdir)
+}
+
+// linkedWorktreeGitdir reports whether gitdir, read from the .git file at path,
+// is a linked worktree's admin directory.
+func linkedWorktreeGitdir(path, gitdir string) bool {
 	// Git gives each linked worktree an admin directory with a commondir file,
 	// and a submodule's has none. This also covers worktrees of bare
 	// repositories. After git prunes the admin directory, only its place under
@@ -303,7 +347,7 @@ func isLinkedWorktreeGitFile(path string) bool {
 // resolved against the file's directory. It reports false when path is not such
 // a file, which includes a .git directory.
 func gitdirFromFile(path string) (string, bool) {
-	f, err := os.Open(path)
+	f, err := openGitFile(path)
 	if err != nil {
 		return "", false
 	}
@@ -479,7 +523,7 @@ func CollectElixirFilesParallel(root string) []string {
 		if err != nil {
 			return
 		}
-		if dir != root && (HasLinkedWorktreeGitFile(dir, entries) || HasUnsettledGitFile(dir, entries)) {
+		if dir != root && GitFileFromEntries(dir, entries).Nested() {
 			return
 		}
 

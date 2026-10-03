@@ -158,17 +158,21 @@ func (w *fsnotifyWatcher) walkDirectories(root string, includeRoot bool) (int, b
 			return
 		}
 		// The entries show a nested worktree without another syscall.
-		if dir != w.root && parser.HasLinkedWorktreeGitFile(dir, entries) {
-			w.tops.add(dir)
-			return
-		}
-		// A worktree that git is still moving has an empty .git file. It is a
-		// top until the pending check says otherwise, so that its files are
-		// not reported in the meantime.
-		if dir != w.root && parser.HasUnsettledGitFile(dir, entries) {
-			w.tops.add(dir)
-			w.markPending(dir)
-			return
+		// One read of the .git file classifies the directory: two reads can
+		// see an empty file and then a complete one while git writes it.
+		if dir != w.root {
+			switch parser.GitFileFromEntries(dir, entries) {
+			case parser.WorktreeGitFile:
+				w.tops.add(dir)
+				return
+			case parser.UnsettledGitFile:
+				// A worktree that git is still moving has an empty .git file. It
+				// is a top until the pending check says otherwise, so that its
+				// files are not reported in the meantime.
+				w.tops.add(dir)
+				w.markPending(dir)
+				return
+			}
 		}
 		for _, e := range entries {
 			if e.IsDir() && !skipWatchDir(e.Name()) {
@@ -210,11 +214,12 @@ func (w *fsnotifyWatcher) checkPending() {
 		delete(w.pending, dir)
 		info, err := os.Stat(dir)
 		if err == nil && info.IsDir() {
-			if parser.IsLinkedWorktree(dir) {
+			state := parser.GitFile(dir)
+			if state == parser.WorktreeGitFile {
 				continue
 			}
 			// git may still be writing the .git file of a worktree it moved.
-			if parser.UnsettledGitFile(dir) || recordedWorktree(w.root, dir) {
+			if state == parser.UnsettledGitFile || recordedWorktree(w.root, dir) {
 				recorded = append(recorded, dir)
 				continue
 			}
