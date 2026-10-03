@@ -50,13 +50,6 @@ func (w *fsnotifyWatcher) Degraded() bool {
 	return len(w.failed) > 0
 }
 
-func (w *fsnotifyWatcher) isFailed(path string) bool {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	_, ok := w.failed[path]
-	return ok
-}
-
 func (w *fsnotifyWatcher) failedDirectories() []string {
 	w.mu.Lock()
 	paths := make([]string, 0, len(w.failed))
@@ -362,7 +355,8 @@ func (w *fsnotifyWatcher) handle(ev fsnotify.Event) {
 			if skipWatchDir(base) {
 				return
 			}
-			if added := w.watchTree(path); added == 0 {
+			added, read := w.walkDirectories(path, true)
+			if added == 0 {
 				log.Printf("Warning: no directory under %s could be watched", path)
 			}
 			w.retryFailedUnder(path)
@@ -371,8 +365,10 @@ func (w *fsnotifyWatcher) handle(ev fsnotify.Event) {
 			}
 			// A directory that could not be read is not known to be plain:
 			// it can be a worktree moved into place. Its files are indexed by
-			// the reconcile that follows when coverage comes back.
-			if w.isFailed(path) {
+			// the reconcile that follows when a retry reads it. A directory
+			// that was read but could not be watched is known to be plain, and
+			// is indexed now.
+			if !read {
 				return
 			}
 			_ = parser.WalkElixirFiles(path, func(file string, _ fs.DirEntry) error {

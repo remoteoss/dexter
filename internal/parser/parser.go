@@ -276,7 +276,9 @@ func GitFile(dir string) GitFileState {
 func GitFileFromEntries(dir string, entries []fs.DirEntry) GitFileState {
 	for _, e := range entries {
 		if e.Name() == ".git" {
-			if e.IsDir() {
+			// The same rule as GitFile: only a regular file is read. A .git
+			// directory, a symlink or another kind of entry counts as none.
+			if !e.Type().IsRegular() {
 				return NoGitFile
 			}
 			return gitFileState(filepath.Join(dir, ".git"))

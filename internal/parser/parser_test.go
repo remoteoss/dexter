@@ -3939,6 +3939,7 @@ func TestGitFileStates(t *testing.T) {
 		{"submodule", write(filepath.Join(app, "deps", "shared"), "gitdir: ../../.git/modules/shared\n"), PlainGitFile},
 		{"empty .git file", write(filepath.Join(app, "moving"), ""), UnsettledGitFile},
 		{"not a gitdir line", write(filepath.Join(app, "odd"), "something else\n"), UnsettledGitFile},
+		{"symlinked .git", symlinkedGit(t, app), NoGitFile},
 	} {
 		if got := GitFile(tc.dir); got != tc.want {
 			t.Errorf("%s: GitFile = %v, want %v", tc.name, got, tc.want)
@@ -3985,4 +3986,21 @@ func TestGitFileReadsTheFileOnce(t *testing.T) {
 	if got := GitFileFromEntries(wt, entries); got != UnsettledGitFile || reads != 1 {
 		t.Errorf("GitFileFromEntries = %v after %d reads, want %v after one read", got, reads, UnsettledGitFile)
 	}
+}
+
+// symlinkedGit makes a directory whose .git is a symlink to an empty file.
+func symlinkedGit(t *testing.T, app string) string {
+	t.Helper()
+	dir := filepath.Join(app, "linked")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(app, "empty-gitfile")
+	if err := os.WriteFile(target, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(dir, ".git")); err != nil {
+		t.Fatal(err)
+	}
+	return dir
 }

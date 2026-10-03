@@ -805,3 +805,33 @@ func TestWatcherDoesNotReportDirectoryItCouldNotRead(t *testing.T) {
 		})
 	}
 }
+
+// A directory that could be read but not watched, as at the inotify watch
+// limit, is known to be plain, so its files are indexed at once. This holds
+// also when the watcher is already degraded and no coverage edge is reported.
+func TestWatcherIndexesReadableDirectoryItCouldNotWatch(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "arrived")
+	if err := os.MkdirAll(filepath.Join(dir, "lib"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(dir, "lib", "plain.ex")
+	if err := os.WriteFile(file, []byte("defmodule Plain do\nend\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stub := &watchAddStub{failing: map[string]bool{dir: true, filepath.Join(dir, "lib"): true}}
+	w, changed, _ := newRecordingWatcher(root, stub)
+	var coverage []bool
+	w.onCoverageChange = func(degraded bool) { coverage = append(coverage, degraded) }
+	// Already degraded by another directory.
+	w.setFailed(filepath.Join(root, "elsewhere"), true)
+	coverage = nil
+
+	w.handle(fsnotify.Event{Name: dir, Op: fsnotify.Create})
+	if !slices.Contains(*changed, file) {
+		t.Errorf("reported %v, want %s from a readable directory that could not be watched", *changed, file)
+	}
+	if len(coverage) != 0 {
+		t.Errorf("coverage edges %v while already degraded, want none", coverage)
+	}
+}
