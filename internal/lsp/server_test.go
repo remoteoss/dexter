@@ -8331,3 +8331,34 @@ func TestDebugEnvironmentAppliesWithoutInitialize(t *testing.T) {
 		}
 	}
 }
+
+// Paths from editor URIs are stored as the editor spells them, so removing a
+// root's files compares cleaned paths.
+func TestRemoveFilesUnderRootMatchesUncleanStoredPaths(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+	parent := t.TempDir()
+	stdlib := filepath.Join(parent, "stdlib")
+	sep := string(filepath.Separator)
+	unclean := parent + sep + sep + "stdlib" + sep + "lib" + sep + "kernel.ex"
+	kept := filepath.Join(t.TempDir(), "lib", "app.ex")
+	for _, path := range []string{unclean, kept} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("defmodule K do\nend\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := server.store.IndexFileWithRefs(path, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	server.RemoveFilesUnderRoot(stdlib)
+	paths, err := server.store.ListFilePaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 1 || paths[0] != kept {
+		t.Errorf("stored paths = %v, want only %s", paths, kept)
+	}
+}

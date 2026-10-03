@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -2912,6 +2913,315 @@ func TestWalkAndCollectAgreeOnSymlinkedRoot(t *testing.T) {
 		if collected != 2 || walked != 2 {
 			t.Errorf("root %s: Collect=%d Walk=%d, want 2 and 2", root, collected, walked)
 		}
+	}
+}
+
+// TestWalkAndCollectSkipNestedLinkedWorktrees covers a linked git worktree
+// checked out below the project root (e.g. `.claude/worktrees/<name>`): it is a
+// full copy of the repository, so indexing it returns every definition twice.
+// Submodules also carry a `.git` file, but theirs points into `.git/modules/`
+// and they are indexed; so are directories with a `.git` directory, such as
+// Mix git dependencies under deps/.
+func TestWalkAndCollectSkipNestedLinkedWorktrees(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "my_app")
+	write := func(rel, content string) {
+		t.Helper()
+		path := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mod := "defmodule X do\nend\n"
+	write("lib/my_app.ex", mod)
+	write(".git/HEAD", "ref: refs/heads/main\n")
+	// Linked worktrees, absolute and relative gitdir, at two depths.
+	write(".claude/worktrees/feature/.git", "gitdir: "+filepath.Join(root, ".git", "worktrees", "feature")+"\n")
+	write(".claude/worktrees/feature/.formatter.exs", "[]\n")
+	write(".claude/worktrees/feature/lib/my_app.ex", mod)
+	write("wt/.git", "gitdir: ../.git/worktrees/wt\n")
+	write("wt/lib/my_app.ex", mod)
+	// Indexed: a submodule and a git dependency.
+	write("vendor/shared_lib/.git", "gitdir: ../../.git/modules/vendor/shared_lib\n")
+	write("vendor/shared_lib/lib/shared_lib.ex", mod)
+	write("deps/dep_a/.git/HEAD", "ref: refs/heads/main\n")
+	write("deps/dep_a/lib/dep_a.ex", mod)
+
+	want := []string{
+		filepath.Join(root, "deps/dep_a/lib/dep_a.ex"),
+		filepath.Join(root, "lib/my_app.ex"),
+		filepath.Join(root, "vendor/shared_lib/lib/shared_lib.ex"),
+	}
+
+	var walked []string
+	if err := WalkElixirFiles(root, func(path string, d fs.DirEntry) error {
+		walked = append(walked, path)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	collected := CollectElixirFilesParallel(root)
+	sort.Strings(walked)
+	sort.Strings(collected)
+	if !reflect.DeepEqual(walked, want) {
+		t.Errorf("WalkElixirFiles = %v, want %v", walked, want)
+	}
+	if !reflect.DeepEqual(collected, want) {
+		t.Errorf("CollectElixirFilesParallel = %v, want %v", collected, want)
+	}
+
+	// A linked worktree opened as the project root is indexed normally.
+	wt := filepath.Join(root, "wt")
+	if got := CollectElixirFilesParallel(wt); len(got) != 1 {
+		t.Errorf("worktree as root: Collect = %v, want its one file", got)
+	}
+	walked = walked[:0]
+	_ = WalkElixirFiles(wt, func(path string, d fs.DirEntry) error { walked = append(walked, path); return nil })
+	if len(walked) != 1 {
+		t.Errorf("worktree as root: Walk = %v, want its one file", walked)
+	}
+
+	if !InLinkedWorktree(root, filepath.Join(root, "wt/lib/my_app.ex")) {
+		t.Error("InLinkedWorktree missed a file in a nested worktree")
+	}
+	for _, p := range []string{"lib/my_app.ex", "vendor/shared_lib/lib/shared_lib.ex", "deps/dep_a/lib/dep_a.ex"} {
+		if InLinkedWorktree(root, filepath.Join(root, p)) {
+			t.Errorf("InLinkedWorktree(%s) = true", p)
+		}
+	}
+	if InLinkedWorktree(wt, filepath.Join(wt, "lib/my_app.ex")) {
+		t.Error("InLinkedWorktree treated the root itself as nested")
+	}
+	if InLinkedWorktree(root, filepath.Join(base, "elsewhere/lib/a.ex")) {
+		t.Error("InLinkedWorktree matched a path outside the root")
+	}
+}
+
+// TestLinkedWorktreeDetection uses git's own marker, the commondir file in a
+// worktree's admin directory, so worktrees of bare repositories count and a
+// submodule checked out at a path named worktrees/ does not.
+func TestLinkedWorktreeDetection(t *testing.T) {
+	base := t.TempDir()
+	write := func(rel, content string) string {
+		t.Helper()
+		path := filepath.Join(base, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	// A worktree of a bare repository.
+	write("repo.git/worktrees/bare_wt/commondir", "../..\n")
+	write("app/bare_wt/.git", "gitdir: "+filepath.Join(base, "repo.git/worktrees/bare_wt")+"\n")
+	// A worktree whose admin directory git has pruned.
+	write("app/pruned/.git", "gitdir: "+filepath.Join(base, "app/.git/worktrees/pruned")+"\n")
+	// A submodule at worktrees/lib: its admin directory has no commondir.
+	write("app/.git/modules/worktrees/lib/HEAD", "ref: refs/heads/main\n")
+	write("app/worktrees/lib/.git", "gitdir: ../../.git/modules/worktrees/lib\n")
+	// A submodule at worktrees/gone whose git directory is missing.
+	write("app/worktrees/gone/.git", "gitdir: ../../.git/modules/worktrees/gone\n")
+
+	for dir, want := range map[string]bool{
+		"app/bare_wt":        true,
+		"app/pruned":         true,
+		"app/worktrees/lib":  false,
+		"app/worktrees/gone": false,
+		"app":                false,
+	} {
+		if got := IsLinkedWorktree(filepath.Join(base, dir)); got != want {
+			t.Errorf("IsLinkedWorktree(%s) = %v, want %v", dir, got, want)
+		}
+	}
+
+	for dir, want := range map[string]string{
+		"app":               filepath.Join(base, "app/.git"),
+		"app/bare_wt":       filepath.Join(base, "repo.git/worktrees/bare_wt"),
+		"app/worktrees/lib": filepath.Join(base, "app/.git/modules/worktrees/lib"),
+	} {
+		if got, ok := GitDir(filepath.Join(base, dir)); !ok || got != want {
+			t.Errorf("GitDir(%s) = %q, %v; want %q", dir, got, ok, want)
+		}
+	}
+	if _, ok := GitDir(filepath.Join(base, "repo.git")); ok {
+		t.Error("GitDir found a checkout in a bare repository's directory")
+	}
+}
+
+// TestLinkedWorktreeDetectionWithGit checks the detection against the .git
+// files that git itself writes: absolute and relative worktrees, a worktree of a
+// bare repository, and a submodule.
+func TestLinkedWorktreeDetectionWithGit(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	base := t.TempDir()
+	git := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "protocol.file.allow=always"}, args...)...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	lib := filepath.Join(base, "shared_lib")
+	app := filepath.Join(base, "app")
+	for _, dir := range []string{lib, app} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		git(dir, "init", "-q")
+		git(dir, "commit", "-q", "--allow-empty", "-m", "init")
+	}
+	git(app, "submodule", "add", "-q", lib, "vendor/shared_lib")
+	git(app, "commit", "-qm", "submodule")
+	git(app, "worktree", "add", "-q", ".claude/worktrees/abs")
+	git(app, "-c", "worktree.useRelativePaths=true", "worktree", "add", "-q", "wt_rel")
+	git(base, "clone", "-q", "--bare", app, "bare.git")
+	git(filepath.Join(base, "bare.git"), "worktree", "add", "-q", filepath.Join(app, "from_bare"))
+
+	for dir, want := range map[string]bool{
+		".claude/worktrees/abs": true,
+		"wt_rel":                true,
+		"from_bare":             true,
+		"vendor/shared_lib":     false,
+	} {
+		if got := IsLinkedWorktree(filepath.Join(app, dir)); got != want {
+			t.Errorf("IsLinkedWorktree(%s) = %v, want %v", dir, got, want)
+		}
+	}
+	for _, dir := range []string{".", "wt_rel", "from_bare", "vendor/shared_lib"} {
+		gitDir, ok := GitDir(filepath.Join(app, dir))
+		if !ok {
+			t.Errorf("GitDir(%s) found nothing", dir)
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(gitDir, "HEAD")); err != nil {
+			t.Errorf("GitDir(%s) = %s, which has no HEAD", dir, gitDir)
+		}
+	}
+}
+
+// gitRepoWithNestedWorktree makes a committed repository at base/app with a
+// linked worktree at .claude/worktrees/feature, both with one Elixir file.
+func gitRepoWithNestedWorktree(t *testing.T) (app, wt string, git func(args ...string)) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	app = filepath.Join(t.TempDir(), "app")
+	git = func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-c", "user.name=t", "-c", "user.email=t@example.com"}, args...)...)
+		cmd.Dir = app
+		cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(app, "lib"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(app, "lib", "app.ex"), []byte("defmodule App do\nend\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git("init", "-q")
+	git("add", ".")
+	git("commit", "-qm", "init")
+	wt = filepath.Join(app, ".claude", "worktrees", "feature")
+	git("worktree", "add", "-q", wt)
+	return app, wt, git
+}
+
+func walkedAndCollected(t *testing.T, root string) ([]string, []string) {
+	t.Helper()
+	var walked []string
+	if err := WalkElixirFiles(root, func(path string, d fs.DirEntry) error {
+		walked = append(walked, path)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	collected := CollectElixirFilesParallel(root)
+	sort.Strings(walked)
+	sort.Strings(collected)
+	return walked, collected
+}
+
+// git worktree remove, like rm -r, can delete a worktree's .git file before the
+// rest of its checkout, and git's record of it last. A walk in between must
+// still skip the worktree; once git no longer records it, it is a plain
+// directory and is indexed.
+func TestWalkAndCollectSkipWorktreeBeingRemoved(t *testing.T) {
+	app, wt, git := gitRepoWithNestedWorktree(t)
+	if err := os.Remove(filepath.Join(wt, ".git")); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{filepath.Join(app, "lib", "app.ex")}
+	walked, collected := walkedAndCollected(t, app)
+	if !reflect.DeepEqual(walked, want) || !reflect.DeepEqual(collected, want) {
+		t.Errorf("while git records the worktree: Walk = %v, Collect = %v; want %v", walked, collected, want)
+	}
+
+	git("worktree", "prune")
+	want = append(want, filepath.Join(wt, "lib", "app.ex"))
+	sort.Strings(want)
+	walked, collected = walkedAndCollected(t, app)
+	if !reflect.DeepEqual(walked, want) || !reflect.DeepEqual(collected, want) {
+		t.Errorf("after git worktree prune: Walk = %v, Collect = %v; want %v", walked, collected, want)
+	}
+}
+
+// git worktree add writes the admin directory's gitdir file, then the .git
+// file, then commondir. A watcher that reads the .git file in between must
+// still see a worktree.
+func TestLinkedWorktreeDetectedBeforeCommondir(t *testing.T) {
+	app, wt, _ := gitRepoWithNestedWorktree(t)
+	if err := os.Remove(filepath.Join(app, ".git", "worktrees", "feature", "commondir")); err != nil {
+		t.Fatal(err)
+	}
+	if !IsLinkedWorktree(wt) {
+		t.Error("IsLinkedWorktree missed a worktree whose commondir is not written yet")
+	}
+}
+
+// git records a worktree's path with symlinks resolved. A root spelled
+// through a symlink must still find it, in the root's spelling.
+func TestNestedWorktreeTopsThroughSymlinkedRoot(t *testing.T) {
+	app, _, _ := gitRepoWithNestedWorktree(t)
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(app, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	want := []string{filepath.Join(link, ".claude", "worktrees", "feature")}
+	if got := NestedWorktreeTops(link); !reflect.DeepEqual(got, want) {
+		t.Errorf("NestedWorktreeTops(link) = %v, want %v", got, want)
+	}
+}
+
+// A root that is a file is yielded by both walkers.
+func TestWalkAndCollectAgreeOnFileRoot(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "one.ex")
+	if err := os.WriteFile(file, []byte("defmodule One do\nend\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	walked, collected := walkedAndCollected(t, file)
+	if want := []string{file}; !reflect.DeepEqual(walked, want) || !reflect.DeepEqual(collected, want) {
+		t.Errorf("Walk = %v, Collect = %v; want %v", walked, collected, want)
+	}
+	other := filepath.Join(dir, "notes.txt")
+	if err := os.WriteFile(other, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if walked, collected := walkedAndCollected(t, other); len(walked) != 0 || len(collected) != 0 {
+		t.Errorf("non-Elixir file root: Walk = %v, Collect = %v", walked, collected)
 	}
 }
 

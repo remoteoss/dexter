@@ -75,6 +75,10 @@ func LegacyDBPath(projectRoot string) string {
 // the defaults, in the order given. The CLI passes "mix.exs" to fall back
 // to the nearest Mix project when no dexter/git marker is found.
 //
+// The search never climbs above a linked git worktree: one checked out inside
+// another checkout (e.g. .claude/worktrees/<name>) is its own project, and
+// finding the enclosing checkout's database first would serve the wrong files.
+//
 // Returns the original path if no marker is found.
 func FindProjectRoot(path string, extraMarkers ...string) string {
 	markers := append([]string{
@@ -88,6 +92,9 @@ func FindProjectRoot(path string, extraMarkers ...string) string {
 		for {
 			if validProjectMarker(filepath.Join(dir, marker), marker) {
 				return dir
+			}
+			if parser.IsLinkedWorktree(dir) {
+				break
 			}
 			parent := filepath.Dir(dir)
 			if parent == dir {
@@ -796,6 +803,30 @@ func (b *Batch) closeStmts() {
 
 func (s *Store) ListFilePaths() ([]string, error) {
 	rows, err := s.db.Query("SELECT path FROM files")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var paths []string
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			return nil, err
+		}
+		paths = append(paths, path)
+	}
+	return paths, rows.Err()
+}
+
+// ListFilePathsUnder returns the indexed files below the directory dir. Like
+// HasPath, it reads only the matching range of the unique path index instead of
+// every stored path.
+func (s *Store) ListFilePathsUnder(dir string) ([]string, error) {
+	rows, err := s.db.Query(
+		"SELECT path FROM files WHERE path >= ? AND path < ?",
+		dir+string(os.PathSeparator), dir+string(rune(os.PathSeparator+1)),
+	)
 	if err != nil {
 		return nil, err
 	}

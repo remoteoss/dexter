@@ -12,7 +12,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -600,27 +599,38 @@ func (r *Runtime) reconcilePath(path string) error {
 	info, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			paths := []string{path}
-			stored, listErr := r.store.ListFilePaths()
+			under, listErr := r.store.ListFilePathsUnder(path)
 			if listErr != nil {
 				return listErr
 			}
-			prefix := path + string(os.PathSeparator)
-			for _, storedPath := range stored {
-				if strings.HasPrefix(storedPath, prefix) {
-					paths = append(paths, storedPath)
-				}
-			}
-			r.core.RemoveFiles(paths)
+			r.core.RemoveFiles(append(under, path))
 			return nil
 		}
 		return err
 	}
 	if info.IsDir() {
+		// A watcher reports a directory when it turns out to be a nested
+		// worktree. Files indexed from it before its .git file appeared, as cp -r
+		// can do, are removed with one range read of the path index.
+		if path != r.root && parser.IsLinkedWorktree(path) {
+			under, err := r.store.ListFilePathsUnder(path)
+			if err != nil {
+				return err
+			}
+			if len(under) > 0 {
+				r.core.RemoveFiles(under)
+			}
+		}
 		return nil
 	}
 	base := filepath.Base(path)
 	if base == "mix.lock" || base == "mix.exs" {
+		// A nested worktree is a separate checkout the index leaves out, so its
+		// manifests must not reindex this workspace. Source files need no check
+		// here: the core skips them itself.
+		if parser.InLinkedWorktree(r.root, path) {
+			return nil
+		}
 		r.core.ReindexWorkspace()
 		return nil
 	}
@@ -699,8 +709,17 @@ func (r *Runtime) startNativeWatcher() {
 	}
 }
 
+// gitHeadPollInterval is how often the runtime checks HEAD for a branch switch.
+var gitHeadPollInterval = 2 * time.Second
+
 func (r *Runtime) startGitWatch() {
-	headPath := filepath.Join(r.root, ".git", "HEAD")
+	// In a linked worktree or a submodule, .git is a file that names the git
+	// directory, and HEAD is there.
+	gitDir, ok := parser.GitDir(r.root)
+	if !ok {
+		return
+	}
+	headPath := filepath.Join(gitDir, "HEAD")
 	info, err := os.Stat(headPath)
 	if err != nil {
 		return
@@ -709,7 +728,7 @@ func (r *Runtime) startGitWatch() {
 	r.gitWG.Add(1)
 	go func() {
 		defer r.gitWG.Done()
-		ticker := time.NewTicker(2 * time.Second)
+		ticker := time.NewTicker(gitHeadPollInterval)
 		defer ticker.Stop()
 		for {
 			select {

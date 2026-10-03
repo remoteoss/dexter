@@ -362,7 +362,8 @@ func (s *Server) warmUsingCache() {
 	s.debugf("warmUsingCache: %d __using__ modules in %s", len(usingModules), time.Since(start).Round(time.Millisecond))
 }
 
-// pruneMissingFiles removes stored files that the sweep did not see on disk.
+// pruneMissingFiles removes stored files that the sweep did not see on disk, and
+// stored files inside a nested worktree, which the sweep skips.
 //
 // It holds indexWrites for writing, so no single-file write can land between
 // the decision and the delete, and it re-checks each candidate against the
@@ -389,18 +390,55 @@ func (s *Server) pruneMissingFiles(seen map[string]struct{}) {
 	}
 
 	var toRemove []string
+	// Files in a nested worktree exist, but no walk yields them, and indexes
+	// built before worktrees were skipped still hold them. The answer is the
+	// same for every file in a directory, so it is looked up once per directory,
+	// and only for the few paths the sweep did not see. The walk also skips
+	// worktrees that git records after their .git file is gone.
+	inWorktree := make(map[string]bool)
+	var recorded map[string]struct{}
+	recordedRead := false
 	for _, storedPath := range storedPaths {
 		if _, ok := seen[storedPath]; ok {
 			continue
 		}
-		if _, err := os.Lstat(storedPath); err == nil || !errors.Is(err, fs.ErrNotExist) {
+		_, err := os.Lstat(storedPath)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			continue
+		}
+		if err == nil {
+			dir := filepath.Dir(storedPath)
+			in, ok := inWorktree[dir]
+			if !ok {
+				if !recordedRead {
+					recorded, recordedRead = parser.NestedWorktreeSet(s.projectRoot), true
+				}
+				in = underTop(s.projectRoot, dir, recorded) || parser.InLinkedWorktree(s.projectRoot, storedPath)
+				inWorktree[dir] = in
+			}
+			if !in {
+				continue
+			}
 		}
 		toRemove = append(toRemove, storedPath)
 	}
 	if len(toRemove) > 0 {
 		_ = s.store.RemoveFiles(toRemove)
 	}
+}
+
+// underTop reports whether dir is one of tops or lies below one, not counting
+// root itself.
+func underTop(root, dir string, tops map[string]struct{}) bool {
+	if len(tops) == 0 {
+		return false
+	}
+	for ; len(dir) > len(root); dir = filepath.Dir(dir) {
+		if _, ok := tops[dir]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // showError reports a problem the user has to act on. The caller logs as well,
@@ -472,6 +510,11 @@ func (s *Server) indexOneFile(path string) {
 // indexOneFileLocked is indexOneFile for callers already holding indexWrites.
 // Go's RWMutex is not reentrant, so the two must stay separate.
 func (s *Server) indexOneFileLocked(path string) {
+	// Watchers and editors report changes in nested worktrees too; the full
+	// walk skips them, so a single-file update must as well.
+	if parser.InLinkedWorktree(s.projectRoot, path) {
+		return
+	}
 	defs, refs, err := parser.ParseFile(path)
 	if err != nil {
 		log.Printf("Error parsing %s: %v", path, err)
@@ -692,7 +735,13 @@ func (s *Server) RemoveFilesUnderRoot(root string) {
 // watchGitHead polls .git/HEAD mtime and triggers reindex on branch switches.
 func (s *Server) watchGitHead() {
 	go func() {
-		headPath := filepath.Join(s.projectRoot, ".git", "HEAD")
+		// In a linked worktree or a submodule, .git is a file that names the
+		// git directory, and HEAD is there.
+		gitDir, ok := parser.GitDir(s.projectRoot)
+		if !ok {
+			return
+		}
+		headPath := filepath.Join(gitDir, "HEAD")
 		var lastMtime int64
 
 		info, err := os.Stat(headPath)

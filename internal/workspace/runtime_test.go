@@ -176,6 +176,154 @@ func readChange(t *testing.T, changes <-chan Change) Change {
 	return Change{}
 }
 
+// A manifest change in a nested worktree belongs to that checkout, not to this
+// workspace, so it must not start a workspace reindex.
+func TestManifestInNestedWorktreeDoesNotReindexWorkspace(t *testing.T) {
+	rt, root := newTestRuntime(t)
+	wt := filepath.Join(root, ".claude", "worktrees", "feature")
+	makeLinkedWorktree(t, root, wt)
+	manifest := filepath.Join(wt, "mix.exs")
+	if err := os.WriteFile(manifest, []byte("defmodule Feature.MixProject do\nend\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// No event reports this file, so only a workspace reindex can index it.
+	writeTestModule(t, root, "lib/unreported.ex", "SharedLib.Unreported")
+
+	if err := rt.ReindexPath(testContext(t, 10*time.Second), manifest); err != nil {
+		t.Fatal(err)
+	}
+	if countModule(t, rt, "SharedLib.Unreported") != 0 {
+		t.Fatal("a nested worktree's mix.exs reindexed the workspace")
+	}
+}
+
+// cp -r can copy a worktree's files before its .git file, so some can be indexed
+// first. When the watcher reports the directory, those rows go.
+func TestDirectoryThatBecomesWorktreeLosesItsRows(t *testing.T) {
+	rt, root := newTestRuntime(t)
+	wt := filepath.Join(root, "copied")
+	early := writeTestModule(t, wt, "lib/early.ex", "SharedLib.Early")
+	if err := rt.ReindexPath(testContext(t, 10*time.Second), early); err != nil {
+		t.Fatal(err)
+	}
+	if countModule(t, rt, "SharedLib.Early") == 0 {
+		t.Fatal("setup: the early file was not indexed")
+	}
+	makeLinkedWorktree(t, root, wt)
+	main := filepath.Join(root, "lib", "main.ex")
+	if err := rt.ReindexPath(testContext(t, 10*time.Second), main); err != nil {
+		t.Fatal(err)
+	}
+	// The watcher reports the directory itself, which is not a full reindex.
+	if err := rt.awaitPath(testContext(t, 10*time.Second), wt); err != nil {
+		t.Fatal(err)
+	}
+	if countModule(t, rt, "SharedLib.Early") != 0 {
+		t.Fatal("rows indexed before the .git file appeared are still there")
+	}
+	if countModule(t, rt, "Main") == 0 {
+		t.Fatal("rows outside the worktree went too")
+	}
+}
+
+// An index built before nested worktrees were skipped holds their files. They
+// still exist on disk, so the sweep must remove them for another reason.
+func TestReindexRemovesRowsFromNestedWorktree(t *testing.T) {
+	rt, root := newTestRuntime(t)
+	wt := filepath.Join(root, ".claude", "worktrees", "feature")
+	old := writeTestModule(t, wt, "lib/old.ex", "SharedLib.OldCopy")
+	if err := rt.ReindexPath(testContext(t, 10*time.Second), old); err != nil {
+		t.Fatal(err)
+	}
+	if countModule(t, rt, "SharedLib.OldCopy") == 0 {
+		t.Fatal("setup: the worktree file was not indexed")
+	}
+	makeLinkedWorktree(t, root, wt)
+	if err := rt.Reindex(testContext(t, 10*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if countModule(t, rt, "SharedLib.OldCopy") != 0 {
+		t.Fatal("the sweep kept a row from a nested worktree")
+	}
+	if countModule(t, rt, "Main") == 0 {
+		t.Fatal("the sweep did not index the project")
+	}
+}
+
+// git worktree remove deletes the .git file before the rest of the checkout,
+// and its record last. A sweep in between must drop rows from the worktree, not
+// keep them because the files still exist.
+func TestReindexRemovesRowsFromWorktreeBeingRemoved(t *testing.T) {
+	rt, root := newTestRuntime(t)
+	wt := filepath.Join(root, ".claude", "worktrees", "feature")
+	old := writeTestModule(t, wt, "lib/old.ex", "SharedLib.OldCopy")
+	if err := rt.ReindexPath(testContext(t, 10*time.Second), old); err != nil {
+		t.Fatal(err)
+	}
+	if countModule(t, rt, "SharedLib.OldCopy") == 0 {
+		t.Fatal("setup: the worktree file was not indexed")
+	}
+	makeLinkedWorktree(t, root, wt)
+	if err := os.Remove(filepath.Join(wt, ".git")); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.Reindex(testContext(t, 10*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if countModule(t, rt, "SharedLib.OldCopy") != 0 {
+		t.Fatal("the sweep kept a row from a worktree that git still records")
+	}
+	if countModule(t, rt, "Main") == 0 {
+		t.Fatal("the sweep did not index the project")
+	}
+}
+
+// In a linked worktree, .git is a file and HEAD is in the git directory it
+// names. A branch switch there must still reconcile the workspace.
+func TestGitWatchFollowsLinkedWorktreeHead(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv("SHELL", "/bin/false")
+	previous := gitHeadPollInterval
+	gitHeadPollInterval = 20 * time.Millisecond
+	t.Cleanup(func() { gitHeadPollInterval = previous })
+
+	base := t.TempDir()
+	admin := filepath.Join(base, "app", ".git", "worktrees", "feature")
+	head := filepath.Join(admin, "HEAD")
+	root := filepath.Join(base, "feature")
+	for path, content := range map[string]string{
+		head:                              "ref: refs/heads/feature\n",
+		filepath.Join(admin, "commondir"): "../..\n",
+		filepath.Join(root, ".git"):       "gitdir: " + admin + "\n",
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rt, err := OpenWithOptions(root, Options{NoWatch: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rt.Close() })
+	if err := rt.WaitReady(testContext(t, 30*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	changes, cancel := rt.Subscribe(8)
+	defer cancel()
+
+	later := time.Now().Add(time.Minute)
+	if err := os.Chtimes(head, later, later); err != nil {
+		t.Fatal(err)
+	}
+	if change := readChange(t, changes); !change.Full {
+		t.Fatalf("change = %+v, want a full reconcile", change)
+	}
+}
+
 // An isolated editor save must not pay the coalescing window: that window exists
 // for bursts, and adding it to every save would be a straight latency tax on the
 // most common mutation there is.
