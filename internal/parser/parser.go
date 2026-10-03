@@ -237,6 +237,31 @@ func HasLinkedWorktreeGitFile(dir string, entries []fs.DirEntry) bool {
 	return false
 }
 
+// UnsettledGitFile reports whether dir holds a .git file that names no git
+// directory yet. git rewrites a worktree's .git file in place when it moves the
+// worktree, so for a moment after the rename the file is empty, and a directory
+// that is a worktree looks like a plain one. Such a directory is checked again
+// once git is done, rather than indexed.
+func UnsettledGitFile(dir string) bool {
+	info, err := os.Lstat(filepath.Join(dir, ".git"))
+	if err != nil || !info.Mode().IsRegular() {
+		return false
+	}
+	_, ok := gitdirFromFile(filepath.Join(dir, ".git"))
+	return !ok
+}
+
+// HasUnsettledGitFile is UnsettledGitFile for a directory whose entries are
+// already read, so a directory without a .git file costs no syscall.
+func HasUnsettledGitFile(dir string, entries []fs.DirEntry) bool {
+	for _, e := range entries {
+		if e.Name() == ".git" {
+			return !e.IsDir() && UnsettledGitFile(dir)
+		}
+	}
+	return false
+}
+
 // isLinkedWorktreeGitFile reports whether the .git file at path belongs to a
 // linked worktree. Submodules also have a .git file, and they stay indexed like
 // any other directory. Only a directory that has a .git file pays for this check.

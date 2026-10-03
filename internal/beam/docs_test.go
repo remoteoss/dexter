@@ -136,20 +136,35 @@ func TestParseDocsMalformed(t *testing.T) {
 	}
 }
 
-// Deeply nested terms must be rejected rather than followed into a stack
-// overflow, which a corrupt length field could otherwise cause.
-func TestParseDocsRejectsDeepNesting(t *testing.T) {
+// Stepping over a deeply nested term costs no stack, and a nested anno is read
+// the same way: a million levels, which a corrupt chunk could hold, must not
+// overflow the stack.
+func TestParseDocsDeepNestingCostsNoStack(t *testing.T) {
 	var w etfTestWriter
 	w.smallTuple(7)
 	w.atom("docs_v1")
-	// The anno field is skipped, so nesting it past the limit exercises the
-	// depth guard inside skip rather than the header checks.
-	for range maxETFDepth + 10 {
+	for range 1_000_000 {
 		w.smallTuple(1)
 	}
 	w.nil()
+	// The rest of docs_v1 is missing, so the parse fails, but only after it
+	// stepped over the nested anno.
 	if _, err := parseDocs(w.buf); err == nil {
-		t.Error("expected deeply nested input to be rejected")
+		t.Error("expected the incomplete term to be rejected")
+	}
+
+	var anno etfTestWriter
+	for range 1_000_000 {
+		anno.smallTuple(2)
+	}
+	anno.smallInt(7)
+	for range 1_000_000 {
+		anno.smallInt(1)
+	}
+	r := &etfReader{buf: anno.buf}
+	line, err := readAnnoLine(r)
+	if err != nil || line != 7 || r.remaining() != 0 {
+		t.Errorf("readAnnoLine = %d, %v with %d bytes left; want 7 and the whole term read", line, err, r.remaining())
 	}
 }
 

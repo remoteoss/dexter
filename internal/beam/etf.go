@@ -40,15 +40,10 @@ func isAtomTag(tag byte) bool {
 	return tag == tagAtom || tag == tagAtomUTF8 || tag == tagSmallAtom || tag == tagSmallAtomUTF8
 }
 
-// maxETFDepth bounds recursion in skip. A Docs chunk nests at most five levels
-// deep, so a corrupt length that implied more is rejected rather than followed.
-const maxETFDepth = 64
-
 var (
 	errUnsupportedTag = errors.New("unsupported ETF tag")
 	errTruncated      = errors.New("truncated ETF term")
 	errBadCount       = errors.New("ETF count exceeds remaining bytes")
-	errTooDeep        = errors.New("ETF nesting too deep")
 )
 
 // etfReader walks an ETF term in place.
@@ -63,13 +58,8 @@ var (
 // Every read is bounds-checked, so malformed input yields an error rather than a
 // panic or an out-of-range slice.
 type etfReader struct {
-	buf   []byte
-	pos   int
-	depth int
-
-	// maxDepth overrides maxETFDepth for terms that legitimately nest deeper,
-	// such as the clause ASTs in a Dbgi chunk. Zero keeps the default.
-	maxDepth int
+	buf []byte
+	pos int
 }
 
 func (r *etfReader) remaining() int { return len(r.buf) - r.pos }
@@ -302,131 +292,114 @@ func (r *etfReader) binarySpan() (start, length int, err error) {
 
 // skip advances past one term of any shape without allocating for it.
 func (r *etfReader) skip() error {
-	limit := r.maxDepth
-	if limit == 0 {
-		limit = maxETFDepth
-	}
-	if r.depth >= limit {
-		return errTooDeep
-	}
-	tag, err := r.u8()
-	if err != nil {
-		return err
-	}
-	switch tag {
-	case tagNil:
-		return nil
-	case tagSmallInteger:
-		return r.skipBytes(1)
-	case tagInteger:
-		return r.skipBytes(4)
-	case tagNewFloat:
-		return r.skipBytes(8)
-	case tagFloat:
-		return r.skipBytes(31)
-	case tagAtom, tagAtomUTF8, tagString:
-		n, err := r.u16()
-		if err != nil {
-			return err
-		}
-		return r.skipBytes(int64(n))
-	case tagSmallAtom, tagSmallAtomUTF8:
-		n, err := r.u8()
-		if err != nil {
-			return err
-		}
-		return r.skipBytes(int64(n))
-	case tagBinary:
-		n, err := r.u32()
-		if err != nil {
-			return err
-		}
-		return r.skipBytes(n)
-	case tagBitBinary:
-		n, err := r.u32()
-		if err != nil {
-			return err
-		}
-		if err := r.skipBytes(1); err != nil {
-			return err
-		}
-		return r.skipBytes(n)
-	case tagSmallBig:
-		n, err := r.u8()
-		if err != nil {
-			return err
-		}
-		return r.skipBytes(int64(n) + 1)
-	case tagLargeBig:
-		n, err := r.u32()
-		if err != nil {
-			return err
-		}
-		return r.skipBytes(n + 1)
-	case tagSmallTuple:
-		n, err := r.u8()
-		if err != nil {
-			return err
-		}
-		return r.skipTerms(int64(n))
-	case tagLargeTuple:
-		n, err := r.u32()
-		if err != nil {
-			return err
-		}
-		return r.skipTerms(n)
-	case tagList:
-		n, err := r.u32()
-		if err != nil {
-			return err
-		}
-		if err := r.checkCount(n, 1); err != nil {
-			return err
-		}
-		if err := r.skipTerms(n); err != nil {
-			return err
-		}
-		return r.skip() // the tail
-	case tagMap:
-		n, err := r.u32()
-		if err != nil {
-			return err
-		}
-		if err := r.checkCount(n, 2); err != nil {
-			return err
-		}
-		return r.skipTerms(n * 2)
-	case tagNewFun:
-		// Size counts the whole term including the four size bytes themselves.
-		n, err := r.u32()
-		if err != nil {
-			return err
-		}
-		return r.skipBytes(n - 4)
-	case tagExport:
-		// An external fun, `fun M:F/A`. Unlike NEW_FUN_EXT, whose Arity is a bare
-		// byte, this one encodes the arity as an integer term, so skipping a fixed
-		// byte would misalign every term that follows it.
-		if _, err := r.readAtom(); err != nil {
-			return err
-		}
-		if _, err := r.readAtom(); err != nil {
-			return err
-		}
-		return r.skip()
-	default:
-		return fmt.Errorf("%w: %d", errUnsupportedTag, tag)
-	}
+	return r.skipTerms(1)
 }
 
+// skipTerms steps over count terms. It does not recurse: a tuple, list or map
+// adds its elements to the terms still to step over, so a deeply nested term,
+// as a clause body in a Dbgi chunk can be, costs no stack. Every term takes at
+// least one byte, so more terms to step over than bytes left is corrupt input,
+// and is rejected before it can drive the loop.
 func (r *etfReader) skipTerms(count int64) error {
-	if err := r.checkCount(count, 1); err != nil {
+	pending := int64(0)
+	add := func(n int64) error {
+		if n < 0 {
+			return errBadCount
+		}
+		pending += n
+		if pending > int64(r.remaining()) {
+			return errBadCount
+		}
+		return nil
+	}
+	if err := add(count); err != nil {
 		return err
 	}
-	r.depth++
-	defer func() { r.depth-- }()
-	for i := int64(0); i < count; i++ {
-		if err := r.skip(); err != nil {
+	for ; pending > 0; pending-- {
+		tag, err := r.u8()
+		if err != nil {
+			return err
+		}
+		switch tag {
+		case tagNil:
+		case tagSmallInteger:
+			err = r.skipBytes(1)
+		case tagInteger:
+			err = r.skipBytes(4)
+		case tagNewFloat:
+			err = r.skipBytes(8)
+		case tagFloat:
+			err = r.skipBytes(31)
+		case tagAtom, tagAtomUTF8, tagString:
+			var n int
+			if n, err = r.u16(); err == nil {
+				err = r.skipBytes(int64(n))
+			}
+		case tagSmallAtom, tagSmallAtomUTF8:
+			var n byte
+			if n, err = r.u8(); err == nil {
+				err = r.skipBytes(int64(n))
+			}
+		case tagBinary:
+			var n int64
+			if n, err = r.u32(); err == nil {
+				err = r.skipBytes(n)
+			}
+		case tagBitBinary:
+			var n int64
+			if n, err = r.u32(); err == nil {
+				err = r.skipBytes(n + 1)
+			}
+		case tagSmallBig:
+			var n byte
+			if n, err = r.u8(); err == nil {
+				err = r.skipBytes(int64(n) + 1)
+			}
+		case tagLargeBig:
+			var n int64
+			if n, err = r.u32(); err == nil {
+				err = r.skipBytes(n + 1)
+			}
+		case tagSmallTuple:
+			var n byte
+			if n, err = r.u8(); err == nil {
+				err = add(int64(n))
+			}
+		case tagLargeTuple:
+			var n int64
+			if n, err = r.u32(); err == nil {
+				err = add(n)
+			}
+		case tagList:
+			// The elements, then the tail.
+			var n int64
+			if n, err = r.u32(); err == nil {
+				err = add(n + 1)
+			}
+		case tagMap:
+			var n int64
+			if n, err = r.u32(); err == nil {
+				err = add(n * 2)
+			}
+		case tagNewFun:
+			// Size counts the whole term including the four size bytes themselves.
+			var n int64
+			if n, err = r.u32(); err == nil {
+				err = r.skipBytes(n - 4)
+			}
+		case tagExport:
+			// An external fun, `fun M:F/A`. Unlike NEW_FUN_EXT, whose Arity is a
+			// bare byte, this one encodes the arity as an integer term, so
+			// skipping a fixed byte would misalign every term that follows it.
+			if _, err = r.readAtom(); err == nil {
+				if _, err = r.readAtom(); err == nil {
+					err = add(1)
+				}
+			}
+		default:
+			err = fmt.Errorf("%w: %d", errUnsupportedTag, tag)
+		}
+		if err != nil {
 			return err
 		}
 	}

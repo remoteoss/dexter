@@ -567,29 +567,36 @@ func parseDocsEntry(r *etfReader) ([]Function, bool, error) {
 // consumed and reported as line 0 rather than failing the whole entry. A dropped annotation must never cost the
 // module its generated functions.
 func readAnnoLine(r *etfReader) (int, error) {
-	tag, err := r.peekTag()
-	if err != nil {
-		return 0, err
-	}
-	switch tag {
-	case tagSmallInteger, tagInteger:
-		return r.readInt()
-	case tagSmallTuple:
-		// {line, column}, as erl_anno writes a location with a column.
-		arity, err := r.enterTuple()
+	// rest counts the elements after each tuple's first one, which are stepped
+	// over once the line is found. A loop rather than recursion, so a corrupt
+	// chunk of nested tuples costs no stack.
+	rest := int64(0)
+	for {
+		tag, err := r.peekTag()
 		if err != nil {
 			return 0, err
 		}
-		if arity == 0 {
-			return 0, nil
+		switch tag {
+		case tagSmallInteger, tagInteger:
+			line, err := r.readInt()
+			if err != nil {
+				return 0, err
+			}
+			return line, r.skipTerms(rest)
+		case tagSmallTuple:
+			// {line, column}, as erl_anno writes a location with a column.
+			arity, err := r.enterTuple()
+			if err != nil {
+				return 0, err
+			}
+			if arity == 0 {
+				return 0, r.skipTerms(rest)
+			}
+			rest += int64(arity) - 1
+			continue
 		}
-		line, err := readAnnoLine(r)
-		if err != nil {
-			return 0, err
-		}
-		return line, r.skipTerms(int64(arity) - 1)
+		return 0, r.skipTerms(rest + 1)
 	}
-	return 0, r.skip()
 }
 
 // readSignatureParams consumes the signature list and parses the first signature

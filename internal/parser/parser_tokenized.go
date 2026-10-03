@@ -19,6 +19,11 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 	var moduleStack []moduleFrame
 	depth := 0
 
+	aliases := map[string]string{}
+	injectors := map[string]bool{}
+
+	n := len(tokens)
+
 	// A def inside a macro's quote is code the macro generates in its caller,
 	// not a function of the macro's module, so it is not indexed as one. The
 	// compiled caller's BEAM records where it was declared. `__using__` is the
@@ -28,6 +33,18 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 	// in one, or zero. quoteLine is the line of an inline `quote do:`.
 	var macroBodies []int
 	quoteDepth, quoteLine := 0, 0
+	// inlineMacroLine is the line of the last such macro written with `, do:`,
+	// whose quote can follow on the next line.
+	inlineMacroLine := 0
+	markQuote := func(at, depthAt int) {
+		switch form, line := quoteForm(source, tokens, n, at+1); form {
+		case quoteBlock:
+			// The do is counted when the walk reaches it.
+			quoteDepth = depthAt + 1
+		case quoteInline:
+			quoteLine = line
+		}
+	}
 	leaveBlocks := func() {
 		if quoteDepth > depth {
 			quoteDepth = 0
@@ -36,10 +53,6 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 			macroBodies = macroBodies[:len(macroBodies)-1]
 		}
 	}
-	aliases := map[string]string{}
-	injectors := map[string]bool{}
-
-	n := len(tokens)
 
 	tokenText := func(t Token) string {
 		return TokenText(source, t)
@@ -328,10 +341,34 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 					delegateTo, delegateAs = scanDelegateOpts(pj)
 				}
 
-				if (kind == "defmacro" || kind == "defmacrop") && funcName != "__using__" && opensDoBlock(tokens, n, pj) {
-					// The do on this line is counted when the line is walked
-					// below, so the body is one deeper than here.
-					macroBodies = append(macroBodies, depth+1)
+				if (kind == "defmacro" || kind == "defmacrop") && funcName != "__using__" {
+					if opensDoBlock(tokens, n, pj) {
+						// The do on this line is counted when the line is walked
+						// below, so the body is one deeper than here.
+						macroBodies = append(macroBodies, depth+1)
+					} else {
+						inlineMacroLine = defLine
+					}
+					// The walk below takes the rest of this line, so a quote on
+					// it (`, do: quote do`) is found here.
+					if quoteDepth == 0 {
+						lineDepth := depth
+						for k := pj; k < n && tokens[k].Kind != TokEOL && tokens[k].Kind != TokEOF; k++ {
+							switch tokens[k].Kind {
+							case TokDo, TokFn:
+								lineDepth++
+							case TokEnd:
+								lineDepth--
+							case TokIdent:
+								if tokenText(tokens[k]) == "quote" {
+									markQuote(k, lineDepth)
+								}
+							}
+							if quoteDepth != 0 || quoteLine == defLine {
+								break
+							}
+						}
+					}
 				}
 				if (quoteDepth > 0 && depth >= quoteDepth) || quoteLine == defLine {
 					i = j
@@ -666,14 +703,8 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 			continue
 
 		case TokIdent:
-			if len(macroBodies) > 0 && quoteDepth == 0 && tokenText(tok) == "quote" {
-				switch form, line := quoteForm(source, tokens, n, i+1); form {
-				case quoteBlock:
-					// Counted when the walk reaches the do.
-					quoteDepth = depth + 1
-				case quoteInline:
-					quoteLine = line
-				}
+			if quoteDepth == 0 && tokenText(tok) == "quote" && (len(macroBodies) > 0 || followsInlineMacroHead(source, tokens, i, inlineMacroLine)) {
+				markQuote(i, depth)
 			}
 			cm := currentModule()
 			if cm != "" && len(injectors) > 0 {
@@ -1114,4 +1145,21 @@ func quoteForm(source []byte, tokens []Token, n, from int) (quoteShape, int) {
 		}
 	}
 	return quoteNone, 0
+}
+
+// followsInlineMacroHead reports whether the token at i comes right after the
+// `do:` that ends the head of a macro on line, as in
+//
+//	defmacro route(verb, path), do:
+//	  quote do
+func followsInlineMacroHead(source []byte, tokens []Token, i, line int) bool {
+	if line == 0 {
+		return false
+	}
+	k := i - 1
+	for k >= 0 && (tokens[k].Kind == TokEOL || tokens[k].Kind == TokComment) {
+		k--
+	}
+	return k >= 1 && tokens[k].Kind == TokColon && tokens[k-1].Kind == TokIdent &&
+		TokenText(source, tokens[k-1]) == "do" && tokens[k-1].Line == line
 }

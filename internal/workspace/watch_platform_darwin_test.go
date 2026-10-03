@@ -350,6 +350,29 @@ func TestFSEventsWorktreeLifecycle(t *testing.T) {
 	git("worktree", "remove", wt)
 	settle()
 
+	// git worktree move renames the directory, then writes its .git file again
+	// in place, so the watcher can find the file empty.
+	outside := filepath.Join(t.TempDir(), "feature")
+	git("worktree", "add", "-q", outside)
+	content, err := os.ReadFile(filepath.Join(outside, ".git"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, ".git"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(outside, wt); err != nil {
+		t.Fatal(err)
+	}
+	settle()
+	if err := os.WriteFile(filepath.Join(wt, ".git"), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git("worktree", "repair", wt)
+	settle()
+	git("worktree", "remove", "--force", wt)
+	settle()
+
 	mu.Lock()
 	defer mu.Unlock()
 	if full != 0 {

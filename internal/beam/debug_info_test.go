@@ -302,7 +302,8 @@ func TestReadDefinitionLinesTruncated(t *testing.T) {
 }
 
 // Clause bodies are arbitrary AST and nest far deeper than a Docs chunk. A long
-// pipeline or nested case must not trip the depth guard and lose the module.
+// pipeline or nested case is stepped over without recursion, so it costs no
+// stack and does not lose the module.
 func TestReadDefinitionLinesDeepClauseBody(t *testing.T) {
 	var w etfTestWriter
 	w.smallTuple(3)
@@ -324,8 +325,8 @@ func TestReadDefinitionLinesDeepClauseBody(t *testing.T) {
 		w.atom("line")
 		w.smallInt(10 + i)
 		w.nil()
-		// 300 nested {:|>, [], [left, ...]} levels: 600 ETF levels.
-		const depth = 300
+		// 100,000 nested {:|>, [], [left, ...]} levels: 200,000 ETF levels.
+		const depth = 100_000
 		for range depth {
 			w.smallTuple(3)
 			w.atom("|>")

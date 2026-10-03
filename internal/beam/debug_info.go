@@ -6,12 +6,6 @@ import (
 	"slices"
 )
 
-// maxDebugInfoDepth bounds recursion while stepping over clause bodies. Each
-// level of Elixir AST costs two ETF levels (the call tuple and its argument
-// list), so this allows a thousand nested expressions: far past any real code,
-// and still a bounded Go stack on a corrupt file.
-const maxDebugInfoDepth = 2048
-
 // maxPreallocatedSites bounds the definitions slice allocated up front.
 const maxPreallocatedSites = 1024
 
@@ -100,7 +94,7 @@ func parseDebugInfo(buf []byte) (info DebugInfo, err error) {
 		}
 	}()
 
-	r := &etfReader{buf: buf, maxDepth: maxDebugInfoDepth}
+	r := &etfReader{buf: buf}
 	if arity, err := r.enterTuple(); err != nil {
 		return DebugInfo{}, err
 	} else if arity != 3 {
