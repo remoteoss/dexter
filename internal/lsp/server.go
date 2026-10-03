@@ -103,7 +103,20 @@ type IndexCoordinator struct {
 	unavailable bool // guarded by writes
 
 	backgroundWork sync.WaitGroup
+
+	// work is canceled by CancelWork when the workspace shuts down. A
+	// reconciliation pass, a prune, and a cold build check it and stop.
+	work       context.Context
+	cancelWork context.CancelFunc
 }
+
+// CancelWork stops the reconciliation in flight and makes every later one
+// return at once. The workspace calls it first when it shuts down, so a pass
+// over a large change set cannot keep the process (and its workspace lock)
+// alive for minutes. A stopped pass leaves no file half written: each write
+// transaction holds whole files, and a canceled one rolls back. The files it
+// did not reach keep their old mtime, so the next start picks them up.
+func (c *IndexCoordinator) CancelWork() { c.cancelWork() }
 
 func (c *IndexCoordinator) setStdlibRoot(root string) (string, bool) {
 	c.stdlibMu.Lock()
@@ -124,7 +137,8 @@ func (c *IndexCoordinator) getStdlibRoot() string {
 
 // NewIndexCoordinator returns write coordination for one workspace store.
 func NewIndexCoordinator() *IndexCoordinator {
-	return &IndexCoordinator{}
+	work, cancel := context.WithCancel(context.Background())
+	return &IndexCoordinator{work: work, cancelWork: cancel}
 }
 
 // ServerOptions configures a Server attached to a daemon-owned workspace.
@@ -378,6 +392,10 @@ func (s *Server) warmUsingCache() {
 // removed is still pruned, which is why the check is per candidate rather than
 // a test on seen being empty.
 func (s *Server) pruneMissingFiles(seen map[string]struct{}) {
+	ctx := s.index.work
+	if ctx.Err() != nil {
+		return
+	}
 	s.index.writes.Lock()
 	defer s.index.writes.Unlock()
 	if s.index.unavailable {
@@ -398,9 +416,12 @@ func (s *Server) pruneMissingFiles(seen map[string]struct{}) {
 	inWorktree := make(map[string]bool)
 	var recorded map[string]struct{}
 	recordedRead := false
-	for _, storedPath := range storedPaths {
+	for i, storedPath := range storedPaths {
 		if _, ok := seen[storedPath]; ok {
 			continue
+		}
+		if i&1023 == 0 && ctx.Err() != nil {
+			return
 		}
 		_, err := os.Lstat(storedPath)
 		if err != nil && !errors.Is(err, fs.ErrNotExist) {
@@ -423,7 +444,14 @@ func (s *Server) pruneMissingFiles(seen map[string]struct{}) {
 		toRemove = append(toRemove, storedPath)
 	}
 	if len(toRemove) > 0 {
-		_ = s.store.RemoveFiles(toRemove)
+		start := time.Now()
+		if err := s.store.RemoveFilesContext(ctx, toRemove); err != nil {
+			if ctx.Err() == nil {
+				log.Printf("Warning: removing %d files from the index: %v", len(toRemove), err)
+			}
+			return
+		}
+		log.Printf("Removed %d files from the index (%s)", len(toRemove), time.Since(start).Round(time.Millisecond))
 	}
 }
 
@@ -487,6 +515,7 @@ func (s *Server) fullBuild() (stats indexer.Stats, ran bool, err error) {
 	stats, err = indexer.FullBuild(s.store, s.projectRoot, indexer.Options{
 		StdlibRoot: s.StdlibRoot(),
 		InProcess:  true,
+		Context:    s.index.work,
 		Warn: func(format string, args ...interface{}) {
 			log.Printf("Warning: "+format, args...)
 		},
@@ -539,6 +568,9 @@ func (s *Server) startBackgroundReindex() <-chan struct{} {
 		defer s.index.backgroundWork.Done()
 		s.index.reindexing.Lock()
 		defer s.index.reindexing.Unlock()
+		if s.index.work.Err() != nil {
+			return // the workspace is shutting down
+		}
 
 		start := time.Now()
 		reindexed := 0
@@ -575,6 +607,9 @@ func (s *Server) startBackgroundReindex() <-chan struct{} {
 					log.Printf("Warning: WAL checkpoint: %v", err)
 				}
 				return
+			case s.index.work.Err() != nil:
+				log.Printf("Index build canceled")
+				return
 			case err != nil:
 				// The incremental walk below needs nothing to be true of the
 				// database, so it is the safe thing to fall back to. It is
@@ -591,65 +626,23 @@ func (s *Server) startBackgroundReindex() <-chan struct{} {
 			}
 		}
 
-		// Re-read rather than reusing coldStart. A full build, a failed build
-		// and a concurrent write all change the answer, and reading a stale
-		// true here would skip the mtime short-circuit for every file.
-		isEmpty := s.store.IsEmpty()
-
-		seen := make(map[string]struct{})
-		walkAndIndex := func(root string, indexRefs bool) {
-			_ = parser.WalkElixirFiles(root, func(path string, d fs.DirEntry) error {
-				seen[path] = struct{}{}
-
-				if !isEmpty {
-					info, err := d.Info()
-					if err != nil {
-						return nil
-					}
-					storedMtime, found := s.store.GetFileMtime(path)
-					currentMtime := info.ModTime().UnixNano()
-					if found && storedMtime == currentMtime {
-						return nil
-					}
-				}
-
-				defs, refs, err := parser.ParseFile(path)
-				if err != nil {
-					return nil
-				}
-				if !indexRefs {
-					refs = nil
-				}
-				if err := s.store.IndexFileWithRefs(path, defs, refs); err != nil {
-					log.Printf("Warning: reindex %s: %v", path, err)
-				}
-				reindexed++
-				return nil
-			})
-		}
-
 		// A full build already indexed every file on disk from the traversal
-		// this walk would repeat, so skipping it saves a second traversal and a
-		// stored-mtime query per file. The prune lives in the same branch and
-		// so cannot run without the walk that fills `seen`.
+		// this walk would repeat, so skipping it saves a second traversal. The
+		// prune lives in the same branch and so cannot run without the walk
+		// that fills `seen`.
 		if !fullBuilt {
-			// The walk writes, so it takes indexWrites for reading, the same as
-			// every other single-file write. That is what keeps it from
-			// overlapping a cold build.
-			s.index.writes.RLock()
-			if s.index.unavailable {
-				s.index.writes.RUnlock()
+			seen, n, ok := s.reconcileChangedFiles()
+			reindexed += n
+			if ok {
+				s.pruneMissingFiles(seen)
+			}
+			if s.index.work.Err() != nil {
+				log.Printf("Background reindex canceled after %d files (%s)", reindexed, time.Since(start).Round(time.Millisecond))
 				return
 			}
-			// Index stdlib first (definitions only).
-			if stdlibRoot := s.StdlibRoot(); stdlibRoot != "" {
-				walkAndIndex(stdlibRoot, false)
+			if !ok {
+				return
 			}
-
-			walkAndIndex(s.projectRoot, true)
-			s.index.writes.RUnlock()
-
-			s.pruneMissingFiles(seen)
 		}
 
 		// Collapse the WAL back to disk now that the (potentially large) reindex
@@ -707,7 +700,10 @@ func (s *Server) RemoveFiles(paths []string) {
 	if s.index.unavailable {
 		return
 	}
-	if err := s.store.RemoveFiles(paths); err != nil {
+	// A large removal can rebuild the symbol tables, which takes seconds on a
+	// large index, so shutdown must be able to stop it. A canceled removal
+	// leaves the files in the index, and the next start's prune removes them.
+	if err := s.store.RemoveFilesContext(s.index.work, paths); err != nil && s.index.work.Err() == nil {
 		log.Printf("Error removing %d files from index: %v", len(paths), err)
 	}
 }
@@ -1092,7 +1088,11 @@ func (s *Server) DidSave(ctx context.Context, params *protocol.DidSaveTextDocume
 	if s.workspaceEvents != nil {
 		s.workspaceEvents.ReconcileFile(path)
 	} else {
-		go s.indexOneFile(path)
+		// ReconcileFile waits behind a reconciliation pass in flight. With
+		// only the write coordinator's read lock, the save would race the
+		// pass's batches for SQLite's write lock and could fail after
+		// busy_timeout, and then stay unindexed until the next pass.
+		go s.ReconcileFile(path)
 	}
 
 	return nil
@@ -4271,7 +4271,7 @@ func (s *Server) DidChangeWatchedFiles(ctx context.Context, params *protocol.Did
 			if s.workspaceEvents != nil {
 				s.workspaceEvents.ReconcileFile(path)
 			} else {
-				go s.indexOneFile(path)
+				go s.ReconcileFile(path) // see DidSave
 			}
 		case protocol.FileChangeTypeDeleted:
 			if s.workspaceEvents != nil {

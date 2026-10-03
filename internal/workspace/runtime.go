@@ -595,7 +595,14 @@ func (r *Runtime) publishBatch(full bool, paths map[string]struct{}) {
 	r.publish(c)
 }
 
+// testHookReconcilePath, when set by a test, runs before each path event is
+// reconciled.
+var testHookReconcilePath func(path string)
+
 func (r *Runtime) reconcilePath(path string) error {
+	if testHookReconcilePath != nil {
+		testHookReconcilePath(path)
+	}
 	info, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -640,10 +647,17 @@ func (r *Runtime) reconcilePath(path string) error {
 	return nil
 }
 
-// Close stops event sources, drains accepted mutations, waits for background
-// index work, checkpoints, and closes the store.
+// Close cancels a reconciliation in flight, stops event sources, drains
+// accepted mutations, waits for background index work, checkpoints, and closes
+// the store.
+//
+// The cancel comes first. A warm pass over a large change set can run for
+// minutes, and the daemon holds the workspace lock without serving its socket
+// until Close returns. A canceled pass leaves every file fully old or fully new,
+// and the next start finishes it from the stored mtimes.
 func (r *Runtime) Close() error {
 	r.closeOnce.Do(func() {
+		r.index.CancelWork()
 		close(r.watcherStop)
 		r.watcherWG.Wait()
 		<-r.watcherReady
