@@ -539,6 +539,32 @@ func TestFSNotifyWatcherSkipsWorktreeAddedWhileRunning(t *testing.T) {
 			env.settle(t)
 			env.git("worktree", "move", outside, wt)
 		}},
+		// git worktree move renames the directory, then writes its .git file
+		// again in place, so the watcher can find the file empty.
+		{"move in while git rewrites its .git file", func(t *testing.T, env *watchedRepo, wt string) {
+			outside := filepath.Join(t.TempDir(), "feature")
+			env.git("worktree", "add", "-q", outside)
+			dotgit := filepath.Join(outside, ".git")
+			content, err := os.ReadFile(dotgit)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(dotgit, nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Dir(wt), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			env.settle(t)
+			if err := os.Rename(outside, wt); err != nil {
+				t.Fatal(err)
+			}
+			env.settle(t)
+			if err := os.WriteFile(filepath.Join(wt, ".git"), content, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			env.git("worktree", "repair", wt)
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

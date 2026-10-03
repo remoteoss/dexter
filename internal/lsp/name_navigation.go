@@ -47,6 +47,11 @@ type NameReferenceOptions struct {
 func (s *Server) LookupName(module, function string, opts NameLookupOptions) ([]NameLocation, error) {
 	if function == "" {
 		results, err := s.store.LookupModule(module)
+		if err == nil && len(results) == 0 {
+			// A module that exists only as a BEAM, such as one Module.create
+			// made, is defined where the compiler recorded it.
+			results = s.generatedModuleLocation(module)
+		}
 		return s.lookupLocations(results, opts.ExcludeStdlib), err
 	}
 
@@ -69,14 +74,16 @@ func (s *Server) LookupName(module, function string, opts NameLookupOptions) ([]
 	}
 	if len(results) == 0 && opts.Kind != NameKindType {
 		if generated, found := s.generatedSymbol(module, "", function); found && len(generated) > 0 {
-			if opts.ExactModule {
+			// A line the compiled module records for the function is its own
+			// definition, so even an exact lookup takes it.
+			var precise bool
+			results, precise = s.generatedDefinitionResultsFor(module, "", generated)
+			if !precise && opts.ExactModule {
 				if results, err = s.store.LookupModule(module); err != nil {
 					return nil, err
 				}
-			} else {
-				results = s.generatedDefinitionResults(module)
 			}
-			if len(results) > 0 {
+			if !precise && len(results) > 0 {
 				results[0].Arity = generated[0].Arity
 				results[0].Kind = generated[0].Kind
 			}

@@ -7,4 +7,4 @@ const Version = "0.7.2"
 // a change that makes existing indexes stale — and bump daemon.ContractVersion
 // in the same release, because a running daemon from the older build would
 // otherwise keep serving the new frontend from that stale index.
-const IndexVersion = 14
+const IndexVersion = 15

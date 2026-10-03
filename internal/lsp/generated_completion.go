@@ -43,6 +43,13 @@ type generatedFunctionCacheEntry struct {
 	providers         []string
 	providersResolved bool
 
+	// definitionSources holds what the BEAM records about where its functions
+	// were defined, read on the first definition request that needs it.
+	// Memoized on the entry for the same reason as providers: the BEAM stamp
+	// invalidates both.
+	definitionSources         generatedDefinitionSources
+	definitionSourcesResolved bool
+
 	// docs memoizes rendered documentation prose for functions a hover has asked
 	// about, so sweeping the mouse does not re-inflate the Docs chunk each time.
 	// It is a pointer because get hands out a copy of the entry: the copy has to
@@ -692,11 +699,12 @@ func generatedFunctionsNamed(functions []beam.Function, name string) []beam.Func
 // generatedDefinitionResults returns the closest source-backed module for a
 // generated provider. Generated nested modules have no source row, so walking
 // their lexical parents yields a stable artifact-level destination without
-// knowing which framework created them.
-func (s *Server) generatedDefinitionResults(module string) []store.LookupResult {
+// knowing which framework created them. owner is the module those results
+// belong to: module itself, or the lexical parent that was found.
+func (s *Server) generatedDefinitionResults(module string) (results []store.LookupResult, owner string) {
 	for candidate := module; candidate != ""; {
 		if results, err := s.store.LookupModule(candidate); err == nil && len(results) > 0 {
-			return results
+			return results, candidate
 		}
 		dot := strings.LastIndexByte(candidate, '.')
 		if dot < 0 {
@@ -704,7 +712,7 @@ func (s *Server) generatedDefinitionResults(module string) []store.LookupResult 
 		}
 		candidate = candidate[:dot]
 	}
-	return nil
+	return nil, ""
 }
 
 // filterGeneratedProviderReferences removes the conservative false positives
