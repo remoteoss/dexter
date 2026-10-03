@@ -192,7 +192,9 @@ func WalkElixirFiles(root string, fn func(path string, d fs.DirEntry) error) err
 		if err != nil {
 			return nil
 		}
-		if !isRoot && HasLinkedWorktreeGitFile(dir, entries) {
+		// A worktree that git is still moving has an empty .git file; it is
+		// skipped like a settled one, as the watchers treat it.
+		if !isRoot && (HasLinkedWorktreeGitFile(dir, entries) || HasUnsettledGitFile(dir, entries)) {
 			return nil
 		}
 		for _, e := range entries {
@@ -477,7 +479,7 @@ func CollectElixirFilesParallel(root string) []string {
 		if err != nil {
 			return
 		}
-		if dir != root && HasLinkedWorktreeGitFile(dir, entries) {
+		if dir != root && (HasLinkedWorktreeGitFile(dir, entries) || HasUnsettledGitFile(dir, entries)) {
 			return
 		}
 

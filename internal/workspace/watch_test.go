@@ -3,12 +3,14 @@ package workspace
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -733,4 +735,73 @@ func (env *watchedRepo) changedPaths() []string {
 		paths = append(paths, path)
 	}
 	return paths
+}
+
+// A directory that cannot be read, for example when the process has no file
+// descriptor left, cannot be classified: it may be a worktree that was moved
+// into place. Its files are not reported from the Create event; the directory
+// is marked failed, so the coverage report says so and the retry reads it
+// again. A retry classifies it, and a plain directory reports its restored
+// coverage, which makes the runtime index it.
+func TestWatcherDoesNotReportDirectoryItCouldNotRead(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		worktree bool
+	}{
+		{"worktree moved into place", true},
+		{"plain directory", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			dir := filepath.Join(root, "arrived")
+			if tc.worktree {
+				makeLinkedWorktree(t, root, dir)
+			} else {
+				if err := os.MkdirAll(filepath.Join(dir, "lib"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, "lib", "plain.ex"), []byte("defmodule Plain do\nend\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			stub := &watchAddStub{failing: map[string]bool{}}
+			var coverage []bool
+			w, changed, _ := newRecordingWatcher(root, stub)
+			w.onCoverageChange = func(degraded bool) { coverage = append(coverage, degraded) }
+			unreadable := true
+			w.readDir = func(path string) ([]fs.DirEntry, error) {
+				if unreadable && path == dir {
+					return nil, syscall.EMFILE
+				}
+				return parser.ReadDirUnsorted(path)
+			}
+
+			w.handle(fsnotify.Event{Name: dir, Op: fsnotify.Create})
+			if len(*changed) != 0 {
+				t.Fatalf("reported %v from a directory that could not be read", *changed)
+			}
+			if !slices.Equal(w.failedDirectories(), []string{dir}) || !slices.Equal(coverage, []bool{true}) {
+				t.Fatalf("failed = %v, coverage = %v; want %s failed and one degraded report", w.failedDirectories(), coverage, dir)
+			}
+
+			// A retry while the directory still cannot be read keeps it failed.
+			w.retryFailed()
+			if !slices.Equal(w.failedDirectories(), []string{dir}) {
+				t.Fatalf("failed = %v after a retry that could not read %s", w.failedDirectories(), dir)
+			}
+
+			unreadable = false
+			w.retryFailed()
+			if len(w.failedDirectories()) != 0 || !slices.Equal(coverage, []bool{true, false}) {
+				t.Fatalf("failed = %v, coverage = %v after the directory became readable", w.failedDirectories(), coverage)
+			}
+			if w.tops.has(dir) != tc.worktree {
+				t.Errorf("tops.has(%s) = %v, want %v", dir, w.tops.has(dir), tc.worktree)
+			}
+			if len(*changed) != 0 {
+				t.Errorf("reported %v; the coverage reconcile indexes the directory", *changed)
+			}
+		})
+	}
 }

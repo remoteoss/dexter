@@ -3886,3 +3886,27 @@ func TestHeredocLineContinuationClosesHeredoc(t *testing.T) {
 		})
 	}
 }
+
+// git worktree move renames a worktree and then writes its .git file again in
+// place, so for a moment the file is empty. Both walkers skip such a
+// directory, as the watchers do, rather than index a worktree on the move.
+func TestWalkAndCollectSkipUnsettledGitFile(t *testing.T) {
+	app := t.TempDir()
+	for path, content := range map[string]string{
+		filepath.Join(app, "lib", "app.ex"):              "defmodule App do\nend\n",
+		filepath.Join(app, "moving", "lib", "moving.ex"): "defmodule Moving do\nend\n",
+		filepath.Join(app, "moving", ".git"):             "",
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := []string{filepath.Join(app, "lib", "app.ex")}
+	walked, collected := walkedAndCollected(t, app)
+	if !reflect.DeepEqual(walked, want) || !reflect.DeepEqual(collected, want) {
+		t.Errorf("Walk = %v, Collect = %v; want %v", walked, collected, want)
+	}
+}
