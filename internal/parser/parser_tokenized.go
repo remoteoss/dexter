@@ -341,6 +341,9 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 					delegateTo, delegateAs = scanDelegateOpts(pj)
 				}
 
+				// Decided before the head is scanned below, which can mark a
+				// quote on this same line (`defmacro m, do: quote do: ...`).
+				insideQuote := (quoteDepth > 0 && depth >= quoteDepth) || quoteLine == defLine
 				if (kind == "defmacro" || kind == "defmacrop") && funcName != "__using__" {
 					if opensDoBlock(tokens, n, pj) {
 						// The do on this line is counted when the line is walked
@@ -370,7 +373,7 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 						}
 					}
 				}
-				if (quoteDepth > 0 && depth >= quoteDepth) || quoteLine == defLine {
+				if insideQuote {
 					i = j
 					goto extractRefsForLine
 				}

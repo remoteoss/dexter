@@ -45,3 +45,53 @@ func TestSkipExportExtKeepsAlignment(t *testing.T) {
 		})
 	}
 }
+
+// A term that ends exactly at the end of the input is stepped over whole, and
+// every strict prefix of it is rejected: the count of terms still to step over
+// is compared with the bytes after each header, not with the header as well.
+func TestSkipTermsThatEndTheInput(t *testing.T) {
+	cases := map[string]func(w *etfTestWriter){
+		"tuple of an empty list": func(w *etfTestWriter) {
+			w.smallTuple(1)
+			w.nil()
+		},
+		"empty map": func(w *etfTestWriter) {
+			w.mapHeader(0)
+		},
+		"list of empty lists": func(w *etfTestWriter) {
+			w.listHeader(2)
+			w.nil()
+			w.nil()
+			w.nil()
+		},
+		"map of empty lists": func(w *etfTestWriter) {
+			w.mapHeader(1)
+			w.nil()
+			w.nil()
+		},
+		"nested tuples": func(w *etfTestWriter) {
+			w.smallTuple(2)
+			w.smallTuple(1)
+			w.nil()
+			w.listHeader(1)
+			w.smallTuple(0)
+			w.nil()
+		},
+	}
+	for name, build := range cases {
+		t.Run(name, func(t *testing.T) {
+			var w etfTestWriter
+			build(&w)
+			r := &etfReader{buf: w.buf}
+			if err := r.skip(); err != nil || r.remaining() != 0 {
+				t.Fatalf("skip = %v with %d bytes left, want the whole term", err, r.remaining())
+			}
+			for i := range len(w.buf) {
+				r := &etfReader{buf: w.buf[:i]}
+				if err := r.skip(); err == nil {
+					t.Errorf("skip accepted a truncation at %d of %d bytes", i, len(w.buf))
+				}
+			}
+		})
+	}
+}

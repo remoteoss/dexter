@@ -315,7 +315,10 @@ func (r *etfReader) skipTerms(count int64) error {
 	if err := add(count); err != nil {
 		return err
 	}
-	for ; pending > 0; pending-- {
+	for pending > 0 {
+		// Counted off before its header is read, so that its elements are
+		// compared with the bytes left after it, not with it as well.
+		pending--
 		tag, err := r.u8()
 		if err != nil {
 			return err
