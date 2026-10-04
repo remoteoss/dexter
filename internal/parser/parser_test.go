@@ -2,6 +2,7 @@ package parser
 
 import (
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -3885,4 +3886,121 @@ func TestHeredocLineContinuationClosesHeredoc(t *testing.T) {
 			}
 		})
 	}
+}
+
+// git worktree move renames a worktree and then writes its .git file again in
+// place, so for a moment the file is empty. Both walkers skip such a
+// directory, as the watchers do, rather than index a worktree on the move.
+func TestWalkAndCollectSkipUnsettledGitFile(t *testing.T) {
+	app := t.TempDir()
+	for path, content := range map[string]string{
+		filepath.Join(app, "lib", "app.ex"):              "defmodule App do\nend\n",
+		filepath.Join(app, "moving", "lib", "moving.ex"): "defmodule Moving do\nend\n",
+		filepath.Join(app, "moving", ".git"):             "",
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := []string{filepath.Join(app, "lib", "app.ex")}
+	walked, collected := walkedAndCollected(t, app)
+	if !reflect.DeepEqual(walked, want) || !reflect.DeepEqual(collected, want) {
+		t.Errorf("Walk = %v, Collect = %v; want %v", walked, collected, want)
+	}
+}
+
+// GitFile tells each kind of .git entry apart, from one read of the file.
+func TestGitFileStates(t *testing.T) {
+	app, wt, _ := gitRepoWithNestedWorktree(t)
+	write := func(dir, content string) string {
+		t.Helper()
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, ".git"), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+	if err := os.MkdirAll(filepath.Join(app, ".git", "modules", "shared"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		dir  string
+		want GitFileState
+	}{
+		{"repository root (.git directory)", app, NoGitFile},
+		{"no .git", filepath.Join(app, "lib"), NoGitFile},
+		{"linked worktree", wt, WorktreeGitFile},
+		{"submodule", write(filepath.Join(app, "deps", "shared"), "gitdir: ../../.git/modules/shared\n"), PlainGitFile},
+		{"empty .git file", write(filepath.Join(app, "moving"), ""), UnsettledGitFile},
+		{"not a gitdir line", write(filepath.Join(app, "odd"), "something else\n"), UnsettledGitFile},
+		{"symlinked .git", symlinkedGit(t, app), NoGitFile},
+	} {
+		if got := GitFile(tc.dir); got != tc.want {
+			t.Errorf("%s: GitFile = %v, want %v", tc.name, got, tc.want)
+		}
+		entries, err := os.ReadDir(tc.dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := GitFileFromEntries(tc.dir, entries); got != tc.want {
+			t.Errorf("%s: GitFileFromEntries = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// git 2.48 and later rename a worktree on `git worktree move` and then write
+// its .git file again in place: a reader can find it empty, and a moment later
+// complete. One classification must use one read, so that it cannot see the
+// empty file for one question and the complete file for the next, and then
+// answer that a worktree is neither a worktree nor unsettled.
+func TestGitFileReadsTheFileOnce(t *testing.T) {
+	_, wt, _ := gitRepoWithNestedWorktree(t)
+	content, err := os.ReadFile(filepath.Join(wt, ".git"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reads := 0
+	previous := openGitFile
+	t.Cleanup(func() { openGitFile = previous })
+	openGitFile = func(string) (io.ReadCloser, error) {
+		reads++
+		if reads == 1 {
+			return io.NopCloser(strings.NewReader("")), nil
+		}
+		return io.NopCloser(strings.NewReader(string(content))), nil
+	}
+	if got := GitFile(wt); got != UnsettledGitFile || reads != 1 {
+		t.Errorf("GitFile = %v after %d reads, want %v after one read", got, reads, UnsettledGitFile)
+	}
+	reads = 0
+	entries, err := os.ReadDir(wt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := GitFileFromEntries(wt, entries); got != UnsettledGitFile || reads != 1 {
+		t.Errorf("GitFileFromEntries = %v after %d reads, want %v after one read", got, reads, UnsettledGitFile)
+	}
+}
+
+// symlinkedGit makes a directory whose .git is a symlink to an empty file.
+func symlinkedGit(t *testing.T, app string) string {
+	t.Helper()
+	dir := filepath.Join(app, "linked")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(app, "empty-gitfile")
+	if err := os.WriteFile(target, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(dir, ".git")); err != nil {
+		t.Fatal(err)
+	}
+	return dir
 }

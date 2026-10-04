@@ -25,7 +25,10 @@ type fsnotifyWatcher struct {
 	add              func(string) error
 	remove           func(string) error
 	watchList        func() []string
-	wg               sync.WaitGroup
+	// readDir reads a directory for the walk; nil uses parser.ReadDirUnsorted.
+	// Tests replace it to make a read fail.
+	readDir func(string) ([]fs.DirEntry, error)
+	wg      sync.WaitGroup
 
 	// tops are the nested worktrees found so far. Only a top itself is watched,
 	// for its .git file. pending holds tops whose .git file went away; the retry
@@ -104,13 +107,24 @@ func (w *fsnotifyWatcher) Close() error {
 // whole tree because one directory could not be watched would leave a large
 // repository with no native watching at all, which is far worse.
 func (w *fsnotifyWatcher) watchTree(root string) int {
-	return w.walkDirectories(root, true)
+	watched, _ := w.walkDirectories(root, true)
+	return watched
 }
 
-func (w *fsnotifyWatcher) walkDirectories(root string, includeRoot bool) int {
+// walkDirectories watches root's tree and reports whether root itself could be
+// read. A directory that cannot be read, for example because the process has
+// no file descriptor left, cannot be told apart from a nested worktree and its
+// subdirectories cannot be watched, so it is marked failed: the retry timer
+// walks it again, and the coverage report says that the tree is not covered.
+func (w *fsnotifyWatcher) walkDirectories(root string, includeRoot bool) (int, bool) {
 	if info, err := os.Lstat(root); err != nil || !info.IsDir() || skipWatchDir(info.Name()) {
-		return 0
+		return 0, true
 	}
+	readDir := w.readDir
+	if readDir == nil {
+		readDir = parser.ReadDirUnsorted
+	}
+	rootRead := true
 	watched := 0
 	var walk func(dir string)
 	walk = func(dir string) {
@@ -127,22 +141,31 @@ func (w *fsnotifyWatcher) walkDirectories(root string, includeRoot bool) int {
 		if dir != w.root && w.tops.has(dir) {
 			return
 		}
-		entries, err := parser.ReadDirUnsorted(dir)
+		entries, err := readDir(dir)
 		if err != nil {
+			log.Printf("Warning: cannot read %s to watch it: %v", dir, err)
+			w.setFailed(dir, true)
+			if dir == root {
+				rootRead = false
+			}
 			return
 		}
 		// The entries show a nested worktree without another syscall.
-		if dir != w.root && parser.HasLinkedWorktreeGitFile(dir, entries) {
-			w.tops.add(dir)
-			return
-		}
-		// A worktree that git is still moving has an empty .git file. It is a
-		// top until the pending check says otherwise, so that its files are
-		// not reported in the meantime.
-		if dir != w.root && parser.HasUnsettledGitFile(dir, entries) {
-			w.tops.add(dir)
-			w.markPending(dir)
-			return
+		// One read of the .git file classifies the directory: two reads can
+		// see an empty file and then a complete one while git writes it.
+		if dir != w.root {
+			switch parser.GitFileFromEntries(dir, entries) {
+			case parser.WorktreeGitFile:
+				w.tops.add(dir)
+				return
+			case parser.UnsettledGitFile:
+				// A worktree that git is still moving has an empty .git file. It
+				// is a top until the pending check says otherwise, so that its
+				// files are not reported in the meantime.
+				w.tops.add(dir)
+				w.markPending(dir)
+				return
+			}
 		}
 		for _, e := range entries {
 			if e.IsDir() && !skipWatchDir(e.Name()) {
@@ -151,7 +174,7 @@ func (w *fsnotifyWatcher) walkDirectories(root string, includeRoot bool) int {
 		}
 	}
 	walk(root)
-	return watched
+	return watched, rootRead
 }
 
 // unwatchBelow drops the watches below dir, which turned out to be a nested
@@ -184,11 +207,12 @@ func (w *fsnotifyWatcher) checkPending() {
 		delete(w.pending, dir)
 		info, err := os.Stat(dir)
 		if err == nil && info.IsDir() {
-			if parser.IsLinkedWorktree(dir) {
+			state := parser.GitFile(dir)
+			if state == parser.WorktreeGitFile {
 				continue
 			}
 			// git may still be writing the .git file of a worktree it moved.
-			if parser.UnsettledGitFile(dir) || recordedWorktree(w.root, dir) {
+			if state == parser.UnsettledGitFile || recordedWorktree(w.root, dir) {
 				recorded = append(recorded, dir)
 				continue
 			}
@@ -263,8 +287,10 @@ func (w *fsnotifyWatcher) retryPaths(paths []string) {
 		}
 		// The recovered parent watch closes the race with this walk. Add any
 		// descendants created while the parent had no coverage before restoring.
-		w.walkDirectories(path, false)
-		w.setFailed(path, false)
+		// A directory that still cannot be read stays failed.
+		if _, read := w.walkDirectories(path, false); read {
+			w.setFailed(path, false)
+		}
 	}
 }
 
@@ -329,11 +355,20 @@ func (w *fsnotifyWatcher) handle(ev fsnotify.Event) {
 			if skipWatchDir(base) {
 				return
 			}
-			if added := w.watchTree(path); added == 0 {
+			added, read := w.walkDirectories(path, true)
+			if added == 0 {
 				log.Printf("Warning: no directory under %s could be watched", path)
 			}
 			w.retryFailedUnder(path)
 			if w.tops.has(path) {
+				return
+			}
+			// A directory that could not be read is not known to be plain:
+			// it can be a worktree moved into place. Its files are indexed by
+			// the reconcile that follows when a retry reads it. A directory
+			// that was read but could not be watched is known to be plain, and
+			// is indexed now.
+			if !read {
 				return
 			}
 			_ = parser.WalkElixirFiles(path, func(file string, _ fs.DirEntry) error {
