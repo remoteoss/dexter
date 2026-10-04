@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func readFile(t *testing.T, root, rel string) string {
@@ -150,6 +151,57 @@ end
 					t.Fatalf("round %d: caller_%d.ex lost the rename %s → %s:\n%s", round, i, r[0], r[1], text)
 				}
 			}
+		}
+	}
+}
+
+// Regression: a call canceled while it waited for the index still ran, so a
+// rename could start its writes after the client was told that it may have
+// been applied.
+func TestRenameTool_CanceledCallChangesNothing(t *testing.T) {
+	e := setupProject(t)
+	h := NewHandler(e.rt, e.lsp)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	args, _ := json.Marshal(map[string]any{"module": "MyApp.Accounts", "function": "fetch_user", "new_name": "get_user"})
+	if _, err := h.Call(ctx, renameToolName, args, time.Second); err == nil {
+		t.Fatal("a canceled rename succeeded")
+	}
+	wantContains(t, readFile(t, e.root, "lib/my_app/worker.ex"), "MyApp.Accounts.fetch_user(1)")
+	wantNotContains(t, readFile(t, e.root, "lib/my_app/accounts.ex"), "get_user")
+}
+
+// Regression: the check that the new name is free ran before the rename
+// lock, so two renames to the same new name could both pass it and both
+// write.
+func TestRenameTool_ConcurrentRenamesToOneNameOnlyOneWins(t *testing.T) {
+	e := setupProject(t)
+	h := NewHandler(e.rt, e.lsp)
+	current := [2]string{"fetch_user", "list_users"}
+	for round := 0; round < 8; round++ {
+		target := fmt.Sprintf("taken_%d", round)
+		var wg sync.WaitGroup
+		errs := make([]error, 2)
+		for i := range current {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				args, _ := json.Marshal(map[string]any{"module": "MyApp.Accounts", "function": current[i], "new_name": target})
+				_, errs[i] = h.Call(context.Background(), renameToolName, args, 0)
+			}()
+		}
+		wg.Wait()
+		wins := 0
+		for i, err := range errs {
+			if err == nil {
+				wins++
+				current[i] = target
+			} else if !strings.Contains(err.Error(), "already exists") {
+				t.Fatalf("round %d: unexpected error: %v", round, err)
+			}
+		}
+		if wins != 1 {
+			t.Fatalf("round %d: %d renames to %s succeeded, want 1:\n%s", round, wins, target, readFile(t, e.root, "lib/my_app/accounts.ex"))
 		}
 	}
 }

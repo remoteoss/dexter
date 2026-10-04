@@ -30,6 +30,10 @@ func (h *Handler) rename(ctx context.Context, args RenameParams) (string, error)
 	if function != "" {
 		target = fmt.Sprintf("%s.%s to %s", module, function, newName)
 	}
+	// The last point where a canceled rename has changed nothing.
+	if err := ctx.Err(); err != nil {
+		return "", fmt.Errorf("the rename was canceled before it changed any file: %w", err)
+	}
 	summary, err := renameSymbol(h.lsp, module, function, newName)
 	if err != nil {
 		return "", err

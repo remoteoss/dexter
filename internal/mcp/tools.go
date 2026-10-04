@@ -167,6 +167,11 @@ func (h *Handler) Call(ctx context.Context, name string, args json.RawMessage, w
 		cancel()
 	}
 
+	// A call canceled during the wait does not run: a rename must not start
+	// its writes after the client was told that it may have been applied.
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	call := &Handler{rt: h.rt, lsp: h.lsp, store: h.store, projectRoot: h.projectRoot}
 	text, err := spec.run(call, ctx, args)
 	var noteList []string

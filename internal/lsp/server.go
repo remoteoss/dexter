@@ -101,8 +101,11 @@ type IndexCoordinator struct {
 	// workspace, editor and headless alike. A rename reads the affected files
 	// and writes them back; two at once would each write over the other's
 	// edits. It is held from the first read of the affected files to the end
-	// of the writes, and no other request takes it.
-	renameSerial sync.Mutex
+	// of the writes, and no other request takes it. renameIndexed, guarded by
+	// it, closes when the index shows the last rename, so the next rename
+	// checks its new name against a current index.
+	renameSerial  sync.Mutex
+	renameIndexed <-chan struct{}
 
 	// writes is held for writing by a cold full build and for reading by every
 	// single-file write. The bulk path is insert-only and cannot overlap any
@@ -125,6 +128,16 @@ type IndexCoordinator struct {
 	// reconciliation pass, a prune, and a cold build check it and stop.
 	work       context.Context
 	cancelWork context.CancelFunc
+}
+
+// lockRename takes renameSerial and waits until the index shows the last
+// rename. It returns the unlock.
+func (ic *IndexCoordinator) lockRename() func() {
+	ic.renameSerial.Lock()
+	if ic.renameIndexed != nil {
+		<-ic.renameIndexed
+	}
+	return ic.renameSerial.Unlock
 }
 
 // CancelWork stops the reconciliation in flight and makes every later one
@@ -5770,8 +5783,11 @@ func (s *Server) RenameEdit(ctx context.Context, params *protocol.RenameParams) 
 // module.functionName to newName across the codebase. When report is not nil,
 // it receives the files the rename changed and the files it could not change.
 func (s *Server) renameFunctionEdits(module, functionName, newName string, report *RenameSummary) (*WorkspaceEdit, error) {
-	s.index.renameSerial.Lock()
-	defer s.index.renameSerial.Unlock()
+	defer s.index.lockRename()()
+	// The check before the lock can race another rename to the same name.
+	if existing, err := s.store.LookupFunction(module, newName); err == nil && len(existing) > 0 {
+		return nil, fmt.Errorf("function %s.%s already exists", module, newName)
+	}
 	// Collect all (filePath, lineNumber) pairs — definitions + references
 	type siteKey struct {
 		filePath string
@@ -5976,8 +5992,7 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string, repor
 // report is not nil, it receives the files the rename changed or moved and the
 // files it could not change.
 func (s *Server) renameModuleEdits(oldModule, newModule string, report *RenameSummary) (*WorkspaceEdit, error) {
-	s.index.renameSerial.Lock()
-	defer s.index.renameSerial.Unlock()
+	defer s.index.lockRename()()
 	mr := s.buildModuleRename(oldModule, newModule)
 
 	// Check for collisions: verify that none of the target module names
@@ -6804,6 +6819,7 @@ func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string, r
 // The returned channel is closed when the index shows the rename.
 func (s *Server) reindexAfterRename(removePaths, diskPaths []string, textPaths []textReindex) <-chan struct{} {
 	done := make(chan struct{})
+	s.index.renameIndexed = done // the caller holds renameSerial
 	s.index.backgroundWork.Add(1)
 	go func() {
 		defer s.index.backgroundWork.Done()
