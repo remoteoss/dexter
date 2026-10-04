@@ -176,3 +176,23 @@ func TestMCPFallbackRefusesNonProject(t *testing.T) {
 		t.Errorf("an explicit root was refused: %v", explicit.FallbackErr)
 	}
 }
+
+// Regression: a client root that was not a project (or was the home
+// directory) started a daemon that indexed all of it. It is refused like the
+// launch directory, so the frontend skips it as unusable.
+func TestMCPClientRootRefusesNonProject(t *testing.T) {
+	cfg, err := mcpConfig(t.TempDir(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain := t.TempDir()
+	if _, err := cfg.ResolveRoot(plain); err == nil || !strings.Contains(err.Error(), "does not look like an Elixir project") {
+		t.Errorf("ResolveRoot(%s) error = %v, want a refusal", plain, err)
+	}
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if _, err := cfg.ResolveRoot(home); err == nil || !strings.Contains(err.Error(), "home directory") {
+		t.Errorf("ResolveRoot(home) error = %v, want a refusal", err)
+	}
+}

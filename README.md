@@ -487,14 +487,15 @@ Register it with your MCP client. For Claude Code:
 claude mcp add dexter -- dexter mcp
 ```
 
-Any client that speaks MCP over stdio works the same way: point it at `dexter mcp`. The server obtains its workspace from the client through MCP roots and resolves it the way the CLI does, so it binds the project the client is working in rather than the directory it was launched from. Clients that provide no roots get the launch directory (when it is a project), and an explicit path argument (`dexter mcp <path>`) overrides negotiation entirely. In `--listen` mode each resolved root gets its own workspace, so sessions from different projects can share one server.
+Any client that speaks MCP over stdio works the same way: point it at `dexter mcp`. The server obtains its workspace from the client through MCP roots and resolves it the way the CLI does, so it binds the project the client is working in rather than the directory it was launched from. Clients that provide no roots get the launch directory (when it is a project), and an explicit path argument (`dexter mcp <path>`) overrides negotiation entirely. One session serves one workspace: when a client gives several roots, the session uses the first one that is a usable project (an existing directory inside an Elixir project, not the home directory) and ignores the others. In `--listen` mode each resolved root gets its own workspace, so sessions from different projects can share one server.
 
-`dexter mcp` is a frontend of the workspace daemon, like `dexter lsp` and the CLI: it starts the daemon when necessary and keeps no index of its own. The tools answer from the same index, watchers, and caches as the editor, so edits made directly by an agent are indexed by the daemon's file watcher, and a `dexter_reindex` tool forces an immediate update if a lookup ever seems stale. A tool that answers from an index that is still building or degraded says so in its answer.
+`dexter mcp` is a frontend of the workspace daemon, like `dexter lsp` and the CLI: it starts the daemon when necessary and keeps no index of its own. The tools answer from the same index, watchers, and caches as the editor, so edits made directly by an agent are indexed by the daemon's file watcher, and a `dexter_reindex` tool forces an immediate update if a lookup ever seems stale. A tool that answers from an index that is still building or degraded says so in its answer. The tools read file text the way the user sees it: when an editor attached to the same daemon holds a file open with unsaved changes, outlines, definition snippets, and reference lines come from that buffer (with its line numbers), and the answer says so. The rename tool writes on disk and does not yet look at editor buffers, so save your editor's changes before an agent renames.
 
 Useful variants:
 
 ```sh
-# Serve over streamable HTTP instead of stdio
+# Serve over streamable HTTP instead of stdio (loopback addresses only; the
+# server has no authentication, so another address needs --listen-unsafe)
 dexter mcp --listen localhost:8092
 
 # Print the agent-facing usage guide (save as context for clients that want it)
@@ -685,7 +686,7 @@ dexter init --force ~/code/my-elixir-project
 If the issue persists, enable debug mode to get verbose logs. You can do this in two ways:
 
 1. Set the `debug` option in your editor's LSP `initializationOptions` (see [LSP options](#lsp-options)). It applies to that editor session as soon as it connects.
-2. Or set the `DEXTER_DEBUG=true` environment variable for the editor or CLI command that starts the workspace daemon. The daemon reads it when it starts, so if one is already running, run `dexter stop` first. This is also how to debug CLI commands such as `dexter lookup`.
+2. Or set the `DEXTER_DEBUG=true` environment variable for the editor or CLI command that starts the workspace daemon. The daemon reads it when it starts, so if one is already running, run `dexter stop --force` first (a plain stop is refused while an editor or an MCP session is attached). This is also how to debug CLI commands such as `dexter lookup`.
 
 Debug mode logs timing and resolution details for every definition, hover, references, and rename request. Each editor receives the lines for its own requests in its LSP log (in Neovim usually `~/.local/state/nvim/lsp.log`, in VS Code Output > Dexter). Every editor and CLI command for a workspace shares one daemon, and all of its lines, including those for CLI commands, also go to the daemon's log file: `<key>.log` in its runtime directory (`/tmp/dexter-<uid>` on macOS and Linux; see [docs/daemon.md](docs/daemon.md)). The first line `dexter lsp` writes to your editor's log names that file.
 

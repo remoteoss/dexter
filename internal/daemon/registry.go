@@ -49,6 +49,8 @@ type Frontend interface {
 
 // MethodContext is what a registered control method may use.
 type MethodContext struct {
+	// Context is canceled when the client cancels this request (MethodCancel),
+	// when the connection ends, or when the daemon stops.
 	Context context.Context
 	Runtime *workspace.Runtime
 	Session string
@@ -129,7 +131,7 @@ func lookupMethod(name string) (MethodHandler, bool) {
 func isBuiltinMethod(name string) bool {
 	switch name {
 	case MethodStatus, MethodShutdown, MethodWorkspaceStatus, MethodLookup,
-		MethodReferences, MethodReindex, MethodWatch, MethodUnwatch:
+		MethodReferences, MethodReindex, MethodWatch, MethodUnwatch, MethodCancel:
 		return true
 	}
 	return false

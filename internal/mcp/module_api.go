@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/remoteoss/dexter/internal/lsp"
 	"github.com/remoteoss/dexter/internal/store"
 )
 
@@ -159,34 +158,27 @@ func (h *Handler) delegateTarget(module, function string, arity int) string {
 }
 
 func (h *Handler) extractModuledoc(filePath string, defLine int) string {
-	text, _, ok := h.lsp.ReadFileText(filePath)
+	a, ok := h.at(filePath, defLine)
 	if !ok {
 		return ""
 	}
-	return lsp.NewTokenizedFile(text).ExtractModuledoc(defLine - 1)
+	return a.tokenized().ExtractModuledoc(a.line - 1)
 }
 
 // docExtractor extracts @doc summaries, tokenizing each source file at most once.
 type docExtractor struct {
-	h     *Handler
-	files map[string]*lsp.TokenizedFile
+	h *Handler
 }
 
 func (h *Handler) newDocExtractor() *docExtractor {
-	return &docExtractor{h: h, files: make(map[string]*lsp.TokenizedFile)}
+	return &docExtractor{h: h}
 }
 
 func (d *docExtractor) docFor(filePath string, defLine int) string {
-	tf, ok := d.files[filePath]
+	a, ok := d.h.at(filePath, defLine)
 	if !ok {
-		if text, _, found := d.h.lsp.ReadFileText(filePath); found {
-			tf = lsp.NewTokenizedFile(text)
-		}
-		d.files[filePath] = tf // cache nil results too
-	}
-	if tf == nil {
 		return ""
 	}
-	doc, _ := tf.ExtractDocAbove(defLine - 1)
+	doc, _ := a.tokenized().ExtractDocAbove(a.line - 1)
 	return firstDocLine(doc)
 }

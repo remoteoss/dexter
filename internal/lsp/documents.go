@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	tree_sitter "github.com/tree-sitter/go-tree-sitter"
 	tree_sitter_elixir "github.com/tree-sitter/tree-sitter-elixir/bindings/go"
@@ -31,7 +32,14 @@ type cachedDoc struct {
 	// LRU and evicted once the transient cap is reached. Editor-owned
 	// entries (created via Set) are never transient and never evicted.
 	transient bool
+	// seq orders editor-owned entries across every store in the process:
+	// the higher one was set later. A frontend without an editor uses it to
+	// pick the newest unsaved buffer when several editors hold one file.
+	seq uint64
 }
+
+// docSeq numbers editor-owned entries; see cachedDoc.seq.
+var docSeq atomic.Uint64
 
 // refTree wraps a tree-sitter parse tree with refcounting so that
 // concurrent handlers walking the tree (RootNode, queries) aren't racing
@@ -144,7 +152,7 @@ func (ds *DocumentStore) Set(uri string, text string) {
 	}
 	// Editor took ownership of this URI - drop any LRU tracking for it.
 	ds.removeFromLRULocked(uri)
-	ds.docs[uri] = &cachedDoc{text: text}
+	ds.docs[uri] = &cachedDoc{text: text, seq: docSeq.Add(1)}
 }
 
 func (ds *DocumentStore) Close(uri string) {
@@ -204,6 +212,18 @@ func (ds *DocumentStore) GetIfOpen(uri string) (string, bool) {
 		return "", false
 	}
 	return doc.text, true
+}
+
+// GetOpenSeq is GetIfOpen that also returns the entry's sequence number; see
+// cachedDoc.seq.
+func (ds *DocumentStore) GetOpenSeq(uri string) (string, uint64, bool) {
+	ds.mu.RLock()
+	defer ds.mu.RUnlock()
+	doc, ok := ds.docs[uri]
+	if !ok || doc.transient {
+		return "", 0, false
+	}
+	return doc.text, doc.seq, true
 }
 
 // GetOrLoad returns the text for the given URI, falling back to a disk

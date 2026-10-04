@@ -26,6 +26,10 @@ not be indexed) can be incomplete; retry after the note goes away.
 
 Elixir specifics: modules are not tied to files (use `dexter_file_outline` for
 a file, `dexter_definition` for a module); pass fully-qualified module names,
-not aliases; function names take no arity; functions defined inside a
-`__using__` quote block may not be indexed, so an empty lookup can mean
-macro-generated code.
+not aliases; function names take no arity. Functions that a `__using__`
+quote block injects resolve through the use chain, but code generated in other
+ways (other macros, `unquote` names) can be missing from the index, so an empty
+lookup can mean macro-generated code.
+
+Answers read files the way the user sees them: a file open in an attached
+editor with unsaved changes is read from that buffer, and the answer says so.

@@ -367,6 +367,13 @@ func (c *Client) Call(ctx context.Context, method string, params, result any) er
 		c.pendingMu.Lock()
 		delete(c.pending, id)
 		c.pendingMu.Unlock()
+		// Tell the daemon, so the request stops waiting and frees its slot.
+		// Best effort: a connection that cannot take it is ending anyway.
+		if cancelParams, err := json.Marshal(CancelParams{ID: id}); err == nil {
+			c.writeMu.Lock()
+			_ = writeJSONLine(c.conn, request{Method: MethodCancel, Params: cancelParams})
+			c.writeMu.Unlock()
+		}
 		return ctx.Err()
 	}
 }

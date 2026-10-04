@@ -9,10 +9,20 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/remoteoss/dexter/internal/store"
 	"github.com/remoteoss/dexter/internal/version"
 )
 
 var errClosed = errors.New("the MCP server is shutting down")
+
+// errRootsChanged is the error of a call whose workspace connection closed
+// because the client's roots changed to another project.
+var errRootsChanged = errors.New("the MCP client's workspace roots changed during the call, so the call ended; retry it")
+
+// retirer is a Backend that can close with the error its calls in flight get.
+type retirer interface {
+	retire(reason error) error
+}
 
 // Config configures a Frontend.
 type Config struct {
@@ -124,9 +134,17 @@ func (f *Frontend) backendFor(ctx context.Context, ss *mcp.ServerSession) (Backe
 		}()
 	}
 	if orphan != nil {
-		closeBackend(orphan)
+		if r, ok := orphan.(retirer); ok {
+			if err := r.retire(errRootsChanged); err != nil {
+				log.Printf("MCP: closing workspace connection: %v", err)
+			}
+		} else {
+			closeBackend(orphan)
+		}
 	}
-	if w, ok := c.backend.(warmer); ok && !exists {
+	// Warm only a project: a root that the user gave explicitly but that is
+	// not one starts its daemon at the first tool call, not before.
+	if w, ok := c.backend.(warmer); ok && !exists && store.NonProjectRootError(root) == nil {
 		go w.warm(context.WithoutCancel(ctx))
 	}
 	return c.backend, nil

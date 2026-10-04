@@ -1,9 +1,13 @@
 package mcp
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -100,4 +104,52 @@ end
 	})
 	wantContains(t, readFile(t, e.root, "lib/my_app/greeter.ex"),
 		`  def greet(id), do: {"héllo wörld ✓", MyApp.Accounts.get_user(id)}`)
+}
+
+// Regression: two renames at the same time each read the affected files and
+// wrote them back, so the later write dropped the other rename's edits while
+// both reported success.
+func TestRenameTool_ConcurrentRenamesKeepBothEdits(t *testing.T) {
+	e := setupProject(t)
+	for i := 0; i < 40; i++ {
+		e.indexFile(fmt.Sprintf("lib/my_app/caller_%d.ex", i), fmt.Sprintf(`defmodule MyApp.Caller%d do
+  def run do
+    MyApp.Accounts.fetch_user(1)
+    MyApp.Accounts.list_users([])
+  end
+end
+`, i))
+	}
+	h := NewHandler(e.rt, e.lsp)
+	pairs := [][2][2]string{
+		{{"fetch_user", "get_user"}, {"list_users", "all_users"}},
+		{{"get_user", "fetch_user"}, {"all_users", "list_users"}},
+	}
+	for round := 0; round < 6; round++ {
+		renames := pairs[round%2]
+		var wg sync.WaitGroup
+		errs := make([]error, 2)
+		for i, r := range renames {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				args, _ := json.Marshal(map[string]any{"module": "MyApp.Accounts", "function": r[0], "new_name": r[1]})
+				_, errs[i] = h.Call(context.Background(), renameToolName, args, 0)
+			}()
+		}
+		wg.Wait()
+		for _, err := range errs {
+			if err != nil {
+				t.Fatalf("round %d: rename failed: %v", round, err)
+			}
+		}
+		for i := 0; i < 40; i++ {
+			text := readFile(t, e.root, fmt.Sprintf("lib/my_app/caller_%d.ex", i))
+			for _, r := range renames {
+				if !strings.Contains(text, "MyApp.Accounts."+r[1]+"(") || strings.Contains(text, "MyApp.Accounts."+r[0]+"(") {
+					t.Fatalf("round %d: caller_%d.ex lost the rename %s → %s:\n%s", round, i, r[0], r[1], text)
+				}
+			}
+		}
+	}
 }

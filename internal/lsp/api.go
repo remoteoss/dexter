@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+
+	"go.lsp.dev/uri"
 )
 
 // This file is the exported, name-based surface of the LSP server for callers
@@ -19,6 +21,12 @@ func (s *Server) ReadFileText(filePath string) (text string, open bool, ok bool)
 // FileLine returns one 1-based line, preferring an editor-owned buffer.
 func (s *Server) FileLine(filePath string, lineNum int) (string, bool) {
 	return s.getFileLine(filePath, lineNum)
+}
+
+// OpenBuffer returns the text of filePath when an editor holds it open in this
+// session. seq orders buffers across sessions: the higher one changed later.
+func (s *Server) OpenBuffer(filePath string) (text string, seq uint64, ok bool) {
+	return s.docs.GetOpenSeq(string(uri.File(filePath)))
 }
 
 // RenameSummary reports what a rename changed on disk.

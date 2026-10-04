@@ -44,7 +44,7 @@ func (h *Handler) workspace(ctx context.Context, args WorkspaceParams) (string, 
 		fmt.Fprintf(&b, "Index state: still building; answers can be incomplete until it is ready\n")
 	}
 	if st.IndexVersion != st.ExpectedIndexVersion && st.Ready {
-		fmt.Fprintf(&b, "WARNING: index version %d does not match this binary (%d). Run `dexter stop` in the project so the next call starts a current daemon.\n", st.IndexVersion, st.ExpectedIndexVersion)
+		fmt.Fprintf(&b, "WARNING: index version %d does not match this binary (%d). Run `dexter stop --force` in the project so the next call starts a current daemon (a plain stop is refused while this MCP session is attached).\n", st.IndexVersion, st.ExpectedIndexVersion)
 	}
 	if st.Watching {
 		fmt.Fprintf(&b, "\nThe index updates automatically as files change and on git branch switches; dexter_reindex forces an immediate update.\n")

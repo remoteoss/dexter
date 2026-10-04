@@ -97,6 +97,13 @@ type IndexCoordinator struct {
 	stdlibMu   sync.RWMutex
 	stdlibRoot string
 
+	// renameSerial keeps renames one at a time across every session of the
+	// workspace, editor and headless alike. A rename reads the affected files
+	// and writes them back; two at once would each write over the other's
+	// edits. It is held from the first read of the affected files to the end
+	// of the writes, and no other request takes it.
+	renameSerial sync.Mutex
+
 	// writes is held for writing by a cold full build and for reading by every
 	// single-file write. The bulk path is insert-only and cannot overlap any
 	// incremental mutation.
@@ -5763,6 +5770,8 @@ func (s *Server) RenameEdit(ctx context.Context, params *protocol.RenameParams) 
 // module.functionName to newName across the codebase. When report is not nil,
 // it receives the files the rename changed and the files it could not change.
 func (s *Server) renameFunctionEdits(module, functionName, newName string, report *RenameSummary) (*WorkspaceEdit, error) {
+	s.index.renameSerial.Lock()
+	defer s.index.renameSerial.Unlock()
 	// Collect all (filePath, lineNumber) pairs — definitions + references
 	type siteKey struct {
 		filePath string
@@ -5967,6 +5976,8 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string, repor
 // report is not nil, it receives the files the rename changed or moved and the
 // files it could not change.
 func (s *Server) renameModuleEdits(oldModule, newModule string, report *RenameSummary) (*WorkspaceEdit, error) {
+	s.index.renameSerial.Lock()
+	defer s.index.renameSerial.Unlock()
 	mr := s.buildModuleRename(oldModule, newModule)
 
 	// Check for collisions: verify that none of the target module names

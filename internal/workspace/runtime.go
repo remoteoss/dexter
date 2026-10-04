@@ -222,6 +222,31 @@ func (r *Runtime) Session(id string) (*lsp.Server, bool) {
 	return s.server, true
 }
 
+// EditorBuffer returns the newest buffer that an attached editor holds open
+// for path, or false when no editor has it open. A frontend without an editor,
+// such as MCP, uses it to read what the user sees instead of the disk.
+func (r *Runtime) EditorBuffer(path string) (string, bool) {
+	r.sessMu.Lock()
+	if len(r.sessions) == 0 {
+		r.sessMu.Unlock()
+		return "", false
+	}
+	servers := make([]*lsp.Server, 0, len(r.sessions))
+	for _, s := range r.sessions {
+		servers = append(servers, s.server)
+	}
+	r.sessMu.Unlock()
+	var text string
+	var newest uint64
+	found := false
+	for _, srv := range servers {
+		if t, seq, ok := srv.OpenBuffer(path); ok && (!found || seq > newest) {
+			text, newest, found = t, seq, true
+		}
+	}
+	return text, found
+}
+
 // SessionInfo describes one attached editor session for status output.
 type SessionInfo struct {
 	ID            string

@@ -64,7 +64,18 @@ const (
 	MethodReindex         = "workspace/reindex"
 	MethodWatch           = "workspace/watch"
 	MethodUnwatch         = "workspace/unwatch"
+
+	// MethodCancel cancels one in-flight request of the same connection, like
+	// $/cancelRequest in LSP. It is sent with id 0 and gets no response; the
+	// canceled request still answers, usually with a context error, and the
+	// client has stopped waiting for it.
+	MethodCancel = "$/cancel"
 )
+
+// CancelParams names the request that MethodCancel cancels.
+type CancelParams struct {
+	ID uint64 `json:"id"`
+}
 
 // Status describes the daemon serving a workspace.
 type Status struct {
@@ -579,6 +590,11 @@ type conn struct {
 	sem      chan struct{}
 	requests sync.WaitGroup
 
+	// inflight maps the id of each running request to the cancel func of its
+	// context, for MethodCancel.
+	inflightMu sync.Mutex
+	inflight   map[uint64]context.CancelFunc
+
 	writeMu sync.Mutex
 	subsMu  sync.Mutex
 	subs    map[string]func()
@@ -772,7 +788,7 @@ func (s lspStream) Close() error                { return s.conn.Close() }
 // serveControl handles requests concurrently so a long reindex cannot block a
 // lookup, and serializes only the writes.
 func (s *server) serveControl(c *conn, reader *bufio.Reader, sessionID string) error {
-	mc := MethodContext{
+	base := MethodContext{
 		Context: c.ctx,
 		Runtime: s.runtime,
 		Session: sessionID,
@@ -785,6 +801,15 @@ func (s *server) serveControl(c *conn, reader *bufio.Reader, sessionID string) e
 		if err := readJSONLine(reader, &req); err != nil {
 			return err
 		}
+		if req.Method == MethodCancel {
+			// Handled on the reader, outside the request limit, so a cancel
+			// gets through when every slot is taken.
+			var params CancelParams
+			if err := json.Unmarshal(req.Params, &params); err == nil {
+				c.cancelRequest(params.ID)
+			}
+			continue
+		}
 		select {
 		case c.sem <- struct{}{}:
 		case <-c.ctx.Done():
@@ -794,6 +819,12 @@ func (s *server) serveControl(c *conn, reader *bufio.Reader, sessionID string) e
 			continue
 		}
 		c.requests.Add(1)
+		// Each request has its own context, so a cancel ends its waits and
+		// frees its slot before the connection ends.
+		mc := base
+		var cancel context.CancelFunc
+		mc.Context, cancel = context.WithCancel(c.ctx)
+		c.trackRequest(req.ID, cancel)
 		go func(req request) {
 			res := response{ID: req.ID}
 			defer func() {
@@ -808,6 +839,8 @@ func (s *server) serveControl(c *conn, reader *bufio.Reader, sessionID string) e
 					log.Printf("Daemon control method %q: %v", req.Method, err)
 					_ = c.write(response{ID: req.ID, Error: fmt.Sprintf("%s result is too large to send (%d bytes, limit %d); narrow the query", req.Method, len(res.Result), maxProtocolLine)})
 				}
+				c.untrackRequest(req.ID)
+				cancel()
 				<-c.sem
 				c.requests.Done()
 			}()
@@ -821,6 +854,30 @@ func (s *server) serveControl(c *conn, reader *bufio.Reader, sessionID string) e
 				}
 			}
 		}(req)
+	}
+}
+
+func (c *conn) trackRequest(id uint64, cancel context.CancelFunc) {
+	c.inflightMu.Lock()
+	if c.inflight == nil {
+		c.inflight = make(map[uint64]context.CancelFunc)
+	}
+	c.inflight[id] = cancel
+	c.inflightMu.Unlock()
+}
+
+func (c *conn) untrackRequest(id uint64) {
+	c.inflightMu.Lock()
+	delete(c.inflight, id)
+	c.inflightMu.Unlock()
+}
+
+func (c *conn) cancelRequest(id uint64) {
+	c.inflightMu.Lock()
+	cancel := c.inflight[id]
+	c.inflightMu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 }
 
@@ -958,7 +1015,9 @@ func (s *server) handleRequest(c *conn, mc MethodContext, req request) (any, err
 // the only watchers, so a frontend uses this instead of watching the tree again.
 func (s *server) watch(c *conn, mc MethodContext, params WatchParams) (any, error) {
 	changes, cancel := s.runtime.Subscribe(params.Buffer)
-	ctx, stop := context.WithCancel(mc.Context)
+	// The subscription outlives the request that made it: it ends with the
+	// connection or an unwatch.
+	ctx, stop := context.WithCancel(c.ctx)
 	id := c.addSub(func() {
 		stop()
 		cancel()

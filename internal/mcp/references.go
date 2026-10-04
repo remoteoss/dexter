@@ -63,11 +63,11 @@ func (h *Handler) references(ctx context.Context, args ReferencesParams) (string
 			fmt.Fprintf(&b, "\n%s\n", h.relPath(r.FilePath))
 			lastFile = r.FilePath
 		}
-		srcLine := ""
-		if line, ok := h.lsp.FileLine(r.FilePath, r.Line); ok {
-			srcLine = strings.TrimSpace(line)
+		srcLine, line, label, ok := h.sourceLine(r.FilePath, r.Line)
+		if !ok {
+			line = r.Line
 		}
-		fmt.Fprintf(&b, "  %d: %s\n", r.Line, srcLine)
+		fmt.Fprintf(&b, "  %d: %s%s\n", line, strings.TrimSpace(srcLine), label)
 		written++
 	}
 	if truncated > 0 {

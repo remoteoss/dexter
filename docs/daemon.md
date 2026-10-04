@@ -77,6 +77,15 @@ responses carry an id, and the daemon may push notifications (a method, no id)
 between them. One connection therefore multiplexes concurrent calls and
 subscriptions, and a slow reindex cannot block a lookup.
 
+A connection runs at most 64 requests at once; one more is refused at once
+instead of blocking the reader. Each request has its own context, derived from
+the connection's. A client that stops waiting for a request sends
+`{"id":0,"method":"$/cancel","params":{"id":N}}`, the pattern of LSP's
+`$/cancelRequest`: the reader handles it outside the request limit and cancels
+request `N`, so its index waits end and its slot is free again. The canceled
+request still answers; the client has dropped it. A subscription made by
+`workspace/watch` belongs to the connection, not to the request that made it.
+
 Each message is one line of at most 16 MiB, newline included. A writer refuses
 a longer line before sending anything, so the stream stays in step: a result
 that is too large fails only its own call, and a `workspace/changed`
@@ -289,6 +298,7 @@ Built-in control surface:
 | `workspace/references` | semantic references through the shared language service |
 | `workspace/reindex` | whole workspace or one path, returning after the barrier |
 | `workspace/watch`, `workspace/unwatch` | subscribe to coalesced index changes, pushed as `workspace/changed` notifications |
+| `$/cancel` | cancel one in-flight request of this connection; sent with id 0, no response |
 
 ## The MCP frontend
 
@@ -318,8 +328,30 @@ runs no LSP lifecycle of its own.
   or error condition, ends with a note that says so. The rename tool refuses
   until the index is complete, because a rename from a partial index would
   change some call sites and leave others with the old name.
+- **Editor buffers.** Tools that read file text (outlines, definition and
+  module docs, reference lines) use the newest buffer that any attached editor
+  session holds open when it differs from the disk, and the disk otherwise.
+  The answer names the files that came from unsaved buffers. The index
+  positions refer to the saved file, so a line is mapped into the buffer
+  through the lines that both share at the start and at the end; a position
+  in the changed part shows the saved line, marked as such. Paths that the
+  agent gives must be inside the project root after symlinks are resolved, and
+  must name a regular file of at most 10 MB.
+- **Limits and cancellation.** One frontend runs at most 32 tool calls at once
+  on a workspace connection, below the daemon's 64, and a call past the limit
+  waits for a slot. A call that the MCP client cancels sends `$/cancel`, so the
+  daemon stops waiting for the index for it. A canceled rename says that it may
+  have been applied. When the client's roots change to another project during
+  a call, the call ends with an error that says so.
+- **HTTP.** `--listen` accepts only a loopback address unless
+  `--listen-unsafe` is given, because the server has no authentication. The
+  SDK refuses a non-loopback `Host` on a loopback connection (DNS rebinding),
+  cross-origin browser requests are refused, a request body is capped at
+  4 MB, and a session with no request for 30 minutes is closed, so a client
+  that went away does not keep its daemon alive.
 - **Reconnects.** When the daemon goes away (an upgrade replaced it, or
-  `dexter stop`), the next tool call connects again, which starts a new daemon.
+  `dexter stop --force`; a plain `dexter stop` is refused while MCP is
+  attached), the next tool call connects again, which starts a new daemon.
   A read-only call that was in flight is sent once more; a rename is never
   repeated.
 - **Rename.** The rename runs on the headless language service and writes the

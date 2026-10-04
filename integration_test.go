@@ -1192,3 +1192,20 @@ func TestIntegration_MCPListenHTTP(t *testing.T) {
 		t.Errorf("definition over HTTP missing location:\n%s", out)
 	}
 }
+
+// Regression: --listen accepted any address, and the server has no
+// authentication, so a wildcard address exposed the code and the rename tool
+// to the network.
+func TestIntegration_MCPListenRefusesNonLoopback(t *testing.T) {
+	binary := buildDexter(t)
+	root := scaffoldProject(t)
+	cmd := exec.Command(binary, "mcp", "--listen=0.0.0.0:0", root)
+	cmd.Dir = root
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("dexter mcp --listen=0.0.0.0:0 started:\n%s", out)
+	}
+	if !strings.Contains(string(out), "refusing to listen") || !strings.Contains(string(out), "--listen-unsafe") {
+		t.Errorf("refusal does not explain itself:\n%s", out)
+	}
+}

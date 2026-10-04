@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -17,10 +18,19 @@ func (h *Handler) fileOutline(ctx context.Context, args FileOutlineParams) (stri
 	if strings.TrimSpace(args.File) == "" {
 		return "", fmt.Errorf("file must not be empty")
 	}
-	path := h.resolvePath(args.File)
-	text, _, ok := h.lsp.ReadFileText(path)
-	if !ok {
+	path, err := h.userPath(args.File)
+	if errors.Is(err, errNotFound) {
 		return fmt.Sprintf("File not found: %s", h.relPath(path)), nil
+	}
+	if err != nil {
+		return "", err
+	}
+	text, err := h.readSource(path)
+	if errors.Is(err, errNotFound) {
+		return fmt.Sprintf("File not found: %s", h.relPath(path)), nil
+	}
+	if err != nil {
+		return "", err
 	}
 
 	// Parse fresh source so the outline is correct when either the index is

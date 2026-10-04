@@ -1,6 +1,7 @@
 package store
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 )
@@ -46,4 +47,21 @@ func regularFile(path string) bool {
 func gitMarker(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && (info.IsDir() || info.Mode().IsRegular())
+}
+
+// NonProjectRootError explains why dir is not a workspace to index, or returns
+// nil when it is one. Every frontend refuses such a directory unless the user
+// insists, because indexing it (the home directory, a mistyped path) would
+// read every file under it.
+func NonProjectRootError(dir string) error {
+	if IsHomeDir(dir) {
+		if HasIndex(dir) {
+			return nil
+		}
+		return fmt.Errorf("refusing to use %s as a workspace: it is your home directory, not a project", dir)
+	}
+	if LooksLikeProject(dir) {
+		return nil
+	}
+	return fmt.Errorf("refusing to use %s as a workspace: no mix.exs, .git, or Dexter database found, so it does not look like an Elixir project", dir)
 }

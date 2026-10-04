@@ -615,6 +615,10 @@ func init() {
 	RegisterMethod("srvtest/panic", func(MethodContext, json.RawMessage) (any, error) {
 		panic("method exploded on purpose")
 	})
+	RegisterMethod("srvtest/wait", func(mc MethodContext, _ json.RawMessage) (any, error) {
+		<-mc.Context.Done()
+		return nil, mc.Context.Err()
+	})
 	RegisterMethod("srvtest/block", func(mc MethodContext, _ json.RawMessage) (any, error) {
 		blockingMethodMu.Lock()
 		state := blockingMethod
@@ -836,5 +840,85 @@ func TestDaemonExitsWhenItsSocketDisappears(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("daemon kept running after its socket disappeared")
+	}
+}
+
+// pipeControlClient serves one control connection over an in-memory pipe.
+func pipeControlClient(t *testing.T) *Client {
+	t.Helper()
+	quietEnv(t)
+	root := t.TempDir()
+	s, endpoint := pipeServer(t, root)
+	serverConn, clientConn := net.Pipe()
+	go func() { _ = s.serveConn(serverConn) }()
+	reader := bufio.NewReader(clientConn)
+	if err := writeJSONLine(clientConn, hello{
+		Contract: ContractVersion,
+		Kind:     kindControl,
+		Root:     endpoint.Root,
+		Identity: endpoint.Identity,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var response helloResponse
+	if err := readJSONLine(reader, &response); err != nil || !response.OK {
+		t.Fatalf("handshake = %+v, %v", response, err)
+	}
+	client := newClient(clientConn, reader)
+	t.Cleanup(func() { _ = client.Close() })
+	return client
+}
+
+// Regression: a call that the client canceled kept running in the daemon
+// until the connection ended, so after 64 canceled calls every new call on the
+// connection failed with "too many concurrent control requests".
+func TestCanceledCallsFreeTheirSlots(t *testing.T) {
+	client := pipeControlClient(t)
+	for i := 0; i < 3*maxConcurrentRequests; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+		err := client.Call(ctx, "srvtest/wait", struct{}{}, nil)
+		cancel()
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("call %d: error = %v, want the deadline", i, err)
+		}
+	}
+	if _, err := client.DaemonStatus(context.Background()); err != nil {
+		t.Fatalf("connection unusable after canceled calls: %v", err)
+	}
+}
+
+// lastContractWithoutCancel is the contract of the builds whose daemons do not
+// know $/cancel. A frontend that sends it must not attach to such a daemon:
+// its canceled requests would keep their slots.
+const lastContractWithoutCancel = 3
+
+// The contract was bumped with $/cancel, so the two builds refuse each other
+// and the newer one replaces the older daemon (TestEnsureReplacesAnOlderDaemon)
+// instead of sharing it.
+func TestContractBumpedForRequestCancel(t *testing.T) {
+	if ContractVersion <= lastContractWithoutCancel {
+		t.Fatalf("ContractVersion = %d; $/cancel needs a contract above %d", ContractVersion, lastContractWithoutCancel)
+	}
+	quietEnv(t)
+	root := t.TempDir()
+	s, endpoint := pipeServer(t, root)
+	serverConn, clientConn := net.Pipe()
+	go func() { _ = s.serveConn(serverConn) }()
+	defer func() { _ = clientConn.Close() }()
+	reader := bufio.NewReader(clientConn)
+	if err := writeJSONLine(clientConn, hello{
+		Contract: lastContractWithoutCancel,
+		Kind:     kindControl,
+		Root:     endpoint.Root,
+		Identity: endpoint.Identity,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var response helloResponse
+	if err := readJSONLine(reader, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.OK || !response.Incompatible || response.Exiting {
+		t.Fatalf("handshake from contract %d = %+v, want an incompatible refusal that keeps the daemon", lastContractWithoutCancel, response)
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -449,4 +450,50 @@ func TestNegotiation_SkipsUnusableRoot(t *testing.T) {
 	}
 	cs, _ := e.connect(nil, "file:///nonexistent/dexter-negotiation-test", fileURI(file), uri)
 	wantContains(t, mustTool(t, cs, "dexter_search", map[string]any{"query": "x"}), "root="+root)
+}
+
+// warmCounter is a fake backend that counts warm calls.
+type warmCounter struct {
+	fakeBackend
+	warms *atomic.Int32
+}
+
+func (w *warmCounter) warm(context.Context) { w.warms.Add(1) }
+
+// Regression: a session's workspace was warmed (its daemon started and
+// indexing) even when the root was not an Elixir project.
+func TestFrontend_WarmsOnlyProjects(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		project bool
+	}{{"project", true}, {"plain directory", false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			if tc.project {
+				writeSource(t, root, "mix.exs", "defmodule App.MixProject do\nend\n")
+			}
+			var warms atomic.Int32
+			f := NewFrontend(Config{Root: root, Fixed: true, Connect: func(root string) Backend {
+				return &warmCounter{fakeBackend: fakeBackend{root: root}, warms: &warms}
+			}})
+			cs := connectFrontend(t, f)
+			mustTool(t, cs, "dexter_search", map[string]any{"query": "x"})
+			time.Sleep(50 * time.Millisecond) // warm runs in a goroutine
+			if got := warms.Load() > 0; got != tc.project {
+				t.Errorf("warmed = %v, want %v", got, tc.project)
+			}
+		})
+	}
+}
+
+// A client root that is not a project is unusable: a later project root wins.
+func TestNegotiation_SkipsNonProjectRoot(t *testing.T) {
+	e := setupNegotiation(t)
+	plain := t.TempDir()
+	project, projectURI := projectDir(t)
+	cs, _ := e.connect(nil, fileURI(plain), projectURI)
+	wantContains(t, mustTool(t, cs, "dexter_search", map[string]any{"query": "x"}), "root="+project)
+	if got := e.backendsFor(plain); len(got) != 0 {
+		t.Errorf("a backend was opened for the non-project root %s", plain)
+	}
 }

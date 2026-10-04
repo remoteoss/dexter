@@ -41,6 +41,10 @@ type Handler struct {
 	lsp         *lsp.Server
 	store       *store.Store
 	projectRoot string
+
+	// sources caches the files that one tool call reads. Call gives each call
+	// its own Handler, so the cache never outlives the call.
+	sources sourceCache
 }
 
 // NewHandler returns a Handler over the runtime's store and the given language
@@ -163,11 +167,18 @@ func (h *Handler) Call(ctx context.Context, name string, args json.RawMessage, w
 		cancel()
 	}
 
-	text, err := spec.run(h, ctx, args)
-	notes := ""
+	call := &Handler{rt: h.rt, lsp: h.lsp, store: h.store, projectRoot: h.projectRoot}
+	text, err := spec.run(call, ctx, args)
+	var noteList []string
 	if !spec.ownStatus {
-		notes = h.indexNotes()
+		if n := h.indexNotes(); n != "" {
+			noteList = append(noteList, n)
+		}
 	}
+	if n := call.unsavedNote(); n != "" {
+		noteList = append(noteList, n)
+	}
+	notes := strings.Join(noteList, "\n")
 	if err != nil {
 		if notes != "" {
 			return "", fmt.Errorf("%w\n%s", err, notes)
@@ -219,14 +230,6 @@ func (h *Handler) relPath(p string) string {
 		return rel
 	}
 	return p
-}
-
-// resolvePath interprets a user-supplied path against the project root.
-func (h *Handler) resolvePath(p string) string {
-	if filepath.IsAbs(p) {
-		return p
-	}
-	return filepath.Join(h.projectRoot, p)
 }
 
 // symbolName renders Module.function/arity (or just the module name).
