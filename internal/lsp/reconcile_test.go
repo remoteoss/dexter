@@ -132,6 +132,46 @@ func TestReconcile_WarmChangeSetPaths(t *testing.T) {
 	}
 }
 
+// When every changed file fails to parse, a rebuild has nothing to write. It
+// must not copy and swap the tables, and the old rows of those files stay.
+func TestReconcile_RebuildWithNoParsedFileChangesNothing(t *testing.T) {
+	setReconcileVars(t, 3, 1, 4)
+	logs := captureLog(t)
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	var paths []string
+	for i := 0; i < 3; i++ {
+		paths = append(paths, writeTestFile(t, server.projectRoot, fmt.Sprintf("lib/gen%d.ex", i), moduleSource(i, 0)))
+	}
+	reindexOnce(t, server) // cold: full build
+
+	future := time.Now().Add(time.Hour)
+	for _, path := range paths {
+		if err := os.Chtimes(path, future, future); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, 0); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
+	}
+	before := logs.String()
+	reindexOnce(t, server)
+	pass := strings.TrimPrefix(logs.String(), before)
+	if strings.Contains(pass, "Rebuilt the index") {
+		t.Errorf("a rebuild with no parsed file swapped the tables:\n%s", pass)
+	}
+	if !strings.Contains(pass, "Index rebuild skipped") {
+		t.Errorf("the log does not say that the rebuild was skipped:\n%s", pass)
+	}
+	for i := 0; i < 3; i++ {
+		if r, _ := server.store.LookupFunction(fmt.Sprintf("MyApp.Gen%d", i), "run_v0"); len(r) != 1 {
+			t.Errorf("file %d lost its old definition: %d rows", i, len(r))
+		}
+	}
+}
+
 // CancelWork must end a warm pass in flight promptly, leave no file half
 // written, and leave the rest for the next start, which finishes it from the
 // stored mtimes. This is what shutdown relies on.

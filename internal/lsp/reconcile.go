@@ -285,6 +285,14 @@ func (s *Server) rebuildChanged(ctx context.Context, changed []changedFile) (int
 		}
 		return 0, false
 	}
+	if files == 0 {
+		// Every changed file failed to parse, so nothing changes: their old
+		// rows stay. Copying and swapping the tables would only cost time, and
+		// the next start would do it again for the same files.
+		_ = batch.Rollback()
+		log.Printf("Index rebuild skipped: none of %d changed files could be parsed", len(changed))
+		return 0, true
+	}
 	written := time.Now()
 	if err := batch.Commit(); err != nil {
 		if ctx.Err() == nil {
