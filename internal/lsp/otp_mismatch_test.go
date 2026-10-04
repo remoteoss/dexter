@@ -3,11 +3,14 @@ package lsp
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -303,5 +306,93 @@ func TestOTPMismatchInUmbrellaIsStableUnderAlternateSaves(t *testing.T) {
 	}
 	if n := beamStarts(t, starts); n != 1 {
 		t.Errorf("the failing BEAM started %d times, want 1", n)
+	}
+}
+
+// A decision about the shared OTP Warning must not apply after a newer one.
+// The hook pauses an older decision (app a failed, nothing works yet: clear)
+// while a newer one (app b works: set) runs. The Warning must end active.
+func TestOTPDecisionsApplyInOrder(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+	server.mixBin = filepath.Join(t.TempDir(), "mix")
+	buildRoot := server.projectRoot
+	appA := filepath.Join(buildRoot, "apps", "a")
+	appB := filepath.Join(buildRoot, "apps", "b")
+	server.rememberOTPMismatch(buildRoot)
+
+	paused := make(chan struct{})
+	resume := make(chan struct{})
+	var calls atomic.Int32
+	otpApplyHook = func() {
+		if calls.Add(1) == 1 {
+			close(paused)
+			<-resume
+		}
+	}
+	t.Cleanup(func() { otpApplyHook = nil })
+
+	older := make(chan struct{})
+	go func() {
+		defer close(older)
+		server.reportBeamOTP(buildRoot, appA, fmt.Errorf("%w: exit status 1", errOTPMismatch))
+	}()
+	<-paused
+	newer := make(chan struct{})
+	go func() {
+		defer close(newer)
+		server.reportBeamOTP(buildRoot, appB, nil)
+	}()
+	select {
+	case <-newer:
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(resume)
+	<-older
+	<-newer
+	if !server.index.reporter.Active(condOTP + ":" + buildRoot) {
+		t.Fatal("an older decision cleared the Warning after a newer one set it, although app b still formats")
+	}
+}
+
+// Many concurrent formats in two Mix projects on one build root, one whose
+// fallback works and one whose fallback fails with the mismatch, must end with
+// the Warning active and sent once.
+func TestConcurrentFormatsKeepTheOTPWarning(t *testing.T) {
+	server, client, starts := otpMismatchProject(t)
+	aFails := filepath.Join(filepath.Dir(starts), "afails")
+	script := "#!/bin/sh\ncase \"$PWD\" in */apps/a) if [ -e " + aFails + " ]; then echo '" + otpMismatchStderr + "' >&2; exit 1; fi ;; esac\ncat\n"
+	if err := os.WriteFile(server.mixBin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(aFails, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	apps := []string{filepath.Join(server.projectRoot, "apps", "a"), filepath.Join(server.projectRoot, "apps", "b")}
+	for _, app := range apps {
+		if err := os.MkdirAll(filepath.Join(app, "lib"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Remember the mismatch first, as the first save does, so that every
+	// concurrent format below takes the fallback.
+	_, _ = server.formatContent(context.Background(), apps[1], filepath.Join(apps[1], "lib", "x.ex"), "x\n")
+
+	var wg sync.WaitGroup
+	for i := 0; i < 40; i++ {
+		app := apps[i%2]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _ = server.formatContent(context.Background(), app, filepath.Join(app, "lib", "x.ex"), "x\n")
+		}()
+	}
+	wg.Wait()
+	if !server.index.reporter.Active(condOTP + ":" + server.projectRoot) {
+		t.Fatal("the Warning is not active although app b still formats")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if n := countMessages(client, "still works"); n != 1 {
+		t.Errorf("the Warning was sent %d times, want 1:\n%s", n, client.Dump())
 	}
 }

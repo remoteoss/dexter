@@ -275,12 +275,24 @@ var otpMismatchRetry = 10 * time.Minute
 type otpMismatch struct {
 	at    time.Time
 	stamp string
-	// fallbackWorks is the last mix format outcome of each Mix project that
-	// uses this build root: true when it formatted, false when it failed with
-	// the same mismatch. It is bounded by the number of Mix projects, and it
-	// goes away with the entry.
-	fallbackWorks map[string]bool
 }
+
+// otpOutcomes is the last mix format fallback outcome of each Mix project on a
+// build root whose BEAM failed with an OTP mismatch: true when it formatted,
+// false when it failed with the same mismatch. It is shared by every session,
+// like the reporter, and mu orders each update with the Set or Clear that it
+// decides, so an older decision cannot apply after a newer one. mu is taken
+// before the reporter's lock, which is a leaf: the reporter only queues.
+// Memory is bounded by the build roots and Mix projects of the workspace; a
+// build root's outcomes go when its BEAM formats.
+type otpOutcomes struct {
+	mu            sync.Mutex
+	fallbackWorks map[string]map[string]bool // build root → Mix project → works
+}
+
+// otpApplyHook runs between the decision of reportBeamOTP and its Set or Clear.
+// Tests use it to force an order of concurrent formats.
+var otpApplyHook func()
 
 // otpStamp identifies what can fix an OTP mismatch for a build root: the
 // Elixir and mix binaries, and the _build directory.
@@ -305,7 +317,7 @@ func (s *Server) rememberOTPMismatch(buildRoot string) {
 	if _, ok := s.otpMismatches[buildRoot]; ok {
 		return
 	}
-	s.otpMismatches[buildRoot] = otpMismatch{at: time.Now(), stamp: s.otpStamp(buildRoot), fallbackWorks: make(map[string]bool)}
+	s.otpMismatches[buildRoot] = otpMismatch{at: time.Now(), stamp: s.otpStamp(buildRoot)}
 }
 
 // reportBeamOTP tells the user about an OTP mismatch of the BEAM of buildRoot
@@ -321,22 +333,36 @@ func (s *Server) rememberOTPMismatch(buildRoot string) {
 // saves in any order do not repeat it.
 func (s *Server) reportBeamOTP(buildRoot, mixRoot string, err error) {
 	s.beamMu.Lock()
-	if !s.otpMismatchHolds(buildRoot) {
-		s.beamMu.Unlock()
+	holds := s.otpMismatchHolds(buildRoot)
+	s.beamMu.Unlock()
+	if !holds {
 		return
 	}
-	m := s.otpMismatches[buildRoot]
+
+	o := &s.index.otp
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.fallbackWorks == nil {
+		o.fallbackWorks = make(map[string]map[string]bool)
+	}
+	outcomes := o.fallbackWorks[buildRoot]
+	if outcomes == nil {
+		outcomes = make(map[string]bool)
+		o.fallbackWorks[buildRoot] = outcomes
+	}
 	switch {
 	case err == nil:
-		m.fallbackWorks[mixRoot] = true
+		outcomes[mixRoot] = true
 	case errors.Is(err, errOTPMismatch):
-		m.fallbackWorks[mixRoot] = false
+		outcomes[mixRoot] = false
 	}
-	anyWorks, known := false, len(m.fallbackWorks) > 0
-	for _, works := range m.fallbackWorks {
+	anyWorks, known := false, len(outcomes) > 0
+	for _, works := range outcomes {
 		anyWorks = anyWorks || works
 	}
-	s.beamMu.Unlock()
+	if otpApplyHook != nil {
+		otpApplyHook()
+	}
 
 	key := condOTP + ":" + buildRoot
 	switch {
@@ -373,7 +399,12 @@ func (s *Server) otpMismatchHolds(buildRoot string) bool {
 func (s *Server) reportBeamFormatWorks(mixRoot, buildRoot string) {
 	r := s.index.reporter
 	formatter := r.Clear(condFormatter+":"+mixRoot, "")
-	if r.Clear(condOTP+":"+buildRoot, "") {
+	o := &s.index.otp
+	o.mu.Lock()
+	delete(o.fallbackWorks, buildRoot)
+	otpCleared := r.Clear(condOTP+":"+buildRoot, "")
+	o.mu.Unlock()
+	if otpCleared {
 		r.Notify(notify.Info, fmt.Sprintf("Dexter: the fast persistent formatter works again in %s.", buildRoot))
 		return
 	}

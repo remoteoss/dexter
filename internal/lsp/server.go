@@ -112,6 +112,7 @@ type IndexCoordinator struct {
 	failures fileFailures
 	// firstBuildReported makes the first-build report once per workspace.
 	firstBuildReported atomic.Bool
+	otp                otpOutcomes // see reportBeamOTP
 }
 
 func (c *IndexCoordinator) setStdlibRoot(root string) (string, bool) {
