@@ -146,21 +146,25 @@ func (w *fseventsWatcher) handle(event fsevents.Event) {
 		// A worktree moved or copied into place is a top from now on. The
 		// runtime is told once, as for a new .git file, to drop anything
 		// indexed from it; it needs no full reconcile.
-		if flags&(fsevents.ItemCreated|fsevents.ItemRenamed) != 0 && parser.IsLinkedWorktree(path) {
-			if w.tops.add(path) {
-				w.callbacks.PathChanged(path)
+		if flags&(fsevents.ItemCreated|fsevents.ItemRenamed) != 0 {
+			// One read of the .git file classifies the directory: two reads can
+			// see an empty file and then a complete one while git writes it.
+			switch parser.GitFile(path) {
+			case parser.WorktreeGitFile:
+				if w.tops.add(path) {
+					w.callbacks.PathChanged(path)
+				}
+				return
+			case parser.UnsettledGitFile:
+				// A worktree that git is still moving has an empty .git file.
+				// It is a top until it is checked again, so that no full
+				// reconcile indexes it in the meantime.
+				if w.tops.add(path) {
+					w.callbacks.PathChanged(path)
+				}
+				w.checkTopLater(path)
+				return
 			}
-			return
-		}
-		// A worktree that git is still moving has an empty .git file. It is a
-		// top until it is checked again, so that no full reconcile indexes it
-		// in the meantime.
-		if flags&(fsevents.ItemCreated|fsevents.ItemRenamed) != 0 && parser.UnsettledGitFile(path) {
-			if w.tops.add(path) {
-				w.callbacks.PathChanged(path)
-			}
-			w.checkTopLater(path)
-			return
 		}
 		if flags&(fsevents.ItemCreated|fsevents.ItemRemoved|fsevents.ItemRenamed) != 0 {
 			w.callbacks.FullReconcile()
@@ -205,11 +209,12 @@ func (w *fseventsWatcher) checkTopLater(dir string) {
 		}
 		info, err := os.Stat(dir)
 		if err == nil && info.IsDir() {
-			if parser.IsLinkedWorktree(dir) {
+			state := parser.GitFile(dir)
+			if state == parser.WorktreeGitFile {
 				return
 			}
 			// git may still be writing the .git file of a worktree it moved.
-			if parser.UnsettledGitFile(dir) || recordedWorktree(w.root, dir) {
+			if state == parser.UnsettledGitFile || recordedWorktree(w.root, dir) {
 				w.checkTopLater(dir)
 				return
 			}
