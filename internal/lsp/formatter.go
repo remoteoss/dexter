@@ -968,7 +968,7 @@ func (s *Server) evictBeam(bp *beamProcess, reason string) {
 func (s *Server) formatFallback(ctx context.Context, mixRoot, buildRoot, path, content string) (string, error) {
 	out, err := s.formatWithMixFormat(ctx, mixRoot, path, content)
 	if ctx.Err() == nil {
-		s.reportBeamOTP(buildRoot, err)
+		s.reportBeamOTP(buildRoot, mixRoot, err)
 	}
 	return out, err
 }

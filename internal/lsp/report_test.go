@@ -352,7 +352,7 @@ func TestFormatterFailuresAreKeptForEachProject(t *testing.T) {
 	client.WaitMessage(t, reportWait, protocol.MessageTypeInfo, "Dexter: formatting works again in "+broken+".")
 
 	server.rememberOTPMismatch(good)
-	server.reportBeamOTP(good, nil)
+	server.reportBeamOTP(good, good, nil)
 	client.WaitMessage(t, reportWait, protocol.MessageTypeWarning, "Elixir/OTP version mismatch in "+good)
 	other := filepath.Join(server.projectRoot, "apps", "other")
 	if err := os.MkdirAll(other, 0o755); err != nil {

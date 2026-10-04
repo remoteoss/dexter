@@ -236,3 +236,72 @@ func TestOTPMismatchInBeamAndMixShowsOnlyTheError(t *testing.T) {
 		t.Errorf("the failing BEAM started %d times, want 1", n)
 	}
 }
+
+// In an umbrella, the Mix projects share one build root and so one BEAM and
+// one Warning. When one project's mix format also fails with the mismatch and
+// another's works, saves that alternate between them must not drop and set the
+// Warning again each time.
+func TestOTPMismatchInUmbrellaIsStableUnderAlternateSaves(t *testing.T) {
+	server, client, starts := otpMismatchProject(t)
+	bin := filepath.Dir(starts)
+	aFails := filepath.Join(bin, "afails")
+	script := "#!/bin/sh\ncase \"$PWD\" in */apps/a) if [ -e " + aFails + " ]; then echo '" + otpMismatchStderr + "' >&2; exit 1; fi ;; esac\ncat\n"
+	if err := os.WriteFile(server.mixBin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(aFails, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	appA := filepath.Join(server.projectRoot, "apps", "a")
+	appB := filepath.Join(server.projectRoot, "apps", "b")
+	for _, dir := range []string{appA, appB} {
+		if err := os.MkdirAll(filepath.Join(dir, "lib"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	content := "defmodule A do\nend\n"
+	save := func(app string) error {
+		got, err := server.formatContent(context.Background(), app, filepath.Join(app, "lib", "x.ex"), content)
+		if err == nil && got != content {
+			t.Fatalf("format in %s = %q, want %q", app, got, content)
+		}
+		return err
+	}
+
+	for i, app := range []string{appA, appB, appA, appB, appA} {
+		err := save(app)
+		if app == appA && err == nil {
+			t.Fatalf("save %d in app a worked although its mix fails", i+1)
+		}
+		if app == appB && err != nil {
+			t.Fatalf("save %d in app b failed: %v", i+1, err)
+		}
+	}
+	client.WaitMessage(t, reportWait, protocol.MessageTypeWarning, "Formatting still works through the slower `mix format` fallback")
+	client.WaitMessage(t, reportWait, protocol.MessageTypeError, "formatting does not work in "+appA)
+	time.Sleep(50 * time.Millisecond)
+	if n := countMessages(client, "still works"); n != 1 {
+		t.Errorf("alternate saves sent %d Warnings, want 1:\n%s", n, client.Dump())
+	}
+	if n := countMessages(client, "formatting does not work in "+appA); n != 1 {
+		t.Errorf("got %d Errors for app a, want 1:\n%s", n, client.Dump())
+	}
+
+	if err := os.Remove(aFails); err != nil {
+		t.Fatal(err)
+	}
+	if err := save(appA); err != nil {
+		t.Fatalf("app a did not format after its mix works: %v", err)
+	}
+	client.WaitMessage(t, reportWait, protocol.MessageTypeInfo, "Dexter: formatting works again in "+appA+".")
+	time.Sleep(50 * time.Millisecond)
+	if n := countMessages(client, "still works"); n != 1 {
+		t.Errorf("the Warning was sent again:\n%s", client.Dump())
+	}
+	if !server.index.reporter.Active(condOTP + ":" + server.projectRoot) {
+		t.Error("the Warning is not active although the BEAM still cannot start")
+	}
+	if n := beamStarts(t, starts); n != 1 {
+		t.Errorf("the failing BEAM started %d times, want 1", n)
+	}
+}

@@ -275,6 +275,11 @@ var otpMismatchRetry = 10 * time.Minute
 type otpMismatch struct {
 	at    time.Time
 	stamp string
+	// fallbackWorks is the last mix format outcome of each Mix project that
+	// uses this build root: true when it formatted, false when it failed with
+	// the same mismatch. It is bounded by the number of Mix projects, and it
+	// goes away with the entry.
+	fallbackWorks map[string]bool
 }
 
 // otpStamp identifies what can fix an OTP mismatch for a build root: the
@@ -300,28 +305,46 @@ func (s *Server) rememberOTPMismatch(buildRoot string) {
 	if _, ok := s.otpMismatches[buildRoot]; ok {
 		return
 	}
-	s.otpMismatches[buildRoot] = otpMismatch{at: time.Now(), stamp: s.otpStamp(buildRoot)}
+	s.otpMismatches[buildRoot] = otpMismatch{at: time.Now(), stamp: s.otpStamp(buildRoot), fallbackWorks: make(map[string]bool)}
 }
 
 // reportBeamOTP tells the user about an OTP mismatch of the BEAM of buildRoot
-// after a mix format fallback ran with result err. Only one of two
-// conditions may show: when the fallback worked, a Warning that formatting is
-// only slower; when the fallback failed with the same mismatch, the Error from
-// reportFormatFailure alone, so this Warning is cleared without a message.
-// Any other fallback failure, such as a syntax error, changes nothing.
-func (s *Server) reportBeamOTP(buildRoot string, err error) {
+// after the mix format fallback of mixRoot ran with result err.
+//
+// The Warning that formatting is only slower belongs to the build root, which
+// the Mix projects of an umbrella share, so it depends on all of them. It is
+// active while at least one project's last fallback worked. It is cleared,
+// without a message, only when no project's fallback works: each of those
+// projects then has its own Error from reportFormatFailure, and the Warning
+// would contradict them. A fallback failure for another cause, such as a
+// syntax error, changes nothing. Setting an active Warning sends nothing, so
+// saves in any order do not repeat it.
+func (s *Server) reportBeamOTP(buildRoot, mixRoot string, err error) {
 	s.beamMu.Lock()
-	holds := s.otpMismatchHolds(buildRoot)
+	if !s.otpMismatchHolds(buildRoot) {
+		s.beamMu.Unlock()
+		return
+	}
+	m := s.otpMismatches[buildRoot]
+	switch {
+	case err == nil:
+		m.fallbackWorks[mixRoot] = true
+	case errors.Is(err, errOTPMismatch):
+		m.fallbackWorks[mixRoot] = false
+	}
+	anyWorks, known := false, len(m.fallbackWorks) > 0
+	for _, works := range m.fallbackWorks {
+		anyWorks = anyWorks || works
+	}
 	s.beamMu.Unlock()
+
 	key := condOTP + ":" + buildRoot
 	switch {
-	case !holds:
-		return
-	case err == nil:
+	case anyWorks:
 		s.index.reporter.Set(key, notify.Warning, fmt.Sprintf(
 			"Dexter: Elixir/OTP version mismatch in %s: the Elixir install of this project was compiled for a newer OTP version than the one that runs, so the fast persistent formatter cannot start. Formatting still works through the slower `mix format` fallback. To fix it, update Erlang to match, or switch to an Elixir build that targets your current OTP (for example elixir@...-otp-27). Dexter tries the fast formatter again when the Elixir install or the _build directory changes, or after %s.",
 			buildRoot, otpMismatchRetry))
-	case errors.Is(err, errOTPMismatch):
+	case known:
 		s.index.reporter.Clear(key, "")
 	}
 }
