@@ -110,6 +110,47 @@ func (f *fileFailures) removed(path string) {
 	f.count.Store(int32(len(f.paths)))
 }
 
+// replace makes the set equal to the failures of a full build, which saw
+// every file: a file that was indexed, or that is gone, is no longer a failure.
+func (f *fileFailures) replace(paths map[string]string) {
+	if f.count.Load() == 0 && len(paths) == 0 {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(paths) != len(f.paths) {
+		f.changed.Store(true)
+	} else {
+		for path := range paths {
+			if _, ok := f.paths[path]; !ok {
+				f.changed.Store(true)
+				break
+			}
+		}
+	}
+	f.paths = paths
+	f.count.Store(int32(len(paths)))
+}
+
+// buildFailures collects the files that a full build could not read or parse.
+// The parse workers call add concurrently.
+type buildFailures struct {
+	mu    sync.Mutex
+	paths map[string]string
+}
+
+func (b *buildFailures) add(path string, err error) {
+	if errors.Is(err, fs.ErrNotExist) {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.paths == nil {
+		b.paths = make(map[string]string)
+	}
+	b.paths[path] = err.Error()
+}
+
 // retain drops failures for files that a full walk did not see: they are gone
 // or no longer belong to the workspace.
 func (f *fileFailures) retain(seen map[string]struct{}) {

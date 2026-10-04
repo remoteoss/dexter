@@ -216,6 +216,48 @@ func TestRemovedDirectoryEndsItsFileFailures(t *testing.T) {
 	client.WaitMessage(t, reportWait, protocol.MessageTypeInfo, "all files that could not be indexed are indexed now")
 }
 
+// A full build sees every file, so after it the failures are exactly its own.
+// A file that failed in an earlier build and is now indexed, or gone, must end
+// the warning. The index stays empty after a build in which the only file
+// failed, so the next pass is a full build again.
+func TestFullBuildReplacesFileFailures(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can read files without read permission")
+	}
+	for _, fix := range []string{"readable", "deleted"} {
+		t.Run(fix, func(t *testing.T) {
+			server, cleanup := setupTestServer(t)
+			defer cleanup()
+			path := writeTestFile(t, server.projectRoot, "lib/only.ex", "defmodule Only do\nend\n")
+			if err := os.Chmod(path, 0); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
+			client := attachFakeEditor(t, server, false)
+			server.backgroundReindex()
+			server.index.backgroundWork.Wait()
+			client.WaitMessage(t, reportWait, protocol.MessageTypeWarning, "1 file could not be indexed: "+path)
+			if !server.store.IsEmpty() {
+				t.Fatal("the index is not empty, so the next pass is not a full build")
+			}
+
+			if fix == "readable" {
+				if err := os.Chmod(path, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+			server.backgroundReindex()
+			server.index.backgroundWork.Wait()
+			client.WaitMessage(t, reportWait, protocol.MessageTypeInfo, "all files that could not be indexed are indexed now")
+			if server.index.reporter.Active(CondIndexFiles) {
+				t.Error("the warning is still active")
+			}
+		})
+	}
+}
+
 // A file that went away during a walk is not a failure.
 func TestMissingFileIsNotAFailure(t *testing.T) {
 	var f fileFailures

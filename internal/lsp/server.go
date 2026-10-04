@@ -504,16 +504,21 @@ func (s *Server) fullBuild() (stats indexer.Stats, ran bool, err error) {
 		return indexer.Stats{}, false, nil
 	}
 
+	var failed buildFailures
 	stats, err = indexer.FullBuild(s.store, s.projectRoot, indexer.Options{
 		StdlibRoot: s.StdlibRoot(),
 		InProcess:  true,
 		Warn: func(format string, args ...interface{}) {
 			log.Printf("Warning: "+format, args...)
 		},
-		FileError: s.index.failures.fail,
+		FileError: failed.add,
 	})
 	if errors.Is(err, indexer.ErrUnindexed) {
 		s.index.unavailable = true
+	}
+	if err == nil {
+		// The build saw every file, so its failures are the whole set.
+		s.index.failures.replace(failed.paths)
 	}
 	return stats, true, err
 }
