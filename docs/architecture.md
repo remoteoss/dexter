@@ -207,7 +207,7 @@ The MCP rename tool runs in the workspace daemon on its headless language servic
 
 ### Grouped aliases
 
-`alias Old.{A, B}` (and the `require`/`import` forms) names the module once, as the prefix, while the index records one reference per member — so a member's full name never appears on the line. `findGroupedAliasEdits` handles both directions: renaming the prefix rewrites the prefix, renaming a member rewrites that member inside the braces. Since every member on the line resolves to the same prefix edit, `applyEdits` drops TextEdits that overlap one already emitted for that line; the on-disk path rewrites the line as it goes and never sees the second match.
+`alias Old.{A, B}` (and the `require`/`import` forms) names the module once, as the prefix, while the index records one reference per member — so a member's full name never appears on the line. `findGroupedAliasEdits` handles both directions: when the renamed module is the prefix or one of its ancestors, the prefix is rewritten (also on the opening line of a group whose members continue on the next lines, where the index records every member); renaming a member rewrites that member inside the braces, and a member that moves to another namespace leaves the group and gets its own `alias` line, so the other members keep their prefix. Since every member on the line resolves to the same prefix edit, `applyEdits` drops TextEdits that overlap one already emitted for that line; the on-disk path rewrites the line as it goes and never sees the second match.
 
 ## Indexing throughput
 

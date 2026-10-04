@@ -766,6 +766,25 @@ func fatal(err error) {
 	os.Exit(1)
 }
 
+// mcpConfig resolves the MCP frontend's workspace roots. The fallback root and
+// the roots that clients give go through the same project-root search as the
+// CLI, so every frontend reaches the same daemon for one directory.
+func mcpConfig(launchDir string, explicitRoot bool) (dexter_mcp.Config, error) {
+	root, err := projectRootFor(launchDir)
+	if err != nil {
+		return dexter_mcp.Config{}, err
+	}
+	cfg := dexter_mcp.Config{Root: root, Fixed: explicitRoot, ResolveRoot: projectRootFor}
+	if !explicitRoot {
+		// The launch directory is only a guess at the workspace. Starting a
+		// daemon on a directory that is not a project would index all of it.
+		if err := nonProjectRootError(root); err != nil {
+			cfg.FallbackErr = fmt.Errorf("%w. The MCP client gave no workspace root; configure the server with the project path (`dexter mcp <path>`) or start it in the project", err)
+		}
+	}
+	return cfg, nil
+}
+
 // cmdMCP serves MCP to an agent. Like `dexter lsp`, it is a frontend of the
 // shared workspace daemon: it opens no index and starts no watcher, and every
 // tool call is answered by the daemon of the session's workspace, which it
@@ -778,18 +797,11 @@ func fatal(err error) {
 // fallback for clients that give no root.
 func cmdMCP(projectRoot string, listen string, explicitRoot bool) {
 	log.SetOutput(os.Stderr)
-	root, err := projectRootFor(projectRoot)
+	cfg, err := mcpConfig(projectRoot, explicitRoot)
 	if err != nil {
 		fatal(err)
 	}
-	cfg := dexter_mcp.Config{Root: root, Fixed: explicitRoot, ResolveRoot: projectRootFor}
-	if !explicitRoot {
-		// The launch directory is only a guess at the workspace. Starting a
-		// daemon on a directory that is not a project would index all of it.
-		if err := nonProjectRootError(root); err != nil {
-			cfg.FallbackErr = fmt.Errorf("%w. The MCP client gave no workspace root; configure the server with the project path (`dexter mcp <path>`) or start it in the project", err)
-		}
-	}
+	root := cfg.Root
 	frontend := dexter_mcp.NewFrontend(cfg)
 	defer frontend.Close()
 	if explicitRoot {

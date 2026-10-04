@@ -85,3 +85,19 @@ func TestRenameTool_Errors(t *testing.T) {
 		t.Error("failed rename modified files")
 	}
 }
+
+// Regression: the rename once applied editor positions (UTF-16 columns) as
+// byte offsets on disk, so a non-ASCII character left of the name moved the
+// edit and corrupted the line.
+func TestRenameTool_NonASCIIBeforeName(t *testing.T) {
+	e := setupProject(t)
+	e.indexFile("lib/my_app/greeter.ex", `defmodule MyApp.Greeter do
+  def greet(id), do: {"héllo wörld ✓", MyApp.Accounts.fetch_user(id)}
+end
+`)
+	e.callTool("dexter_rename_symbol", map[string]any{
+		"module": "MyApp.Accounts", "function": "fetch_user", "new_name": "get_user",
+	})
+	wantContains(t, readFile(t, e.root, "lib/my_app/greeter.ex"),
+		`  def greet(id), do: {"héllo wörld ✓", MyApp.Accounts.get_user(id)}`)
+}

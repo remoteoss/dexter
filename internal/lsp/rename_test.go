@@ -3567,3 +3567,90 @@ func TestRename_Module_ConventionalPathUnchangedOpenFile(t *testing.T) {
 		t.Errorf("expected 'defmodule MyApp.AbTest', got:\n%s", got)
 	}
 }
+
+// Moving one member of a grouped alias to another namespace must not rewrite
+// the shared prefix: the other members would then resolve to modules that do
+// not exist. The moved member leaves the group and gets its own alias.
+func TestRename_Module_GroupedAliasMemberMovedToOtherNamespace(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/shared_lib/worker.ex", `defmodule SharedLib.Worker do
+  def call, do: :ok
+end
+`)
+	indexFile(t, server.store, server.projectRoot, "lib/shared_lib/config.ex", `defmodule SharedLib.Config do
+  def get, do: :ok
+end
+`)
+	callerPath := filepath.Join(server.projectRoot, "lib", "runner.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/runner.ex", `defmodule MyApp.Runner do
+  alias SharedLib.{Config, Worker}
+
+  def run, do: {Config.get(), Worker.call()}
+end
+`)
+
+	if _, err := server.RenameModule("SharedLib.Worker", "OtherLib.Worker"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := os.ReadFile(callerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"  alias SharedLib.{Config}\n", "  alias OtherLib.Worker\n"} {
+		if !strings.Contains(string(got), want) {
+			t.Errorf("expected %q, got:\n%s", want, got)
+		}
+	}
+	if strings.Contains(string(got), "OtherLib.{") {
+		t.Errorf("the shared prefix was rewritten, so Config now names OtherLib.Config:\n%s", got)
+	}
+}
+
+// A grouped alias whose members continue on the next lines names the prefix
+// only on the opening line, where the index records every member. Renaming
+// the prefix module must rewrite that line.
+func TestRename_Module_MultilineGroupedAlias(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	indexFile(t, server.store, server.projectRoot, "lib/shared_lib.ex", `defmodule SharedLib do
+  def start, do: :ok
+end
+`)
+	indexFile(t, server.store, server.projectRoot, "lib/shared_lib/worker.ex", `defmodule SharedLib.Worker do
+  def call, do: :ok
+end
+`)
+	indexFile(t, server.store, server.projectRoot, "lib/shared_lib/config.ex", `defmodule SharedLib.Config do
+  def get, do: :ok
+end
+`)
+	callerPath := filepath.Join(server.projectRoot, "lib", "runner.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/runner.ex", `defmodule MyApp.Runner do
+  alias SharedLib.{
+    Config,
+    Worker
+  }
+
+  def run, do: {Config.get(), Worker.call()}
+end
+`)
+
+	if _, err := server.RenameModule("SharedLib", "CoreLib"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := os.ReadFile(callerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "  alias CoreLib.{\n    Config,\n    Worker\n  }") {
+		t.Errorf("expected the multi-line group to use CoreLib, got:\n%s", got)
+	}
+	if strings.Contains(string(got), "SharedLib") {
+		t.Errorf("SharedLib should be gone, got:\n%s", got)
+	}
+}

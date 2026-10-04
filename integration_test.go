@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"os"
 	"os/exec"
@@ -1129,5 +1130,65 @@ func TestIntegration_MCPSharesWorkspaceDaemon(t *testing.T) {
 	}
 	if after.PID != status.PID {
 		t.Errorf("daemon pid changed from %d to %d: a second daemon served the workspace", status.PID, after.PID)
+	}
+}
+
+// TestIntegration_MCPListenHTTP serves MCP over streamable HTTP and calls a
+// tool, which the workspace daemon answers.
+func TestIntegration_MCPListenHTTP(t *testing.T) {
+	binary := buildDexter(t)
+	root := scaffoldProject(t)
+	runDexter(t, binary, root, "init", root)
+
+	cmd := exec.Command(binary, "mcp", "--listen=localhost:0", root)
+	cmd.Dir = root
+	cmd.Env = append(os.Environ(), "DEXTER_DAEMON_IDLE_TIMEOUT=1s", "PWD="+mustAbs(t, root))
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Signal(os.Interrupt)
+		_, _ = cmd.Process.Wait()
+	})
+
+	addrCh := make(chan string, 1)
+	go func() {
+		scanner := bufio.NewScanner(stderr)
+		for scanner.Scan() {
+			if i := strings.Index(scanner.Text(), "MCP server listening on "); i >= 0 {
+				addrCh <- strings.TrimSpace(scanner.Text()[i+len("MCP server listening on "):])
+				break
+			}
+		}
+		// Keep draining so the child never blocks on a full stderr pipe.
+		for scanner.Scan() {
+		}
+	}()
+	var addr string
+	select {
+	case addr = <-addrCh:
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for the MCP listen address on stderr")
+	}
+
+	client := sdkmcp.NewClient(&sdkmcp.Implementation{Name: "integration-test", Version: "0.0.1"}, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	session, err := client.Connect(ctx, &sdkmcp.StreamableClientTransport{Endpoint: "http://" + addr}, nil)
+	if err != nil {
+		t.Fatalf("connecting to the MCP HTTP server: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	res, err := session.CallTool(ctx, &sdkmcp.CallToolParams{Name: "dexter_definition", Arguments: map[string]any{"module": "MyApp.Repo", "function": "get"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out := mcpToolText(t, res); !strings.Contains(out, "lib/my_app/repo.ex") {
+		t.Errorf("definition over HTTP missing location:\n%s", out)
 	}
 }

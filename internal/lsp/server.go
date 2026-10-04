@@ -6281,10 +6281,14 @@ func (mr *moduleRename) findModuleEdits(lineText string, token string) []moduleE
 // is indexed as its own reference — so the reference's full name never appears
 // on the line.
 //
-// Which half moves depends on the rename: renaming the prefix rewrites the
-// prefix, renaming a member rewrites that member inside the braces. Sites for
-// the other members on the same line find nothing once the prefix is rewritten,
-// so a group is only edited once.
+// Which half moves depends on the rename. When the renamed module is the
+// prefix or one of its ancestors, every member moves with it, so the prefix is
+// rewritten; this is also correct for a group whose members continue on the
+// next lines, where the index records every member on the opening line. Sites
+// for the other members on the same line find nothing once the prefix is
+// rewritten, so a group is only edited once. When only the member is renamed,
+// the member is rewritten inside the braces, or, when it moves to another
+// namespace, it leaves the group and gets its own alias.
 func (mr *moduleRename) findGroupedAliasEdits(lineText, token, newToken string) []moduleEditResult {
 	dot := strings.LastIndexByte(token, '.')
 	if dot <= 0 {
@@ -6295,29 +6299,61 @@ func (mr *moduleRename) findGroupedAliasEdits(lineText, token, newToken string) 
 	if prefixCol < 0 {
 		return nil
 	}
-	memberCols := findAllTokenColumns(lineText[groupStart:groupEnd], member)
-	if len(memberCols) == 0 {
-		return nil
-	}
 
 	newDot := strings.LastIndexByte(newToken, '.')
 	if newDot <= 0 {
 		// The member lost its namespace; a grouped alias cannot express that.
 		return nil
 	}
-	if newPrefix := newToken[:newDot]; newPrefix != prefix {
+	newPrefix, newMember := newToken[:newDot], newToken[newDot+1:]
+	if prefix == mr.oldModule || strings.HasPrefix(prefix, mr.oldModule+".") {
+		if newPrefix == prefix {
+			return nil
+		}
 		return []moduleEditResult{{prefixCol, len(prefix), newPrefix}}
 	}
 
-	newMember := newToken[newDot+1:]
-	if newMember == member {
+	memberCols := findAllTokenColumns(lineText[groupStart:groupEnd], member)
+	if len(memberCols) == 0 {
 		return nil
 	}
-	results := make([]moduleEditResult, 0, len(memberCols))
-	for _, col := range memberCols {
-		results = append(results, moduleEditResult{groupStart + col, len(member), newMember})
+	if newPrefix == prefix {
+		if newMember == member {
+			return nil
+		}
+		results := make([]moduleEditResult, 0, len(memberCols))
+		for _, col := range memberCols {
+			results = append(results, moduleEditResult{groupStart + col, len(member), newMember})
+		}
+		return results
 	}
-	return results
+	return splitGroupedAlias(lineText, prefix, member, newToken, prefixCol, groupStart, groupEnd)
+}
+
+// splitGroupedAlias moves one member out of `Prefix.{A, B}` to its own
+// `alias New.A` line after the group, because only that member changes
+// namespace. Rewriting the shared prefix instead would move the other members
+// too. A group with no other member gets the new name in place. A group that
+// continues on the next lines is left unchanged: the members are not on this
+// line.
+func splitGroupedAlias(lineText, prefix, member, newToken string, prefixCol, groupStart, groupEnd int) []moduleEditResult {
+	if groupEnd >= len(lineText) || lineText[groupEnd] != '}' {
+		return nil
+	}
+	var rest []string
+	for _, m := range strings.Split(lineText[groupStart:groupEnd], ",") {
+		if m = strings.TrimSpace(m); m != "" && m != member {
+			rest = append(rest, m)
+		}
+	}
+	span := groupEnd + 1 - prefixCol
+	if len(rest) == 0 {
+		return []moduleEditResult{{prefixCol, span, newToken}}
+	}
+	// The new line repeats what comes before the prefix: the indentation and
+	// the alias, require, or import keyword.
+	replacement := prefix + ".{" + strings.Join(rest, ", ") + "}\n" + lineText[:prefixCol] + newToken
+	return []moduleEditResult{{prefixCol, span, replacement}}
 }
 
 type moduleEditResult struct {

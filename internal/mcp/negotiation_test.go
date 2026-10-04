@@ -417,3 +417,23 @@ func TestFixedRootIgnoresClientRoots(t *testing.T) {
 	cs, _ := e.connect(nil, uri)
 	wantContains(t, mustTool(t, cs, "dexter_search", map[string]any{"query": "x"}), "root="+fixed)
 }
+
+// A Windows file URI carries the drive letter after a leading slash. Without
+// removing that slash, `C:/project` is not an absolute path on Windows and the
+// negotiation fails. Other systems keep the path as it is.
+func TestURIPathDriveLetter(t *testing.T) {
+	cases := []struct {
+		path, goos, want string
+	}{
+		{"/C:/project", "windows", "C:/project"},
+		{"/c:/my project", "windows", "c:/my project"},
+		{"/project", "windows", "/project"},
+		{"/C:/project", "linux", "/C:/project"},
+		{"/C:/project", "darwin", "/C:/project"},
+	}
+	for _, tc := range cases {
+		if got := uriPath(tc.path, tc.goos); got != tc.want {
+			t.Errorf("uriPath(%q, %s) = %q, want %q", tc.path, tc.goos, got, tc.want)
+		}
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -23,11 +24,24 @@ func fileURIToPath(raw string) (string, error) {
 	if u.Host != "" && u.Host != "localhost" {
 		return "", fmt.Errorf("root URI %q names a remote host", raw)
 	}
-	path := filepath.Clean(filepath.FromSlash(u.Path))
+	path := filepath.Clean(filepath.FromSlash(uriPath(u.Path, runtime.GOOS)))
 	if !filepath.IsAbs(path) {
 		return "", fmt.Errorf("root URI %q has no absolute path", raw)
 	}
 	return path, nil
+}
+
+// uriPath returns the filesystem form of a file URI's path. On Windows,
+// file:///C:/project carries the drive letter after a leading slash.
+func uriPath(p, goos string) string {
+	if goos == "windows" && len(p) >= 3 && p[0] == '/' && p[2] == ':' && isDriveLetter(p[1]) {
+		return p[1:]
+	}
+	return p
+}
+
+func isDriveLetter(c byte) bool {
+	return ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z')
 }
 
 // negotiatedRoot resolves a session's workspace root from the MCP roots the

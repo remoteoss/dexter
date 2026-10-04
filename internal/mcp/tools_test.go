@@ -344,6 +344,9 @@ func TestReindexTool(t *testing.T) {
 func TestToolNotesIndexStillBuilding(t *testing.T) {
 	root := t.TempDir()
 	release := make(chan struct{})
+	rt := openTestRuntime(t, root, workspace.Options{BeforeInitialReconcile: func() { <-release }})
+	// Registered after the runtime, so it runs before the runtime closes: a
+	// close waits for the held reconciliation.
 	t.Cleanup(func() {
 		select {
 		case <-release:
@@ -351,7 +354,6 @@ func TestToolNotesIndexStillBuilding(t *testing.T) {
 			close(release)
 		}
 	})
-	rt := openTestRuntime(t, root, workspace.Options{BeforeInitialReconcile: func() { <-release }})
 	h := NewHandler(rt, rt.LanguageServices())
 
 	out, err := h.Call(context.Background(), "dexter_search", json.RawMessage(`{"query":"x"}`), 10*time.Millisecond)
@@ -391,4 +393,29 @@ func TestToolNotesDegradedIndex(t *testing.T) {
 	// The workspace tool lists every active condition itself.
 	out = e.callTool("dexter_workspace", nil)
 	wantContains(t, out, "Workspace conditions:", "warning: 2 files could not be indexed")
+}
+
+// Regression: a call written through an alias that a `__using__` block
+// injects is indexed under the short name. The editor's find-references found
+// it, and dexter_references must find it too.
+func TestReferencesTool_ViaUseInjectedAlias(t *testing.T) {
+	e := setupProject(t)
+	e.indexFile("lib/my_app/repo.ex", `defmodule MyApp.Repo do
+  defmacro __using__(_) do
+    quote do
+      alias MyApp.Repo
+    end
+  end
+
+  def all(q), do: q
+end
+`)
+	e.indexFile("lib/my_app/users.ex", `defmodule MyApp.Users do
+  use MyApp.Repo
+
+  def list, do: Repo.all(:users)
+end
+`)
+	out := e.callTool("dexter_references", map[string]any{"module": "MyApp.Repo", "function": "all"})
+	wantContains(t, out, "lib/my_app/users.ex", "4: def list, do: Repo.all(:users)")
 }

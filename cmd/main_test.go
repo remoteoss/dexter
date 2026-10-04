@@ -123,3 +123,56 @@ func TestFileFailureDoesNotHideTheBuildingNote(t *testing.T) {
 		t.Errorf("the building note is hidden: %q", got)
 	}
 }
+
+// Regression: the MCP fallback root and the roots that MCP clients give were
+// resolved by two different searches (one treated mix.exs as a marker, one did
+// not), so a session with roots and a session without them could start two
+// daemons for one directory. Both now use the CLI's search.
+func TestMCPRootsResolveLikeCLI(t *testing.T) {
+	project := t.TempDir()
+	if err := os.WriteFile(filepath.Join(project, "mix.exs"), []byte("defmodule App.MixProject do\nend\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sub := filepath.Join(project, "lib")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := mcpConfig(sub, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := findProjectRoot(sub)
+	if cfg.Root != want {
+		t.Errorf("fallback root = %q, want the CLI root %q", cfg.Root, want)
+	}
+	negotiated, err := cfg.ResolveRoot(sub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if negotiated != want {
+		t.Errorf("negotiated root = %q, want the CLI root %q", negotiated, want)
+	}
+	if cfg.FallbackErr != nil {
+		t.Errorf("a Mix project was refused as the fallback root: %v", cfg.FallbackErr)
+	}
+}
+
+// A launch directory that is not a project is not indexed when the MCP client
+// gives no root.
+func TestMCPFallbackRefusesNonProject(t *testing.T) {
+	cfg, err := mcpConfig(t.TempDir(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.FallbackErr == nil || !strings.Contains(cfg.FallbackErr.Error(), "does not look like an Elixir project") {
+		t.Errorf("FallbackErr = %v, want a refusal", cfg.FallbackErr)
+	}
+	explicit, err := mcpConfig(t.TempDir(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if explicit.FallbackErr != nil {
+		t.Errorf("an explicit root was refused: %v", explicit.FallbackErr)
+	}
+}
