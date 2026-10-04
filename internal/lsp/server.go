@@ -1117,7 +1117,7 @@ func (s *Server) DidChange(ctx context.Context, params *protocol.DidChangeTextDo
 	if len(params.ContentChanges) > 0 {
 		// Full sync mode — last change contains the full text
 		text := params.ContentChanges[len(params.ContentChanges)-1].Text
-		s.docs.Set(string(params.TextDocument.URI), text)
+		s.docs.SetChanged(string(params.TextDocument.URI), text)
 	}
 	return nil
 }
@@ -1143,6 +1143,7 @@ func (s *Server) restartBeamForFormatterConfig(path string) {
 }
 
 func (s *Server) DidSave(ctx context.Context, params *protocol.DidSaveTextDocumentParams) error {
+	s.docs.MarkSaved(string(params.TextDocument.URI))
 	path := uriToPath(params.TextDocument.URI)
 	if path == "" {
 		return nil

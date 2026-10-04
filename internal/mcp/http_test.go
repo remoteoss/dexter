@@ -74,8 +74,16 @@ func TestHTTPHandler_CapsBodySize(t *testing.T) {
 	}
 	// Valid JSON, padded past the limit.
 	padded := initializeBody + strings.Repeat(" ", maxHTTPBodyBytes)
-	if res := postMCP(t, srv.URL, bytes.NewReader([]byte(padded)), nil); res.StatusCode == http.StatusOK {
-		t.Fatalf("a %d-byte body was accepted", len(padded))
+	if res := postMCP(t, srv.URL, bytes.NewReader([]byte(padded)), nil); res.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("a %d-byte body got status %d, want 413", len(padded), res.StatusCode)
+	}
+	// A chunked body has no Content-Length; its limit shows while it is read.
+	chunked := io.MultiReader(strings.NewReader(padded))
+	if res := postMCP(t, srv.URL, chunked, nil); res.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("a chunked %d-byte body got status %d, want 413", len(padded), res.StatusCode)
+	}
+	if res := postMCP(t, srv.URL, io.MultiReader(strings.NewReader(initializeBody)), nil); res.StatusCode != http.StatusOK {
+		t.Fatalf("a small chunked initialize got status %d", res.StatusCode)
 	}
 }
 

@@ -3,13 +3,17 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
+
+	"github.com/remoteoss/dexter/internal/lsp"
 )
 
 // Regression: dexter_file_outline read any path the agent gave, so an
@@ -134,5 +138,258 @@ func TestSourceViewLocate(t *testing.T) {
 		if in != (want[1] == 1) || (in && got != want[0]) {
 			t.Errorf("locate(%d) = %d, %v; want %v", line, got, in, want)
 		}
+	}
+}
+
+// editorSession is an attached editor session that a test drives.
+type editorSession struct {
+	t    *testing.T
+	root string
+	srv  *lsp.Server
+}
+
+func attachEditor(t *testing.T, e *testEnv) *editorSession {
+	t.Helper()
+	_, session, release := e.rt.AttachLSPSession()
+	t.Cleanup(release)
+	return &editorSession{t: t, root: e.root, srv: session}
+}
+
+func (s *editorSession) uri(rel string) protocol.DocumentURI {
+	return protocol.DocumentURI(uri.File(filepath.Join(s.root, rel)))
+}
+
+func (s *editorSession) open(rel, text string) {
+	s.t.Helper()
+	if err := s.srv.DidOpen(context.Background(), &protocol.DidOpenTextDocumentParams{
+		TextDocument: protocol.TextDocumentItem{URI: s.uri(rel), LanguageID: "elixir", Version: 1, Text: text},
+	}); err != nil {
+		s.t.Fatal(err)
+	}
+}
+
+func (s *editorSession) change(rel, text string) {
+	s.t.Helper()
+	if err := s.srv.DidChange(context.Background(), &protocol.DidChangeTextDocumentParams{
+		TextDocument:   protocol.VersionedTextDocumentIdentifier{TextDocumentIdentifier: protocol.TextDocumentIdentifier{URI: s.uri(rel)}},
+		ContentChanges: []protocol.TextDocumentContentChangeEvent{{Text: text}},
+	}); err != nil {
+		s.t.Fatal(err)
+	}
+}
+
+func (s *editorSession) save(rel string) {
+	s.t.Helper()
+	if err := s.srv.DidSave(context.Background(), &protocol.DidSaveTextDocumentParams{
+		TextDocument: protocol.TextDocumentIdentifier{URI: s.uri(rel)},
+	}); err != nil {
+		s.t.Fatal(err)
+	}
+}
+
+// writeLater writes a file with a modification time after every editor change
+// so far, as an agent's write that follows them does.
+func writeLater(t *testing.T, path, text string) {
+	t.Helper()
+	time.Sleep(20 * time.Millisecond)
+	if err := os.WriteFile(path, []byte(text), 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+const agentWorkerSource = "# agent\n# notes\n" + workerSource + "\ndefmodule MyApp.AgentAdded do\n  def added(x), do: x\nend\n"
+
+// Regression: an editor buffer that the user never changed, but that is older
+// than the disk (the editor has not reloaded the file after the agent wrote
+// it), hid the agent's edits and was reported as unsaved work.
+func TestTools_CleanStaleBufferReadsDisk(t *testing.T) {
+	e := setupProject(t)
+	ed := attachEditor(t, e)
+	ed.open("lib/my_app/worker.ex", workerSource)
+	path := filepath.Join(e.root, "lib/my_app/worker.ex")
+	writeLater(t, path, agentWorkerSource)
+
+	out := e.callTool("dexter_file_outline", map[string]any{"file": "lib/my_app/worker.ex"})
+	wantContains(t, out, "defmodule MyApp.AgentAdded")
+	wantNotContains(t, out, "unsaved")
+}
+
+// A buffer with unsaved changes, made after the disk last changed, is what the
+// user sees, so it wins.
+func TestTools_DirtyBufferWins(t *testing.T) {
+	e := setupProject(t)
+	ed := attachEditor(t, e)
+	ed.open("lib/my_app/worker.ex", workerSource)
+	ed.change("lib/my_app/worker.ex", workerSource+"\ndefmodule MyApp.Typed do\nend\n")
+	out := e.callTool("dexter_file_outline", map[string]any{"file": "lib/my_app/worker.ex"})
+	wantContains(t, out, "defmodule MyApp.Typed", "read from unsaved editor buffers")
+}
+
+// When both the buffer and the disk changed, and the disk changed later, the
+// disk wins (the index follows it), and the answer warns about the editor's
+// older unsaved changes.
+func TestTools_DirtyBufferOlderThanDiskReadsDiskWithNote(t *testing.T) {
+	e := setupProject(t)
+	ed := attachEditor(t, e)
+	ed.open("lib/my_app/worker.ex", workerSource)
+	ed.change("lib/my_app/worker.ex", workerSource+"\ndefmodule MyApp.Typed do\nend\n")
+	writeLater(t, filepath.Join(e.root, "lib/my_app/worker.ex"), agentWorkerSource)
+
+	out := e.callTool("dexter_file_outline", map[string]any{"file": "lib/my_app/worker.ex"})
+	wantContains(t, out, "defmodule MyApp.AgentAdded", "an editor also has unsaved changes", "may conflict")
+	wantNotContains(t, out, "MyApp.Typed", "read from unsaved editor buffers")
+}
+
+// A save ends the buffer's unsaved changes: a later write by the agent is
+// read from disk with no warning.
+func TestTools_SaveClearsUnsavedState(t *testing.T) {
+	e := setupProject(t)
+	ed := attachEditor(t, e)
+	path := filepath.Join(e.root, "lib/my_app/worker.ex")
+	ed.open("lib/my_app/worker.ex", workerSource)
+	edited := workerSource + "\ndefmodule MyApp.Typed do\nend\n"
+	ed.change("lib/my_app/worker.ex", edited)
+	if err := os.WriteFile(path, []byte(edited), 0644); err != nil {
+		t.Fatal(err)
+	}
+	ed.save("lib/my_app/worker.ex")
+	writeLater(t, path, agentWorkerSource)
+
+	out := e.callTool("dexter_file_outline", map[string]any{"file": "lib/my_app/worker.ex"})
+	wantContains(t, out, "defmodule MyApp.AgentAdded")
+	wantNotContains(t, out, "unsaved")
+}
+
+// Regression: lines were mapped through the lines that both texts share at
+// the start and at the end, so an edit at the top and one at the bottom
+// marked every line between them as changed, and a buffer with CRLF line
+// endings marked every line.
+func TestLineMap(t *testing.T) {
+	disk := "a\nb\nc\nd\ne\nf"
+	m := newLineMap(disk, "TOP\na\nb\nc\nd\ne\nBOTTOM") // f changed, line added at top
+	for line, want := range map[int]int{1: 2, 2: 3, 3: 4, 4: 5, 5: 6} {
+		if got, ok := m.locate(line); !ok || got != want {
+			t.Errorf("locate(%d) = %d, %v; want %d", line, got, ok, want)
+		}
+	}
+	if _, ok := m.locate(6); ok {
+		t.Error("the changed last line is mapped")
+	}
+
+	crlf := newLineMap(disk, strings.ReplaceAll(disk, "\n", "\r\n"))
+	for line := 1; line <= 6; line++ {
+		if got, ok := crlf.locate(line); !ok || got != line {
+			t.Errorf("CRLF: locate(%d) = %d, %v; want %d", line, got, ok, line)
+		}
+	}
+
+	// A deleted line in the middle, and a changed one.
+	mid := newLineMap(disk, "a\nc\nD\ne\nf")
+	for line, want := range map[int]int{1: 1, 3: 2, 5: 4, 6: 5} {
+		if got, ok := mid.locate(line); !ok || got != want {
+			t.Errorf("mid: locate(%d) = %d, %v; want %d", line, got, ok, want)
+		}
+	}
+	for _, line := range []int{2, 4} {
+		if _, ok := mid.locate(line); ok {
+			t.Errorf("mid: changed line %d is mapped", line)
+		}
+	}
+}
+
+// The diff is exact on random edits: every mapped pair is equal, mapped lines
+// keep their order, and no more lines are left unmapped than a shortest edit
+// script deletes.
+func TestLineMapRandomEdits(t *testing.T) {
+	rng := rand.New(rand.NewPCG(1, 2))
+	for round := 0; round < 200; round++ {
+		var a []string
+		for i := 0; i < 1+rng.IntN(60); i++ {
+			a = append(a, fmt.Sprintf("l%d", rng.IntN(8)))
+		}
+		var b []string
+		for _, l := range a {
+			switch rng.IntN(6) {
+			case 0: // delete
+			case 1:
+				b = append(b, "new", l)
+			case 2:
+				b = append(b, "changed")
+			default:
+				b = append(b, l)
+			}
+		}
+		m := newLineMap(strings.Join(a, "\n"), strings.Join(b, "\n"))
+		last := 0
+		mapped := 0
+		for i := 1; i <= len(a); i++ {
+			j, ok := m.locate(i)
+			if !ok {
+				continue
+			}
+			mapped++
+			if j <= last || a[i-1] != b[j-1] {
+				t.Fatalf("round %d: line %d mapped to %d (last %d): %q vs %q", round, i, j, last, a[i-1], b[j-1])
+			}
+			last = j
+		}
+		if want := lcsLen(a, b); mapped != want {
+			t.Fatalf("round %d: %d lines mapped, want the LCS length %d", round, mapped, want)
+		}
+	}
+}
+
+func lcsLen(a, b []string) int {
+	dp := make([][]int, len(a)+1)
+	for i := range dp {
+		dp[i] = make([]int, len(b)+1)
+	}
+	for i := 1; i <= len(a); i++ {
+		for j := 1; j <= len(b); j++ {
+			if a[i-1] == b[j-1] {
+				dp[i][j] = dp[i-1][j-1] + 1
+			} else {
+				dp[i][j] = max(dp[i-1][j], dp[i][j-1])
+			}
+		}
+	}
+	return dp[len(a)][len(b)]
+}
+
+// BenchmarkLineMap10k measures a 10,000-line file with edits at the top, in
+// the middle, and at the bottom.
+func BenchmarkLineMap10k(b *testing.B) {
+	var lines []string
+	for i := 0; i < 10000; i++ {
+		lines = append(lines, fmt.Sprintf("  def f%d(x), do: x + %d", i, i))
+	}
+	disk := strings.Join(lines, "\n")
+	edited := append([]string{"# top"}, lines...)
+	edited[5000] = "  # changed"
+	edited = append(edited[:7000], append([]string{"  def added(x), do: x"}, edited[7000:]...)...)
+	edited[len(edited)-1] = "# bottom"
+	text := strings.Join(edited, "\n")
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		newLineMap(disk, text)
+	}
+}
+
+// BenchmarkLineMap10kManyEdits is a 10,000-line file with edits near the
+// bound (about 900 inserted and deleted lines).
+func BenchmarkLineMap10kManyEdits(b *testing.B) {
+	var lines []string
+	for i := 0; i < 10000; i++ {
+		lines = append(lines, fmt.Sprintf("  def f%d(x), do: x + %d", i, i))
+	}
+	disk := strings.Join(lines, "\n")
+	edited := append([]string(nil), lines...)
+	for i := 0; i < len(edited); i += 22 {
+		edited[i] = "  # changed"
+	}
+	text := strings.Join(edited, "\n")
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		newLineMap(disk, text)
 	}
 }

@@ -32,4 +32,5 @@ ways (other macros, `unquote` names) can be missing from the index, so an empty
 lookup can mean macro-generated code.
 
 Answers read files the way the user sees them: a file open in an attached
-editor with unsaved changes is read from that buffer, and the answer says so.
+editor with unsaved changes is read from that buffer, unless the file on disk
+changed later, and the answer says so.

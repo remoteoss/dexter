@@ -329,12 +329,18 @@ runs no LSP lifecycle of its own.
   until the index is complete, because a rename from a partial index would
   change some call sites and leave others with the old name.
 - **Editor buffers.** Tools that read file text (outlines, definition and
-  module docs, reference lines) use the newest buffer that any attached editor
-  session holds open when it differs from the disk, and the disk otherwise.
-  The answer names the files that came from unsaved buffers. The index
-  positions refer to the saved file, so a line is mapped into the buffer
-  through the lines that both share at the start and at the end; a position
-  in the changed part shows the saved line, marked as such. Paths that the
+  module docs, reference lines) use the newest buffer that an attached editor
+  session holds open with unsaved changes: the editor changed it after its
+  last open or save (`didChange` after `didOpen`/`didSave`). A buffer with no
+  unsaved changes can be older than the disk (an editor that has not reloaded
+  the file after an agent wrote it), so the disk is used. When the file on
+  disk changed after the buffer's last change, the disk is used too, and the
+  answer warns that the editor's unsaved changes may conflict. The answer
+  names the files that came from unsaved buffers. The index positions refer
+  to the saved file, so a line is mapped into the buffer with a line diff
+  (Myers, line endings ignored; bounded, with a fallback to the lines that
+  both texts share at the start and at the end); a position on a changed line
+  shows the saved line, marked as such. Paths that the
   agent gives must be inside the project root after symlinks are resolved, and
   must name a regular file of at most 10 MB.
 - **Limits and cancellation.** One frontend runs at most 32 tool calls at once
@@ -346,8 +352,8 @@ runs no LSP lifecycle of its own.
 - **HTTP.** `--listen` accepts only a loopback address unless
   `--listen-unsafe` is given, because the server has no authentication. The
   SDK refuses a non-loopback `Host` on a loopback connection (DNS rebinding),
-  cross-origin browser requests are refused, a request body is capped at
-  4 MB, and a session with no request for 30 minutes is closed, so a client
+  cross-origin browser requests are refused, a request body over 4 MB gets
+  413, and a session with no request for 30 minutes is closed, so a client
   that went away does not keep its daemon alive.
 - **Reconnects.** When the daemon goes away (an upgrade replaced it, or
   `dexter stop --force`; a plain `dexter stop` is refused while MCP is

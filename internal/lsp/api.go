@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	"go.lsp.dev/uri"
 )
@@ -24,10 +25,11 @@ func (s *Server) FileLine(filePath string, lineNum int) (string, bool) {
 	return s.getFileLine(filePath, lineNum)
 }
 
-// OpenBuffer returns the text of filePath when an editor holds it open in this
-// session. seq orders buffers across sessions: the higher one changed later.
-func (s *Server) OpenBuffer(filePath string) (text string, seq uint64, ok bool) {
-	return s.docs.GetOpenSeq(string(uri.File(filePath)))
+// UnsavedBuffer returns the text of filePath when an editor holds it open in
+// this session with changes that it has not saved, and the time of the last
+// change. seq orders buffers across sessions: the higher one changed later.
+func (s *Server) UnsavedBuffer(filePath string) (text string, seq uint64, changedAt time.Time, ok bool) {
+	return s.docs.UnsavedBuffer(string(uri.File(filePath)))
 }
 
 // RenameSummary reports what a rename changed on disk.

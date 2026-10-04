@@ -222,29 +222,38 @@ func (r *Runtime) Session(id string) (*lsp.Server, bool) {
 	return s.server, true
 }
 
-// EditorBuffer returns the newest buffer that an attached editor holds open
-// for path, or false when no editor has it open. A frontend without an editor,
-// such as MCP, uses it to read what the user sees instead of the disk.
-func (r *Runtime) EditorBuffer(path string) (string, bool) {
+// EditorBuffer is a buffer that an attached editor holds open with changes it
+// has not saved.
+type EditorBuffer struct {
+	Text      string
+	ChangedAt time.Time // the time of the last change in the editor
+}
+
+// UnsavedBuffer returns the newest buffer for path that an attached editor
+// holds open with unsaved changes, or false when there is none. A frontend
+// without an editor, such as MCP, uses it to read what the user is editing
+// instead of the disk. A buffer the editor has not changed since it opened or
+// saved it is not returned: it can be older than the disk.
+func (r *Runtime) UnsavedBuffer(path string) (EditorBuffer, bool) {
 	r.sessMu.Lock()
 	if len(r.sessions) == 0 {
 		r.sessMu.Unlock()
-		return "", false
+		return EditorBuffer{}, false
 	}
 	servers := make([]*lsp.Server, 0, len(r.sessions))
 	for _, s := range r.sessions {
 		servers = append(servers, s.server)
 	}
 	r.sessMu.Unlock()
-	var text string
+	var out EditorBuffer
 	var newest uint64
 	found := false
 	for _, srv := range servers {
-		if t, seq, ok := srv.OpenBuffer(path); ok && (!found || seq > newest) {
-			text, newest, found = t, seq, true
+		if t, seq, at, ok := srv.UnsavedBuffer(path); ok && (!found || seq > newest) {
+			out, newest, found = EditorBuffer{Text: t, ChangedAt: at}, seq, true
 		}
 	}
-	return text, found
+	return out, found
 }
 
 // SessionInfo describes one attached editor session for status output.

@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/remoteoss/dexter/internal/lsp"
 )
@@ -26,6 +27,9 @@ type sourceCache struct {
 	mu      sync.Mutex
 	views   map[string]*sourceView // nil for a file that cannot be read
 	unsaved map[string]struct{}
+	// conflicts are files read from disk that also have older unsaved
+	// changes in an editor.
+	conflicts map[string]struct{}
 }
 
 // errNotFound reports a file that does not exist.
@@ -52,7 +56,7 @@ func (h *Handler) userPath(p string) (string, error) {
 		// path inside the root as spelled can name one.
 		if rel, ok := inside(h.projectRoot, candidate); ok {
 			path := filepath.Join(h.projectRoot, rel)
-			if _, open := h.rt.EditorBuffer(path); open {
+			if _, open := h.rt.UnsavedBuffer(path); open {
 				return path, nil
 			}
 			return path, errNotFound
@@ -85,37 +89,38 @@ func inside(root, path string) (string, bool) {
 // readRegularFile reads a regular file of at most maxSourceBytes. Devices,
 // FIFOs, sockets, and directories are refused before they are opened, so a
 // read can neither block nor run without end.
-func readRegularFile(path string) (string, error) {
+func readRegularFile(path string) (string, time.Time, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return "", errNotFound
+			return "", time.Time{}, errNotFound
 		}
-		return "", err
+		return "", time.Time{}, err
 	}
 	if !info.Mode().IsRegular() {
-		return "", fmt.Errorf("%s is not a regular file", path)
+		return "", time.Time{}, fmt.Errorf("%s is not a regular file", path)
 	}
 	if info.Size() > maxSourceBytes {
-		return "", fmt.Errorf("%s is %d bytes, more than the %d MB limit for one file", path, info.Size(), maxSourceBytes>>20)
+		return "", time.Time{}, fmt.Errorf("%s is %d bytes, more than the %d MB limit for one file", path, info.Size(), maxSourceBytes>>20)
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		return "", err
+		return "", time.Time{}, err
 	}
 	defer func() { _ = f.Close() }()
 	// The path can change between the stat and the open.
-	if opened, err := f.Stat(); err != nil || !os.SameFile(info, opened) {
-		return "", fmt.Errorf("%s changed while it was read; retry", path)
+	opened, err := f.Stat()
+	if err != nil || !os.SameFile(info, opened) {
+		return "", time.Time{}, fmt.Errorf("%s changed while it was read; retry", path)
 	}
 	data, err := io.ReadAll(io.LimitReader(f, maxSourceBytes+1))
 	if err != nil {
-		return "", err
+		return "", time.Time{}, err
 	}
 	if len(data) > maxSourceBytes {
-		return "", fmt.Errorf("%s is more than the %d MB limit for one file", path, maxSourceBytes>>20)
+		return "", time.Time{}, fmt.Errorf("%s is more than the %d MB limit for one file", path, maxSourceBytes>>20)
 	}
-	return string(data), nil
+	return string(data), opened.ModTime(), nil
 }
 
 // sourceView is one file as a tool call reads it. When an attached editor
@@ -126,27 +131,17 @@ type sourceView struct {
 	unsaved bool
 	disk    string
 	hasDisk bool
-	// The lines that the buffer and the saved file share at the start and at
-	// the end. An index line in one of them is found in the buffer; a line
-	// between them was changed in the buffer.
-	prefix, suffix       int
-	diskLines, textLines int
+	// lines maps the saved file's lines, which the index positions refer
+	// to, into the buffer.
+	lines lineMap
 
 	tf, diskTF *lsp.TokenizedFile
 }
 
 func newSourceView(text string, unsaved bool, disk string, hasDisk bool) *sourceView {
 	v := &sourceView{text: text, unsaved: unsaved, disk: disk, hasDisk: hasDisk}
-	if !unsaved || !hasDisk {
-		return v
-	}
-	a, b := strings.Split(disk, "\n"), strings.Split(text, "\n")
-	v.diskLines, v.textLines = len(a), len(b)
-	for v.prefix < len(a) && v.prefix < len(b) && a[v.prefix] == b[v.prefix] {
-		v.prefix++
-	}
-	for v.suffix < len(a)-v.prefix && v.suffix < len(b)-v.prefix && a[len(a)-1-v.suffix] == b[len(b)-1-v.suffix] {
-		v.suffix++
+	if unsaved && hasDisk {
+		v.lines = newLineMap(disk, text)
 	}
 	return v
 }
@@ -155,13 +150,10 @@ func newSourceView(text string, unsaved bool, disk string, hasDisk bool) *source
 // definition or a reference, to the same line in the text. inText is false
 // when the buffer changed that line.
 func (v *sourceView) locate(indexLine int) (line int, inText bool) {
-	if !v.unsaved || !v.hasDisk || indexLine <= v.prefix {
+	if !v.unsaved || !v.hasDisk {
 		return indexLine, true
 	}
-	if indexLine > v.diskLines-v.suffix {
-		return indexLine + v.textLines - v.diskLines, true
-	}
-	return indexLine, false
+	return v.lines.locate(indexLine)
 }
 
 func (v *sourceView) tokenized(inText bool) *lsp.TokenizedFile {
@@ -239,7 +231,7 @@ func (h *Handler) view(path string) (*sourceView, error) {
 	}
 	c.mu.Unlock()
 
-	v, err := h.loadSource(path)
+	v, conflict, err := h.loadSource(path)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -253,21 +245,35 @@ func (h *Handler) view(path string) (*sourceView, error) {
 		}
 		c.unsaved[path] = struct{}{}
 	}
+	if conflict {
+		if c.conflicts == nil {
+			c.conflicts = make(map[string]struct{})
+		}
+		c.conflicts[path] = struct{}{}
+	}
 	return v, err
 }
 
-func (h *Handler) loadSource(path string) (*sourceView, error) {
-	disk, diskErr := readRegularFile(path)
-	if buffer, open := h.rt.EditorBuffer(path); open {
-		if diskErr == nil && disk == buffer {
-			return newSourceView(disk, false, "", false), nil
+// loadSource reads path as the user sees it. A buffer that an editor holds
+// open is used only when it has changes that the editor has not saved and the
+// file on disk did not change after them. When both changed, the disk wins,
+// because the index follows the disk, and conflict is true.
+func (h *Handler) loadSource(path string) (v *sourceView, conflict bool, err error) {
+	disk, mtime, diskErr := readRegularFile(path)
+	if buffer, open := h.rt.UnsavedBuffer(path); open {
+		switch {
+		case diskErr == nil && disk == buffer.Text:
+			return newSourceView(disk, false, "", false), false, nil
+		case diskErr == nil && mtime.After(buffer.ChangedAt):
+			return newSourceView(disk, false, "", false), true, nil
+		default:
+			return newSourceView(buffer.Text, true, disk, diskErr == nil), false, nil
 		}
-		return newSourceView(buffer, true, disk, diskErr == nil), nil
 	}
 	if diskErr != nil {
-		return nil, diskErr
+		return nil, false, diskErr
 	}
-	return newSourceView(disk, false, "", false), nil
+	return newSourceView(disk, false, "", false), false, nil
 }
 
 // sourceLine returns the text of one index position. A file that no editor
@@ -279,7 +285,7 @@ func (h *Handler) sourceLine(path string, indexLine int) (text string, line int,
 	_, cached := c.views[path]
 	c.mu.Unlock()
 	if !cached {
-		if _, open := h.rt.EditorBuffer(path); !open {
+		if _, open := h.rt.UnsavedBuffer(path); !open {
 			text, ok := h.lsp.FileLine(path, indexLine)
 			return text, indexLine, "", ok
 		}
@@ -313,18 +319,29 @@ func nthLine(text string, n int) (string, bool) {
 }
 
 // unsavedNote names the files whose text came from unsaved editor buffers in
-// this call, or is empty when there are none.
+// this call, and the files that changed on disk after an editor's unsaved
+// changes to them, or is empty when there are none.
 func (h *Handler) unsavedNote() string {
 	c := &h.sources
 	c.mu.Lock()
-	paths := make([]string, 0, len(c.unsaved))
-	for p := range c.unsaved {
-		paths = append(paths, h.relPath(p))
-	}
+	unsaved := h.relPaths(c.unsaved)
+	conflicts := h.relPaths(c.conflicts)
 	c.mu.Unlock()
-	if len(paths) == 0 {
-		return ""
+	var notes []string
+	if len(unsaved) > 0 {
+		notes = append(notes, "Note: read from unsaved editor buffers (the files on disk differ; line numbers are the buffer's): "+strings.Join(unsaved, ", "))
 	}
-	sort.Strings(paths)
-	return "Note: read from unsaved editor buffers (the files on disk differ; line numbers are the buffer's): " + strings.Join(paths, ", ")
+	if len(conflicts) > 0 {
+		notes = append(notes, "Note: read from disk, but an editor also has unsaved changes to these files, made before the files on disk changed; the two may conflict: "+strings.Join(conflicts, ", "))
+	}
+	return strings.Join(notes, "\n")
+}
+
+func (h *Handler) relPaths(set map[string]struct{}) []string {
+	out := make([]string, 0, len(set))
+	for p := range set {
+		out = append(out, h.relPath(p))
+	}
+	sort.Strings(out)
+	return out
 }

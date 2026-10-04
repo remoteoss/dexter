@@ -1,8 +1,11 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"time"
@@ -36,7 +39,33 @@ func HTTPHandler(f *Frontend) http.Handler {
 	h := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return NewServer(f) }, &mcp.StreamableHTTPOptions{
 		SessionTimeout: httpSessionTimeout,
 	})
-	return http.MaxBytesHandler(http.NewCrossOriginProtection().Handler(h), maxHTTPBodyBytes)
+	return limitBody(http.NewCrossOriginProtection().Handler(h), maxHTTPBodyBytes)
+}
+
+// limitBody reads a request body of at most limit bytes before next sees the
+// request, and answers a longer one with 413. The SDK turns a read error into
+// 400, so the limit cannot be left to a reader that next drains.
+func limitBody(next http.Handler, limit int64) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.ContentLength > limit {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		if r.Body != nil && r.Body != http.NoBody {
+			body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
+			if err != nil {
+				var tooLarge *http.MaxBytesError
+				if errors.As(err, &tooLarge) {
+					http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+					return
+				}
+				http.Error(w, "failed to read the request body", http.StatusBadRequest)
+				return
+			}
+			r.Body = io.NopCloser(bytes.NewReader(body))
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // CheckListenAddr refuses an HTTP listen address that other machines can
