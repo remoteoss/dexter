@@ -80,6 +80,11 @@ type DocumentStore struct {
 	mu     sync.RWMutex
 	docs   map[string]*cachedDoc
 	parser *tree_sitter.Parser
+	// closed is set by CloseAll. A closed store ignores writes instead of
+	// re-creating the maps or parsing with the freed parser: one daemon serves
+	// every attached session, so a request that arrives after a session's
+	// shutdown must not be able to take the process down.
+	closed bool
 
 	// LRU bookkeeping for transient (disk-loaded) entries only. The list
 	// holds URIs in access-order, newest at the front. transientIdx maps
@@ -112,13 +117,28 @@ func (ds *DocumentStore) SetMaxTransient(n int) {
 	}
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
+	if ds.closed {
+		return
+	}
 	ds.maxTransient = n
 	ds.evictTransientLocked()
+}
+
+// Count reports how many buffers the store currently holds, including
+// transient disk-loaded entries. It is diagnostic only; the LRU cap governs
+// memory, not this number.
+func (ds *DocumentStore) Count() int {
+	ds.mu.RLock()
+	defer ds.mu.RUnlock()
+	return len(ds.docs)
 }
 
 func (ds *DocumentStore) Set(uri string, text string) {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
+	if ds.closed {
+		return
+	}
 	if doc, ok := ds.docs[uri]; ok {
 		doc.tree.retireLocked()
 	}
@@ -141,9 +161,16 @@ func (ds *DocumentStore) Close(uri string) {
 // referenced by in-flight handlers stay alive until released; the parser
 // itself is safe to close immediately because parse trees are independent
 // of the parser once produced.
+// CloseAll frees all cached trees and the shared parser. It is idempotent: the
+// store is per session, and a daemon session must be able to close twice (a
+// shutdown request followed by a disconnect) without freeing the parser twice.
 func (ds *DocumentStore) CloseAll() {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
+	if ds.closed {
+		return
+	}
+	ds.closed = true
 	for _, doc := range ds.docs {
 		doc.tree.retireLocked()
 	}
@@ -224,6 +251,9 @@ func (ds *DocumentStore) GetOrLoad(uri string) (string, bool) {
 
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
+	if ds.closed {
+		return "", false
+	}
 
 	// Re-check: another goroutine may have populated this URI (via Set
 	// or a concurrent GetOrLoad) while we were reading from disk. If so,

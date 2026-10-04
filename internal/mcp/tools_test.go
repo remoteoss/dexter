@@ -2,14 +2,17 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
-	"go.lsp.dev/protocol"
-	"go.lsp.dev/uri"
+	"github.com/remoteoss/dexter/internal/lsp"
+	"github.com/remoteoss/dexter/internal/notify"
+	"github.com/remoteoss/dexter/internal/workspace"
 )
 
 const accountsSource = `defmodule MyApp.Accounts do
@@ -223,24 +226,21 @@ end
 	)
 }
 
-func TestFileOutlineTool_UsesOpenBuffer(t *testing.T) {
+// The outline parses the file on disk, so it is correct before the index has
+// seen the change.
+func TestFileOutlineTool_ReadsDiskNotIndex(t *testing.T) {
 	e := setupProject(t)
 	path := filepath.Join(e.root, "lib/my_app/accounts.ex")
-	buffer := `defmodule MyApp.Accounts do
-  def unsaved_function, do: :ok
+	changed := `defmodule MyApp.Accounts do
+  def not_yet_indexed, do: :ok
 end
 `
-	if err := e.lsp.DidOpen(context.Background(), &protocol.DidOpenTextDocumentParams{
-		TextDocument: protocol.TextDocumentItem{
-			URI:  protocol.DocumentURI(uri.File(path)),
-			Text: buffer,
-		},
-	}); err != nil {
+	if err := os.WriteFile(path, []byte(changed), 0644); err != nil {
 		t.Fatal(err)
 	}
 
 	out := e.callTool("dexter_file_outline", map[string]any{"file": "lib/my_app/accounts.ex"})
-	wantContains(t, out, "def unsaved_function/0")
+	wantContains(t, out, "def not_yet_indexed/0")
 	wantNotContains(t, out, "def fetch_user/1")
 }
 
@@ -333,8 +333,62 @@ func TestReindexTool(t *testing.T) {
 	}
 
 	out := e.callTool("dexter_reindex", nil)
-	wantContains(t, out, "Reindexed 1 file(s)")
+	wantContains(t, out, "Reindexed the workspace", "up to date")
 
 	out = e.callTool("dexter_search", map[string]any{"query": "new_fun"})
 	wantContains(t, out, "MyApp.Fresh.new_fun/0")
+}
+
+// A tool call while the initial index is still building answers from what is
+// indexed and says so, instead of waiting without end or failing.
+func TestToolNotesIndexStillBuilding(t *testing.T) {
+	root := t.TempDir()
+	release := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	rt := openTestRuntime(t, root, workspace.Options{BeforeInitialReconcile: func() { <-release }})
+	h := NewHandler(rt, rt.LanguageServices())
+
+	out, err := h.Call(context.Background(), "dexter_search", json.RawMessage(`{"query":"x"}`), 10*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantContains(t, out, "still building")
+
+	// The rename finds its sites in the index, so it refuses until the index
+	// is complete.
+	_, err = h.Call(context.Background(), "dexter_rename_symbol", json.RawMessage(`{"module":"MyApp.A","new_name":"MyApp.B"}`), 10*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "still building") {
+		t.Fatalf("rename during the initial build: %v, want a refusal", err)
+	}
+
+	close(release)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := rt.WaitReady(ctx); err != nil {
+		t.Fatal(err)
+	}
+	out, err = h.Call(context.Background(), "dexter_search", json.RawMessage(`{"query":"x"}`), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantNotContains(t, out, "still building")
+}
+
+// A degraded index condition, the same one an editor shows, is added to the
+// tool answer so the agent does not take an incomplete answer as complete.
+func TestToolNotesDegradedIndex(t *testing.T) {
+	e := setupProject(t)
+	e.rt.Reporter().Set(lsp.CondIndexFiles, notify.Warning, "Dexter: 2 files could not be indexed: a.ex, b.ex (permission denied).")
+	out := e.callTool("dexter_search", map[string]any{"query": "fetch_user"})
+	wantContains(t, out, "MyApp.Accounts.fetch_user/1", "Note (warning): 2 files could not be indexed")
+
+	// The workspace tool lists every active condition itself.
+	out = e.callTool("dexter_workspace", nil)
+	wantContains(t, out, "Workspace conditions:", "warning: 2 files could not be indexed")
 }

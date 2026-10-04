@@ -1636,7 +1636,7 @@ end
 	// runs on a goroutine, and if it lands after the re-index below it
 	// deletes the definition test 2 needs, leaving the rename with nothing
 	// to move.
-	server.backgroundWork.Wait()
+	server.index.backgroundWork.Wait()
 	server.docs.Close("file://" + oldPath)
 	indexFile(t, server.store, server.projectRoot, "lib/docusign.ex", defContent)
 	// Test 1 rewrote the closed caller on disk; put it back too.
@@ -3525,7 +3525,7 @@ func TestRename_Module_ConventionalPathUnchanged(t *testing.T) {
 			aliasLine := strings.Split(callerContent, "\n")[1]
 			col := uint32(strings.Index(aliasLine, tc.oldSeg))
 			edit := renameAt(t, server, callerURI, 1, col, tc.newSeg)
-			server.backgroundWork.Wait()
+			server.index.backgroundWork.Wait()
 
 			if _, err := os.Stat(defPath); err != nil {
 				t.Fatalf("%s was deleted by the rename: %v", relPath, err)
@@ -3558,7 +3558,7 @@ func TestRename_Module_ConventionalPathUnchangedOpenFile(t *testing.T) {
 	server.docs.Set(defURI, defContent)
 
 	edit := renameAt(t, server, defURI, 0, uint32(strings.Index(defContent, "ABTest")), "AbTest")
-	server.backgroundWork.Wait()
+	server.index.backgroundWork.Wait()
 
 	if op := renameOp(edit, defPath); op != nil {
 		t.Errorf("rename op emitted for an unchanged path: %s -> %s", op.OldURI, op.NewURI)

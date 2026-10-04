@@ -6,8 +6,6 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/modelcontextprotocol/go-sdk/mcp"
-
 	"github.com/remoteoss/dexter/internal/parser"
 )
 
@@ -15,24 +13,24 @@ type FileOutlineParams struct {
 	File string `json:"file" jsonschema:"path to a .ex/.exs file, absolute or relative to the project root"`
 }
 
-func (h *Handler) fileOutlineHandler(ctx context.Context, req *mcp.CallToolRequest, args FileOutlineParams) (*mcp.CallToolResult, any, error) {
+func (h *Handler) fileOutline(ctx context.Context, args FileOutlineParams) (string, error) {
 	if strings.TrimSpace(args.File) == "" {
-		return nil, nil, fmt.Errorf("file must not be empty")
+		return "", fmt.Errorf("file must not be empty")
 	}
 	path := h.resolvePath(args.File)
 	text, _, ok := h.lsp.ReadFileText(path)
 	if !ok {
-		return textResult(fmt.Sprintf("File not found: %s", h.relPath(path))), nil, nil
+		return fmt.Sprintf("File not found: %s", h.relPath(path)), nil
 	}
 
 	// Parse fresh source so the outline is correct when either the index is
 	// stale or an attached editor has unsaved changes.
 	defs, _, err := parser.ParseText(path, text)
 	if err != nil {
-		return nil, nil, fmt.Errorf("parsing %s: %w", h.relPath(path), err)
+		return "", fmt.Errorf("parsing %s: %w", h.relPath(path), err)
 	}
 	if len(defs) == 0 {
-		return textResult(fmt.Sprintf("%s defines no modules or functions.", h.relPath(path))), nil, nil
+		return fmt.Sprintf("%s defines no modules or functions.", h.relPath(path)), nil
 	}
 
 	// Split into module declarations (in line order) and their members.
@@ -77,7 +75,7 @@ func (h *Handler) fileOutlineHandler(ctx context.Context, req *mcp.CallToolReque
 	for _, m := range orphans {
 		b.WriteString(memberLine(m) + "\n")
 	}
-	return textResult(b.String()), nil, nil
+	return b.String(), nil
 }
 
 func moduleKindLabel(kind string) string {

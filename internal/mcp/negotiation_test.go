@@ -2,44 +2,91 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-
-	"github.com/remoteoss/dexter/internal/store"
 )
 
-// negotiationEnv is a negotiating Handler with no fixed workspace, plus
-// helpers to connect clients that advertise chosen roots.
+// fakeBackend stands in for a workspace daemon connection. It answers every
+// tool call with the root it was opened for.
+type fakeBackend struct {
+	root   string
+	mu     sync.Mutex
+	closed bool
+}
+
+func (b *fakeBackend) CallTool(ctx context.Context, name string, args json.RawMessage) (string, error) {
+	return "root=" + b.root, nil
+}
+
+func (b *fakeBackend) Close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.closed = true
+	return nil
+}
+
+func (b *fakeBackend) isClosed() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.closed
+}
+
+// negotiationEnv is a negotiating Frontend over fake backends, plus helpers to
+// connect clients that advertise chosen roots.
 type negotiationEnv struct {
 	t        *testing.T
-	h        *Handler
+	f        *Frontend
 	fallback string
+
+	mu       sync.Mutex
+	backends []*fakeBackend
 }
 
 func setupNegotiation(t *testing.T) *negotiationEnv {
 	t.Helper()
-	fallback := canonTempDir(t)
-	h := NewHandler(Config{ProjectRoot: fallback, NegotiateRoots: true})
-	t.Cleanup(h.Close)
-	return &negotiationEnv{t: t, h: h, fallback: fallback}
+	return setupNegotiationWith(t, Config{Root: t.TempDir()})
 }
 
-// canonTempDir returns a symlink-free temp dir: negotiated roots are
-// canonicalized, so expectations must be built from canonical paths
-// (t.TempDir itself is symlinked on macOS).
-func canonTempDir(t *testing.T) string {
+func setupNegotiationWith(t *testing.T, cfg Config) *negotiationEnv {
 	t.Helper()
-	dir, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
+	e := &negotiationEnv{t: t, fallback: cfg.Root}
+	cfg.Connect = func(root string) Backend {
+		b := &fakeBackend{root: root}
+		e.mu.Lock()
+		e.backends = append(e.backends, b)
+		e.mu.Unlock()
+		return b
 	}
-	return dir
+	e.f = NewFrontend(cfg)
+	t.Cleanup(e.f.Close)
+	return e
+}
+
+func (e *negotiationEnv) backendsFor(root string) []*fakeBackend {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var out []*fakeBackend
+	for _, b := range e.backends {
+		if b.root == root {
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
+func (e *negotiationEnv) connCount() int {
+	e.f.mu.Lock()
+	defer e.f.mu.Unlock()
+	return len(e.f.conns)
 }
 
 // connect wires a new client session to the negotiating server. Roots are
@@ -48,7 +95,7 @@ func (e *negotiationEnv) connect(opts *mcp.ClientOptions, rootURIs ...string) (*
 	e.t.Helper()
 	ctx := context.Background()
 	serverTransport, clientTransport := mcp.NewInMemoryTransports()
-	ss, err := NewServer(e.h).Connect(ctx, serverTransport, nil)
+	ss, err := NewServer(e.f).Connect(ctx, serverTransport, nil)
 	if err != nil {
 		e.t.Fatal(err)
 	}
@@ -66,12 +113,13 @@ func (e *negotiationEnv) connect(opts *mcp.ClientOptions, rootURIs ...string) (*
 	return cs, client
 }
 
-// projectDir creates a project directory containing one module and returns
-// its path and file URI.
-func projectDir(t *testing.T, module string) (string, string) {
+// projectDir creates a repository directory and returns its path and file URI.
+func projectDir(t *testing.T) (string, string) {
 	t.Helper()
-	dir := canonTempDir(t)
-	writeSource(t, dir, "lib/mod.ex", "defmodule "+module+" do\n  def hello, do: :ok\nend\n")
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
 	return dir, fileURI(dir)
 }
 
@@ -108,6 +156,18 @@ func mustTool(t *testing.T, cs *mcp.ClientSession, name string, args map[string]
 	return out
 }
 
+func eventually(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
 func TestFileURIToPath(t *testing.T) {
 	cases := []struct {
 		uri  string
@@ -115,6 +175,7 @@ func TestFileURIToPath(t *testing.T) {
 	}{
 		{"file:///a/b", "/a/b"},
 		{"file:///a/b/", "/a/b"}, // trailing slash must not key a second workspace
+		{"file:///a/./b/../b", "/a/b"},
 		{"file://localhost/a/b", "/a/b"},
 		{"file:///a/my%20project", "/a/my project"},
 		{"file://otherhost/a", ""},
@@ -135,26 +196,15 @@ func TestFileURIToPath(t *testing.T) {
 	}
 }
 
-func hasIndex(root string) bool {
-	_, err := os.Stat(filepath.Join(root, ".dexter", "dexter.db"))
-	return err == nil
-}
-
 func TestNegotiation_BindsClientRoot(t *testing.T) {
 	e := setupNegotiation(t)
-	root, uri := projectDir(t, "NegBind.Hello")
+	root, uri := projectDir(t)
 	cs, _ := e.connect(nil, uri)
 
-	out := mustTool(t, cs, "dexter_search", map[string]any{"query": "NegBind"})
-	wantContains(t, out, "NegBind.Hello")
-
-	if !hasIndex(root) {
-		t.Error("no index created under the negotiated root")
+	wantContains(t, mustTool(t, cs, "dexter_search", map[string]any{"query": "x"}), "root="+root)
+	if len(e.backendsFor(e.fallback)) != 0 {
+		t.Error("connected to the fallback root despite a negotiated root")
 	}
-	if hasIndex(e.fallback) {
-		t.Error("index created under the fallback root despite a negotiated root")
-	}
-	wantContains(t, mustTool(t, cs, "dexter_workspace", nil), root)
 }
 
 func TestNegotiation_FallsBackWithoutUsableRoots(t *testing.T) {
@@ -172,40 +222,56 @@ func TestNegotiation_FallsBackWithoutUsableRoots(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			e := setupNegotiation(t)
-			writeSource(t, e.fallback, "lib/mod.ex", "defmodule NegFall.Hello do\nend\n")
 			cs, _ := e.connect(tc.opts, tc.uris...)
-
-			out := mustTool(t, cs, "dexter_search", map[string]any{"query": "NegFall"})
-			wantContains(t, out, "NegFall.Hello")
-			if !hasIndex(e.fallback) {
-				t.Error("no index created under the fallback root")
-			}
+			wantContains(t, mustTool(t, cs, "dexter_search", map[string]any{"query": "x"}), "root="+e.fallback)
 		})
 	}
 }
 
-// A root inside a repository resolves upward to the repository, exactly like
-// the LSP's Initialize: .dexter/dexter.db or .git win, and a nested mix.exs
-// does not stop the walk.
-func TestNegotiation_ResolvesRootLikeLSP(t *testing.T) {
-	e := setupNegotiation(t)
-	repo := canonTempDir(t)
-	if err := os.MkdirAll(filepath.Join(repo, ".git"), 0755); err != nil {
-		t.Fatal(err)
+// A launch directory that is not a project is not indexed: a session without
+// roots gets the reason, and a session with roots still works.
+func TestNegotiation_FallbackRefused(t *testing.T) {
+	e := setupNegotiationWith(t, Config{Root: t.TempDir(), FallbackErr: errors.New("refusing to use the launch directory")})
+	noRoots, _ := e.connect(&mcp.ClientOptions{Capabilities: &mcp.ClientCapabilities{}})
+	out, ok := toolText(t, noRoots, "dexter_search", map[string]any{"query": "x"})
+	if ok || !strings.Contains(out, "refusing to use the launch directory") {
+		t.Fatalf("session without roots was not refused: %s", out)
 	}
+	if len(e.backendsFor(e.fallback)) != 0 {
+		t.Error("connected to a refused fallback root")
+	}
+
+	root, uri := projectDir(t)
+	withRoots, _ := e.connect(nil, uri)
+	wantContains(t, mustTool(t, withRoots, "dexter_search", map[string]any{"query": "x"}), "root="+root)
+}
+
+// A root inside a repository resolves upward to the repository: an existing
+// index or .git wins, and a nested mix.exs does not stop the walk.
+func TestNegotiation_ResolvesRootUpward(t *testing.T) {
+	e := setupNegotiation(t)
+	repo, _ := projectDir(t)
 	writeSource(t, repo, "apps/web/mix.exs", "defmodule Web.MixProject do\nend\n")
-	writeSource(t, repo, "lib/top.ex", "defmodule NegRepo.Top do\nend\n")
 	cs, _ := e.connect(nil, fileURI(filepath.Join(repo, "apps", "web")))
 
-	// A module outside the advertised subdirectory is indexed, proving the
-	// workspace anchored on the repository root.
-	out := mustTool(t, cs, "dexter_search", map[string]any{"query": "NegRepo"})
-	wantContains(t, out, "NegRepo.Top")
-	if !hasIndex(repo) {
-		t.Error("no index at the repository root")
-	}
-	if hasIndex(filepath.Join(repo, "apps", "web")) {
-		t.Error("index created at the subdirectory instead of the repository root")
+	wantContains(t, mustTool(t, cs, "dexter_search", map[string]any{"query": "x"}), "root="+repo)
+}
+
+// The resolver that cmd passes decides the root, so that the MCP frontend
+// attaches to the same daemon as the CLI and the editor.
+func TestNegotiation_UsesConfiguredResolver(t *testing.T) {
+	resolved := t.TempDir()
+	var asked string
+	e := setupNegotiationWith(t, Config{Root: t.TempDir(), ResolveRoot: func(dir string) (string, error) {
+		asked = dir
+		return resolved, nil
+	}})
+	dir, uri := projectDir(t)
+	cs, _ := e.connect(nil, uri)
+
+	wantContains(t, mustTool(t, cs, "dexter_search", map[string]any{"query": "x"}), "root="+resolved)
+	if asked != dir {
+		t.Errorf("resolver got %q, want the client root %q", asked, dir)
 	}
 }
 
@@ -223,265 +289,131 @@ func TestNegotiation_BadRootIsRetryable(t *testing.T) {
 	}
 
 	// The failure is not cached: with the roots fixed, the same session works.
-	root, goodURI := projectDir(t, "NegRetry.Hello")
+	root, goodURI := projectDir(t)
 	client.RemoveRoots(badURI)
 	client.AddRoots(&mcp.Root{URI: goodURI})
 	eventually(t, "session to bind the corrected root", func() bool {
-		out, ok := toolText(t, cs, "dexter_search", map[string]any{"query": "NegRetry"})
-		return ok && strings.Contains(out, "NegRetry.Hello")
+		out, ok := toolText(t, cs, "dexter_search", map[string]any{"query": "x"})
+		return ok && strings.Contains(out, "root="+root)
 	})
-	if !hasIndex(root) {
-		t.Error("no index created under the corrected root")
-	}
 }
 
-// Sessions with different roots work concurrently against their own
-// workspaces; sessions with the same root share one.
+// Sessions with different roots use their own workspaces; sessions with the
+// same root share one connection.
 func TestNegotiation_MultipleRoots(t *testing.T) {
 	e := setupNegotiation(t)
-	rootA, uriA := projectDir(t, "NegMultiA.Mod")
-	rootB, uriB := projectDir(t, "NegMultiB.Mod")
+	rootA, uriA := projectDir(t)
+	rootB, uriB := projectDir(t)
 	csA, _ := e.connect(nil, uriA)
 	csB, _ := e.connect(nil, uriB)
 	csA2, _ := e.connect(nil, uriA)
 
-	outA := mustTool(t, csA, "dexter_search", map[string]any{"query": "NegMulti"})
-	wantContains(t, outA, "NegMultiA.Mod")
-	wantNotContains(t, outA, "NegMultiB.Mod")
+	wantContains(t, mustTool(t, csA, "dexter_search", map[string]any{"query": "x"}), "root="+rootA)
+	wantContains(t, mustTool(t, csB, "dexter_search", map[string]any{"query": "x"}), "root="+rootB)
+	wantContains(t, mustTool(t, csA2, "dexter_search", map[string]any{"query": "x"}), "root="+rootA)
 
-	outB := mustTool(t, csB, "dexter_search", map[string]any{"query": "NegMulti"})
-	wantContains(t, outB, "NegMultiB.Mod")
-	wantNotContains(t, outB, "NegMultiA.Mod")
-
-	wantContains(t, mustTool(t, csA2, "dexter_search", map[string]any{"query": "NegMulti"}), "NegMultiA.Mod")
-
-	if !hasIndex(rootA) || !hasIndex(rootB) {
-		t.Error("expected an index under each negotiated root")
+	if n := e.connCount(); n != 2 {
+		t.Errorf("3 sessions over 2 roots hold %d workspace connections, want 2", n)
 	}
-	e.h.mu.Lock()
-	nbindings := len(e.h.bindings)
-	e.h.mu.Unlock()
-	if nbindings != 2 {
-		t.Errorf("3 sessions over 2 roots hold %d workspaces, want 2", nbindings)
+	if n := len(e.backendsFor(rootA)); n != 1 {
+		t.Errorf("2 sessions on one root opened %d connections, want 1", n)
 	}
 }
 
 func TestNegotiation_RootsChangedSwapsWorkspace(t *testing.T) {
 	e := setupNegotiation(t)
-	rootA, uriA := projectDir(t, "NegSwapA.Mod")
-	rootB, uriB := projectDir(t, "NegSwapB.Mod")
+	rootA, uriA := projectDir(t)
+	rootB, uriB := projectDir(t)
 	cs, client := e.connect(nil, uriA)
 
-	wantContains(t, mustTool(t, cs, "dexter_search", map[string]any{"query": "NegSwapA"}), "NegSwapA.Mod")
+	wantContains(t, mustTool(t, cs, "dexter_search", map[string]any{"query": "x"}), "root="+rootA)
 
 	client.RemoveRoots(uriA)
 	client.AddRoots(&mcp.Root{URI: uriB})
 	eventually(t, "session to move to the new root", func() bool {
-		out, ok := toolText(t, cs, "dexter_search", map[string]any{"query": "NegSwapB"})
-		return ok && strings.Contains(out, "NegSwapB.Mod")
+		out, ok := toolText(t, cs, "dexter_search", map[string]any{"query": "x"})
+		return ok && strings.Contains(out, "root="+rootB)
 	})
-	wantContains(t, mustTool(t, cs, "dexter_workspace", nil), rootB)
 
-	// The old workspace is torn down: its watcher no longer indexes new files
-	// into its store.
-	e.h.mu.Lock()
-	_, oldBound := e.h.bindings[rootA]
-	e.h.mu.Unlock()
-	if oldBound {
-		t.Error("old workspace still held after the swap")
+	// The old workspace connection is closed: nothing else uses it.
+	for _, b := range e.backendsFor(rootA) {
+		if !b.isClosed() {
+			t.Error("old workspace connection still open after the swap")
+		}
 	}
-	writeSource(t, rootA, "lib/late.ex", "defmodule NegSwapA.Late do\nend\n")
-	time.Sleep(4 * debounceWindow)
-	oldStore, err := store.Open(rootA)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = oldStore.Close() }()
-	if results, err := oldStore.LookupModule("NegSwapA.Late"); err != nil || len(results) != 0 {
-		t.Errorf("old workspace's watcher still indexing after teardown: %v, %v", results, err)
+	if n := e.connCount(); n != 1 {
+		t.Errorf("%d workspace connections after the swap, want 1", n)
 	}
 }
 
-// A roots change that resolves to the same project keeps the workspace: no
-// teardown, no rebuild.
+// A roots change that resolves to the same project keeps the connection.
 func TestNegotiation_SameRootChangeIsNoop(t *testing.T) {
 	e := setupNegotiation(t)
-	root, uri := projectDir(t, "NegNoop.Mod")
+	root, uri := projectDir(t)
 	cs, client := e.connect(nil, uri)
-	mustTool(t, cs, "dexter_search", map[string]any{"query": "NegNoop"})
+	mustTool(t, cs, "dexter_search", map[string]any{"query": "x"})
 
-	e.h.mu.Lock()
-	before := e.h.bindings[root]
-	e.h.mu.Unlock()
-
-	// Same project, different advertised directory: the first call binds it,
-	// so the subdirectory resolves upward via .dexter/dexter.db.
+	// Same project, different advertised directory: the subdirectory
+	// resolves upward through .git.
 	subdir := filepath.Join(root, "lib")
+	if err := os.MkdirAll(subdir, 0755); err != nil {
+		t.Fatal(err)
+	}
 	client.AddRoots(&mcp.Root{URI: fileURI(subdir)})
 	eventually(t, "roots change notification to arrive", func() bool {
-		e.h.mu.Lock()
-		defer e.h.mu.Unlock()
-		for _, d := range e.h.dirty {
-			if d {
+		e.f.mu.Lock()
+		defer e.f.mu.Unlock()
+		for _, st := range e.f.sessions {
+			if st.dirty {
 				return true
 			}
 		}
 		return false
 	})
-	mustTool(t, cs, "dexter_search", map[string]any{"query": "NegNoop"}) // renegotiates
+	wantContains(t, mustTool(t, cs, "dexter_search", map[string]any{"query": "x"}), "root="+root) // negotiates again
 
-	e.h.mu.Lock()
-	after := e.h.bindings[root]
-	e.h.mu.Unlock()
-	if before != after {
-		t.Error("workspace was rebuilt for a change that resolves to the same root")
+	backends := e.backendsFor(root)
+	if len(backends) != 1 || backends[0].isClosed() {
+		t.Errorf("workspace connection was replaced for a change that resolves to the same root")
 	}
 }
 
 // A workspace root with characters that URI-encode (spaces) binds correctly.
 func TestNegotiation_RootWithSpaces(t *testing.T) {
 	e := setupNegotiation(t)
-	root := filepath.Join(canonTempDir(t), "my project")
-	writeSource(t, root, "lib/mod.ex", "defmodule NegSpace.Mod do\nend\n")
+	root := filepath.Join(t.TempDir(), "my project")
+	if err := os.MkdirAll(filepath.Join(root, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
 	uri := fileURI(root)
 	if !strings.Contains(uri, "%20") {
 		t.Fatalf("test URI %q does not exercise percent-encoding", uri)
 	}
 	cs, _ := e.connect(nil, uri)
-	wantContains(t, mustTool(t, cs, "dexter_search", map[string]any{"query": "NegSpace"}), "NegSpace.Mod")
-	if !hasIndex(root) {
-		t.Error("no index created under the percent-encoded root")
-	}
+	wantContains(t, mustTool(t, cs, "dexter_search", map[string]any{"query": "x"}), "root="+root)
 }
 
-// A tool call during a long initial index reports that the workspace is still
-// building instead of hanging.
-func TestNegotiation_ReportsInitializing(t *testing.T) {
-	prev := indexWaitLimit
-	indexWaitLimit = 10 * time.Millisecond
-	defer func() { indexWaitLimit = prev }()
-
-	e := setupNegotiation(t)
-	// A pre-installed workspace whose initial index never finishes.
-	b := &binding{root: e.fallback, initDone: make(chan struct{}), indexed: make(chan struct{})}
-	close(b.initDone)
-	e.h.mu.Lock()
-	e.h.bindings[e.fallback] = b
-	e.h.mu.Unlock()
-
-	cs, _ := e.connect(nil)
-	out, ok := toolText(t, cs, "dexter_search", map[string]any{"query": "x"})
-	if ok {
-		t.Fatalf("tool call succeeded against an unindexed workspace: %s", out)
-	}
-	if !strings.Contains(out, "still building") {
-		t.Errorf("error does not report the index build: %s", out)
-	}
-	close(b.indexed) // let Close tear it down without blocking
-	b.initErr = context.Canceled
-}
-
-// Symlink aliases of one directory must share a workspace: two live
-// workspaces over one database would race each other's index writes.
-func TestNegotiation_SymlinkedRootsShareWorkspace(t *testing.T) {
-	e := setupNegotiation(t)
-	root, uri := projectDir(t, "NegLink.Mod")
-	link := filepath.Join(canonTempDir(t), "link")
-	if err := os.Symlink(root, link); err != nil {
-		t.Fatal(err)
-	}
-	cs1, _ := e.connect(nil, uri)
-	cs2, _ := e.connect(nil, fileURI(link))
-
-	wantContains(t, mustTool(t, cs1, "dexter_search", map[string]any{"query": "NegLink"}), "NegLink.Mod")
-	wantContains(t, mustTool(t, cs2, "dexter_search", map[string]any{"query": "NegLink"}), "NegLink.Mod")
-
-	e.h.mu.Lock()
-	nbindings := len(e.h.bindings)
-	e.h.mu.Unlock()
-	if nbindings != 1 {
-		t.Errorf("symlink alias created %d workspaces, want 1", nbindings)
-	}
-}
-
-// A symlinked fallback root and a negotiated root for the same directory must
-// key one workspace, so no-roots and roots-advertising sessions share it.
-func TestNegotiation_SymlinkedFallbackSharesWorkspace(t *testing.T) {
-	root, uri := projectDir(t, "NegFallLink.Mod")
-	link := filepath.Join(canonTempDir(t), "link")
-	if err := os.Symlink(root, link); err != nil {
-		t.Fatal(err)
-	}
-	e := &negotiationEnv{t: t, h: NewHandler(Config{ProjectRoot: link, NegotiateRoots: true}), fallback: root}
-	t.Cleanup(e.h.Close)
-
-	noRoots, _ := e.connect(&mcp.ClientOptions{Capabilities: &mcp.ClientCapabilities{}})
-	withRoots, _ := e.connect(nil, uri)
-	wantContains(t, mustTool(t, noRoots, "dexter_search", map[string]any{"query": "NegFallLink"}), "NegFallLink.Mod")
-	wantContains(t, mustTool(t, withRoots, "dexter_search", map[string]any{"query": "NegFallLink"}), "NegFallLink.Mod")
-
-	e.h.mu.Lock()
-	nbindings := len(e.h.bindings)
-	e.h.mu.Unlock()
-	if nbindings != 1 {
-		t.Errorf("fallback and negotiated sessions hold %d workspaces, want 1 shared", nbindings)
-	}
-}
-
-// While a root's last workspace is still tearing down, a new session for that
-// root must wait it out instead of opening a second store over the same
-// database mid-teardown.
-func TestNegotiation_WaitsForDrainingWorkspace(t *testing.T) {
-	e := setupNegotiation(t)
-	root, uri := projectDir(t, "NegDrain.Mod")
-
-	drain := make(chan struct{})
-	e.h.mu.Lock()
-	e.h.draining[root] = drain
-	e.h.mu.Unlock()
-
-	cs, _ := e.connect(nil, uri)
-	result := make(chan string, 1)
-	go func() {
-		out, _ := toolText(t, cs, "dexter_search", map[string]any{"query": "NegDrain"})
-		result <- out
-	}()
-
-	select {
-	case out := <-result:
-		t.Fatalf("call proceeded while the workspace was draining: %s", out)
-	case <-time.After(300 * time.Millisecond):
-	}
-
-	e.h.mu.Lock()
-	delete(e.h.draining, root)
-	e.h.mu.Unlock()
-	close(drain)
-
-	select {
-	case out := <-result:
-		if !strings.Contains(out, "NegDrain.Mod") {
-			t.Errorf("call after drain did not find the module: %s", out)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("call never completed after the drain finished")
-	}
-}
-
-// A session disconnecting releases its workspace.
+// A session disconnecting releases its workspace connection.
 func TestNegotiation_SessionCloseReleasesWorkspace(t *testing.T) {
 	e := setupNegotiation(t)
-	root, uri := projectDir(t, "NegClose.Mod")
+	root, uri := projectDir(t)
 	cs, _ := e.connect(nil, uri)
-	mustTool(t, cs, "dexter_search", map[string]any{"query": "NegClose"})
+	mustTool(t, cs, "dexter_search", map[string]any{"query": "x"})
 
 	if err := cs.Close(); err != nil {
 		t.Fatal(err)
 	}
-	eventually(t, "workspace to be released", func() bool {
-		e.h.mu.Lock()
-		defer e.h.mu.Unlock()
-		_, held := e.h.bindings[root]
-		return !held && len(e.h.sessions) == 0
+	eventually(t, "workspace connection to be released", func() bool {
+		backends := e.backendsFor(root)
+		return len(backends) == 1 && backends[0].isClosed() && e.connCount() == 0
 	})
+}
+
+// A fixed root (`dexter mcp <path>`) ignores the client's roots.
+func TestFixedRootIgnoresClientRoots(t *testing.T) {
+	fixed := t.TempDir()
+	e := setupNegotiationWith(t, Config{Root: fixed, Fixed: true})
+	_, uri := projectDir(t)
+	cs, _ := e.connect(nil, uri)
+	wantContains(t, mustTool(t, cs, "dexter_search", map[string]any{"query": "x"}), "root="+fixed)
 }

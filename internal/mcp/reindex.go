@@ -4,21 +4,17 @@ import (
 	"context"
 	"fmt"
 	"time"
-
-	"github.com/modelcontextprotocol/go-sdk/mcp"
-
-	"github.com/remoteoss/dexter/internal/version"
 )
 
 type ReindexParams struct{}
 
-func (h *Handler) reindexHandler(ctx context.Context, req *mcp.CallToolRequest, args ReindexParams) (*mcp.CallToolResult, any, error) {
-	// A version mismatch requires a full rebuild, which must not happen under a
-	// live store handle; that is handled at server startup instead.
-	if stored := h.store.GetIndexVersion(); stored != version.IndexVersion {
-		return textResult(fmt.Sprintf("Index version %d does not match this binary (%d). Restart dexter mcp to rebuild the index.", stored, version.IndexVersion)), nil, nil
+func (h *Handler) reindex(ctx context.Context, args ReindexParams) (string, error) {
+	// The workspace daemon owns the index: this is the same barrier as
+	// `dexter reindex`. Every change that the daemon accepted before the call
+	// is in the index when it returns.
+	start := time.Now()
+	if err := h.rt.Reindex(ctx); err != nil {
+		return "", fmt.Errorf("reindexing: %w", err)
 	}
-
-	updated, elapsed := h.lsp.ReindexWorkspace()
-	return textResult(fmt.Sprintf("Reindexed %d file(s) in %s. The index is up to date.", updated, elapsed.Round(time.Millisecond))), nil, nil
+	return fmt.Sprintf("Reindexed the workspace in %s. The index is up to date.", time.Since(start).Round(time.Millisecond)), nil
 }

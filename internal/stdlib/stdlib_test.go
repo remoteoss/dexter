@@ -78,6 +78,8 @@ func TestResolve_EnvVarBypassesCache(t *testing.T) {
 func TestResolve_ValidCacheUsedWhenNoVersionManager(t *testing.T) {
 	t.Setenv("DEXTER_ELIXIR_LIB_ROOT", "")
 	t.Setenv("PATH", t.TempDir()) // no mise/asdf/elixir in PATH
+	t.Setenv("HOME", t.TempDir()) // and none in the standard install locations
+	t.Setenv("SHELL", "/bin/false")
 
 	libDir := makeElixirLibDir(t)
 	cache := &fakeCache{value: libDir}
@@ -196,5 +198,30 @@ func TestDeriveFromMise_RespectsProjectRoot(t *testing.T) {
 	// The path should contain the mise installs directory.
 	if !strings.Contains(root, "mise") {
 		t.Errorf("expected mise install path, got %q", root)
+	}
+}
+
+// TestFindExecutableFindsVersionManagerLocations covers the editor case: a GUI
+// process starts dexter with a PATH that never ran the mise or asdf hook, so
+// the standard install locations have to be searched too.
+func TestFindExecutableFindsVersionManagerLocations(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", t.TempDir()) // hide the real tools
+
+	shim := filepath.Join(home, ".asdf", "shims", "mix")
+	if err := os.MkdirAll(filepath.Dir(shim), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(shim, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	got, ok := FindExecutable("mix")
+	if !ok || got != shim {
+		t.Fatalf("FindExecutable(mix) = %q, %v; want %q", got, ok, shim)
+	}
+	if _, ok := FindExecutable("definitely-not-a-tool"); ok {
+		t.Fatal("FindExecutable found a tool that does not exist")
 	}
 }

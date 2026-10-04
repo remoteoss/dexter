@@ -17,11 +17,23 @@ type T struct {
 // t.Cleanup. The server's stderr is discarded unless the test is verbose.
 func StartT(t *testing.T, binary, root string) *T {
 	t.Helper()
+	return startT(t, binary, root, "")
+}
+
+// StartInT is StartT with the process's working directory set separately from
+// the workspace root, for tests that attach to a project from outside it.
+func StartInT(t *testing.T, binary, root, dir string) *T {
+	t.Helper()
+	return startT(t, binary, root, dir)
+}
+
+func startT(t *testing.T, binary, root, dir string) *T {
+	t.Helper()
 	var stderr *os.File
 	if testing.Verbose() {
 		stderr = os.Stderr
 	}
-	client, err := Start(binary, root, stderr)
+	client, err := StartIn(binary, root, dir, stderr)
 	if err != nil {
 		t.Fatalf("lsptest: %v", err)
 	}

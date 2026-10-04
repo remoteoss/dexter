@@ -39,6 +39,7 @@ A fast, full-featured Elixir LSP optimized for large Elixir codebases.
 - [Lightning-fast formatting](#lightning-fast-formatting)
 - [LSP options](#lsp-options)
 - [Index database location (.dexter/)](#index-database-location-dexter)
+- [Workspace daemon](#workspace-daemon)
 - [Debugging](#debugging)
 - [Development (building from source)](#development-building-from-source)
 - [Releasing](#releasing)
@@ -382,6 +383,28 @@ Measured on a 57k-file Elixir monorepo (330k definitions, 2.7M references) on a 
 
 The CLI commands are available for scripting and manual use.
 
+Every command accepts `--root <path>` (or `-C <path>`) and then runs as if it had
+been started there, which lets a shell, an agent, or an editor wrapper query a
+project from somewhere else entirely:
+
+```sh
+# the flag goes anywhere on the command line
+# note that relative paths, including the reindex target, resolve from the root
+dexter --root ~/code/my-elixir-project lookup MyApp.Accounts fetch_user
+dexter lookup --root ~/code/my-elixir-project MyApp.Accounts fetch_user
+dexter reindex --root ~/code/my-elixir-project lib/my_app/accounts.ex
+dexter lsp --root ~/code/my-elixir-project
+dexter stop --root ~/code/my-elixir-project
+```
+
+Dexter refuses to treat a directory with no `mix.exs`, `.git`, or Dexter database as a
+workspace, so a mistyped `dexter lookup` in your home directory stops instead of
+building a database over everything you own. Pass `--root <path>` to name the
+project, or `-y`/`--yes` if that directory really is what you meant; the
+`.dexter/dexter.db` database the first run creates is itself a marker, so the flag is only
+needed once. `dexter lsp` is the exception: an editor is authoritative about what
+the user opened, so it logs a warning and serves the directory anyway.
+
 ### Index a project
 
 ```sh
@@ -464,7 +487,9 @@ Register it with your MCP client. For Claude Code:
 claude mcp add dexter -- dexter mcp
 ```
 
-Any client that speaks MCP over stdio works the same way: point it at `dexter mcp`. The server obtains its workspace from the client through MCP roots and resolves it the way the LSP does (an existing `.dexter` index first, then the `.git` repository root), so it binds the project the client is working in rather than the directory it was launched from; clients that provide no roots get the launch directory, and an explicit path argument (`dexter mcp <path>`) overrides negotiation entirely. In `--listen` mode each resolved root gets its own workspace, so sessions from different projects can share one server. The server indexes a workspace on first use and keeps the index fresh by watching the project tree (fsnotify) and detecting git branch switches; a `dexter_reindex` tool forces an immediate update if a lookup ever seems stale. Attached LSP+MCP mode also watches the tree, so edits made directly by an agent are indexed even when they bypass editor notifications.
+Any client that speaks MCP over stdio works the same way: point it at `dexter mcp`. The server obtains its workspace from the client through MCP roots and resolves it the way the CLI does, so it binds the project the client is working in rather than the directory it was launched from. Clients that provide no roots get the launch directory (when it is a project), and an explicit path argument (`dexter mcp <path>`) overrides negotiation entirely. In `--listen` mode each resolved root gets its own workspace, so sessions from different projects can share one server.
+
+`dexter mcp` is a frontend of the workspace daemon, like `dexter lsp` and the CLI: it starts the daemon when necessary and keeps no index of its own. The tools answer from the same index, watchers, and caches as the editor, so edits made directly by an agent are indexed by the daemon's file watcher, and a `dexter_reindex` tool forces an immediate update if a lookup ever seems stale. A tool that answers from an index that is still building or degraded says so in its answer.
 
 Useful variants:
 
@@ -474,12 +499,7 @@ dexter mcp --listen localhost:8092
 
 # Print the agent-facing usage guide (save as context for clients that want it)
 dexter mcp --instructions
-
-# Expose MCP from a running LSP session (shares open buffers and caches)
-dexter lsp --mcp-listen=localhost:8092
 ```
-
-The MCP server and an editor LSP can run side by side: both read the same `.dexter/dexter.db` index.
 
 ## Hover documentation
 
@@ -572,7 +592,7 @@ Dexter reads `initializationOptions` from your editor configuration:
 
 - **`followDelegates`** (boolean, default: `true`): follow `defdelegate` targets on lookup.
 - **`stdlibPath`** (string): override the Elixir stdlib directory to index. Defaults to auto-detection; use this if your install is non-standard.
-- **`debug`** (boolean, default: `false`): enable verbose logging to stderr. Logs timing and resolution details for every definition, hover, references, and rename request. Can also be enabled via the `DEXTER_DEBUG=true` environment variable.
+- **`debug`** (boolean, default: `false`): enable verbose logging for this editor session. Logs timing and resolution details for every definition, hover, references, and rename request to your editor's LSP log and to the workspace daemon's log (see [Debugging](#debugging)). Can also be enabled via the `DEXTER_DEBUG=true` environment variable.
 - **`maxTransientDocuments`** (integer, default: `50`): cap on how many lazily-loaded buffers the server retains in memory. When an LSP client (e.g. Claude Code) queries a file it never opened via `didOpen`, dexter reads it from disk and caches it. Editor-owned buffers are unaffected; only disk-loaded entries are subject to LRU eviction. Set to `0` to disable transient caching.
 
 ## Index database location (.dexter/)
@@ -599,6 +619,60 @@ cd ~/code/my-monorepo/apps/my_app
 dexter init .
 ```
 
+## Workspace daemon
+
+One background process per project owns the index, so your editor and the CLI
+see the same fresh index instead of each maintaining their own.
+
+The first `dexter lsp`, `dexter mcp`, `dexter lookup`, `dexter references`, or `dexter reindex`
+starts it, and it exits on its own after 15 minutes with no clients. Nothing
+about editor configuration changes: `dexter lsp` still speaks LSP over stdio, it
+just proxies to the daemon, and the protocol bytes are copied rather than
+re-parsed.
+
+The daemon belongs to the workspace, not to whichever frontend started it. No
+editor owns the index for another: a second editor and a lookup in a shell both
+attach to the same daemon and share its index and resolution caches, so neither
+can see a different, staler answer. `dexter mcp` attaches to it too, so every
+frontend answers from one index.
+
+The daemon owns the SQLite index in `.dexter/` (one writer), the file watchers and
+`.git/HEAD` poll that drive incremental reindexes, stdlib and dependency
+discovery, and the use-chain, generated-function, and BEAM caches. A CLI call
+therefore reuses an editor's warm caches instead of starting cold.
+
+Its runtime files live outside your project in the environment-independent
+`/tmp/dexter-<uid>` directory: one socket, lock, and log per workspace. Dexter
+refuses a runtime directory that is not owned by you or would make the socket
+path too long. Ownership is an
+advisory kernel lock, so a crash or `kill -9` releases it immediately — there is
+no stale lock to clean up and no PID file to go wrong. The log is the first place
+to look when something behaves oddly.
+
+```sh
+# how long an idle daemon waits before exiting (0 = never)
+export DEXTER_DAEMON_IDLE_TIMEOUT=30m
+
+# stop the workspace daemon now
+# a plain stop refuses while clients are attached; --force stops it anyway
+dexter stop
+dexter stop --force
+```
+
+`dexter stop` is the manual version, useful when a daemon is stuck,
+misbehaving, or just in the way — it finds the process by workspace rather than
+by pid, reports whether one was running, and is a no-op when there was nothing to
+stop. A plain stop asks the daemon politely and refuses while clients are
+attached; `--force` skips the handshake and signals the process directly, so it
+works even for a daemon that is wedged or built by another version, escalating
+to an outright kill if the process will not exit. Editors attached to a forced
+stop lose the workspace until it restarts on the next `dexter lsp`, lookup, or
+reindex.
+
+`dexter init` is the one command that needs the workspace to itself. It asks an
+idle daemon to exit and refuses while a client is attached, so close your editor
+(or wait for the idle timeout) before rebuilding an index from scratch.
+
 ## Debugging
 
 If something isn't working as expected, start by forcing a full reindex to rule out a stale/corrupted index. It's
@@ -610,14 +684,14 @@ dexter init --force ~/code/my-elixir-project
 
 If the issue persists, enable debug mode to get verbose logs. You can do this in two ways:
 
-1. Set the `debug` option in your editor's LSP `initializationOptions` (see [LSP options](#lsp-options))
-2. Or set the `DEXTER_DEBUG=true` environment variable before launching your editor
+1. Set the `debug` option in your editor's LSP `initializationOptions` (see [LSP options](#lsp-options)). It applies to that editor session as soon as it connects.
+2. Or set the `DEXTER_DEBUG=true` environment variable for the editor or CLI command that starts the workspace daemon. The daemon reads it when it starts, so if one is already running, run `dexter stop` first. This is also how to debug CLI commands such as `dexter lookup`.
 
-Debug mode logs timing and resolution details for every definition, hover, references, and rename request to stderr. In Neovim you can usually view these at `~/.local/state/nvim/lsp.log`. In VS Code, you can see them in Output > Dexter.
+Debug mode logs timing and resolution details for every definition, hover, references, and rename request. Each editor receives the lines for its own requests in its LSP log (in Neovim usually `~/.local/state/nvim/lsp.log`, in VS Code Output > Dexter). Every editor and CLI command for a workspace shares one daemon, and all of its lines, including those for CLI commands, also go to the daemon's log file: `<key>.log` in its runtime directory (`/tmp/dexter-<uid>` on macOS and Linux; see [docs/daemon.md](docs/daemon.md)). The first line `dexter lsp` writes to your editor's log names that file.
 
 When [filing an issue](https://github.com/remoteoss/dexter/issues/new), please include:
 
-- Your Dexter version (`dexter --version`)
+- Your Dexter version (`dexter version`)
 - Your Elixir version (`elixir --version`)
 - The debug logs from the failing operation
 - A minimal code snippet that reproduces the issue, if possible

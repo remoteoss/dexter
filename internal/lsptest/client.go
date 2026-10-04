@@ -87,6 +87,13 @@ type Client struct {
 	nextID int
 	opened map[string]bool
 	closed bool
+	shown  []ShownMessage
+}
+
+// ShownMessage is one window/showMessage the server sent.
+type ShownMessage struct {
+	Type    int    `json:"type"`
+	Message string `json:"message"`
 }
 
 type message struct {
@@ -105,14 +112,38 @@ type message struct {
 // initialize handshake. Call Close when finished. stderr is where the server's
 // own logging goes; pass nil to discard it.
 func Start(binary, root string, stderr io.Writer) (*Client, error) {
+	return StartIn(binary, root, root, stderr)
+}
+
+// StartIn is Start with the process's working directory set separately from the
+// workspace root. Pass dir="" to run in root. The workspace is named explicitly
+// with --root, so the server serves the project it was pointed at rather than
+// the tree it happens to sit in — the shape an editor wrapper, an agent, or a
+// probe needs when it does not run from the project itself.
+func StartIn(binary, root, dir string, stderr io.Writer) (*Client, error) {
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
 		return nil, fmt.Errorf("resolve root %s: %w", root, err)
 	}
+	absDir := absRoot
+	if dir != "" {
+		if absDir, err = filepath.Abs(dir); err != nil {
+			return nil, fmt.Errorf("resolve working directory %s: %w", dir, err)
+		}
+	}
 
-	cmd := exec.Command(binary, "lsp")
-	cmd.Dir = absRoot
+	cmd := exec.Command(binary, "lsp", "--root", absRoot)
+	cmd.Dir = absDir
 	cmd.Stderr = stderr
+	// The workspace daemon outlives the LSP connection by its idle timeout, which
+	// is a long time to leave running after a test finishes. The connection is a
+	// lease, so the daemon stays up for the whole session either way.
+	//
+	// PWD is part of the environment on purpose: a shell updates it when it
+	// changes directory and os.Getwd trusts it when it points at the process's
+	// directory. Letting the parent's value through would make the server see the
+	// symlink-resolved cwd, which is not the spelling this client sends in URIs.
+	cmd.Env = append(os.Environ(), "DEXTER_DAEMON_IDLE_TIMEOUT=1s", "PWD="+absDir)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -249,7 +280,17 @@ func (c *Client) Request(method string, params interface{}) (json.RawMessage, er
 				return
 			}
 			if m.ID == nil {
-				continue // notification from the server
+				// A notification from the server. Messages for the user are
+				// kept, so a test can check what an editor would show.
+				if m.Method == "window/showMessage" {
+					var shown ShownMessage
+					if json.Unmarshal(m.Params, &shown) == nil {
+						c.mu.Lock()
+						c.shown = append(c.shown, shown)
+						c.mu.Unlock()
+					}
+				}
+				continue
 			}
 			if string(*m.ID) == wantID {
 				if m.Error != nil {
@@ -274,6 +315,35 @@ func (c *Client) Request(method string, params interface{}) (json.RawMessage, er
 		return out.result, nil
 	case <-time.After(c.timeout):
 		return nil, fmt.Errorf("%s timed out after %s", method, c.timeout)
+	}
+}
+
+// Shown returns the window/showMessage notifications read so far. The server's
+// output is read only while a request waits, so a caller that waits for a
+// message sends requests (WaitShown does).
+func (c *Client) Shown() []ShownMessage {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]ShownMessage(nil), c.shown...)
+}
+
+// WaitShown sends cheap requests until the server has shown a message that
+// contains text, and returns it.
+func (c *Client) WaitShown(text string, timeout time.Duration) (ShownMessage, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		for _, m := range c.Shown() {
+			if strings.Contains(m.Message, text) {
+				return m, nil
+			}
+		}
+		if time.Now().After(deadline) {
+			return ShownMessage{}, fmt.Errorf("no message containing %q; shown: %+v", text, c.Shown())
+		}
+		if _, err := c.Request("workspace/symbol", map[string]interface{}{"query": "\x00"}); err != nil {
+			return ShownMessage{}, err
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

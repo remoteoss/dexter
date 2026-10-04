@@ -43,6 +43,13 @@ type generatedFunctionCacheEntry struct {
 	providers         []string
 	providersResolved bool
 
+	// definitionSources holds what the BEAM records about where its functions
+	// were defined, read on the first definition request that needs it.
+	// Memoized on the entry for the same reason as providers: the BEAM stamp
+	// invalidates both.
+	definitionSources         generatedDefinitionSources
+	definitionSourcesResolved bool
+
 	// docs memoizes rendered documentation prose for functions a hover has asked
 	// about, so sweeping the mouse does not re-inflate the Docs chunk each time.
 	// It is a pointer because get hands out a copy of the entry: the copy has to
@@ -172,6 +179,10 @@ func (s *Server) generatedFunctionsForModule(module string) []beam.Function {
 func (s *Server) generatedFunctionsFor(module, knownBeam string) []beam.Function {
 	var sourcePath, buildRoot string
 	var sourceStamp fileStamp
+	// hint is the source file that places the module for locating its BEAM:
+	// its own, or for a generated module the nearest lexical parent's. It is
+	// kept apart from sourcePath, which also says how the entry is invalidated.
+	var hint string
 
 	entry, cached := s.generatedCache.get(module)
 	if cached {
@@ -216,11 +227,17 @@ func (s *Server) generatedFunctionsFor(module, knownBeam string) []beam.Function
 		if len(moduleResults) == 0 {
 			// The module itself may be generated. Phoenix route helpers are a
 			// common example: aliases name MyApp.Router.Helpers, but no source
-			// definition exists for the store to return. Probe the project build;
-			// locateModuleBEAM checks the root application first and caches the
-			// application listing, so this is one stat on the warm path.
-			buildRoot = s.findBuildRoot(s.projectRoot)
-			s.debugf("Generated BEAM resolve: module=%s source=generated build_root=%s", module, buildRoot)
+			// definition exists for the store to return. Probe the build its
+			// generator was compiled into; locateModuleBEAM checks the root
+			// application first and caches the application listing, so this is
+			// one stat on the warm path.
+			hint = s.generatedModuleHint(module)
+			if hint != "" {
+				buildRoot = s.findBuildRoot(filepath.Dir(hint))
+			} else {
+				buildRoot = s.findBuildRoot(s.projectRoot)
+			}
+			s.debugf("Generated BEAM resolve: module=%s source=generated hint=%s build_root=%s", module, hint, buildRoot)
 		} else {
 			sourcePath = moduleResults[0].FilePath
 			sourceStamp = statFileStamp(sourcePath)
@@ -234,7 +251,10 @@ func (s *Server) generatedFunctionsFor(module, knownBeam string) []beam.Function
 		}
 	}
 
-	loc := s.locateModuleBEAM(buildRoot, module, sourcePath)
+	if sourcePath != "" {
+		hint = sourcePath
+	}
+	loc := s.locateCompiledModule(buildRoot, module, hint)
 	if loc.beamPath == "" {
 		s.debugf("Generated BEAM resolve: module=%s no compiled BEAM watch=%s", module, loc.watchDir)
 		negative := generatedFunctionCacheEntry{
@@ -256,6 +276,24 @@ func (s *Server) generatedFunctionsFor(module, knownBeam string) []beam.Function
 	}
 	s.debugf("Generated BEAM resolve: module=%s beam=%s", module, loc.beamPath)
 	return s.loadAndCacheGenerated(module, loc.beamPath, sourcePath, sourceStamp, buildRoot)
+}
+
+// generatedModuleHint returns the source file that places a module without
+// source. Frameworks generate a module beneath the one that defines it, such as
+// a router's Helpers or a DSL extension's entity modules, so the nearest
+// lexical parent with source is compiled into the same build and application.
+// It is empty for a top-level name, which falls back to the workspace build.
+func (s *Server) generatedModuleHint(module string) string {
+	for candidate := module; ; {
+		dot := strings.LastIndexByte(candidate, '.')
+		if dot < 0 {
+			return ""
+		}
+		candidate = candidate[:dot]
+		if results, err := s.store.LookupModule(candidate); err == nil && len(results) > 0 {
+			return results[0].FilePath
+		}
+	}
 }
 
 // cachedEntryStillValid reports whether a cached entry's stamps still hold, and
@@ -661,11 +699,12 @@ func generatedFunctionsNamed(functions []beam.Function, name string) []beam.Func
 // generatedDefinitionResults returns the closest source-backed module for a
 // generated provider. Generated nested modules have no source row, so walking
 // their lexical parents yields a stable artifact-level destination without
-// knowing which framework created them.
-func (s *Server) generatedDefinitionResults(module string) []store.LookupResult {
+// knowing which framework created them. owner is the module those results
+// belong to: module itself, or the lexical parent that was found.
+func (s *Server) generatedDefinitionResults(module string) (results []store.LookupResult, owner string) {
 	for candidate := module; candidate != ""; {
 		if results, err := s.store.LookupModule(candidate); err == nil && len(results) > 0 {
-			return results
+			return results, candidate
 		}
 		dot := strings.LastIndexByte(candidate, '.')
 		if dot < 0 {
@@ -673,7 +712,7 @@ func (s *Server) generatedDefinitionResults(module string) []store.LookupResult 
 		}
 		candidate = candidate[:dot]
 	}
-	return nil
+	return nil, ""
 }
 
 // filterGeneratedProviderReferences removes the conservative false positives

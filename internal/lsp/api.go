@@ -1,402 +1,227 @@
 package lsp
 
 import (
-	"context"
 	"fmt"
-	"io"
-	"os"
-	"path/filepath"
 	"sort"
-	"strings"
-
-	"go.lsp.dev/jsonrpc2"
-	"go.lsp.dev/protocol"
-	"go.lsp.dev/uri"
-	"go.uber.org/zap"
-
-	"github.com/remoteoss/dexter/internal/parser"
-	"github.com/remoteoss/dexter/internal/store"
+	"sync"
 )
 
-// This file is the exported, name-based surface of the LSP server used by
-// callers outside the LSP session (the MCP server and the CLI). Everything
-// here delegates to the same internals the LSP handlers use, so results are
-// identical regardless of which front end asked.
+// This file is the exported, name-based surface of the LSP server for callers
+// outside an editor session, such as the MCP tools that the workspace daemon
+// runs. Everything here delegates to the same internals the LSP handlers use,
+// so the results are the same for each frontend.
 
-// Serve runs the Server over the given reader/writer (typically
-// stdin/stdout). It blocks until the connection closes.
-func Serve(server *Server, in io.Reader, out io.Writer) error {
-	logger, _ := zap.NewProduction()
-	stream := jsonrpc2.NewStream(stdinoutCloser{in, out})
-	conn := jsonrpc2.NewConn(stream)
-	server.client = protocol.ClientDispatcher(conn, logger)
-	server.conn = conn
-
-	handler := server.renameHandler(protocol.ServerHandler(server, nil))
-	ctx := context.Background()
-
-	conn.Go(ctx, handler)
-	<-conn.Done()
-	return conn.Err()
+// ReadFileText returns a file's current text, preferring an editor-owned buffer.
+func (s *Server) ReadFileText(filePath string) (text string, open bool, ok bool) {
+	return s.readFileText(filePath)
 }
 
-// Ready is closed after the LSP initialize request has been handled. Attached
-// services must wait for it before accepting requests so client capabilities,
-// stdlib discovery, and the live connection are all available.
-func (s *Server) Ready() <-chan struct{} {
-	return s.ready
-}
-
-// SetStdlibRoot records the Elixir stdlib directory so lookups can classify
-// stdlib symbols. The LSP session sets this during Initialize; headless
-// callers (MCP) set it explicitly after resolving the stdlib themselves.
-func (s *Server) SetStdlibRoot(root string) {
-	s.stdlibRoot = root
-}
-
-// StdlibRoot returns the Elixir stdlib directory, or "" if not detected. In
-// attached MCP mode this is set by Initialize after the Handler is built, so
-// callers must read it per request rather than caching it.
-func (s *Server) StdlibRoot() string {
-	return s.stdlibRoot
-}
-
-// CollectReferences gathers references to module (or module.function) across
-// the workspace, name-based. It mirrors the collection performed by the LSP
-// References handler: direct refs, transitive refs through static __using__
-// import chains, bare intra-module calls in definition files, and refs to
-// defdelegate facades that target the function. Results are deduplicated by
-// file+line, stdlib-filtered, and sorted by file then line.
-func (s *Server) CollectReferences(module, function string) []store.ReferenceResult {
-	refResults, err := s.store.LookupReferences(module, function)
-	if err != nil {
-		return nil
-	}
-
-	// Sites written through an alias that a __using__ block injects. The file
-	// holding them declares no alias of its own, so the index has them under
-	// the bare short name and the direct lookup cannot see them.
-	moduleKindRefs := refResults
-	if function != "" {
-		if refs, err := s.store.LookupReferences(module, ""); err == nil {
-			moduleKindRefs = refs
-		} else {
-			moduleKindRefs = nil
-		}
-	}
-	refResults = append(refResults, s.injectedAliasReferences(module, function, moduleKindRefs)...)
-
-	if function != "" {
-		// Transitive refs via static __using__ import chains. Call sites of
-		// use-injected functions are attributed to the injecting module in the
-		// store, so we look up refs under each injector too.
-		for _, mod := range s.findModulesWhoseUsingImports(module) {
-			if transitive, err := s.store.LookupReferences(mod, function); err == nil {
-				refResults = append(refResults, transitive...)
-			}
-		}
-
-		// Bare intra-module calls in definition files are not indexed.
-		refResults = append(refResults, s.findBareCallRefs(module, function)...)
-
-		// Follow defdelegate in reverse: calls to facades that delegate here.
-		if s.followDelegates {
-			if delegates, err := s.store.LookupDelegatesTo(module, function); err == nil {
-				for _, del := range delegates {
-					if delegateRefs, err := s.store.LookupReferences(del.Module, del.Function); err == nil {
-						refResults = append(refResults, delegateRefs...)
-					}
-					refResults = append(refResults, s.findBareCallRefs(del.Module, del.Function)...)
-				}
-			}
-		}
-	}
-
-	type refKey struct {
-		filePath string
-		line     int
-	}
-	seen := make(map[refKey]struct{}, len(refResults))
-	var out []store.ReferenceResult
-	for _, r := range refResults {
-		if s.stdlibRoot != "" && strings.HasPrefix(r.FilePath, s.stdlibRoot) {
-			continue
-		}
-		k := refKey{r.FilePath, r.Line}
-		if _, ok := seen[k]; ok {
-			continue
-		}
-		seen[k] = struct{}{}
-		out = append(out, r)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].FilePath != out[j].FilePath {
-			return out[i].FilePath < out[j].FilePath
-		}
-		return out[i].Line < out[j].Line
-	})
-	return out
-}
-
-// StopGitHeadWatch ends the WatchGitHead goroutine and waits for it, joining
-// any reindex it is mid-way through, so the store can be closed safely. The
-// MCP server calls it when tearing down a workspace; an LSP session never
-// does, its git-head watch runs for the life of the process.
-func (s *Server) StopGitHeadWatch() {
-	s.gitHeadStopOnce.Do(func() { close(s.gitHeadStop) })
-	s.gitHeadWG.Wait()
-}
-
-// WithReindexLock runs fn while holding the reindex lock, serializing it with
-// ReindexWorkspace and the background reindexes. The MCP file watcher wraps
-// its index writes in it so they cannot interleave with a concurrent
-// workspace reindex's walk-and-prune.
-func (s *Server) WithReindexLock(fn func()) {
-	s.reindexing.Lock()
-	defer s.reindexing.Unlock()
-	s.indexWrites.RLock()
-	defer s.indexWrites.RUnlock()
-	if s.indexUnavailable {
-		return
-	}
-	fn()
+// FileLine returns one 1-based line, preferring an editor-owned buffer.
+func (s *Server) FileLine(filePath string, lineNum int) (string, bool) {
+	return s.getFileLine(filePath, lineNum)
 }
 
 // RenameSummary reports what a rename changed on disk.
 type RenameSummary struct {
 	FilesChanged []string
 	FilesMoved   map[string]string // old path → new path (conventional module renames)
+	// FilesFailed lists the files the rename could not change. They still use
+	// the old name. FailureReason is the first error.
+	FilesFailed   []string
+	FailureReason string
+
+	mu      sync.Mutex
+	indexed []<-chan struct{}
+}
+
+// changed records that the rename changed path. A nil summary ignores it, so
+// the editor rename passes nil.
+func (r *RenameSummary) changed(path string) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.FilesChanged = append(r.FilesChanged, path)
+	r.mu.Unlock()
+}
+
+// failed records that the rename could not change path.
+func (r *RenameSummary) failed(path string, err error) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	if len(r.FilesFailed) == 0 {
+		r.FailureReason = err.Error()
+	}
+	r.FilesFailed = append(r.FilesFailed, path)
+	r.mu.Unlock()
+}
+
+// recordFailures copies the failures of one rename pass into the summary.
+func (r *RenameSummary) recordFailures(f *renameFailures) {
+	if r == nil {
+		return
+	}
+	f.mu.Lock()
+	paths := append([]string(nil), f.paths...)
+	first := f.first
+	f.mu.Unlock()
+	if len(paths) == 0 {
+		return
+	}
+	r.mu.Lock()
+	if len(r.FilesFailed) == 0 {
+		r.FailureReason = first
+	}
+	r.FilesFailed = append(r.FilesFailed, paths...)
+	r.mu.Unlock()
+}
+
+// recordModuleRename records the files and moves of a module rename.
+func (r *RenameSummary) recordModuleRename(sitesByFile map[string][]moduleEditSite, movedFiles, clientRenames map[string]string, failures *renameFailures) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	for path := range sitesByFile {
+		r.FilesChanged = append(r.FilesChanged, path)
+	}
+	if len(movedFiles)+len(clientRenames) > 0 && r.FilesMoved == nil {
+		r.FilesMoved = make(map[string]string, len(movedFiles)+len(clientRenames))
+	}
+	for from, to := range movedFiles {
+		r.FilesMoved[from] = to
+	}
+	for from, to := range clientRenames {
+		r.FilesMoved[from] = to
+	}
+	r.mu.Unlock()
+	r.recordFailures(failures)
+}
+
+// waitFor records an index update that the rename started. finish waits for
+// it, so the caller sees an index that shows the rename.
+func (r *RenameSummary) waitFor(indexed <-chan struct{}) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	r.indexed = append(r.indexed, indexed)
+	r.mu.Unlock()
+}
+
+// finish waits for the index updates, sorts the lists, removes duplicates,
+// and removes the failed files from the changed files.
+func (r *RenameSummary) finish() {
+	r.mu.Lock()
+	indexed := r.indexed
+	r.indexed = nil
+	r.mu.Unlock()
+	for _, ch := range indexed {
+		<-ch
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.FilesFailed = sortedUnique(r.FilesFailed)
+	failed := make(map[string]struct{}, len(r.FilesFailed))
+	for _, path := range r.FilesFailed {
+		failed[path] = struct{}{}
+	}
+	all := sortedUnique(r.FilesChanged)
+	changed := make([]string, 0, len(all))
+	for _, path := range all {
+		if _, ok := failed[path]; !ok {
+			changed = append(changed, path)
+		}
+	}
+	r.FilesChanged = changed
+}
+
+func sortedUnique(paths []string) []string {
+	if len(paths) == 0 {
+		return paths
+	}
+	sort.Strings(paths)
+	out := paths[:1]
+	for _, path := range paths[1:] {
+		if path != out[len(out)-1] {
+			out = append(out, path)
+		}
+	}
+	return out
 }
 
 // RenameFunction renames module.functionName to newName across the workspace
-// with the same validation and on-disk semantics as the LSP rename. It returns
-// once the index reflects the rename. Open-buffer edits are delivered per
-// deliverEdits.
-func (s *Server) RenameFunction(module, functionName, newName string) (RenameSummary, error) {
+// with the same validation and the same machinery as the editor rename. It
+// returns when the index shows the rename.
+//
+// The caller has no editor, so every file that this server does not hold open
+// is written on disk. The workspace daemon calls it on its headless language
+// service, which holds no editor buffers.
+func (s *Server) RenameFunction(module, functionName, newName string) (*RenameSummary, error) {
 	if !isValidFunctionName(newName) {
-		return RenameSummary{}, fmt.Errorf("invalid function name %q: must match [a-z_][a-z0-9_?!]*", newName)
+		return nil, fmt.Errorf("invalid function name %q: must match [a-z_][a-z0-9_?!]*", newName)
 	}
 	defs, err := s.store.LookupFunction(module, functionName)
 	if err != nil {
-		return RenameSummary{}, err
+		return nil, err
 	}
 	if len(defs) == 0 {
-		return RenameSummary{}, fmt.Errorf("function %s.%s not found in the index", module, functionName)
+		return nil, fmt.Errorf("function %s.%s not found in the index", module, functionName)
 	}
 	if existing, err := s.store.LookupFunction(module, newName); err == nil && len(existing) > 0 {
-		return RenameSummary{}, fmt.Errorf("function %s.%s already exists", module, newName)
+		return nil, fmt.Errorf("function %s.%s already exists", module, newName)
 	}
 
-	edit, files, err := s.renameFunctionEdits(module, functionName, newName, true)
+	summary := &RenameSummary{}
+	edit, err := s.renameFunctionEdits(module, functionName, newName, summary)
+	summary.finish()
 	if err != nil {
-		return RenameSummary{}, err
+		return nil, err
 	}
-	if err := s.deliverEdits(edit); err != nil {
-		return RenameSummary{}, err
+	if err := requireNoBufferEdits(edit); err != nil {
+		return summary, err
 	}
-	// The machinery reindexes what it wrote in the background; callers are
-	// promised an up-to-date index.
-	s.backgroundWork.Wait()
-	return RenameSummary{FilesChanged: files}, nil
+	return summary, nil
 }
 
 // RenameModule renames oldModule (and its submodules) to newModule across the
-// workspace, writing changes and conventional file moves to disk.
-func (s *Server) RenameModule(oldModule, newModule string) (RenameSummary, error) {
+// workspace, with the same validation and machinery as the editor rename,
+// including the moves of files that follow the naming convention. It returns
+// when the index shows the rename.
+func (s *Server) RenameModule(oldModule, newModule string) (*RenameSummary, error) {
 	if !isValidModuleName(newModule) {
-		return RenameSummary{}, fmt.Errorf("invalid module name %q: must be CamelCase segments separated by dots", newModule)
+		return nil, fmt.Errorf("invalid module name %q: must be CamelCase segments separated by dots", newModule)
 	}
-	if defs, err := s.store.LookupModule(oldModule); err != nil || len(defs) == 0 {
-		if err != nil {
-			return RenameSummary{}, err
-		}
-		return RenameSummary{}, fmt.Errorf("module %s not found in the index", oldModule)
-	}
-
-	edit, moved, files, err := s.renameModuleEdits(oldModule, newModule, true)
+	defs, err := s.store.LookupModule(oldModule)
 	if err != nil {
-		return RenameSummary{}, err
+		return nil, err
 	}
-	if err := s.deliverEdits(edit); err != nil {
-		return RenameSummary{}, err
+	if len(defs) == 0 {
+		return nil, fmt.Errorf("module %s not found in the index", oldModule)
 	}
-	s.backgroundWork.Wait()
-	return RenameSummary{FilesChanged: files, FilesMoved: moved}, nil
+
+	summary := &RenameSummary{}
+	edit, err := s.renameModuleEdits(oldModule, newModule, summary)
+	summary.finish()
+	if err != nil {
+		return nil, err
+	}
+	if err := requireNoBufferEdits(edit); err != nil {
+		return summary, err
+	}
+	return summary, nil
 }
 
-// deliverEdits carries out a WorkspaceEdit on behalf of a caller that is not
-// an editor. With a live LSP client (attached mode) the whole edit is
-// forwarded as a workspace/applyEdit request: the editor owns the open
-// buffers, and for a file it has open it owns the move too, so it applies
-// everything and syncs back via didChange exactly as an editor-initiated
-// rename would. Without a client there is no editor to ask, so the edit is
-// carried out on disk; headless servers have no open buffers and never move a
-// file through the client, so that path is a defensive no-op in practice.
-func (s *Server) deliverEdits(edit *WorkspaceEdit) error {
-	if edit.empty() {
+// requireNoBufferEdits reports an error when the rename machinery left edits
+// for buffers that the server holds open: a caller without an editor cannot
+// apply them. The headless language service holds no buffers, so this is a
+// guard, not an expected path.
+func requireNoBufferEdits(edit *WorkspaceEdit) error {
+	if edit == nil || (len(edit.Changes) == 0 && len(edit.DocumentChanges) == 0) {
 		return nil
 	}
-	if s.conn != nil {
-		prepared, err := s.prepareDeliveredEdit(edit)
-		if err != nil {
-			return err
-		}
-		applied, err := s.applyEdit(context.Background(), "dexter rename", edit)
-		if err != nil {
-			return err
-		}
-		if !applied {
-			return fmt.Errorf("editor did not apply the rename edits for open files")
-		}
-		s.recordDeliveredEdit(prepared)
-		return nil
-	}
-
-	edits := edit.textEditsByPath()
-	renames := edit.fileRenames()
-	for path, fileEdits := range edits {
-		text, _, ok := s.ReadFileText(path)
-		if !ok {
-			return fmt.Errorf("reading %s to apply rename edits", path)
-		}
-		if err := os.WriteFile(path, []byte(s.applyTextEdits(text, fileEdits)), 0644); err != nil {
-			return err
-		}
-	}
-	// Renames come after the edits, so an edited file is moved with its new
-	// contents — the same order the client applies documentChanges in.
-	for from, to := range renames {
-		if err := os.MkdirAll(filepath.Dir(to), 0755); err != nil {
-			return err
-		}
-		if err := os.Rename(from, to); err != nil {
-			return err
-		}
-		_ = s.store.RemoveFile(from)
-	}
-
-	paths := make([]string, 0, len(edits)+len(renames))
-	for path := range edits {
-		if to, moved := renames[path]; moved {
-			paths = append(paths, to)
-		} else {
-			paths = append(paths, path)
-		}
-	}
-	for from, to := range renames {
-		if _, edited := edits[from]; !edited {
-			paths = append(paths, to)
-		}
-	}
-	if len(paths) > 0 {
-		// Under the reindex lock so a concurrent workspace reindex's
-		// walk-and-prune cannot drop rows written after its walk passed.
-		s.WithReindexLock(func() { s.reindexPaths(paths) })
-	}
-	return nil
-}
-
-type deliveredFile struct {
-	oldPath string
-	newPath string
-	text    string
-	open    bool
-}
-
-// prepareDeliveredEdit snapshots the source text without mutating disk or the
-// document store. That keeps an editor-rejected workspace edit fully atomic.
-func (s *Server) prepareDeliveredEdit(edit *WorkspaceEdit) ([]deliveredFile, error) {
-	edits := edit.textEditsByPath()
-	renames := edit.fileRenames()
-	paths := make(map[string]struct{}, len(edits)+len(renames))
-	for path := range edits {
-		paths[path] = struct{}{}
-	}
-	for path := range renames {
-		paths[path] = struct{}{}
-	}
-
-	prepared := make([]deliveredFile, 0, len(paths))
-	for path := range paths {
-		text, open, ok := s.ReadFileText(path)
-		if !ok {
-			return nil, fmt.Errorf("reading %s to prepare rename edits", path)
-		}
-		if fileEdits := edits[path]; len(fileEdits) > 0 {
-			text = s.applyTextEdits(text, fileEdits)
-		}
-		newPath := path
-		if renamed, ok := renames[path]; ok {
-			newPath = renamed
-		}
-		prepared = append(prepared, deliveredFile{oldPath: path, newPath: newPath, text: text, open: open})
-	}
-	return prepared, nil
-}
-
-// recordDeliveredEdit makes MCP reads and index queries reflect an accepted
-// editor edit immediately, without waiting for subsequent didChange events.
-// WithReindexLock supplies both locks the writes need: the reindex lock so a
-// concurrent workspace reindex's walk-and-prune cannot drop rows written
-// after its walk passed, and the indexWrites read lock (not retaken here,
-// RWMutex is not reentrant).
-func (s *Server) recordDeliveredEdit(files []deliveredFile) {
-	s.WithReindexLock(func() {
-		for _, file := range files {
-			if file.oldPath != file.newPath {
-				_ = s.store.RemoveFile(file.oldPath)
-			}
-			defs, refs, err := parser.ParseText(file.newPath, file.text)
-			if err == nil {
-				_ = s.store.IndexFileWithRefs(file.newPath, defs, refs)
-			}
-			if file.open {
-				if file.oldPath != file.newPath {
-					s.docs.Close(string(uri.File(file.oldPath)))
-				}
-				s.docs.Set(string(uri.File(file.newPath)), file.text)
-			}
-		}
-	})
-}
-
-// applyTextEdits applies non-overlapping TextEdits to text. The rename
-// machinery emits Position.Character in the client's encoding (outPos), so
-// columns are converted back to byte offsets before slicing.
-func (s *Server) applyTextEdits(text string, edits []protocol.TextEdit) string {
-	sorted := make([]protocol.TextEdit, len(edits))
-	copy(sorted, edits)
-	sort.Slice(sorted, func(i, j int) bool {
-		a, b := sorted[i].Range.Start, sorted[j].Range.Start
-		if a.Line != b.Line {
-			return a.Line > b.Line
-		}
-		return a.Character > b.Character
-	})
-
-	lines := strings.Split(text, "\n")
-	for _, e := range sorted {
-		start, end := e.Range.Start, e.Range.End
-		if int(start.Line) >= len(lines) || int(end.Line) >= len(lines) {
-			continue
-		}
-		startCol := s.inCol(lines, int(start.Line), start.Character)
-		endCol := s.inCol(lines, int(end.Line), end.Character)
-		if startCol > len(lines[start.Line]) || endCol > len(lines[end.Line]) {
-			continue
-		}
-		prefix := lines[start.Line][:startCol]
-		suffix := lines[end.Line][endCol:]
-		replacement := strings.Split(prefix+e.NewText+suffix, "\n")
-		lines = append(lines[:start.Line], append(replacement, lines[end.Line+1:]...)...)
-	}
-	return strings.Join(lines, "\n")
-}
-
-// reindexPaths must run inside WithReindexLock, which already holds the
-// indexWrites read lock indexOneFile would retake (RWMutex is not reentrant).
-func (s *Server) reindexPaths(paths []string) {
-	for _, path := range paths {
-		s.indexOneFileLocked(path)
-	}
+	return fmt.Errorf("the rename has edits for files that are open in this language service; only an editor can apply them")
 }

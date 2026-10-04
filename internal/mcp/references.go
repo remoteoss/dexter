@@ -3,9 +3,10 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
-	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/remoteoss/dexter/internal/lsp"
 )
 
 type ReferencesParams struct {
@@ -15,32 +16,42 @@ type ReferencesParams struct {
 
 const maxReferenceLines = 100
 
-func (h *Handler) referencesHandler(ctx context.Context, req *mcp.CallToolRequest, args ReferencesParams) (*mcp.CallToolResult, any, error) {
+func (h *Handler) references(ctx context.Context, args ReferencesParams) (string, error) {
 	module := strings.TrimSpace(args.Module)
 	if module == "" {
-		return nil, nil, fmt.Errorf("module must not be empty")
+		return "", fmt.Errorf("module must not be empty")
 	}
 	function := strings.TrimSpace(args.Function)
 
-	refs := h.lsp.CollectReferences(module, function)
-	if len(refs) == 0 {
-		target := module
-		if function != "" {
-			target = module + "." + function
-		}
-		return textResult(fmt.Sprintf("No references to %s found in the index. If files changed recently, call dexter_reindex first.", target)), nil, nil
+	// The same reference search as find-references and `dexter references`:
+	// use chains, aliases injected by __using__, bare calls in the defining
+	// module, and calls through defdelegate facades.
+	refs, err := h.lsp.ReferenceNames(module, function, lsp.NameReferenceOptions{
+		FollowDelegates: true,
+		ExcludeStdlib:   true,
+	})
+	if err != nil {
+		return "", fmt.Errorf("finding references: %w", err)
 	}
 
 	target := module
 	if function != "" {
 		target = module + "." + function
 	}
+	if len(refs) == 0 {
+		return fmt.Sprintf("No references to %s found in the index. If files changed recently, call dexter_reindex first.", target), nil
+	}
+	sort.Slice(refs, func(i, j int) bool {
+		if refs[i].FilePath != refs[j].FilePath {
+			return refs[i].FilePath < refs[j].FilePath
+		}
+		return refs[i].Line < refs[j].Line
+	})
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "%d reference(s) to %s:\n", len(refs), target)
 
 	written := 0
-	files := 0
 	var lastFile string
 	truncated := 0
 	for _, r := range refs {
@@ -51,7 +62,6 @@ func (h *Handler) referencesHandler(ctx context.Context, req *mcp.CallToolReques
 		if r.FilePath != lastFile {
 			fmt.Fprintf(&b, "\n%s\n", h.relPath(r.FilePath))
 			lastFile = r.FilePath
-			files++
 		}
 		srcLine := ""
 		if line, ok := h.lsp.FileLine(r.FilePath, r.Line); ok {
@@ -63,5 +73,5 @@ func (h *Handler) referencesHandler(ctx context.Context, req *mcp.CallToolReques
 	if truncated > 0 {
 		fmt.Fprintf(&b, "\n... and %d more reference(s) not shown. Narrow the search (e.g. pass a function name) to see the rest.\n", truncated)
 	}
-	return textResult(b.String()), nil, nil
+	return b.String(), nil
 }

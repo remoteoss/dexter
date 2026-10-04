@@ -9,12 +9,12 @@ import (
 
 // RunStdio serves MCP over stdin/stdout until ctx is canceled or the client
 // disconnects.
-func RunStdio(ctx context.Context, h *Handler) error {
-	return NewServer(h).Run(ctx, &mcp.StdioTransport{})
+func RunStdio(ctx context.Context, f *Frontend) error {
+	return NewServer(f).Run(ctx, &mcp.StdioTransport{})
 }
 
 // HTTPHandler returns a streamable-HTTP handler serving MCP. Each session
-// gets its own protocol server; they all share the Handler.
-func HTTPHandler(h *Handler) http.Handler {
-	return mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return NewServer(h) }, nil)
+// gets its own protocol server; they all share the Frontend.
+func HTTPHandler(f *Frontend) http.Handler {
+	return mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return NewServer(f) }, nil)
 }

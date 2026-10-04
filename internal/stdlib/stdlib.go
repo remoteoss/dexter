@@ -77,6 +77,59 @@ func DetectElixirLibRoot(projectRoot string) (string, bool) {
 	return "", false
 }
 
+// FindExecutable locates a tool the way a shell would, then the way a GUI
+// editor's stripped PATH needs: PATH first, then the standard mise, asdf, and
+// Homebrew locations. An editor-launched daemon often inherits a PATH that never
+// ran the version manager's shell hook, and one failed detection would disable
+// stdlib indexing (and formatting) for every frontend sharing that daemon.
+func FindExecutable(name string) (string, bool) {
+	if path, err := exec.LookPath(name); err == nil {
+		return path, true
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", false
+	}
+	for _, candidate := range []string{
+		filepath.Join(home, ".local", "bin", name),
+		filepath.Join(home, ".local", "share", "mise", "bin", name),
+		filepath.Join(home, ".local", "share", "mise", "shims", name),
+		filepath.Join(home, ".asdf", "bin", name),
+		filepath.Join(home, ".asdf", "shims", name),
+		filepath.Join("/opt/homebrew", "bin", name),
+		filepath.Join("/usr/local", "bin", name),
+	} {
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate, true
+		}
+	}
+	return "", false
+}
+
+// FindViaLoginShell asks the user's login shell where a tool is. It is the last
+// resort for an editor-launched process whose PATH never ran the mise or asdf
+// hook; a login shell does.
+func FindViaLoginShell(name string) (string, bool) {
+	shell := os.Getenv("SHELL")
+	if shell == "" || !filepath.IsAbs(shell) {
+		shell = "/bin/sh"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), detectionTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, shell, "-l", "-c", "command -v "+name).Output()
+	if err != nil {
+		return "", false
+	}
+	path := strings.TrimSpace(string(out))
+	if path == "" {
+		return "", false
+	}
+	if info, err := os.Stat(path); err != nil || info.IsDir() {
+		return "", false
+	}
+	return path, true
+}
+
 // deriveFromVersionManager tries mise then asdf. Used by Resolve to validate
 // the cache before falling back to the full detection chain.
 func deriveFromVersionManager(projectRoot string) (string, bool) {
@@ -88,7 +141,8 @@ func deriveFromVersionManager(projectRoot string) (string, bool) {
 
 // deriveFromMise asks mise for the active Elixir install path for the project.
 func deriveFromMise(projectRoot string) (string, bool) {
-	if _, err := exec.LookPath("mise"); err != nil {
+	mise, ok := FindExecutable("mise")
+	if !ok {
 		return "", false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), detectionTimeout)
@@ -97,7 +151,7 @@ func deriveFromMise(projectRoot string) (string, bool) {
 	if projectRoot != "" {
 		args = append(args, "-C", projectRoot)
 	}
-	out, err := exec.CommandContext(ctx, "mise", args...).Output()
+	out, err := exec.CommandContext(ctx, mise, args...).Output()
 	if err != nil {
 		return "", false
 	}
@@ -114,12 +168,13 @@ func deriveFromMise(projectRoot string) (string, bool) {
 
 // deriveFromAsdf asks asdf for the active Elixir install path for the project.
 func deriveFromAsdf(projectRoot string) (string, bool) {
-	if _, err := exec.LookPath("asdf"); err != nil {
+	asdf, ok := FindExecutable("asdf")
+	if !ok {
 		return "", false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), detectionTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "asdf", "where", "elixir")
+	cmd := exec.CommandContext(ctx, asdf, "where", "elixir")
 	if projectRoot != "" {
 		cmd.Dir = projectRoot
 	}
@@ -142,8 +197,8 @@ func deriveFromAsdf(projectRoot string) (string, bool) {
 // the lib root from the install prefix. Works for Homebrew and direct installs
 // where the executable is a real symlink to the versioned binary.
 func deriveFromElixirExecutable() (string, bool) {
-	exe, err := exec.LookPath("elixir")
-	if err != nil || exe == "" {
+	exe, ok := FindExecutable("elixir")
+	if !ok {
 		return "", false
 	}
 	if resolved, err := filepath.EvalSymlinks(exe); err == nil && resolved != "" {
@@ -161,9 +216,13 @@ func deriveFromElixirExecutable() (string, bool) {
 // detectViaRuntime asks the Elixir runtime directly. This starts a VM, so it
 // is slower than the filesystem-based approaches above.
 func detectViaRuntime() (string, bool) {
+	elixir, ok := FindExecutable("elixir")
+	if !ok {
+		return "", false
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), detectionTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "elixir", "-e", "IO.puts(:code.lib_dir(:elixir))").Output()
+	out, err := exec.CommandContext(ctx, elixir, "-e", "IO.puts(:code.lib_dir(:elixir))").Output()
 	if err != nil {
 		return "", false
 	}

@@ -11,6 +11,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,14 +22,17 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"go.lsp.dev/jsonrpc2"
 	"go.lsp.dev/protocol"
 	"go.lsp.dev/uri"
+	"go.uber.org/zap"
 
 	"github.com/remoteoss/dexter/internal/beam"
 	"github.com/remoteoss/dexter/internal/indexer"
+	"github.com/remoteoss/dexter/internal/notify"
 	"github.com/remoteoss/dexter/internal/parser"
 	"github.com/remoteoss/dexter/internal/stdlib"
 	"github.com/remoteoss/dexter/internal/store"
@@ -74,20 +78,106 @@ type erlangRuntimeCache struct {
 	readyCh     chan struct{}
 }
 
+// WorkspaceEvents receives disk-backed workspace changes from an LSP session.
+// A daemon-backed session uses this to feed the workspace's single mutation
+// coordinator instead of writing the index independently; an embedded Server
+// that owns its store leaves it nil and writes directly.
+type WorkspaceEvents interface {
+	ReconcileFile(path string)
+	RemoveFile(path string)
+	SetStdlibRoot(ctx context.Context, path string) error
+}
+
+// IndexCoordinator contains the write-side state that must be shared by every
+// language-service session attached to one store. Session-local state (open
+// documents, client capabilities, and connections) deliberately remains on
+// Server.
+type IndexCoordinator struct {
+	reindexing sync.Mutex
+	stdlibMu   sync.RWMutex
+	stdlibRoot string
+
+	// writes is held for writing by a cold full build and for reading by every
+	// single-file write. The bulk path is insert-only and cannot overlap any
+	// incremental mutation.
+	writes      sync.RWMutex
+	unavailable bool // guarded by writes
+
+	backgroundWork sync.WaitGroup
+
+	// reporter tells every attached editor about failures, degraded states,
+	// and long work. It is shared like the store: one workspace, one set of
+	// conditions.
+	reporter *notify.Reporter
+	failures fileFailures
+	// firstBuildReported makes the first-build report once per workspace.
+	firstBuildReported atomic.Bool
+	otp                otpOutcomes // see reportBeamOTP
+
+	// work is canceled by CancelWork when the workspace shuts down. A
+	// reconciliation pass, a prune, and a cold build check it and stop.
+	work       context.Context
+	cancelWork context.CancelFunc
+}
+
+// CancelWork stops the reconciliation in flight and makes every later one
+// return at once. The workspace calls it first when it shuts down, so a pass
+// over a large change set cannot keep the process (and its workspace lock)
+// alive for minutes. A stopped pass leaves no file half written: each write
+// transaction holds whole files, and a canceled one rolls back. The files it
+// did not reach keep their old mtime, so the next start picks them up.
+func (c *IndexCoordinator) CancelWork() { c.cancelWork() }
+
+func (c *IndexCoordinator) setStdlibRoot(root string) (string, bool) {
+	c.stdlibMu.Lock()
+	defer c.stdlibMu.Unlock()
+	if c.stdlibRoot == root {
+		return c.stdlibRoot, false
+	}
+	old := c.stdlibRoot
+	c.stdlibRoot = root
+	return old, true
+}
+
+func (c *IndexCoordinator) getStdlibRoot() string {
+	c.stdlibMu.RLock()
+	defer c.stdlibMu.RUnlock()
+	return c.stdlibRoot
+}
+
+// NewIndexCoordinator returns write coordination for one workspace store.
+func NewIndexCoordinator() *IndexCoordinator {
+	work, cancel := context.WithCancel(context.Background())
+	return &IndexCoordinator{reporter: notify.New(), work: work, cancelWork: cancel}
+}
+
+// ServerOptions configures a Server attached to a daemon-owned workspace.
+// Embedded callers that own their store and workspace lifecycle — the
+// package's tests, for example — use NewServer instead.
+type ServerOptions struct {
+	Index             *IndexCoordinator
+	Events            WorkspaceEvents
+	ManageWorkspace   bool
+	InitialStdlibRoot string
+}
+
 type Server struct {
 	store           *store.Store
 	docs            *DocumentStore
 	projectRoot     string
 	explicitRoot    bool // true when projectRoot was provided via CLI, not inferred from Initialize
-	stdlibRoot      string
 	initialized     bool
 	client          protocol.Client
+	clientLog       *clientLog // forwards this session's log lines to its editor
 	followDelegates bool
 	debug           bool
 	mixBin          string // resolved path to the mix binary
 
 	beams  map[string]*beamProcess // build root → persistent BEAM process
 	beamMu sync.Mutex
+	// otpMismatches are the build roots whose BEAM failed with an OTP
+	// mismatch, guarded by beamMu. See otpMismatchHolds.
+	otpMismatches map[string]otpMismatch
 
 	erlangBuildRoots   map[string]*erlangBuildRootState // build root → runtime resolution state
 	erlangRuntimeCache map[string]*erlangRuntimeCache   // runtime key → cached OTP modules/exports
@@ -97,6 +187,8 @@ type Server struct {
 	usingCacheMu   sync.RWMutex
 	generatedCache *generatedFunctionCache
 	beamLibs       *beamLibIndexCache // build root → compiled application directories
+	buildRoots     *buildRootCache    // compiled Mix projects in the workspace
+	mixApps        *mixAppCache       // mix.exs → application name
 	ebinIndexes    *ebinIndexCache    // ebin dir → modules compiled into it
 
 	depsCache   map[string]bool // dir → whether files in that dir are deps
@@ -113,29 +205,21 @@ type Server struct {
 	// negotiation can set it without touching every call site.
 	positionEncoding PositionEncoding
 
-	reindexing sync.Mutex // serializes concurrent backgroundReindex calls
+	index           *IndexCoordinator
+	workspaceEvents WorkspaceEvents
+	manageWorkspace bool
+	closeOnce       sync.Once
 
-	// indexWrites is held for writing by a cold full build and for reading by
-	// every single-file write. The bulk path a full build uses is insert-only:
-	// it skips the DELETE the incremental path does, and allocates file ids
-	// from a counter seeded when the batch opens. A save landing in the middle
-	// of one would duplicate rows or collide on a primary key.
-	indexWrites         sync.RWMutex
-	indexUnavailable    bool      // guarded by indexWrites; set only after index recreation exhausts its retries
-	notifiedOTPMismatch sync.Once // prevents repeated OTP mismatch warnings
-
-	backgroundWork sync.WaitGroup // tracks background reindex goroutines so the store isn't closed while they're running
-	ready          chan struct{}  // closed once the LSP initialize request has completed
-	readyOnce      sync.Once
-
-	gitHeadStop     chan struct{} // closed by StopGitHeadWatch to end the WatchGitHead goroutine
-	gitHeadStopOnce sync.Once
-	gitHeadWG       sync.WaitGroup
+	workDoneProgress bool         // client supports window/workDoneProgress/create
+	mixMissing       bool         // Initialize found no mix binary for this session
+	detachReporter   atomic.Value // func(); set when the client sent initialized
 }
 
 func (s *Server) debugf(format string, args ...interface{}) {
 	if s.debug {
-		log.Printf("[debug] "+format, args...)
+		line := "[debug] " + fmt.Sprintf(format, args...)
+		log.Print(line)
+		s.clientLog.send(line)
 	}
 }
 
@@ -147,33 +231,115 @@ func (s *Server) debugNow() time.Time {
 }
 
 func NewServer(s *store.Store, projectRoot string) *Server {
+	return NewServerWithOptions(s, projectRoot, ServerOptions{ManageWorkspace: true})
+}
+
+// NewServerWithOptions constructs an LSP session over shared workspace state.
+// Daemon sessions pass one IndexCoordinator and set ManageWorkspace false so
+// only the daemon performs startup reconciliation and owns watchers.
+func NewServerWithOptions(s *store.Store, projectRoot string, opts ServerOptions) *Server {
+	index := opts.Index
+	if index == nil {
+		index = NewIndexCoordinator()
+	}
+	if opts.InitialStdlibRoot != "" {
+		_, _ = index.setStdlibRoot(opts.InitialStdlibRoot)
+	}
 	return &Server{
-		store:              s,
-		docs:               NewDocumentStore(),
-		projectRoot:        projectRoot,
-		explicitRoot:       projectRoot != "",
-		followDelegates:    true,
+		store:           s,
+		docs:            NewDocumentStore(),
+		projectRoot:     projectRoot,
+		explicitRoot:    projectRoot != "",
+		followDelegates: true,
+		// Read here as well as in Initialize: the daemon's headless service
+		// answers CLI and MCP calls and never receives an initialize request.
+		debug:              os.Getenv("DEXTER_DEBUG") == "true",
 		erlangBuildRoots:   make(map[string]*erlangBuildRootState),
 		erlangRuntimeCache: make(map[string]*erlangRuntimeCache),
 		usingCache:         make(map[string]*usingCacheEntry),
 		generatedCache:     newGeneratedFunctionCache(),
 		beamLibs:           newBeamLibIndexCache(),
+		buildRoots:         &buildRootCache{},
+		mixApps:            &mixAppCache{apps: make(map[string]mixAppEntry)},
 		ebinIndexes:        newEbinIndexCache(),
 		depsCache:          make(map[string]bool),
-		ready:              make(chan struct{}),
-		gitHeadStop:        make(chan struct{}),
+		index:              index,
+		workspaceEvents:    opts.Events,
+		manageWorkspace:    opts.ManageWorkspace,
 		// What every client sends when the server declares no encoding, which
 		// Dexter does not.
 		positionEncoding: EncodingUTF16,
 	}
 }
 
-type stdinoutCloser struct {
-	io.Reader
-	io.Writer
+// StdlibRoot returns the workspace-wide stdlib root shared by all sessions.
+func (s *Server) StdlibRoot() string { return s.index.getStdlibRoot() }
+
+// SetStdlibRoot changes the workspace-wide stdlib root and returns its previous
+// value. Workspace runtimes use both values to reconcile the shared index.
+func (s *Server) SetStdlibRoot(root string) (string, bool) { return s.index.setStdlibRoot(root) }
+
+func (s *Server) isStdlibPath(path string) bool {
+	root := s.StdlibRoot()
+	if root == "" {
+		return false
+	}
+	rel, err := filepath.Rel(root, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
 }
 
-func (s stdinoutCloser) Close() error { return nil }
+// ServeStream runs one preconstructed LSP session over a stream the session is
+// allowed to close. Workspace daemons use this so an editor's `exit`
+// notification ends that session — releasing its registration and its lease on
+// the daemon — instead of waiting for the peer to hang up. Sessions share index
+// coordination while keeping independent document overlays and client
+// capabilities.
+//
+// A closed stream is what a normal shutdown looks like, so it is reported as nil.
+func ServeStream(server *Server, rwc io.ReadWriteCloser) error {
+	logger, _ := zap.NewProduction()
+	stream := jsonrpc2.NewStream(rwc)
+	conn := jsonrpc2.NewConn(stream)
+	server.client = protocol.ClientDispatcher(conn, logger)
+	server.conn = conn
+	server.clientLog = startClientLog(server.client, conn.Done())
+
+	handler := server.renameHandler(protocol.ServerHandler(server, nil))
+	ctx := context.Background()
+
+	conn.Go(ctx, handler)
+	<-conn.Done()
+	server.detachFromReporter()
+	if err := conn.Err(); err != nil && !isStreamClosed(err) {
+		return err
+	}
+	return nil
+}
+
+// isStreamClosed reports whether an error is just the stream ending: the expected
+// result of an `exit` notification or a disconnecting client, not a failure worth
+// surfacing to an editor's log.
+func isStreamClosed(err error) bool {
+	return errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, os.ErrClosed) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, syscall.EPIPE)
+}
+
+// WaitForIndexWork waits for background index writes already accepted by this
+// workspace. Callers must prevent new sessions from adding work first.
+func (s *Server) WaitForIndexWork() {
+	s.index.backgroundWork.Wait()
+}
+
+// OpenDocuments reports how many buffers this session holds. Daemon status
+// uses it to describe attached editor sessions; it is diagnostic only.
+func (s *Server) OpenDocuments() int { return s.docs.Count() }
+
+// ProjectRoot returns the workspace root this session answers for.
+func (s *Server) ProjectRoot() string { return s.projectRoot }
 
 // warmUsingCache parses every module's defmacro __using__ body ahead of the
 // first request that needs one.
@@ -227,7 +393,8 @@ func (s *Server) warmUsingCache() {
 	s.debugf("warmUsingCache: %d __using__ modules in %s", len(usingModules), time.Since(start).Round(time.Millisecond))
 }
 
-// pruneMissingFiles removes stored files that the sweep did not see on disk.
+// pruneMissingFiles removes stored files that the sweep did not see on disk, and
+// stored files inside a nested worktree, which the sweep skips.
 //
 // It holds indexWrites for writing, so no single-file write can land between
 // the decision and the delete, and it re-checks each candidate against the
@@ -242,9 +409,13 @@ func (s *Server) warmUsingCache() {
 // removed is still pruned, which is why the check is per candidate rather than
 // a test on seen being empty.
 func (s *Server) pruneMissingFiles(seen map[string]struct{}) {
-	s.indexWrites.Lock()
-	defer s.indexWrites.Unlock()
-	if s.indexUnavailable {
+	ctx := s.index.work
+	if ctx.Err() != nil {
+		return
+	}
+	s.index.writes.Lock()
+	defer s.index.writes.Unlock()
+	if s.index.unavailable {
 		return
 	}
 
@@ -254,31 +425,81 @@ func (s *Server) pruneMissingFiles(seen map[string]struct{}) {
 	}
 
 	var toRemove []string
-	for _, storedPath := range storedPaths {
+	// Files in a nested worktree exist, but no walk yields them, and indexes
+	// built before worktrees were skipped still hold them. The answer is the
+	// same for every file in a directory, so it is looked up once per directory,
+	// and only for the few paths the sweep did not see. The walk also skips
+	// worktrees that git records after their .git file is gone.
+	inWorktree := make(map[string]bool)
+	var recorded map[string]struct{}
+	recordedRead := false
+	for i, storedPath := range storedPaths {
 		if _, ok := seen[storedPath]; ok {
 			continue
 		}
-		if _, err := os.Lstat(storedPath); err == nil || !errors.Is(err, fs.ErrNotExist) {
+		if i&1023 == 0 && ctx.Err() != nil {
+			return
+		}
+		_, err := os.Lstat(storedPath)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			continue
+		}
+		if err == nil {
+			dir := filepath.Dir(storedPath)
+			in, ok := inWorktree[dir]
+			if !ok {
+				if !recordedRead {
+					recorded, recordedRead = parser.NestedWorktreeSet(s.projectRoot), true
+				}
+				in = underTop(s.projectRoot, dir, recorded) || parser.InLinkedWorktree(s.projectRoot, storedPath)
+				inWorktree[dir] = in
+			}
+			if !in {
+				continue
+			}
 		}
 		toRemove = append(toRemove, storedPath)
 	}
 	if len(toRemove) > 0 {
-		_ = s.store.RemoveFiles(toRemove)
+		start := time.Now()
+		if err := s.store.RemoveFilesContext(ctx, toRemove); err != nil {
+			if ctx.Err() == nil {
+				log.Printf("Warning: removing %d files from the index: %v", len(toRemove), err)
+			}
+			return
+		}
+		log.Printf("Removed %d files from the index (%s)", len(toRemove), time.Since(start).Round(time.Millisecond))
 	}
 }
 
-// showError reports a problem the user has to act on. The caller logs as well,
-// so a client without window/showMessage support still leaves a trace.
-func (s *Server) showError(message string) {
-	if s.client == nil {
-		return
+// underTop reports whether dir is one of tops or lies below one, not counting
+// root itself.
+func underTop(root, dir string, tops map[string]struct{}) bool {
+	if len(tops) == 0 {
+		return false
 	}
-	if err := s.client.ShowMessage(context.Background(), &protocol.ShowMessageParams{
-		Type:    protocol.MessageTypeError,
-		Message: message,
-	}); err != nil {
-		log.Printf("ShowMessage: %v", err)
+	for ; len(dir) > len(root); dir = filepath.Dir(dir) {
+		if _, ok := tops[dir]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// notifySession logs a report about this editor's own request and shows it
+// to this editor only. Workspace states go through the shared reporter.
+func (s *Server) notifySession(sev notify.Severity, message string) {
+	prefix := map[notify.Severity]string{notify.Error: "Error: ", notify.Warning: "Warning: "}[sev]
+	log.Printf("%s%s", prefix, strings.TrimPrefix(message, "Dexter: "))
+	if s.client != nil {
+		notify.Show(context.Background(), s.client, sev, message)
+	}
+}
+
+// detachFromReporter stops sending workspace reports to this editor.
+func (s *Server) detachFromReporter() {
+	if detach, ok := s.detachReporter.Load().(func()); ok {
+		detach()
 	}
 }
 
@@ -304,215 +525,263 @@ func (s *Server) showError(message string) {
 // reliably or undone on a live pool — leaving WAL needs exclusive access, and
 // the per-connection ones land on whichever pooled connection happens to serve
 // them. They were also the smallest part of the win.
+// testHookFullBuild, when set by a test, makes the fast full build fail with
+// its error, so that the incremental fallback runs.
+var testHookFullBuild func() error
+
 func (s *Server) fullBuild() (stats indexer.Stats, ran bool, err error) {
-	s.indexWrites.Lock()
-	defer s.indexWrites.Unlock()
+	s.index.writes.Lock()
+	defer s.index.writes.Unlock()
 	if !s.store.IsEmpty() {
 		return indexer.Stats{}, false, nil
 	}
+	if testHookFullBuild != nil {
+		if err := testHookFullBuild(); err != nil {
+			return indexer.Stats{}, true, err
+		}
+	}
 
+	var failed buildFailures
 	stats, err = indexer.FullBuild(s.store, s.projectRoot, indexer.Options{
-		StdlibRoot: s.stdlibRoot,
+		StdlibRoot: s.StdlibRoot(),
 		InProcess:  true,
+		Context:    s.index.work,
 		Warn: func(format string, args ...interface{}) {
 			log.Printf("Warning: "+format, args...)
 		},
+		FileError: failed.add,
 	})
 	if errors.Is(err, indexer.ErrUnindexed) {
-		s.indexUnavailable = true
+		s.index.unavailable = true
+	}
+	if err == nil {
+		// The build saw every file, so its failures are the whole set.
+		s.index.failures.replace(failed.paths)
 	}
 	return stats, true, err
 }
 
 // indexOneFile parses and indexes a single file, the incremental path.
 func (s *Server) indexOneFile(path string) {
-	s.indexWrites.RLock()
-	defer s.indexWrites.RUnlock()
-	if s.indexUnavailable {
+	s.index.writes.RLock()
+	defer s.index.writes.RUnlock()
+	if s.index.unavailable {
 		return
 	}
 	s.indexOneFileLocked(path)
+	s.index.reportFileFailures()
 }
 
 // indexOneFileLocked is indexOneFile for callers already holding indexWrites.
 // Go's RWMutex is not reentrant, so the two must stay separate.
 func (s *Server) indexOneFileLocked(path string) {
+	// Watchers and editors report changes in nested worktrees too; the full
+	// walk skips them, so a single-file update must as well.
+	if parser.InLinkedWorktree(s.projectRoot, path) {
+		return
+	}
 	defs, refs, err := parser.ParseFile(path)
 	if err != nil {
 		log.Printf("Error parsing %s: %v", path, err)
+		s.index.failures.fail(path, err)
 		return
 	}
 	if err := s.store.IndexFileWithRefs(path, defs, refs); err != nil {
 		log.Printf("Error indexing %s: %v", path, err)
+		s.index.failures.fail(path, err)
+		return
 	}
+	s.index.failures.ok(path)
 }
 
 // backgroundReindex runs in the background. If the index is empty it does a
 // full build, otherwise it does an incremental mtime-based update.
 func (s *Server) backgroundReindex() {
-	s.backgroundWork.Add(1)
+	s.startBackgroundReindex()
+}
+
+func (s *Server) startBackgroundReindex() <-chan struct{} {
+	done := make(chan struct{})
+	s.index.backgroundWork.Add(1)
 	go func() {
-		defer s.backgroundWork.Done()
-		if !s.reindexing.TryLock() {
+		defer close(done)
+		defer s.index.backgroundWork.Done()
+		s.index.reindexing.Lock()
+		defer s.index.reindexing.Unlock()
+		if s.index.work.Err() != nil {
+			return // the workspace is shutting down
+		}
+
+		start := time.Now()
+		reindexed := 0
+		coldStart := s.store.IsEmpty()
+		fullBuilt := false
+		var buildTask *notify.Task
+		progress := reconcileProgress{reporter: s.index.reporter}
+
+		if coldStart {
+			buildTask = s.beginIndexBuild()
+
+			stats, ran, err := s.fullBuild()
+			switch {
+			case errors.Is(err, indexer.ErrUnindexed):
+				// The SQL indexes did not come back after the bulk load committed
+				// or rolled back, so every query is a full table scan. Falling back
+				// to the incremental walk would be far worse than doing nothing:
+				// each per-file write issues a DELETE by file_id against definitions
+				// and refs tables, once per file on disk. FullBuild leaves the
+				// index version unset, so the next editor start rebuilds from
+				// scratch through cmdInit — in a process with no live readers,
+				// where deleting the database is safe.
+				s.indexBuildFailedUnindexed(buildTask, err)
+				// Collapse any committed data in the WAL rather than leaving it at
+				// its high-water mark for the rest of the process.
+				if err := s.store.Checkpoint(); err != nil {
+					log.Printf("Warning: WAL checkpoint: %v", err)
+				}
+				return
+			case s.index.work.Err() != nil:
+				log.Printf("Index build canceled")
+				return
+			case err != nil:
+				// The incremental walk below needs nothing to be true of the
+				// database, so it is the safe thing to fall back to. It is
+				// slower, not wrong.
+				s.indexBuildFellBack(err)
+			case !ran:
+				// Something wrote to the index between the check above and the
+				// build's lock. Nothing was built, and the incremental path
+				// below covers whatever is there.
+				log.Printf("Index was no longer empty at build time, using incremental reindex")
+			default:
+				fullBuilt = true
+				reindexed = stats.Files
+			}
+		}
+
+		// A full build already indexed every file on disk from the traversal
+		// this walk would repeat, so skipping it saves a second traversal. The
+		// prune lives in the same branch and so cannot run without the walk
+		// that fills `seen`.
+		if !fullBuilt {
+			// A cold build that fell back to this pass already shows its
+			// own progress; the pass counts its files only when it is warm.
+			var passProgress *reconcileProgress
+			if !coldStart {
+				passProgress = &progress
+			}
+			seen, n, ok := s.reconcileChangedFiles(passProgress)
+			reindexed += n
+			if ok {
+				s.pruneMissingFiles(seen)
+				// Failures of files that the walk no longer finds are gone.
+				s.index.failures.retain(seen)
+			}
+			if s.index.work.Err() != nil {
+				log.Printf("Background reindex canceled after %d files (%s)", reindexed, time.Since(start).Round(time.Millisecond))
+				buildTask.End("")
+				return
+			}
+			if !ok {
+				buildTask.End("")
+				return
+			}
+		}
+
+		// Collapse the WAL back to disk now that the (potentially large) reindex
+		// is complete, so the -wal file does not stay parked at its high-water
+		// mark for the lifetime of the LSP process.
+		if err := s.store.Checkpoint(); err != nil {
+			log.Printf("Warning: WAL checkpoint after reindex: %v", err)
+		}
+
+		// The index is in place now, so fill the __using__ cache before a user
+		// asks for it. See warmUsingCache.
+		s.warmUsingCache()
+
+		elapsed := time.Since(start).Round(time.Millisecond)
+		log.Printf("Background reindex: %d files updated (%s)", reindexed, elapsed)
+		progress.end(elapsed)
+		s.finishReindex(buildTask, reindexed, elapsed)
+	}()
+	return done
+}
+
+// ReindexWorkspace schedules the standard full-or-incremental reconciliation
+// and waits for all accepted index work. Daemon mutation coordinators call it
+// serially, so a concurrent pass can safely satisfy the request.
+func (s *Server) ReindexWorkspace() {
+	<-s.startBackgroundReindex()
+}
+
+// ReconcileFile applies one disk-backed file change under the workspace-wide
+// mutation lock shared by every attached LSP session.
+func (s *Server) ReconcileFile(path string) {
+	s.index.reindexing.Lock()
+	defer s.index.reindexing.Unlock()
+	s.indexOneFile(path)
+}
+
+// RemoveFile removes one deleted path under the workspace-wide mutation lock.
+func (s *Server) RemoveFile(path string) {
+	s.RemoveFiles([]string{path})
+}
+
+// RemoveFiles removes disk paths as one workspace mutation.
+func (s *Server) RemoveFiles(paths []string) {
+	s.index.reindexing.Lock()
+	defer s.index.reindexing.Unlock()
+	s.index.writes.RLock()
+	defer s.index.writes.RUnlock()
+	if s.index.unavailable {
+		return
+	}
+	// A large removal can rebuild the symbol tables, which takes seconds on a
+	// large index, so shutdown must be able to stop it. A canceled removal
+	// leaves the files in the index, and the next start's prune removes them.
+	if err := s.store.RemoveFilesContext(s.index.work, paths); err != nil && s.index.work.Err() == nil {
+		log.Printf("Error removing %d files from index: %v", len(paths), err)
+		for _, path := range paths {
+			s.index.failures.fail(path, err)
+		}
+	} else {
+		for _, path := range paths {
+			s.index.failures.removed(path)
+		}
+	}
+	s.index.reportFileFailures()
+}
+
+// RemoveFilesUnderRoot removes indexed files below root as one workspace
+// mutation. The runtime uses it before reconciling a changed stdlib root.
+func (s *Server) RemoveFilesUnderRoot(root string) {
+	if root == "" {
+		return
+	}
+	stored, err := s.store.ListFilePaths()
+	if err != nil {
+		return
+	}
+	prefix := filepath.Clean(root) + string(os.PathSeparator)
+	paths := make([]string, 0)
+	for _, path := range stored {
+		if strings.HasPrefix(filepath.Clean(path), prefix) {
+			paths = append(paths, path)
+		}
+	}
+	s.RemoveFiles(paths)
+}
+
+// watchGitHead polls .git/HEAD mtime and triggers reindex on branch switches.
+func (s *Server) watchGitHead() {
+	go func() {
+		// In a linked worktree or a submodule, .git is a file that names the
+		// git directory, and HEAD is there.
+		gitDir, ok := parser.GitDir(s.projectRoot)
+		if !ok {
 			return
 		}
-		defer s.reindexing.Unlock()
-		s.reindexWorkspace()
-	}()
-}
-
-// ReindexWorkspace runs the same full-or-incremental reindex as
-// backgroundReindex, but blocks until it completes.
-func (s *Server) ReindexWorkspace() (int, time.Duration) {
-	s.reindexing.Lock()
-	defer s.reindexing.Unlock()
-	return s.reindexWorkspace()
-}
-
-func (s *Server) reindexWorkspace() (int, time.Duration) {
-	start := time.Now()
-	reindexed := 0
-	coldStart := s.store.IsEmpty()
-	fullBuilt := false
-
-	if coldStart {
-		log.Printf("No index found, building from scratch...")
-		if s.client != nil {
-			if err := s.client.ShowMessage(context.Background(), &protocol.ShowMessageParams{
-				Type:    protocol.MessageTypeInfo,
-				Message: "Dexter: building index for the first time, go-to-definition will be available shortly...",
-			}); err != nil {
-				log.Printf("ShowMessage: %v", err)
-			}
-		}
-
-		stats, ran, err := s.fullBuild()
-		switch {
-		case errors.Is(err, indexer.ErrUnindexed):
-			// The SQL indexes did not come back after the bulk load committed
-			// or rolled back, so every query is a full table scan. Falling back
-			// to the incremental walk would be far worse than doing nothing:
-			// each per-file write issues a DELETE by file_id against definitions
-			// and refs tables, once per file on disk. FullBuild leaves the
-			// index version unset, so the next editor start rebuilds from
-			// scratch through cmdInit — in a process with no live readers,
-			// where deleting the database is safe.
-			log.Printf("Error: SQL indexes could not be restored after the bulk build: %v", err)
-			s.showError("Dexter: the index could not be completed. Run `dexter init --force` in your project root and restart your editor. If it happens again, please report it.")
-			// Collapse any committed data in the WAL rather than leaving it at
-			// its high-water mark for the rest of the process.
-			if err := s.store.Checkpoint(); err != nil {
-				log.Printf("Warning: WAL checkpoint: %v", err)
-			}
-			return reindexed, time.Since(start).Round(time.Millisecond)
-		case err != nil:
-			// The incremental walk below needs nothing to be true of the
-			// database, so it is the safe thing to fall back to. It is
-			// slower, not wrong.
-			log.Printf("Warning: full index build failed, falling back to incremental: %v", err)
-		case !ran:
-			// Something wrote to the index between the check above and the
-			// build's lock. Nothing was built, and the incremental path
-			// below covers whatever is there.
-			log.Printf("Index was no longer empty at build time, using incremental reindex")
-		default:
-			fullBuilt = true
-			reindexed = stats.Files
-		}
-	}
-
-	// Re-read rather than reusing coldStart. A full build, a failed build
-	// and a concurrent write all change the answer, and reading a stale
-	// true here would skip the mtime short-circuit for every file.
-	isEmpty := s.store.IsEmpty()
-
-	seen := make(map[string]struct{})
-	walkAndIndex := func(root string, indexRefs bool) {
-		_ = parser.WalkElixirFiles(root, func(path string, d fs.DirEntry) error {
-			seen[path] = struct{}{}
-
-			if !isEmpty {
-				info, err := d.Info()
-				if err != nil {
-					return nil
-				}
-				storedMtime, found := s.store.GetFileMtime(path)
-				currentMtime := info.ModTime().UnixNano()
-				if found && storedMtime == currentMtime {
-					return nil
-				}
-			}
-
-			defs, refs, err := parser.ParseFile(path)
-			if err != nil {
-				return nil
-			}
-			if !indexRefs {
-				refs = nil
-			}
-			if err := s.store.IndexFileWithRefs(path, defs, refs); err != nil {
-				log.Printf("Warning: reindex %s: %v", path, err)
-			}
-			reindexed++
-			return nil
-		})
-	}
-
-	// A full build already indexed every file on disk from the traversal
-	// this walk would repeat, so skipping it saves a second traversal and a
-	// stored-mtime query per file. The prune lives in the same branch and
-	// so cannot run without the walk that fills `seen`.
-	if !fullBuilt {
-		// The walk writes, so it takes indexWrites for reading, the same as
-		// every other single-file write. That is what keeps it from
-		// overlapping a cold build.
-		s.indexWrites.RLock()
-		if s.indexUnavailable {
-			s.indexWrites.RUnlock()
-			return reindexed, time.Since(start).Round(time.Millisecond)
-		}
-		// Index stdlib first (definitions only).
-		if s.stdlibRoot != "" {
-			walkAndIndex(s.stdlibRoot, false)
-		}
-
-		walkAndIndex(s.projectRoot, true)
-		s.indexWrites.RUnlock()
-
-		s.pruneMissingFiles(seen)
-	}
-
-	// Collapse the WAL back to disk now that the (potentially large) reindex
-	// is complete, so the -wal file does not stay parked at its high-water
-	// mark for the lifetime of the LSP process.
-	if err := s.store.Checkpoint(); err != nil {
-		log.Printf("Warning: WAL checkpoint after reindex: %v", err)
-	}
-
-	// The index is in place now, so fill the __using__ cache before a user
-	// asks for it. See warmUsingCache.
-	s.warmUsingCache()
-
-	elapsed := time.Since(start).Round(time.Millisecond)
-	log.Printf("Background reindex: %d files updated (%s)", reindexed, elapsed)
-
-	if coldStart && s.client != nil {
-		if err := s.client.ShowMessage(context.Background(), &protocol.ShowMessageParams{
-			Type:    protocol.MessageTypeInfo,
-			Message: fmt.Sprintf("Dexter: index built (%d files in %s)", reindexed, elapsed),
-		}); err != nil {
-			log.Printf("ShowMessage: %v", err)
-		}
-	}
-	return reindexed, elapsed
-}
-
-// WatchGitHead polls .git/HEAD mtime and triggers reindex on branch switches.
-func (s *Server) WatchGitHead() {
-	s.gitHeadWG.Add(1)
-	go func() {
-		defer s.gitHeadWG.Done()
-		headPath := filepath.Join(s.projectRoot, ".git", "HEAD")
+		headPath := filepath.Join(gitDir, "HEAD")
 		var lastMtime int64
 
 		info, err := os.Stat(headPath)
@@ -524,12 +793,7 @@ func (s *Server) WatchGitHead() {
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
 
-		for {
-			select {
-			case <-s.gitHeadStop:
-				return
-			case <-ticker.C:
-			}
+		for range ticker.C {
 			info, err := os.Stat(headPath)
 			if err != nil {
 				continue
@@ -538,25 +802,16 @@ func (s *Server) WatchGitHead() {
 			if currentMtime != lastMtime {
 				lastMtime = currentMtime
 				log.Printf("Git HEAD changed, reindexing...")
-				s.ReindexWorkspace()
+				s.backgroundReindex()
 			}
 		}
 	}()
 }
 
-// notifyOTPMismatch checks stderr output for an OTP version mismatch and
-// sends a one-time warning to the editor so the user doesn't have to dig
-// through logs.
-func (s *Server) notifyOTPMismatch(stderr string) {
-	if s.client == nil || !strings.Contains(stderr, "requires a more recent Erlang/OTP") {
-		return
-	}
-	s.notifiedOTPMismatch.Do(func() {
-		_ = s.client.ShowMessage(context.Background(), &protocol.ShowMessageParams{
-			Type:    protocol.MessageTypeError,
-			Message: "Dexter: Elixir/OTP version mismatch - your Elixir install for this project was compiled for a newer OTP version than what is running. Update your Erlang to match, or switch to an Elixir build that targets your current OTP (e.g. elixir@...-otp-27).",
-		})
-	})
+// isOTPMismatch reports whether BEAM or mix output says that the Elixir install
+// was compiled for a newer OTP than the one that runs.
+func isOTPMismatch(stderr string) bool {
+	return strings.Contains(stderr, "requires a more recent Erlang/OTP")
 }
 
 // === LSP Lifecycle ===
@@ -586,16 +841,27 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 	// to store.FindProjectRoot. In a monorepo we want to anchor on
 	// .dexter/dexter.db or .git so the whole repo is indexed, not the first
 	// nested Mix app we encounter.
+	var clientRoot string
+	if len(params.WorkspaceFolders) > 0 {
+		clientRoot = uriToPath(protocol.DocumentURI(params.WorkspaceFolders[0].URI))
+	} else if params.RootURI != "" { //nolint:staticcheck // RootURI is deprecated but Neovim still sends it
+		clientRoot = uriToPath(params.RootURI) //nolint:staticcheck
+	}
 	if !s.explicitRoot {
-		if len(params.WorkspaceFolders) > 0 {
-			root := uriToPath(protocol.DocumentURI(params.WorkspaceFolders[0].URI))
-			if root != "" {
-				s.projectRoot = store.FindProjectRoot(root)
-			}
-		} else if params.RootURI != "" { //nolint:staticcheck // RootURI is deprecated but Neovim still sends it
-			root := uriToPath(params.RootURI) //nolint:staticcheck
-			if root != "" {
-				s.projectRoot = store.FindProjectRoot(root)
+		if clientRoot != "" {
+			s.projectRoot = store.FindProjectRoot(clientRoot)
+		}
+	} else if clientRoot != "" && s.workspaceEvents != nil {
+		rel, err := filepath.Rel(s.projectRoot, clientRoot)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+			return nil, fmt.Errorf("editor workspace root %s does not use daemon root spelling %s", clientRoot, s.projectRoot)
+		}
+		resolvedProject, projectErr := filepath.EvalSymlinks(s.projectRoot)
+		resolvedClient, clientErr := filepath.EvalSymlinks(clientRoot)
+		if projectErr == nil && clientErr == nil {
+			resolvedRel, relErr := filepath.Rel(resolvedProject, resolvedClient)
+			if relErr != nil || filepath.Clean(resolvedRel) != filepath.Clean(rel) {
+				return nil, fmt.Errorf("editor workspace root %s uses a symlink spelling that differs from daemon root %s", clientRoot, s.projectRoot)
 			}
 		}
 	}
@@ -622,7 +888,13 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 	log.Printf("Initialize: projectRoot=%s debug=%v", s.projectRoot, s.debug)
 
 	if root, ok := stdlib.Resolve(s.store, explicitStdlibPath, s.projectRoot); ok {
-		s.stdlibRoot = root
+		if explicitStdlibPath != "" && s.workspaceEvents != nil {
+			if err := s.workspaceEvents.SetStdlibRoot(ctx, root); err != nil {
+				return nil, err
+			}
+		} else if s.workspaceEvents == nil {
+			s.SetStdlibRoot(root)
+		}
 		log.Printf("Elixir stdlib at: %s", root)
 
 		// Derive mix binary from the same Elixir install
@@ -634,35 +906,36 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 			s.mixBin = mixBin
 			log.Printf("Mix binary at: %s", mixBin)
 		}
-	} else {
-		log.Printf("Could not detect Elixir stdlib (set stdlibPath in initializationOptions or DEXTER_ELIXIR_LIB_ROOT)")
-		if s.client != nil {
-			_ = s.client.ShowMessage(context.Background(), &protocol.ShowMessageParams{
-				Type:    protocol.MessageTypeWarning,
-				Message: "Dexter: could not detect Elixir stdlib - stdlib modules (Enum, String, etc.) won't resolve. Verify the Elixir version in your .tool-versions or mise.toml is installed (e.g. `mise install`), or set DEXTER_ELIXIR_LIB_ROOT.",
-			})
-		}
 	}
+	s.ReportStdlib()
 
-	// Fallback: find mix in PATH
+	// Fallback: the PATH, then the standard version-manager locations and a
+	// login shell, because an editor-launched process often never ran the mise
+	// or asdf hook that puts mix on its PATH.
 	if s.mixBin == "" {
-		if p, err := exec.LookPath("mix"); err == nil {
+		if p, ok := stdlib.FindExecutable("mix"); ok {
 			s.mixBin = p
 			log.Printf("Mix binary at: %s (PATH fallback)", p)
-		} else {
-			log.Printf("Could not find mix binary — formatting will not work")
+		} else if p, ok := stdlib.FindViaLoginShell("mix"); ok {
+			s.mixBin = p
+			log.Printf("Mix binary at: %s (login shell)", p)
 		}
 	}
+	s.mixMissing = s.mixBin == ""
+	if s.mixMissing {
+		log.Printf("Warning: %s", strings.TrimPrefix(mixMissingMessage, "Dexter: "))
+	}
 
-	if !s.initialized {
+	if !s.initialized && s.manageWorkspace {
 		s.initialized = true
 		s.backgroundReindex()
-		s.WatchGitHead()
+		s.watchGitHead()
 	}
 
 	if params.Capabilities.Window != nil && params.Capabilities.Window.ShowDocument != nil {
 		s.showDocumentSupported = params.Capabilities.Window.ShowDocument.Support
 	}
+	s.workDoneProgress = params.Capabilities.Window != nil && params.Capabilities.Window.WorkDoneProgress
 	// Resource operations only exist inside documentChanges, so advertising
 	// them implies documentChanges support. Neovim, for one, lists
 	// resourceOperations without setting the separate documentChanges flag.
@@ -718,11 +991,29 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 		},
 	}
 	s.debugf("Initialize: capabilities: %+v", result.Capabilities)
-	s.readyOnce.Do(func() { close(s.ready) })
 	return result, nil
 }
 
 func (s *Server) Initialized(ctx context.Context, params *protocol.InitializedParams) error {
+	// Workspace reports start now, not in Initialize: before the initialize
+	// response, a server must not send requests such as
+	// window/workDoneProgress/create. The reporter replays what started
+	// earlier, so nothing is lost.
+	if s.client != nil {
+		detach := s.index.reporter.Attach(s.client, s.workDoneProgress)
+		if previous, ok := s.detachReporter.Swap(detach).(func()); ok {
+			previous()
+		}
+		if s.mixMissing {
+			notify.Show(ctx, s.client, notify.Warning, mixMissingMessage)
+		}
+	}
+
+	// Registered for daemon-backed sessions too. The workspace's native watcher
+	// deliberately skips deps/ — one watch per dependency directory would cost
+	// thousands of descriptors — while the editor's glob covers it, along with
+	// path dependencies. Events from both sources coalesce by path in the one
+	// mutation queue, so the overlap costs a map insert, not a second reindex.
 	if s.client != nil {
 		go func() {
 			if err := s.client.RegisterCapability(context.Background(), &protocol.RegistrationParams{
@@ -747,11 +1038,27 @@ func (s *Server) Initialized(ctx context.Context, params *protocol.InitializedPa
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
-	s.closeBeams()
+	s.CloseSession()
 	return nil
 }
 
+// CloseSession releases resources owned by one LSP client. Daemon transports
+// call it even when a client disconnects without the protocol shutdown request.
+func (s *Server) CloseSession() {
+	s.closeOnce.Do(func() {
+		s.detachFromReporter()
+		s.closeBeams()
+		s.docs.CloseAll()
+	})
+}
+
 func (s *Server) Exit(ctx context.Context) error {
+	if !s.manageWorkspace {
+		if s.conn != nil {
+			return s.conn.Close()
+		}
+		return nil
+	}
 	os.Exit(0)
 	return nil
 }
@@ -824,7 +1131,15 @@ func (s *Server) DidSave(ctx context.Context, params *protocol.DidSaveTextDocume
 		return nil
 	}
 
-	go s.indexOneFile(path)
+	if s.workspaceEvents != nil {
+		s.workspaceEvents.ReconcileFile(path)
+	} else {
+		// ReconcileFile waits behind a reconciliation pass in flight. With
+		// only the write coordinator's read lock, the save would race the
+		// pass's batches for SQLite's write lock and could fail after
+		// busy_timeout, and then stay unindexed until the next pass.
+		go s.ReconcileFile(path)
+	}
 
 	return nil
 }
@@ -939,11 +1254,11 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		s.debugf("Definition: resolved bare %q -> %q", functionName, fullModule)
 		if fullModule == "" {
 			currentModule := s.store.LookupEnclosingModule(uriToPath(protocol.DocumentURI(docURI)), lineNum+1)
-			if provider, _, found := s.generatedSymbolInScope(currentModule, func() []string {
+			if provider, functions, found := s.generatedSymbolInScope(currentModule, func() []string {
 				return s.enclosingBlockPath(docURI, lineNum, col)
 			}, functionName); found {
-				if results := s.generatedDefinitionResults(provider.module); len(results) > 0 {
-					s.debugf("Definition: generated bare %q provider=%s", functionName, provider.module)
+				if results, precise := s.generatedDefinitionResultsFor(provider.module, provider.beamPath, functions); len(results) > 0 {
+					s.debugf("Definition: generated bare %q provider=%s precise=%t", functionName, provider.module, precise)
 					return storeResultsToLocations(results), nil
 				}
 			}
@@ -966,30 +1281,18 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 			}
 		}
 
-		// Look up via store
-		var results []store.LookupResult
-		var err error
-		if s.followDelegates {
-			results, err = s.store.LookupFollowDelegate(fullModule, functionName)
-		} else {
-			results, err = s.store.LookupFunction(fullModule, functionName)
+		kind := NameKindCallable
+		if tf.InTypespec(lineNum) {
+			kind = NameKindType
 		}
+		results, err := s.LookupName(fullModule, functionName, NameLookupOptions{
+			Kind:            kind,
+			FollowDelegates: s.followDelegates,
+			External:        fullModule != extractEnclosingModuleFromTokens(tf.source, tf.tokens, lineNum),
+		})
 		if err == nil && len(results) > 0 {
-			s.debugf("Definition: found %d result(s) in store for %s.%s", len(results), fullModule, functionName)
-			hits := byKindForContext(tf, lineNum, results)
-			// An imported call (e.g. `field` from `use Ecto.Schema`) reaches
-			// only the public definitions of the module it came from.
-			if fullModule != extractEnclosingModuleFromTokens(tf.source, tf.tokens, lineNum) {
-				hits = filterOutPrivate(hits)
-			}
-			return storeResultsToLocations(hits), nil
-		}
-
-		// fullModule may not directly define the function — try its use chain
-		// (e.g. `import MyApp.Factory` where MyApp.Factory uses ExMachina).
-		if results := s.lookupThroughUseOf(fullModule, functionName); len(results) > 0 {
-			s.debugf("Definition: found %d result(s) via use chain of %s for %s", len(results), fullModule, functionName)
-			return storeResultsToLocations(byKindForContext(tf, lineNum, results)), nil
+			s.debugf("Definition: found %d semantic result(s) for %s.%s", len(results), fullModule, functionName)
+			return nameLocationsToProtocol(results), nil
 		}
 
 		// Fallback for use-chain inline defs (not stored as module definitions)
@@ -999,11 +1302,11 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		}
 
 		currentModule = s.store.LookupEnclosingModule(uriToPath(protocol.DocumentURI(docURI)), lineNum+1)
-		if provider, _, found := s.generatedSymbolInScope(currentModule, func() []string {
+		if provider, functions, found := s.generatedSymbolInScope(currentModule, func() []string {
 			return s.enclosingBlockPath(docURI, lineNum, col)
 		}, functionName); found {
-			if results := s.generatedDefinitionResults(provider.module); len(results) > 0 {
-				s.debugf("Definition: generated fallback for bare %q provider=%s", functionName, provider.module)
+			if results, precise := s.generatedDefinitionResultsFor(provider.module, provider.beamPath, functions); len(results) > 0 {
+				s.debugf("Definition: generated fallback for bare %q provider=%s precise=%t", functionName, provider.module, precise)
 				return storeResultsToLocations(results), nil
 			}
 		}
@@ -1018,33 +1321,23 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 	s.debugf("Definition: qualified call resolved %q -> %q", moduleRef, fullModule)
 
 	if functionName != "" {
-		var results []store.LookupResult
-		var err error
-		if s.followDelegates {
-			results, err = s.store.LookupFollowDelegate(fullModule, functionName)
-		} else {
-			results, err = s.store.LookupFunction(fullModule, functionName)
+		kind := NameKindCallable
+		if tf.InTypespec(lineNum) {
+			kind = NameKindType
 		}
-		if err == nil && len(results) > 0 {
-			s.debugf("Definition: found %d result(s) in store for %s.%s", len(results), fullModule, functionName)
-			hits := byKindForContext(tf, lineNum, results)
-			// A remote call reaches only the public definitions of the target.
-			if fullModule != extractEnclosingModuleFromTokens(tf.source, tf.tokens, lineNum) {
-				hits = filterOutPrivate(hits)
-			}
-			return storeResultsToLocations(hits), nil
+		results, err := s.LookupName(fullModule, functionName, NameLookupOptions{
+			Kind:             kind,
+			FollowDelegates:  s.followDelegates,
+			External:         fullModule != extractEnclosingModuleFromTokens(tf.source, tf.tokens, lineNum),
+			FallbackToModule: true,
+		})
+		if err != nil {
+			return nil, nil
 		}
-		// Not directly defined — the function may have been injected by a
-		// `use` macro in fullModule's source (e.g. Oban.Worker injects `new`).
-		if results := s.lookupThroughUseOf(fullModule, functionName); len(results) > 0 {
-			s.debugf("Definition: found %d result(s) via use chain of %s for %s", len(results), fullModule, functionName)
-			return storeResultsToLocations(results), nil
-		}
-		s.debugf("Definition: no indexed or use-chain definition for %s.%s; falling back to module source", fullModule, functionName)
+		return nameLocationsToProtocol(results), nil
 	}
 
-	// Fall back to module (fullModule already resolved via nesting above)
-	results, err := s.store.LookupModule(fullModule)
+	results, err := s.LookupName(fullModule, "", NameLookupOptions{})
 	if err != nil {
 		s.debugf("Definition: module fallback lookup failed for %s: %v", fullModule, err)
 		return nil, nil
@@ -1054,7 +1347,18 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		return nil, nil
 	}
 	s.debugf("Definition: module fallback for %s.%s -> %s:%d (%d result(s))", fullModule, functionName, results[0].FilePath, results[0].Line, len(results))
-	return storeResultsToLocations(results), nil
+	return nameLocationsToProtocol(results), nil
+}
+
+func nameLocationsToProtocol(results []NameLocation) []protocol.Location {
+	locations := make([]protocol.Location, 0, len(results))
+	for _, result := range results {
+		locations = append(locations, protocol.Location{
+			URI:   uri.File(result.FilePath),
+			Range: lineRange(result.Line - 1),
+		})
+	}
+	return locations
 }
 
 func storeResultsToLocations(results []store.LookupResult) []protocol.Location {
@@ -2279,6 +2583,10 @@ func (s *Server) parseUsingFile(filePath, moduleName string) *usingCacheEntry {
 // fullModule's source file. This handles qualified calls like M.func() where
 // func is not defined directly in M but is injected by a macro M uses.
 func (s *Server) lookupThroughUseOf(fullModule, functionName string) []store.LookupResult {
+	return s.lookupThroughUseOfWithFollow(fullModule, functionName, s.followDelegates)
+}
+
+func (s *Server) lookupThroughUseOfWithFollow(fullModule, functionName string, followDelegates bool) []store.LookupResult {
 	modResults, err := s.store.LookupModule(fullModule)
 	if err != nil || len(modResults) == 0 {
 		return nil
@@ -2287,7 +2595,7 @@ func (s *Server) lookupThroughUseOf(fullModule, functionName string) []store.Loo
 	if !ok {
 		return nil
 	}
-	return s.lookupThroughUse(fileText, functionName, ExtractAliases(fileText))
+	return s.lookupThroughUseWithFollow(fileText, functionName, ExtractAliases(fileText), followDelegates)
 }
 
 // lookupThroughUse searches for functionName in definitions injected by `use`
@@ -2295,11 +2603,15 @@ func (s *Server) lookupThroughUseOf(fullModule, functionName string) []store.Loo
 // priority over imported ones. Later `use` declarations shadow earlier ones.
 // Transitive use chains (use inside __using__ body) are followed recursively.
 func (s *Server) lookupThroughUse(text, functionName string, aliases map[string]string) []store.LookupResult {
+	return s.lookupThroughUseWithFollow(text, functionName, aliases, s.followDelegates)
+}
+
+func (s *Server) lookupThroughUseWithFollow(text, functionName string, aliases map[string]string, followDelegates bool) []store.LookupResult {
 	useCalls := ExtractUsesWithOpts(text, aliases)
 	visited := make(map[string]bool)
 
 	for i := len(useCalls) - 1; i >= 0; i-- {
-		if result := s.lookupInUsingEntryFor(useCalls[i].Module, functionName, useCalls[i].dispatchAtom(), useCalls[i].Opts, visited); result != nil {
+		if result := s.lookupInUsingEntryForWithFollow(useCalls[i].Module, functionName, useCalls[i].dispatchAtom(), useCalls[i].Opts, visited, followDelegates); result != nil {
 			return result
 		}
 	}
@@ -2311,7 +2623,7 @@ func (s *Server) lookupThroughUse(text, functionName string, aliases map[string]
 // consumerOpts are the keyword args from the `use Module, key: Val` call and
 // are used to resolve dynamic imports like `import unquote(mod)`.
 func (s *Server) lookupInUsingEntry(moduleName, functionName string, consumerOpts map[string]string, visited map[string]bool) []store.LookupResult {
-	return s.lookupInUsingEntryFor(moduleName, functionName, "", consumerOpts, visited)
+	return s.lookupInUsingEntryForWithFollow(moduleName, functionName, "", consumerOpts, visited, s.followDelegates)
 }
 
 // bodyFor picks the injected body for a `use` call. An ordinary __using__ has a
@@ -2344,6 +2656,10 @@ func usingVisitKey(moduleName, which string) string {
 // lookupInUsingEntryFor is lookupInUsingEntry with the dispatch atom from the
 // `use` site (empty for an ordinary `use Module`).
 func (s *Server) lookupInUsingEntryFor(moduleName, functionName, which string, consumerOpts map[string]string, visited map[string]bool) []store.LookupResult {
+	return s.lookupInUsingEntryForWithFollow(moduleName, functionName, which, consumerOpts, visited, s.followDelegates)
+}
+
+func (s *Server) lookupInUsingEntryForWithFollow(moduleName, functionName, which string, consumerOpts map[string]string, visited map[string]bool, followDelegates bool) []store.LookupResult {
 	visitKey := usingVisitKey(moduleName, which)
 	if visited[visitKey] {
 		return nil
@@ -2372,7 +2688,7 @@ func (s *Server) lookupInUsingEntryFor(moduleName, functionName, which string, c
 	for j := len(body.imports) - 1; j >= 0; j-- {
 		var results []store.LookupResult
 		var err error
-		if s.followDelegates {
+		if followDelegates {
 			results, err = s.store.LookupFollowDelegate(body.imports[j], functionName)
 			results = publicOnly(results)
 		} else {
@@ -2397,7 +2713,7 @@ func (s *Server) lookupInUsingEntryFor(moduleName, functionName, which string, c
 		case "import":
 			var results []store.LookupResult
 			var err error
-			if s.followDelegates {
+			if followDelegates {
 				results, err = s.store.LookupFollowDelegate(mod, functionName)
 				results = publicOnly(results)
 			} else {
@@ -2407,7 +2723,7 @@ func (s *Server) lookupInUsingEntryFor(moduleName, functionName, which string, c
 				return results
 			}
 		case "use":
-			if result := s.lookupInUsingEntry(mod, functionName, nil, visited); result != nil {
+			if result := s.lookupInUsingEntryForWithFollow(mod, functionName, "", nil, visited, followDelegates); result != nil {
 				return result
 			}
 		}
@@ -2416,7 +2732,7 @@ func (s *Server) lookupInUsingEntryFor(moduleName, functionName, which string, c
 	// Transitive uses: use Module inside the __using__ body (double-use chains)
 	for k := len(body.transCalls) - 1; k >= 0; k-- {
 		call := body.transCalls[k]
-		if result := s.lookupInUsingEntryFor(call.Module, functionName, call.dispatchAtom(), call.Opts, visited); result != nil {
+		if result := s.lookupInUsingEntryForWithFollow(call.Module, functionName, call.dispatchAtom(), call.Opts, visited, followDelegates); result != nil {
 			return result
 		}
 	}
@@ -2424,7 +2740,7 @@ func (s *Server) lookupInUsingEntryFor(moduleName, functionName, which string, c
 		if body.hasTransCall(body.transUses[k]) {
 			continue
 		}
-		if result := s.lookupInUsingEntry(body.transUses[k], functionName, nil, visited); result != nil {
+		if result := s.lookupInUsingEntryForWithFollow(body.transUses[k], functionName, "", nil, visited, followDelegates); result != nil {
 			return result
 		}
 	}
@@ -3015,7 +3331,10 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 	scanRefStream := func(tf *TokenizedFile, tokens []parser.Token, line int, module, function string, interp bool) []refOccurrence {
 		n := len(tokens)
 		var occurrences []refOccurrence
-		for i := 0; i < n; i++ {
+		// Both streams are in byte order, so their lines never decrease and the
+		// first token on the line can be found without walking the file.
+		start := sort.Search(n, func(k int) bool { return tokens[k].Line >= line })
+		for i := start; i < n; i++ {
 			if tokens[i].Line > line {
 				break
 			}
@@ -3096,9 +3415,45 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 		return parser.ResolveModuleRef(call.moduleExpr, aliases, current)
 	}
 	for _, ia := range aliases {
+		// Candidates come first: only a file holding one can yield a result, and
+		// an injector is typically used by far more files than contain the name.
+		// Tokenizing just those files is what keeps a hot target affordable.
+		var functionRefs []store.ReferenceResult
+		var prefixRefs []store.ModuleReferenceResult
+		candidateFiles := make(map[string]bool)
+		if functionName != "" {
+			refs, err := s.store.LookupReferences(ia.shortName, functionName)
+			if err != nil {
+				continue
+			}
+			functionRefs = refs
+			for _, r := range refs {
+				candidateFiles[r.FilePath] = true
+			}
+		} else {
+			// The short name stands in for ia.module, so `Repo.Migrations` under
+			// an injected `alias MyApp.Repo` names `MyApp.Repo.Migrations`.
+			refs, err := s.store.LookupReferencesByPrefix(ia.shortName)
+			if err != nil {
+				continue
+			}
+			for _, r := range refs {
+				if moduleSitesOnly && r.Kind != "alias" && r.Kind != "import" && r.Kind != "use" && r.Kind != "require" {
+					continue
+				}
+				prefixRefs = append(prefixRefs, r)
+				candidateFiles[r.FilePath] = true
+			}
+		}
+		if len(candidateFiles) == 0 {
+			continue
+		}
+
 		// Exact lexical module scopes whose `use` brings this alias in. Keeping
 		// the line also prevents an earlier bare name in the same module from
-		// being mistaken for an alias that is introduced later.
+		// being mistaken for an alias that is introduced later. Sites are read
+		// only in candidate files, which depend on nothing but the short name
+		// within one call, so the cache key stays sound.
 		consumers := make(map[string][]useSite)
 		for _, inj := range ia.injectors {
 			cacheKey := inj + "\x00" + ia.shortName + "\x00" + ia.module
@@ -3106,7 +3461,7 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 			if !ok {
 				if refs, err := s.store.LookupReferences(inj, ""); err == nil {
 					for _, r := range refs {
-						if r.Kind != "use" {
+						if r.Kind != "use" || !candidateFiles[r.FilePath] {
 							continue
 						}
 						tf, exists := tokenizedAt(r.FilePath)
@@ -3165,11 +3520,7 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 		}
 
 		if functionName != "" {
-			refs, err := s.store.LookupReferences(ia.shortName, functionName)
-			if err != nil {
-				continue
-			}
-			for _, r := range refs {
+			for _, r := range functionRefs {
 				columns := consumerColumns(r.FilePath, r.Line, ia.shortName, functionName)
 				if len(columns) == 0 {
 					continue
@@ -3188,16 +3539,7 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 			continue
 		}
 
-		// The short name stands in for ia.module, so `Repo.Migrations` under
-		// an injected `alias MyApp.Repo` names `MyApp.Repo.Migrations`.
-		refs, err := s.store.LookupReferencesByPrefix(ia.shortName)
-		if err != nil {
-			continue
-		}
-		for _, r := range refs {
-			if moduleSitesOnly && r.Kind != "alias" && r.Kind != "import" && r.Kind != "use" && r.Kind != "require" {
-				continue
-			}
+		for _, r := range prefixRefs {
 			columns := consumerColumns(r.FilePath, r.Line, r.Module, "")
 			if len(columns) == 0 {
 				continue
@@ -3390,6 +3732,14 @@ func (s *Server) resolveBareFunctionModuleWithOrigin(filePath, text string, tf *
 	// Kernel is always in scope
 	if results, err := s.store.LookupPublicFunction("Kernel", functionName); err == nil && len(results) > 0 {
 		return "Kernel", false
+	}
+
+	// An imported module can export a function that a macro generated, which
+	// only its BEAM knows about.
+	for _, mod := range imports {
+		if _, found := s.generatedSymbol(mod, "", functionName); found {
+			return mod, false
+		}
 	}
 
 	// Slow fallback: function may be injected into an imported module via its
@@ -3721,7 +4071,8 @@ func (s *Server) CompletionResolve(ctx context.Context, params *protocol.Complet
 
 	cleaned := filepath.Clean(data.FilePath)
 	inProject := strings.HasPrefix(cleaned, s.projectRoot+string(os.PathSeparator))
-	inStdlib := s.stdlibRoot != "" && strings.HasPrefix(cleaned, s.stdlibRoot+string(os.PathSeparator))
+	stdlibRoot := s.StdlibRoot()
+	inStdlib := stdlibRoot != "" && strings.HasPrefix(cleaned, stdlibRoot+string(os.PathSeparator))
 	if !inProject && !inStdlib {
 		return params, nil
 	}
@@ -3963,18 +4314,17 @@ func (s *Server) DidChangeWatchedFiles(ctx context.Context, params *protocol.Did
 		}
 		switch change.Type {
 		case protocol.FileChangeTypeCreated, protocol.FileChangeTypeChanged:
-			go s.indexOneFile(path)
+			if s.workspaceEvents != nil {
+				s.workspaceEvents.ReconcileFile(path)
+			} else {
+				go s.ReconcileFile(path) // see DidSave
+			}
 		case protocol.FileChangeTypeDeleted:
-			go func(filePath string) {
-				s.indexWrites.RLock()
-				defer s.indexWrites.RUnlock()
-				if s.indexUnavailable {
-					return
-				}
-				if err := s.store.RemoveFile(filePath); err != nil {
-					log.Printf("Error removing %s from index: %v", filePath, err)
-				}
-			}(path)
+			if s.workspaceEvents != nil {
+				s.workspaceEvents.RemoveFile(path)
+			} else {
+				go s.RemoveFile(path)
+			}
 		}
 	}
 	return nil
@@ -5025,7 +5375,7 @@ func (s *Server) PrepareRename(ctx context.Context, params *protocol.PrepareRena
 			}
 			hasFirstPartyDef := false
 			for _, p := range defPaths {
-				if (s.stdlibRoot != "" && strings.HasPrefix(p, s.stdlibRoot)) || s.isDepsFile(p) {
+				if s.isStdlibPath(p) || s.isDepsFile(p) {
 					continue
 				}
 				hasFirstPartyDef = true
@@ -5092,19 +5442,11 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 		moduleName := tf.FirstDefmodule()
 		if moduleName != "" {
 			s.debugf("References: __using__ in module %s — looking up use sites", moduleName)
-			allRefs, err := s.store.LookupReferences(moduleName, "")
+			allRefs, err := s.ReferenceNames(moduleName, "__using__", NameReferenceOptions{ExcludeStdlib: true})
 			if err != nil {
 				return nil, nil
 			}
-			var locations []protocol.Location
-			for _, r := range allRefs {
-				if r.Kind == "use" {
-					locations = append(locations, protocol.Location{
-						URI:   uri.File(r.FilePath),
-						Range: lineRange(r.Line - 1),
-					})
-				}
-			}
+			locations := nameLocationsToProtocol(allRefs)
 			s.debugf("References: returning %d use sites", len(locations))
 			return locations, nil
 		}
@@ -5233,129 +5575,30 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 		}
 	}
 
-	// Run direct lookup and (if needed) the static use-chain injector scan.
-	// The static scan is expensive but necessary when the function comes from
-	// a static __using__ import rather than a dynamic opt binding.
-	type injectorResult struct {
-		injectors []string
-		elapsed   time.Duration
+	kind := NameKindCallable
+	if functionName == "" {
+		kind = NameKindAny
+	} else if tf.InTypespec(lineNum) {
+		kind = NameKindType
 	}
-	var injectorCh chan injectorResult
-	if functionName != "" && len(injectors) == 0 {
-		// Only run the expensive scan if the fast opt-binding check found nothing
-		injectorCh = make(chan injectorResult, 1)
-		go func() {
-			tInj := s.debugNow()
-			inj := s.findModulesWhoseUsingImports(fullModule)
-			injectorCh <- injectorResult{inj, time.Since(tInj)}
-		}()
-	}
-
-	tStep := s.debugNow()
-	refResults, err := s.store.LookupReferences(fullModule, functionName)
+	semantic, err := s.ReferenceNames(fullModule, functionName, NameReferenceOptions{
+		Kind:               kind,
+		FollowDelegates:    s.followDelegates,
+		IncludeDeclaration: params.Context.IncludeDeclaration,
+		ExcludeStdlib:      true,
+		InjectorModules:    injectors,
+		GeneratedProvider:  generatedProvider,
+	})
 	if err != nil {
-		s.debugf("References: store error: %v", err)
+		s.debugf("References: semantic lookup error: %v", err)
 		return nil, nil
 	}
-	if s.debug {
-		s.debugf("References: direct lookup: %d results (%s)", len(refResults), time.Since(tStep).Round(time.Microsecond))
-	}
 
-	// Sites written through an alias that a __using__ block injects. The file
-	// holding them declares no alias of its own, so the index has them under
-	// the bare short name and the lookup above cannot see them. The injecting
-	// module is found from the module's own references, so this costs one
-	// small query when nothing in the project injects the module.
-	moduleKindRefs := refResults
-	if functionName != "" {
-		moduleKindRefs, err = s.store.LookupReferences(fullModule, "")
-		if err != nil {
-			moduleKindRefs = nil
-		}
-	}
-	if injected := s.injectedAliasReferences(fullModule, functionName, moduleKindRefs); len(injected) > 0 {
-		s.debugf("References: via injected alias: +%d results", len(injected))
-		refResults = append(refResults, injected...)
-	}
-
-	if injectorCh != nil {
-		ir := <-injectorCh
-		if s.debug {
-			s.debugf("References: use-chain injectors for %s: %v (%s)", fullModule, ir.injectors, ir.elapsed.Round(time.Microsecond))
-		}
-		injectors = append(injectors, ir.injectors...)
-	}
-
-	for _, mod := range injectors {
-		transitive, err := s.store.LookupReferences(mod, functionName)
-		if err == nil {
-			if generatedProvider != "" {
-				transitive = s.filterGeneratedProviderReferences(generatedProvider, functionName, transitive)
-			}
-			refResults = append(refResults, transitive...)
-			s.debugf("References: transitive via %s: +%d results", mod, len(transitive))
-		}
-	}
-
-	// Scan definition files for bare intra-module calls (not indexed in store)
-	if functionName != "" {
-		tStep = s.debugNow()
-		refResults = append(refResults, s.findBareCallRefs(fullModule, functionName)...)
-		if s.debug {
-			s.debugf("References: bare call scan (%s)", time.Since(tStep).Round(time.Microsecond))
-		}
-	}
-
-	// Follow defdelegate in reverse: if other modules delegate this function
-	// to fullModule, include refs to those delegating modules too.
-	if functionName != "" && s.followDelegates {
-		tStep = s.debugNow()
-		delegates, err := s.store.LookupDelegatesTo(fullModule, functionName)
-		if err == nil {
-			for _, del := range delegates {
-				// The facade function name may differ from the target if as: is used
-				facadeFunc := del.Function
-				delegateRefs, err := s.store.LookupReferences(del.Module, facadeFunc)
-				if err == nil {
-					refResults = append(refResults, delegateRefs...)
-					s.debugf("References: via delegate %s.%s: +%d results", del.Module, facadeFunc, len(delegateRefs))
-				}
-				refResults = append(refResults, s.findBareCallRefs(del.Module, facadeFunc)...)
-			}
-		}
-		if s.debug {
-			s.debugf("References: delegate follow (%s)", time.Since(tStep).Round(time.Microsecond))
-		}
-	}
-
-	// A name written in a typespec refers to a type, and the same name written
-	// anywhere else refers to a function, even where a module declares both —
-	// `Ecto.Schema` has `@type schema` and `defmacro schema/2`. Keep whichever
-	// kind the cursor is asking about. Module-level lookups (no function name)
-	// are left alone: alias/import/use sites are references to the module
-	// whatever line they sit on.
-	if functionName != "" {
-		wantTypespec := tf.InTypespec(lineNum)
-		kept := refResults[:0]
-		for _, r := range refResults {
-			if (r.Kind == "typespec") == wantTypespec {
-				kept = append(kept, r)
-			}
-		}
-		if s.debug {
-			s.debugf("References: typespec filter (want=%v): %d of %d kept", wantTypespec, len(kept), len(refResults))
-		}
-		refResults = kept
-	}
-
-	// Deduplicate by file+line (multiple injector modules may attribute the same call)
 	type refKey struct {
 		filePath string
 		line     int
 	}
-	seen := make(map[refKey]struct{}, len(refResults))
-
-	// Filter out stdlib paths
+	seen := make(map[refKey]struct{}, len(semantic))
 	var locations []protocol.Location
 
 	// Bare uses of a type in the file being edited, which no indexed ref and
@@ -5371,10 +5614,7 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 			locations = append(locations, l)
 		}
 	}
-	for _, r := range refResults {
-		if s.stdlibRoot != "" && strings.HasPrefix(r.FilePath, s.stdlibRoot) {
-			continue
-		}
+	for _, r := range semantic {
 		k := refKey{r.FilePath, r.Line}
 		if _, ok := seen[k]; ok {
 			continue
@@ -5384,31 +5624,6 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 			URI:   uri.File(r.FilePath),
 			Range: lineRange(r.Line - 1),
 		})
-	}
-
-	// Include declaration if requested
-	if params.Context.IncludeDeclaration {
-		defResults, err := s.store.LookupFunction(fullModule, functionName)
-		if (err != nil || len(defResults) == 0) && len(generatedInjectors) > 0 {
-			defResults = s.generatedDefinitionResults(fullModule)
-			err = nil
-		}
-		if err == nil {
-			defResults = byKindForContext(tf, lineNum, defResults)
-			for _, r := range defResults {
-				if s.stdlibRoot != "" && strings.HasPrefix(r.FilePath, s.stdlibRoot) {
-					continue
-				}
-				k := refKey{r.FilePath, r.Line}
-				if _, ok := seen[k]; ok {
-					continue
-				}
-				locations = append(locations, protocol.Location{
-					URI:   uri.File(r.FilePath),
-					Range: lineRange(r.Line - 1),
-				})
-			}
-		}
 	}
 
 	s.debugf("References: returning %d locations", len(locations))
@@ -5522,8 +5737,7 @@ func (s *Server) RenameEdit(ctx context.Context, params *protocol.RenameParams) 
 				if existing, err := s.store.LookupFunction(fullModule, params.NewName); err == nil && len(existing) > 0 {
 					return nil, fmt.Errorf("function %s.%s already exists", fullModule, params.NewName)
 				}
-				edit, _, err := s.renameFunctionEdits(fullModule, functionName, params.NewName, false)
-				return edit, err
+				return s.renameFunctionEdits(fullModule, functionName, params.NewName, nil)
 			}
 		} else if moduleRef != "" {
 			fullModule := resolveModule(moduleRef, aliases)
@@ -5537,8 +5751,7 @@ func (s *Server) RenameEdit(ctx context.Context, params *protocol.RenameParams) 
 				if !isValidModuleName(newModule) {
 					return nil, fmt.Errorf("invalid module name %q: must be CamelCase segments separated by dots", params.NewName)
 				}
-				edit, _, _, err := s.renameModuleEdits(fullModule, newModule, false)
-				return edit, err
+				return s.renameModuleEdits(fullModule, newModule, nil)
 			}
 		}
 	}
@@ -5547,8 +5760,9 @@ func (s *Server) RenameEdit(ctx context.Context, params *protocol.RenameParams) 
 }
 
 // renameFunctionEdits builds a WorkspaceEdit renaming all occurrences of
-// module.functionName to newName across the codebase.
-func (s *Server) renameFunctionEdits(module, functionName, newName string, deliverAll bool) (*WorkspaceEdit, []string, error) {
+// module.functionName to newName across the codebase. When report is not nil,
+// it receives the files the rename changed and the files it could not change.
+func (s *Server) renameFunctionEdits(module, functionName, newName string, report *RenameSummary) (*WorkspaceEdit, error) {
 	// Collect all (filePath, lineNumber) pairs — definitions + references
 	type siteKey struct {
 		filePath string
@@ -5558,7 +5772,7 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string, deliv
 	var sites []renameSite
 
 	addSiteOpts := func(filePath string, line int, includeKeyword bool) {
-		if s.stdlibRoot != "" && strings.HasPrefix(filePath, s.stdlibRoot) {
+		if s.isStdlibPath(filePath) {
 			return
 		}
 		if s.isDepsFile(filePath) {
@@ -5577,7 +5791,7 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string, deliv
 	// Definition sites
 	defResults, err := s.store.LookupFunction(module, functionName)
 	if err != nil {
-		return nil, nil, nil
+		return nil, nil
 	}
 	for _, r := range defResults {
 		addSite(r.FilePath, r.Line)
@@ -5586,7 +5800,7 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string, deliv
 	// Direct reference sites (calls, imports — skip alias/use which are module-level)
 	refResults, err := s.store.LookupReferences(module, functionName)
 	if err != nil {
-		return nil, nil, nil
+		return nil, nil
 	}
 	for _, r := range refResults {
 		if r.Kind == "alias" || r.Kind == "use" {
@@ -5672,11 +5886,7 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string, deliv
 		}
 	}
 
-	edit := s.buildTextEdits(sites, functionName, newName, deliverAll)
-	changedFiles := make(map[string]bool, len(sites))
-	for _, site := range sites {
-		changedFiles[site.filePath] = true
-	}
+	edit := s.buildTextEdits(sites, functionName, newName, report)
 
 	// Update defdelegate lines that forward to this function: add or update
 	// the `as:` option so the facade keeps working after the rename.
@@ -5684,7 +5894,7 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string, deliv
 		delegates, err := s.store.LookupDelegatesTo(module, functionName)
 		if err == nil {
 			for _, del := range delegates {
-				if s.stdlibRoot != "" && strings.HasPrefix(del.FilePath, s.stdlibRoot) {
+				if s.isStdlibPath(del.FilePath) {
 					continue
 				}
 				if s.isDepsFile(del.FilePath) {
@@ -5714,10 +5924,10 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string, deliv
 				if !changed {
 					continue
 				}
-				changedFiles[del.FilePath] = true
 
 				fileURI := protocol.DocumentURI(uri.File(del.FilePath))
-				if open || deliverAll {
+				report.changed(del.FilePath)
+				if open {
 					if edit.Changes == nil {
 						edit.Changes = make(map[protocol.DocumentURI][]protocol.TextEdit)
 					}
@@ -5734,18 +5944,16 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string, deliv
 					newFileLines = append(newFileLines, fileLines[:spanStart]...)
 					newFileLines = append(newFileLines, updatedSpan...)
 					newFileLines = append(newFileLines, fileLines[spanEnd:]...)
-					_ = os.WriteFile(del.FilePath, []byte(strings.Join(newFileLines, "\n")), 0644)
+					if err := os.WriteFile(del.FilePath, []byte(strings.Join(newFileLines, "\n")), 0644); err != nil {
+						log.Printf("Rename: cannot write %s: %v", del.FilePath, err)
+						report.failed(del.FilePath, err)
+					}
 				}
 			}
 		}
 	}
 
-	files := make([]string, 0, len(changedFiles))
-	for filePath := range changedFiles {
-		files = append(files, filePath)
-	}
-	sort.Strings(files)
-	return edit, files, nil
+	return edit, nil
 }
 
 // renameModuleEdits builds a WorkspaceEdit renaming oldModule to newModule,
@@ -5755,43 +5963,34 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string, deliv
 // parallel goroutines. Only open buffers are included in the returned
 // WorkspaceEdit, keeping the response small and avoiding editor freezes.
 // Files following the naming convention are also renamed/moved: closed ones
-// by the server, open ones by the client through rename operations.
-func (s *Server) renameModuleEdits(oldModule, newModule string, deliverAll bool) (*WorkspaceEdit, map[string]string, []string, error) {
+// by the server, open ones by the client through rename operations. When
+// report is not nil, it receives the files the rename changed or moved and the
+// files it could not change.
+func (s *Server) renameModuleEdits(oldModule, newModule string, report *RenameSummary) (*WorkspaceEdit, error) {
 	mr := s.buildModuleRename(oldModule, newModule)
 
 	// Check for collisions: verify that none of the target module names
 	// (including submodules) already exist, and that no destination file
 	// paths are occupied.
 	if err := mr.checkCollisions(); err != nil {
-		return nil, nil, nil, err
+		return nil, err
 	}
 
 	mr.collectSites()
 
 	fileCache := mr.readFiles()
 
-	movedFiles, clientRenames := mr.moveConventionalFiles(fileCache, deliverAll)
-	openChanges := mr.applyEdits(fileCache, movedFiles, deliverAll)
-	if !deliverAll {
-		mr.reindex(fileCache, movedFiles, clientRenames)
-	}
-	moved := make(map[string]string, len(movedFiles)+len(clientRenames))
-	for from, to := range movedFiles {
-		moved[from] = to
-	}
-	for from, to := range clientRenames {
-		moved[from] = to
-	}
-	files := make([]string, 0, len(mr.sitesByFile))
-	for filePath := range mr.sitesByFile {
-		files = append(files, filePath)
-	}
-	sort.Strings(files)
+	movedFiles, clientRenames := mr.moveConventionalFiles(fileCache)
+	openChanges := mr.applyEdits(fileCache, movedFiles)
+	indexed := mr.reindex(fileCache, movedFiles, clientRenames)
+	s.reportRenameFailures(&mr.failures)
+	report.recordModuleRename(mr.sitesByFile, movedFiles, clientRenames, &mr.failures)
+	report.waitFor(indexed)
 
 	if len(clientRenames) == 0 {
-		return &WorkspaceEdit{Changes: openChanges}, moved, files, nil
+		return &WorkspaceEdit{Changes: openChanges}, nil
 	}
-	return renamesToDocumentChanges(openChanges, clientRenames), moved, files, nil
+	return renamesToDocumentChanges(openChanges, clientRenames), nil
 }
 
 // renamesToDocumentChanges folds the open buffers' text edits and the file
@@ -5845,6 +6044,7 @@ type moduleRename struct {
 	tokenReplacements map[string]string // old token → new token
 	allModuleDefs     []store.LookupResult
 	sitesByFile       map[string][]moduleEditSite
+	failures          renameFailures // files the rename could not change
 }
 
 type moduleEditSite struct {
@@ -5928,7 +6128,7 @@ func (mr *moduleRename) checkCollisions() error {
 }
 
 func (mr *moduleRename) isExcluded(filePath string) bool {
-	return (mr.server.stdlibRoot != "" && strings.HasPrefix(filePath, mr.server.stdlibRoot)) || mr.server.isDepsFile(filePath)
+	return mr.server.isStdlibPath(filePath) || mr.server.isDepsFile(filePath)
 }
 
 func (mr *moduleRename) collectSites() {
@@ -6209,7 +6409,7 @@ func (mr *moduleRename) conventionalNewPath(r store.LookupResult) (string, bool)
 // Returns the files moved on disk, the moves left to the client, the open
 // files moved on disk anyway (fallback clients, which need showDocument and a
 // deferred delete), and the path to show for the trigger file.
-func (mr *moduleRename) moveConventionalFiles(fileCache map[string]moduleFileInfo, deliverAll bool) (movedFiles, clientRenames map[string]string) {
+func (mr *moduleRename) moveConventionalFiles(fileCache map[string]moduleFileInfo) (movedFiles, clientRenames map[string]string) {
 	movedFiles = make(map[string]string)
 	clientRenames = make(map[string]string)
 	for _, r := range mr.allModuleDefs {
@@ -6238,16 +6438,6 @@ func (mr *moduleRename) moveConventionalFiles(fileCache map[string]moduleFileInf
 			continue
 		}
 
-		if deliverAll {
-			// Headless callers encode moves in the edit and deliverEdits applies
-			// them on disk. Attached callers can forward them only when the live
-			// editor supports rename resource operations.
-			if mr.server.conn == nil || mr.server.renameFileOpsSupported {
-				clientRenames[r.FilePath] = newPath
-			}
-			continue
-		}
-
 		if fi.open {
 			// Client applies rename operations: leave both paths untouched.
 			// applyEdits still emits TextEdits for the old URI, and the rename
@@ -6271,15 +6461,18 @@ func (mr *moduleRename) moveConventionalFiles(fileCache map[string]moduleFileInf
 
 		if err := os.MkdirAll(filepath.Dir(newPath), 0755); err != nil {
 			log.Printf("Rename: cannot create dir for %s: %v", newPath, err)
+			mr.failures.add(r.FilePath, err)
 			continue
 		}
 		if err := os.WriteFile(newPath, []byte(content), 0644); err != nil {
 			log.Printf("Rename: cannot write %s: %v", newPath, err)
+			mr.failures.add(r.FilePath, err)
 			continue
 		}
 
 		if err := os.Remove(r.FilePath); err != nil {
 			log.Printf("Rename: cannot remove %s: %v", r.FilePath, err)
+			mr.failures.add(r.FilePath, err)
 		}
 		mr.server.debugf("Rename: %s → %s", r.FilePath, newPath)
 		movedFiles[r.FilePath] = newPath
@@ -6289,7 +6482,7 @@ func (mr *moduleRename) moveConventionalFiles(fileCache map[string]moduleFileInf
 
 // applyEdits applies text edits to all non-moved files: open buffers get
 // TextEdits in the WorkspaceEdit, closed files are written directly to disk.
-func (mr *moduleRename) applyEdits(fileCache map[string]moduleFileInfo, movedFiles map[string]string, deliverAll bool) map[protocol.DocumentURI][]protocol.TextEdit {
+func (mr *moduleRename) applyEdits(fileCache map[string]moduleFileInfo, movedFiles map[string]string) map[protocol.DocumentURI][]protocol.TextEdit {
 	openChanges := make(map[protocol.DocumentURI][]protocol.TextEdit)
 	var wg sync.WaitGroup
 
@@ -6301,7 +6494,7 @@ func (mr *moduleRename) applyEdits(fileCache map[string]moduleFileInfo, movedFil
 		if !ok {
 			continue
 		}
-		if fi.open || deliverAll {
+		if fi.open {
 			fileURI := protocol.DocumentURI(uri.File(fp))
 			// Each site is matched against the original line, so two sites can
 			// resolve to the same span — `alias Old.{A, B}` is one reference
@@ -6337,6 +6530,7 @@ func (mr *moduleRename) applyEdits(fileCache map[string]moduleFileInfo, movedFil
 				updatedLines := mr.applyEditsToLines(fi.lines, sites)
 				if err := os.WriteFile(fp, []byte(strings.Join(updatedLines, "\n")), 0644); err != nil {
 					log.Printf("Rename: cannot write %s: %v", fp, err)
+					mr.failures.add(fp, err)
 				}
 			}()
 		}
@@ -6362,7 +6556,7 @@ func overlapsClaimed(claimed []moduleEditResult, e moduleEditResult) bool {
 // back from disk. clientRenames have not moved yet — the client applies them
 // when it receives the reply — so their new paths are indexed from the text
 // the edits produce.
-func (mr *moduleRename) reindex(fileCache map[string]moduleFileInfo, movedFiles, clientRenames map[string]string) {
+func (mr *moduleRename) reindex(fileCache map[string]moduleFileInfo, movedFiles, clientRenames map[string]string) <-chan struct{} {
 	removePaths := make([]string, 0, len(movedFiles)+len(clientRenames))
 	for oldPath := range movedFiles {
 		removePaths = append(removePaths, oldPath)
@@ -6409,7 +6603,7 @@ func (mr *moduleRename) reindex(fileCache map[string]moduleFileInfo, movedFiles,
 		}
 	}
 
-	mr.server.reindexAfterRename(removePaths, reindexPaths, openReindexes)
+	return mr.server.reindexAfterRename(removePaths, reindexPaths, openReindexes)
 }
 
 type renameSite struct {
@@ -6426,7 +6620,7 @@ type textReindex struct {
 // buildTextEdits creates a WorkspaceEdit replacing all whole-token occurrences
 // of oldToken with newToken. Open buffers are returned in the WorkspaceEdit;
 // closed files are written directly to disk in parallel goroutines.
-func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string, deliverAll bool) *WorkspaceEdit {
+func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string, report *RenameSummary) *WorkspaceEdit {
 	// Group sites by file
 	sitesByFile := make(map[string][]renameSite, len(sites))
 	for _, site := range sites {
@@ -6491,6 +6685,7 @@ func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string, d
 	var wg sync.WaitGroup
 	var reindexPaths []string
 	var openReindexes []textReindex
+	var failures renameFailures
 
 	for fp, fileSites := range sitesByFile {
 		fi, ok := fileCache[fp]
@@ -6501,7 +6696,7 @@ func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string, d
 		// Compute edits once for both TextEdits and reindexing
 		updatedLines := applyTokenEdits(fi.lines, fileSites)
 
-		if fi.open || deliverAll {
+		if fi.open {
 			// Open buffer: build TextEdits for the editor AND capture updated
 			// text for reindexing (computed once, used for both purposes).
 			fileURI := protocol.DocumentURI(uri.File(fp))
@@ -6526,9 +6721,7 @@ func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string, d
 					})
 				}
 			}
-			if !deliverAll {
-				openReindexes = append(openReindexes, textReindex{fp, strings.Join(updatedLines, "\n")})
-			}
+			openReindexes = append(openReindexes, textReindex{fp, strings.Join(updatedLines, "\n")})
 		} else {
 			// Closed file: write to disk in parallel
 			wg.Add(1)
@@ -6536,16 +6729,22 @@ func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string, d
 				defer wg.Done()
 				if err := os.WriteFile(fp, []byte(strings.Join(updatedLines, "\n")), 0644); err != nil {
 					log.Printf("Rename: cannot write %s: %v", fp, err)
+					failures.add(fp, err)
 				}
 			}()
 			reindexPaths = append(reindexPaths, fp)
 		}
 	}
 	wg.Wait()
-
-	if !deliverAll {
-		s.reindexAfterRename(nil, reindexPaths, openReindexes)
+	s.reportRenameFailures(&failures)
+	for fp := range sitesByFile {
+		if _, ok := fileCache[fp]; ok {
+			report.changed(fp)
+		}
 	}
+	report.recordFailures(&failures)
+
+	report.waitFor(s.reindexAfterRename(nil, reindexPaths, openReindexes))
 
 	return &WorkspaceEdit{Changes: openChanges}
 }
@@ -6554,14 +6753,20 @@ func (s *Server) buildTextEdits(sites []renameSite, oldToken, newToken string, d
 // lock. Besides keeping each write out of a cold build, holding the lock across
 // removals and inserts prevents a build from observing an empty intermediate
 // state and starting its insert-only transaction in the middle of the rename.
-func (s *Server) reindexAfterRename(removePaths, diskPaths []string, textPaths []textReindex) {
-	s.backgroundWork.Add(1)
+//
+// The returned channel is closed when the index shows the rename.
+func (s *Server) reindexAfterRename(removePaths, diskPaths []string, textPaths []textReindex) <-chan struct{} {
+	done := make(chan struct{})
+	s.index.backgroundWork.Add(1)
 	go func() {
-		defer s.backgroundWork.Done()
+		defer s.index.backgroundWork.Done()
+		defer close(done)
 
-		s.indexWrites.RLock()
-		defer s.indexWrites.RUnlock()
-		if s.indexUnavailable {
+		s.index.reindexing.Lock()
+		defer s.index.reindexing.Unlock()
+		s.index.writes.RLock()
+		defer s.index.writes.RUnlock()
+		if s.index.unavailable {
 			return
 		}
 
@@ -6583,6 +6788,7 @@ func (s *Server) reindexAfterRename(removePaths, diskPaths []string, textPaths [
 			log.Printf("Rename: reindexed %d files", len(diskPaths)+len(textPaths)) // intentionally always logged — useful for user feedback
 		}
 	}()
+	return done
 }
 
 // isDepsFile returns true if filePath lives under the deps/ directory of some
@@ -6644,11 +6850,6 @@ func (s *Server) readFileText(filePath string) (text string, open bool, ok bool)
 	return "", false, false
 }
 
-// ReadFileText returns a file's current text, preferring an editor-owned buffer.
-func (s *Server) ReadFileText(filePath string) (text string, open bool, ok bool) {
-	return s.readFileText(filePath)
-}
-
 // getFileLine returns the text of line lineNum (1-based) from the file at
 // filePath, preferring the in-memory document store for editor-owned
 // buffers. Transient entries loaded via GetOrLoad fall through to the
@@ -6679,11 +6880,6 @@ func (s *Server) getFileLine(filePath string, lineNum int) (string, bool) {
 		}
 	}
 	return "", false
-}
-
-// FileLine returns one 1-based line, preferring an editor-owned buffer.
-func (s *Server) FileLine(filePath string, lineNum int) (string, bool) {
-	return s.getFileLine(filePath, lineNum)
 }
 
 // findBareCallRefs scans definition files for bare intra-module calls to
@@ -6887,7 +7083,7 @@ func (s *Server) Symbols(ctx context.Context, params *protocol.WorkspaceSymbolPa
 		return nil, nil
 	}
 
-	results, err := s.store.SearchSymbols(query, s.stdlibRoot)
+	results, err := s.store.SearchSymbols(query, s.StdlibRoot())
 	if err != nil {
 		return nil, err
 	}
@@ -7038,7 +7234,7 @@ func (s *Server) PrepareCallHierarchy(ctx context.Context, params *protocol.Call
 		if len(generatedFunctions) == 0 {
 			return nil, nil
 		}
-		defResults = s.generatedDefinitionResults(fullModule)
+		defResults, _ = s.generatedDefinitionResultsFor(fullModule, "", generatedFunctions)
 		if len(defResults) == 0 {
 			return nil, nil
 		}
@@ -7115,7 +7311,7 @@ func (s *Server) IncomingCalls(ctx context.Context, params *protocol.CallHierarc
 	var calls []protocol.CallHierarchyIncomingCall
 
 	for _, r := range refResults {
-		if s.stdlibRoot != "" && strings.HasPrefix(r.FilePath, s.stdlibRoot) {
+		if s.isStdlibPath(r.FilePath) {
 			continue
 		}
 		k := refKey{r.FilePath, r.Line}
@@ -7221,7 +7417,7 @@ func (s *Server) OutgoingCalls(ctx context.Context, params *protocol.CallHierarc
 			continue
 		}
 		td := targetDefs[0]
-		if s.stdlibRoot != "" && strings.HasPrefix(td.FilePath, s.stdlibRoot) {
+		if s.isStdlibPath(td.FilePath) {
 			continue
 		}
 

@@ -18,9 +18,11 @@ Which tool for which question:
 - Rename a module or function everywhere: `dexter_rename_symbol` (writes the
   changes; review with `git diff`)
 
-The index updates automatically: file changes are watched (fsnotify) and git
-branch switches are detected. If a lookup ever seems stale, `dexter_reindex`
-forces an immediate incremental update.
+The index updates automatically: the dexter daemon, which the editor shares,
+watches file changes and git branch switches. If a lookup ever seems stale,
+`dexter_reindex` forces an immediate incremental update. An answer that ends
+with a note about the index (still building, being rebuilt, files that could
+not be indexed) can be incomplete; retry after the note goes away.
 
 Elixir specifics: modules are not tied to files (use `dexter_file_outline` for
 a file, `dexter_definition` for a module); pass fully-qualified module names,

@@ -546,3 +546,37 @@ func TestDocumentStore_GetTree_ConcurrentEvictionStress(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestDocumentStore_IsSafeAfterClose covers the shared-daemon blast radius: one
+// session's shutdown must not let a later request panic the process that serves
+// every attached editor. CloseAll is idempotent (a shutdown request followed by
+// a disconnect both close), and a closed store refuses writes rather than
+// re-creating its maps or parsing with the freed parser.
+func TestDocumentStore_IsSafeAfterClose(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "after_close.ex")
+	if err := os.WriteFile(path, []byte("defmodule AfterClose do\nend\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	docURI := string(uri.File(path))
+
+	ds := NewDocumentStore()
+	ds.Set(docURI, "defmodule AfterClose do\n  def open, do: :ok\nend\n")
+	ds.CloseAll()
+	ds.CloseAll() // the parser must not be freed twice
+
+	ds.Set(docURI, "defmodule AfterClose do\n  def replaced, do: :ok\nend\n")
+	if _, ok := ds.Get(docURI); ok {
+		t.Fatal("Set after CloseAll was accepted")
+	}
+	if _, ok := ds.GetOrLoad(docURI); ok {
+		t.Fatal("GetOrLoad after CloseAll was accepted")
+	}
+	if _, _, _, ok := ds.GetTree(docURI); ok {
+		t.Fatal("GetTree after CloseAll returned a tree")
+	}
+	ds.SetMaxTransient(3)
+	if got := ds.Count(); got != 0 {
+		t.Fatalf("Count after CloseAll = %d, want 0", got)
+	}
+}

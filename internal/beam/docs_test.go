@@ -2,6 +2,7 @@ package beam
 
 import (
 	"bytes"
+	"compress/gzip"
 	"compress/zlib"
 	"encoding/binary"
 	"os"
@@ -135,20 +136,35 @@ func TestParseDocsMalformed(t *testing.T) {
 	}
 }
 
-// Deeply nested terms must be rejected rather than followed into a stack
-// overflow, which a corrupt length field could otherwise cause.
-func TestParseDocsRejectsDeepNesting(t *testing.T) {
+// Stepping over a deeply nested term costs no stack, and a nested anno is read
+// the same way: a million levels, which a corrupt chunk could hold, must not
+// overflow the stack.
+func TestParseDocsDeepNestingCostsNoStack(t *testing.T) {
 	var w etfTestWriter
 	w.smallTuple(7)
 	w.atom("docs_v1")
-	// The anno field is skipped, so nesting it past the limit exercises the
-	// depth guard inside skip rather than the header checks.
-	for range maxETFDepth + 10 {
+	for range 1_000_000 {
 		w.smallTuple(1)
 	}
 	w.nil()
+	// The rest of docs_v1 is missing, so the parse fails, but only after it
+	// stepped over the nested anno.
 	if _, err := parseDocs(w.buf); err == nil {
-		t.Error("expected deeply nested input to be rejected")
+		t.Error("expected the incomplete term to be rejected")
+	}
+
+	var anno etfTestWriter
+	for range 1_000_000 {
+		anno.smallTuple(2)
+	}
+	anno.smallInt(7)
+	for range 1_000_000 {
+		anno.smallInt(1)
+	}
+	r := &etfReader{buf: anno.buf}
+	line, err := readAnnoLine(r)
+	if err != nil || line != 7 || r.remaining() != 0 {
+		t.Errorf("readAnnoLine = %d, %v with %d bytes left; want 7 and the whole term read", line, err, r.remaining())
 	}
 }
 
@@ -194,6 +210,59 @@ func TestReadExports(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("export %d = %#v, want %#v", i, got[i], want[i])
 		}
+	}
+}
+
+// A module compiled with the `compressed` option is a gzip stream around the
+// container. Its exports read the same, and a compressed file that does not
+// hold a container is still rejected.
+func TestReadExportsCompressedBEAM(t *testing.T) {
+	dir := t.TempDir()
+	plain := filepath.Join(dir, "plain.beam")
+	writeTestBEAM(t, plain, buildDocsTerm())
+	data, err := os.ReadFile(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gzipped := func(data []byte) []byte {
+		var buf bytes.Buffer
+		zw := gzip.NewWriter(&buf)
+		if _, err := zw.Write(data); err != nil {
+			t.Fatal(err)
+		}
+		if err := zw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return buf.Bytes()
+	}
+
+	compressed := filepath.Join(dir, "Elixir.Example.beam")
+	if err := os.WriteFile(compressed, gzipped(data), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	want, err := ReadExports(plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadExports(compressed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("compressed exports = %#v, want %#v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("compressed export %d = %#v, want %#v", i, got[i], want[i])
+		}
+	}
+
+	notBEAM := filepath.Join(dir, "not.beam")
+	if err := os.WriteFile(notBEAM, gzipped([]byte("this is not a BEAM container")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadExports(notBEAM); err == nil {
+		t.Fatal("ReadExports accepted a compressed file that holds no BEAM container")
 	}
 }
 
@@ -374,6 +443,8 @@ type testBEAMOptions struct {
 	exports   [][3]uint32
 	docs      []byte
 	attrs     []byte
+	dbgi      []byte // written compressed, as the compiler writes it
+	cinf      []byte // written as given
 }
 
 func writeTestBEAM(t *testing.T, path string, docs []byte) {
@@ -389,25 +460,11 @@ func writeTestBEAMOpts(t *testing.T, path string, opts testBEAMOptions) {
 	t.Helper()
 	var size [4]byte
 
-	var raw bytes.Buffer
-	raw.WriteByte(etfVersion)
+	var raw []byte
 	if len(opts.docs) > 0 {
-		raw.WriteByte(tagCompressed)
-		var uncompressed bytes.Buffer
-		uncompressed.Write(opts.docs)
-		binary.BigEndian.PutUint32(size[:], uint32(uncompressed.Len()))
-		raw.Write(size[:])
-		var zw bytes.Buffer
-		compressor := zlib.NewWriter(&zw)
-		if _, err := compressor.Write(uncompressed.Bytes()); err != nil {
-			t.Fatal(err)
-		}
-		if err := compressor.Close(); err != nil {
-			t.Fatal(err)
-		}
-		raw.Write(zw.Bytes())
+		raw = compressedTestTerm(t, opts.docs)
 	} else {
-		raw.WriteByte(tagNil)
+		raw = []byte{etfVersion, tagNil}
 	}
 
 	var atoms bytes.Buffer
@@ -443,7 +500,13 @@ func writeTestBEAMOpts(t *testing.T, path string, opts testBEAMOptions) {
 	if len(opts.attrs) > 0 {
 		writeTestChunk(&chunks, "Attr", opts.attrs)
 	}
-	writeTestChunk(&chunks, "Docs", raw.Bytes())
+	writeTestChunk(&chunks, "Docs", raw)
+	if len(opts.dbgi) > 0 {
+		writeTestChunk(&chunks, "Dbgi", compressedTestTerm(t, opts.dbgi))
+	}
+	if len(opts.cinf) > 0 {
+		writeTestChunk(&chunks, "CInf", opts.cinf)
+	}
 
 	var file bytes.Buffer
 	file.WriteString("FOR1")
@@ -454,6 +517,25 @@ func writeTestBEAMOpts(t *testing.T, path string, opts testBEAMOptions) {
 	if err := os.WriteFile(path, file.Bytes(), 0o600); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// compressedTestTerm wraps an encoded term as a versioned COMPRESSED_TERM, the
+// form Elixir writes its Docs and Dbgi chunks in.
+func compressedTestTerm(t *testing.T, term []byte) []byte {
+	t.Helper()
+	var size [4]byte
+	raw := []byte{etfVersion, tagCompressed}
+	binary.BigEndian.PutUint32(size[:], uint32(len(term)))
+	raw = append(raw, size[:]...)
+	var zw bytes.Buffer
+	compressor := zlib.NewWriter(&zw)
+	if _, err := compressor.Write(term); err != nil {
+		t.Fatal(err)
+	}
+	if err := compressor.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return append(raw, zw.Bytes()...)
 }
 
 func writeTestChunk(chunks *bytes.Buffer, name string, data []byte) {
@@ -487,6 +569,10 @@ type docEntry struct {
 	signature string
 	doc       string // "none", "hidden", or the documentation prose
 	defaults  int
+
+	// anno is the source annotation the compiler records for the entry: the line
+	// the code was created at. Zero means the usual module line.
+	anno int
 
 	// extraMetadata writes additional pairs into the entry's metadata map, the
 	// way a framework's `@doc spark_opts` lands alongside `defaults`.
@@ -523,7 +609,11 @@ func buildDocsTerm(entries ...docEntry) []byte {
 		w.atom(entry.name)
 		w.smallInt(entry.arity)
 
-		w.smallInt(1) // anno
+		anno := entry.anno
+		if anno == 0 {
+			anno = 1
+		}
+		w.smallInt(anno)
 
 		w.listHeader(1)
 		w.binary(entry.signature)
@@ -599,6 +689,14 @@ func (w *etfTestWriter) binary(text string) {
 	w.buf = append(w.buf, text...)
 }
 
+// string writes a STRING_EXT term, the compact encoding Erlang uses for the
+// printable charlists it records in compile info.
+func (w *etfTestWriter) string(text string) {
+	w.byte(tagString)
+	w.be16(uint16(len(text)))
+	w.buf = append(w.buf, text...)
+}
+
 func (w *etfTestWriter) smallInt(value int) {
 	if value >= 0 && value < 256 {
 		w.byte(tagSmallInteger)
@@ -663,5 +761,78 @@ func TestParseDocsMetadataWithCapturedFunction(t *testing.T) {
 	}
 	if got[1].Name != "list" || got[1].Arity != 0 {
 		t.Errorf("entry after the captured function = %+v, want list/0", got[1])
+	}
+}
+
+// The compile-time annotation is what makes a generated callable navigable: it
+// names the line the code was created at, which for a macro-emitted symbol is a
+// specific site rather than the module the symbol ended up in.
+func TestReadDocumentedFunctionsRecordsSourceLine(t *testing.T) {
+	docs := buildDocsTerm(
+		docEntry{kind: "macro", name: "code_interface", arity: 1, signature: "code_interface(body)", doc: "none", anno: 1811},
+		docEntry{kind: "function", name: "generated_at_module_line", arity: 0, signature: "generated_at_module_line()", doc: "none", anno: 1},
+	)
+	path := filepath.Join(t.TempDir(), "Elixir.LibFixture.beam")
+	writeTestBEAM(t, path, docs)
+
+	functions, err := ReadDocumentedFunctions(path)
+	if err != nil {
+		t.Fatalf("ReadDocumentedFunctions: %v", err)
+	}
+
+	got := make(map[string]int, len(functions))
+	for _, f := range functions {
+		got[f.Name] = f.Line
+	}
+	for name, want := range map[string]int{
+		"code_interface":           1811,
+		"generated_at_module_line": 1,
+	} {
+		if got[name] != want {
+			t.Errorf("%s: Line = %d, want %d", name, got[name], want)
+		}
+	}
+}
+
+// An annotation the reader does not understand must cost only the line, never
+// the entry: dropping the whole Docs chunk would take every generated function
+// with it.
+func TestReadDocumentedFunctionsToleratesNonIntegerAnno(t *testing.T) {
+	// writeTestBEAM prepends the ETF version byte, so the payload starts at the
+	// term itself — same as buildDocsTerm.
+	var w etfTestWriter
+	w.smallTuple(7)
+	w.atom("docs_v1")
+	w.smallInt(1)
+	w.atom("elixir")
+	w.binary("text/markdown")
+	w.atom("none")
+	w.mapHeader(0)
+	w.listHeader(1)
+	w.smallTuple(5)
+	w.smallTuple(3)
+	w.atom("function")
+	w.atom("kept")
+	w.smallInt(0)
+	w.atom("none") // anno as an atom instead of a line
+	w.listHeader(1)
+	w.binary("kept()")
+	w.nil()
+	w.atom("none")
+	w.mapHeader(0)
+	w.nil()
+
+	path := filepath.Join(t.TempDir(), "Elixir.LibFixture.beam")
+	writeTestBEAM(t, path, w.buf)
+
+	functions, err := ReadDocumentedFunctions(path)
+	if err != nil {
+		t.Fatalf("ReadDocumentedFunctions: %v", err)
+	}
+	if len(functions) != 1 || functions[0].Name != "kept" {
+		t.Fatalf("functions = %+v, want the single kept/0 entry", functions)
+	}
+	if functions[0].Line != 0 {
+		t.Errorf("Line = %d, want 0 for an unreadable anno", functions[0].Line)
 	}
 }

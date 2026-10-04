@@ -2,65 +2,106 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/remoteoss/dexter/internal/lsp"
-	"github.com/remoteoss/dexter/internal/parser"
 	"github.com/remoteoss/dexter/internal/store"
-	"github.com/remoteoss/dexter/internal/version"
+	"github.com/remoteoss/dexter/internal/workspace"
 )
 
-// testEnv is a full in-memory MCP round trip: client session <-> server with
-// all tools registered, backed by a real store in a temp dir. Going through
-// the SDK session exercises schema inference and argument validation, not
-// just the handler bodies.
+// testEnv is a full in-memory MCP round trip: client session <-> Frontend
+// with all tools declared <-> the tool bodies over a real workspace runtime in
+// a temp dir. Going through the SDK session exercises schema inference and
+// argument validation; the local backend calls the same Handler.Call that the
+// daemon's control method calls.
 type testEnv struct {
 	t       *testing.T
+	rt      *workspace.Runtime
 	store   *store.Store
 	lsp     *lsp.Server
 	root    string
 	session *mcp.ClientSession
 }
 
-func setupTestEnv(t *testing.T) *testEnv {
+// localBackend runs tool bodies in-process, as the daemon does.
+type localBackend struct {
+	h    *Handler
+	wait time.Duration
+}
+
+func (b *localBackend) CallTool(ctx context.Context, name string, args json.RawMessage) (string, error) {
+	return b.h.Call(ctx, name, args, b.wait)
+}
+
+func (b *localBackend) Close() error { return nil }
+
+// openTestRuntime opens a workspace runtime over root without native
+// watching, so tests decide when the index changes.
+func openTestRuntime(t *testing.T, root string, opts workspace.Options) *workspace.Runtime {
 	t.Helper()
-	root := t.TempDir()
-	s, err := store.Open(root)
+	// Keep stdlib and version-manager detection from finding a real Elixir
+	// install and indexing it.
+	t.Setenv("DEXTER_ELIXIR_LIB_ROOT", t.TempDir())
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv("SHELL", "/bin/false")
+	opts.NoWatch = true
+	rt, err := workspace.OpenWithOptions(root, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = s.Close() })
-	if err := s.SetIndexVersion(version.IndexVersion); err != nil {
+	t.Cleanup(func() { _ = rt.Close() })
+	return rt
+}
+
+func setupTestEnv(t *testing.T) *testEnv {
+	t.Helper()
+	root := t.TempDir()
+	rt := openTestRuntime(t, root, workspace.Options{})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := rt.WaitReady(ctx); err != nil {
 		t.Fatal(err)
 	}
+	h := NewHandler(rt, rt.LanguageServices())
+	session := connectFrontend(t, NewFrontend(Config{Root: root, Fixed: true, Connect: func(string) Backend {
+		return &localBackend{h: h, wait: time.Second}
+	}}))
+	return &testEnv{t: t, rt: rt, store: rt.Store(), lsp: rt.LanguageServices(), root: root, session: session}
+}
 
-	server := lsp.NewServer(s, root)
-	h := NewHandler(Config{LSP: server, Store: s, ProjectRoot: root})
-
+// connectFrontend connects an in-memory MCP client to a server over f.
+func connectFrontend(t *testing.T, f *Frontend, rootURIs ...string) *mcp.ClientSession {
+	t.Helper()
+	t.Cleanup(f.Close)
 	ctx := context.Background()
 	serverTransport, clientTransport := mcp.NewInMemoryTransports()
-	serverSession, err := NewServer(h).Connect(ctx, serverTransport, nil)
+	serverSession, err := NewServer(f).Connect(ctx, serverTransport, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = serverSession.Close() })
 
 	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0.0.1"}, nil)
+	for _, u := range rootURIs {
+		client.AddRoots(&mcp.Root{URI: u})
+	}
 	session, err := client.Connect(ctx, clientTransport, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = session.Close() })
-
-	return &testEnv{t: t, store: s, lsp: server, root: root, session: session}
+	return session
 }
 
-// indexFile writes an Elixir source file under the project root and indexes it.
+// indexFile writes an Elixir source file under the project root and waits
+// until the workspace has indexed it.
 func (e *testEnv) indexFile(relPath, content string) string {
 	e.t.Helper()
 	path := filepath.Join(e.root, relPath)
@@ -70,11 +111,9 @@ func (e *testEnv) indexFile(relPath, content string) string {
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		e.t.Fatal(err)
 	}
-	defs, refs, err := parser.ParseFile(path)
-	if err != nil {
-		e.t.Fatal(err)
-	}
-	if err := e.store.IndexFileWithRefs(path, defs, refs); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := e.rt.ReindexPath(ctx, path); err != nil {
 		e.t.Fatal(err)
 	}
 	return path

@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/modelcontextprotocol/go-sdk/mcp"
-
 	"github.com/remoteoss/dexter/internal/lsp"
 	"github.com/remoteoss/dexter/internal/store"
 )
@@ -16,15 +14,15 @@ type ModuleAPIParams struct {
 	IncludePrivate bool   `json:"include_private,omitempty" jsonschema:"also list defp/defmacrop definitions (default false)"`
 }
 
-func (h *Handler) moduleAPIHandler(ctx context.Context, req *mcp.CallToolRequest, args ModuleAPIParams) (*mcp.CallToolResult, any, error) {
+func (h *Handler) moduleAPI(ctx context.Context, args ModuleAPIParams) (string, error) {
 	module := strings.TrimSpace(args.Module)
 	if module == "" {
-		return nil, nil, fmt.Errorf("module must not be empty")
+		return "", fmt.Errorf("module must not be empty")
 	}
 
 	modResults, err := h.store.LookupModule(module)
 	if err != nil {
-		return nil, nil, fmt.Errorf("looking up module: %w", err)
+		return "", fmt.Errorf("looking up module: %w", err)
 	}
 	var moduleDef *store.LookupResult
 	implCount := 0
@@ -43,7 +41,7 @@ func (h *Handler) moduleAPIHandler(ctx context.Context, req *mcp.CallToolRequest
 		}
 	}
 	if moduleDef == nil {
-		return textResult(fmt.Sprintf("Module %s is not in the index. Use dexter_search to find the right name, or dexter_reindex if the module was just created.", module)), nil, nil
+		return fmt.Sprintf("Module %s is not in the index. Use dexter_search to find the right name, or dexter_reindex if the module was just created.", module), nil
 	}
 
 	var b strings.Builder
@@ -62,11 +60,11 @@ func (h *Handler) moduleAPIHandler(ctx context.Context, req *mcp.CallToolRequest
 
 	funcs, err := h.store.ListModuleFunctions(module, !args.IncludePrivate)
 	if err != nil {
-		return nil, nil, fmt.Errorf("listing functions: %w", err)
+		return "", fmt.Errorf("listing functions: %w", err)
 	}
 	callbacks, err := h.store.ListModuleCallbacks(module)
 	if err != nil {
-		return nil, nil, fmt.Errorf("listing callbacks: %w", err)
+		return "", fmt.Errorf("listing callbacks: %w", err)
 	}
 
 	// Bucket by section, preserving store order (name, arity).
@@ -122,7 +120,7 @@ func (h *Handler) moduleAPIHandler(ctx context.Context, req *mcp.CallToolRequest
 	if len(funcs) == 0 && len(callbacks) == 0 {
 		fmt.Fprintf(&b, "\nNo functions indexed for this module.\n")
 	}
-	return textResult(b.String()), nil, nil
+	return b.String(), nil
 }
 
 func sectionFor(kind string) string {

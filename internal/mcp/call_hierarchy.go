@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"go.lsp.dev/protocol"
 )
 
@@ -17,11 +16,11 @@ type CallHierarchyParams struct {
 
 const maxCallsPerDirection = 50
 
-func (h *Handler) callHierarchyHandler(ctx context.Context, req *mcp.CallToolRequest, args CallHierarchyParams) (*mcp.CallToolResult, any, error) {
+func (h *Handler) callHierarchy(ctx context.Context, args CallHierarchyParams) (string, error) {
 	module := strings.TrimSpace(args.Module)
 	function := strings.TrimSpace(args.Function)
 	if module == "" || function == "" {
-		return nil, nil, fmt.Errorf("module and function must not be empty")
+		return "", fmt.Errorf("module and function must not be empty")
 	}
 	direction := strings.ToLower(strings.TrimSpace(args.Direction))
 	switch direction {
@@ -29,7 +28,7 @@ func (h *Handler) callHierarchyHandler(ctx context.Context, req *mcp.CallToolReq
 		direction = "both"
 	case "incoming", "outgoing", "both":
 	default:
-		return nil, nil, fmt.Errorf("direction must be 'incoming', 'outgoing', or 'both', got %q", args.Direction)
+		return "", fmt.Errorf("direction must be 'incoming', 'outgoing', or 'both', got %q", args.Direction)
 	}
 
 	// The LSP call-hierarchy handlers are name-based: they only read the
@@ -45,7 +44,7 @@ func (h *Handler) callHierarchyHandler(ctx context.Context, req *mcp.CallToolReq
 	if direction == "incoming" || direction == "both" {
 		calls, err := h.lsp.IncomingCalls(ctx, &protocol.CallHierarchyIncomingCallsParams{Item: item})
 		if err != nil {
-			return nil, nil, fmt.Errorf("incoming calls: %w", err)
+			return "", fmt.Errorf("incoming calls: %w", err)
 		}
 		fmt.Fprintf(&b, "\nIncoming (callers): %d\n", len(calls))
 		for i, c := range calls {
@@ -65,7 +64,7 @@ func (h *Handler) callHierarchyHandler(ctx context.Context, req *mcp.CallToolReq
 	if direction == "outgoing" || direction == "both" {
 		calls, err := h.lsp.OutgoingCalls(ctx, &protocol.CallHierarchyOutgoingCallsParams{Item: item})
 		if err != nil {
-			return nil, nil, fmt.Errorf("outgoing calls: %w", err)
+			return "", fmt.Errorf("outgoing calls: %w", err)
 		}
 		fmt.Fprintf(&b, "\nOutgoing (callees): %d\n", len(calls))
 		for i, c := range calls {
@@ -81,7 +80,7 @@ func (h *Handler) callHierarchyHandler(ctx context.Context, req *mcp.CallToolReq
 	if !found {
 		fmt.Fprintf(&b, "\nNo calls found. Check the module/function names (dexter_search can help), or call dexter_reindex if files changed recently.\n")
 	}
-	return textResult(b.String()), nil, nil
+	return b.String(), nil
 }
 
 func uriToPath(u protocol.DocumentURI) string {

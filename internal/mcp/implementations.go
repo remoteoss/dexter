@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-
-	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 type ImplementationsParams struct {
@@ -13,15 +11,15 @@ type ImplementationsParams struct {
 	Function string `json:"function,omitempty" jsonschema:"callback or protocol function name; when set, locate its definition in each implementor"`
 }
 
-func (h *Handler) implementationsHandler(ctx context.Context, req *mcp.CallToolRequest, args ImplementationsParams) (*mcp.CallToolResult, any, error) {
+func (h *Handler) implementations(ctx context.Context, args ImplementationsParams) (string, error) {
 	module := strings.TrimSpace(args.Module)
 	if module == "" {
-		return nil, nil, fmt.Errorf("module must not be empty")
+		return "", fmt.Errorf("module must not be empty")
 	}
 
 	modResults, err := h.store.LookupModule(module)
 	if err != nil {
-		return nil, nil, fmt.Errorf("looking up module: %w", err)
+		return "", fmt.Errorf("looking up module: %w", err)
 	}
 
 	// Protocol: implementations are the defimpl rows indexed under the protocol name.
@@ -42,7 +40,7 @@ func (h *Handler) implementationsHandler(ctx context.Context, req *mcp.CallToolR
 		if function := strings.TrimSpace(args.Function); function != "" {
 			defs, err := h.store.LookupFunction(module, function)
 			if err != nil {
-				return nil, nil, fmt.Errorf("looking up protocol function: %w", err)
+				return "", fmt.Errorf("looking up protocol function: %w", err)
 			}
 
 			// Functions in defprotocol and defimpl blocks share the protocol's
@@ -65,7 +63,7 @@ func (h *Handler) implementationsHandler(ctx context.Context, req *mcp.CallToolR
 				}
 			}
 			if len(arities) == 0 {
-				return textResult(fmt.Sprintf("%s does not define a protocol function named %s. List its functions with dexter_module_api.", module, function)), nil, nil
+				return fmt.Sprintf("%s does not define a protocol function named %s. List its functions with dexter_module_api.", module, function), nil
 			}
 
 			fmt.Fprintf(&b, "\nImplementations of protocol function %s.%s:\n", module, function)
@@ -80,11 +78,11 @@ func (h *Handler) implementationsHandler(ctx context.Context, req *mcp.CallToolR
 			if found == 0 {
 				fmt.Fprintf(&b, "  (no indexed defimpl defines %s)\n", function)
 			}
-			return textResult(b.String()), nil, nil
+			return b.String(), nil
 		}
 		if len(impls) == 0 {
 			fmt.Fprintf(&b, "No defimpl implementations found in the index.\n")
-			return textResult(b.String()), nil, nil
+			return b.String(), nil
 		}
 		fmt.Fprintf(&b, "\nImplementations (%d):\n", len(impls))
 		for _, i := range impls {
@@ -92,19 +90,19 @@ func (h *Handler) implementationsHandler(ctx context.Context, req *mcp.CallToolR
 			fmt.Fprintf(&b, "  %s:%d\n", h.relPath(r.FilePath), r.Line)
 		}
 		fmt.Fprintf(&b, "\nNote: the defimpl target type is on the cited line (defimpl %s, for: Type).\n", module)
-		return textResult(b.String()), nil, nil
+		return b.String(), nil
 	}
 
 	// Behaviour: modules that declare @behaviour or `use` this module.
 	implementors, err := h.store.LookupBehaviourImplementors(module)
 	if err != nil {
-		return nil, nil, fmt.Errorf("looking up implementors: %w", err)
+		return "", fmt.Errorf("looking up implementors: %w", err)
 	}
 	if len(implementors) == 0 {
 		if len(modResults) == 0 {
-			return textResult(fmt.Sprintf("Module %s is not in the index. Use dexter_search to find the right name.", module)), nil, nil
+			return fmt.Sprintf("Module %s is not in the index. Use dexter_search to find the right name.", module), nil
 		}
-		return textResult(fmt.Sprintf("No modules declare @behaviour %s (or use it) in the index.", module)), nil, nil
+		return fmt.Sprintf("No modules declare @behaviour %s (or use it) in the index.", module), nil
 	}
 
 	var b strings.Builder
@@ -114,10 +112,10 @@ func (h *Handler) implementationsHandler(ctx context.Context, req *mcp.CallToolR
 		function := strings.TrimSpace(args.Function)
 		cbs, err := h.store.LookupCallbackDef(module, function)
 		if err != nil {
-			return nil, nil, fmt.Errorf("looking up callback: %w", err)
+			return "", fmt.Errorf("looking up callback: %w", err)
 		}
 		if len(cbs) == 0 {
-			return textResult(fmt.Sprintf("%s does not define a @callback named %s. List its callbacks with dexter_module_api.", module, function)), nil, nil
+			return fmt.Sprintf("%s does not define a @callback named %s. List its callbacks with dexter_module_api.", module, function), nil
 		}
 		fmt.Fprintf(&b, "Implementations of callback %s.%s:\n", module, function)
 		arities := make(map[int]bool, len(cbs))
@@ -141,7 +139,7 @@ func (h *Handler) implementationsHandler(ctx context.Context, req *mcp.CallToolR
 		if found == 0 {
 			fmt.Fprintf(&b, "  (none of the %d implementor(s) define %s; they may rely on a default implementation injected via use)\n", len(implementors), function)
 		}
-		return textResult(b.String()), nil, nil
+		return b.String(), nil
 	}
 
 	fmt.Fprintf(&b, "Modules implementing behaviour %s (%d):\n", module, len(implementors))
@@ -159,5 +157,5 @@ func (h *Handler) implementationsHandler(ctx context.Context, req *mcp.CallToolR
 			fmt.Fprintf(&b, "  @%s %s/%d\n", cb.Kind, cb.Function, cb.Arity)
 		}
 	}
-	return textResult(b.String()), nil, nil
+	return b.String(), nil
 }

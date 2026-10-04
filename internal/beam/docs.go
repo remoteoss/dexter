@@ -4,6 +4,7 @@ package beam
 
 import (
 	"bytes"
+	"compress/gzip"
 	"compress/zlib"
 	"encoding/binary"
 	"errors"
@@ -28,6 +29,18 @@ type Function struct {
 	Params string
 	Kind   string
 	Hidden bool
+
+	// Line is the source annotation the compiler recorded for this callable, as
+	// emitted in the Docs chunk. It is zero when the callable came from the export
+	// table alone, which has no annotation.
+	//
+	// The annotation names the site the code was created at, not the module it
+	// ended up in: a symbol created while expanding `use X` is attributed to the
+	// `use` line, while one created by a transformer or a `@before_compile` hook is
+	// attributed to the module line. Combined with the owning module's source file
+	// (see ReadSourcePath) that is a usable definition target for code that exists
+	// only in compiled form.
+	Line int
 
 	// DocOffset and DocLen locate the documentation prose inside the inflated
 	// Docs chunk, so a hover can read one function's docs without decoding the
@@ -125,11 +138,26 @@ func readChunks(path string, wanted ...string) (map[string][]byte, error) {
 	if _, err := io.ReadFull(f, header[:]); err != nil {
 		return nil, err
 	}
+	// A module compiled with the `compressed` option, as some Erlang
+	// dependencies are, is a gzip stream around the usual container.
+	var r io.ReaderAt = f
+	size := info.Size()
+	if header[0] == 0x1f && header[1] == 0x8b {
+		data, err := gunzipBEAM(f)
+		if err != nil {
+			return nil, err
+		}
+		if len(data) < 12 {
+			return nil, fmt.Errorf("invalid BEAM size %d", len(data))
+		}
+		r, size = bytes.NewReader(data), int64(len(data))
+		copy(header[:], data)
+	}
 	if string(header[:4]) != "FOR1" || string(header[8:]) != "BEAM" {
 		return nil, errors.New("invalid BEAM header")
 	}
 	declared := int64(binary.BigEndian.Uint32(header[4:8])) + 8
-	if declared > info.Size() {
+	if declared > size {
 		return nil, errors.New("truncated BEAM container")
 	}
 
@@ -141,7 +169,7 @@ func readChunks(path string, wanted ...string) (map[string][]byte, error) {
 
 	for offset := int64(12); offset+8 <= declared && len(found) < len(pending); {
 		var chunkHeader [8]byte
-		if _, err := f.ReadAt(chunkHeader[:], offset); err != nil {
+		if _, err := r.ReadAt(chunkHeader[:], offset); err != nil {
 			return nil, err
 		}
 		length := int64(binary.BigEndian.Uint32(chunkHeader[4:8]))
@@ -157,7 +185,7 @@ func readChunks(path string, wanted ...string) (map[string][]byte, error) {
 				return nil, fmt.Errorf("%s chunk too large: %d", name, length)
 			}
 			data := make([]byte, length)
-			if _, err := f.ReadAt(data, dataOffset); err != nil {
+			if _, err := r.ReadAt(data, dataOffset); err != nil {
 				return nil, err
 			}
 			found[name] = data
@@ -165,6 +193,28 @@ func readChunks(path string, wanted ...string) (map[string][]byte, error) {
 		offset = dataOffset + ((length + 3) &^ 3)
 	}
 	return found, nil
+}
+
+// gunzipBEAM decompresses a compressed BEAM from its start. The output is
+// bounded like an uncompressed file, so a small file cannot expand into an
+// unbounded allocation.
+func gunzipBEAM(f *os.File) ([]byte, error) {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	zr, err := gzip.NewReader(f)
+	if err != nil {
+		return nil, fmt.Errorf("decompress BEAM: %w", err)
+	}
+	defer func() { _ = zr.Close() }()
+	data, err := io.ReadAll(io.LimitReader(zr, maxBEAMSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("decompress BEAM: %w", err)
+	}
+	if len(data) > maxBEAMSize {
+		return nil, errors.New("decompressed BEAM too large")
+	}
+	return data, nil
 }
 
 func readChunk(path, wanted string) ([]byte, error) {
@@ -456,7 +506,8 @@ func parseDocsEntry(r *etfReader) ([]Function, bool, error) {
 		return nil, false, err
 	}
 
-	if err := r.skip(); err != nil { // anno
+	line, err := readAnnoLine(r)
+	if err != nil {
 		return nil, false, err
 	}
 	params, err := readSignatureParams(r)
@@ -502,11 +553,50 @@ func parseDocsEntry(r *etfReader) ([]Function, bool, error) {
 			Params:    strings.Join(callParams, ","),
 			Kind:      definitionKind,
 			Hidden:    hidden,
+			Line:      line,
 			DocOffset: docOffset,
 			DocLen:    docLen,
 		})
 	}
 	return out, true, nil
+}
+
+// readAnnoLine reads the per-entry source annotation. Elixir writes it as a bare
+// line number, but the field is an erl_anno and may hold other shapes: a
+// {line, column} tuple gives its line, and anything else, such as `none`, is
+// consumed and reported as line 0 rather than failing the whole entry. A dropped annotation must never cost the
+// module its generated functions.
+func readAnnoLine(r *etfReader) (int, error) {
+	// rest counts the elements after each tuple's first one, which are stepped
+	// over once the line is found. A loop rather than recursion, so a corrupt
+	// chunk of nested tuples costs no stack.
+	rest := int64(0)
+	for {
+		tag, err := r.peekTag()
+		if err != nil {
+			return 0, err
+		}
+		switch tag {
+		case tagSmallInteger, tagInteger:
+			line, err := r.readInt()
+			if err != nil {
+				return 0, err
+			}
+			return line, r.skipTerms(rest)
+		case tagSmallTuple:
+			// {line, column}, as erl_anno writes a location with a column.
+			arity, err := r.enterTuple()
+			if err != nil {
+				return 0, err
+			}
+			if arity == 0 {
+				return 0, r.skipTerms(rest)
+			}
+			rest += int64(arity) - 1
+			continue
+		}
+		return 0, r.skipTerms(rest + 1)
+	}
 }
 
 // readSignatureParams consumes the signature list and parses the first signature

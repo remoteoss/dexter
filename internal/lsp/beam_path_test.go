@@ -157,17 +157,33 @@ type testAttr struct {
 // makes a compiled module record facts its source does not state, which is the
 // only way a framework's macro provider can be discovered.
 func minimalBeamWithAttrs(attrs []testAttr, docs string, exports ...beamExport) []byte {
-	return buildTestBeam(attrs, docs, exports...)
+	return buildTestBeam(testBeamChunks{attrs: attrs, docs: docs}, exports...)
 }
 
 // minimalBeamWithDocs is minimalBeam plus a Docs chunk whose inflated payload is
 // docs. ReadDocBody inflates that payload and slices it, so a test can put one
 // function's prose at a known offset without encoding a real docs_v1 term.
 func minimalBeamWithDocs(docs string, exports ...beamExport) []byte {
-	return buildTestBeam(nil, docs, exports...)
+	return buildTestBeam(testBeamChunks{docs: docs}, exports...)
 }
 
-func buildTestBeam(attrs []testAttr, docs string, exports ...beamExport) []byte {
+// minimalBeamWithDbgi adds a Dbgi chunk holding the encoded debug info term,
+// which is where a compiled module records the line of each definition.
+func minimalBeamWithDbgi(dbgi []byte, exports ...beamExport) []byte {
+	return buildTestBeam(testBeamChunks{dbgi: dbgi}, exports...)
+}
+
+// testBeamChunks are the optional chunks of a synthetic BEAM.
+type testBeamChunks struct {
+	attrs []testAttr
+	docs  string
+	dbgi  []byte
+	// source is written as the CInf chunk's :source, the file the module was
+	// compiled from.
+	source string
+}
+
+func buildTestBeam(chunks testBeamChunks, exports ...beamExport) []byte {
 	names := make([]string, 0, len(exports)+1)
 	names = append(names, "Elixir.Minimal")
 	for _, export := range exports {
@@ -189,21 +205,28 @@ func buildTestBeam(attrs []testAttr, docs string, exports ...beamExport) []byte 
 		writeBE32(&table, uint32(index+1)) // label
 	}
 
-	var chunks bytes.Buffer
-	writeBeamChunk(&chunks, "AtU8", atoms.Bytes())
-	writeBeamChunk(&chunks, "ExpT", table.Bytes())
-	if docs != "" {
-		writeBeamChunk(&chunks, "Docs", docsChunk(docs))
+	var body bytes.Buffer
+	writeBeamChunk(&body, "AtU8", atoms.Bytes())
+	writeBeamChunk(&body, "ExpT", table.Bytes())
+	if chunks.docs != "" {
+		writeBeamChunk(&body, "Docs", docsChunk(chunks.docs))
 	}
-	if len(attrs) > 0 {
-		writeBeamChunk(&chunks, "Attr", attrChunk(attrs))
+	if len(chunks.attrs) > 0 {
+		writeBeamChunk(&body, "Attr", attrChunk(chunks.attrs))
+	}
+	if len(chunks.dbgi) > 0 {
+		// Uncompressed, like docsChunk; the reader accepts both forms.
+		writeBeamChunk(&body, "Dbgi", append([]byte{131}, chunks.dbgi...))
+	}
+	if chunks.source != "" {
+		writeBeamChunk(&body, "CInf", compileInfoChunk(chunks.source))
 	}
 
 	var file bytes.Buffer
 	file.WriteString("FOR1")
-	writeBE32(&file, uint32(chunks.Len()+4))
+	writeBE32(&file, uint32(body.Len()+4))
 	file.WriteString("BEAM")
-	file.Write(chunks.Bytes())
+	file.Write(body.Bytes())
 	return file.Bytes()
 }
 
@@ -213,6 +236,19 @@ func docsChunk(docs string) []byte {
 	chunk := make([]byte, 0, len(docs)+1)
 	chunk = append(chunk, 131) // ETF version byte; 80 would mean COMPRESSED
 	return append(chunk, docs...)
+}
+
+// compileInfoChunk encodes the CInf chunk ReadSourcePath reads, with :source
+// as the compact string term the compiler writes for a charlist.
+func compileInfoChunk(source string) []byte {
+	out := []byte{131} // ETF version byte
+	out = append(out, etfListHeader(1)...)
+	out = append(out, 104, 2) // small tuple of arity 2
+	out = append(out, etfAtom("source")...)
+	out = append(out, 107) // STRING_EXT
+	out = binary.BigEndian.AppendUint16(out, uint16(len(source)))
+	out = append(out, source...)
+	return append(out, 106) // NIL_EXT
 }
 
 // attrChunk encodes the Attr chunk ReadModuleAttributes reads: an ETF list of
@@ -262,4 +298,103 @@ func writeBE32(buf *bytes.Buffer, value uint32) {
 	var field [4]byte
 	binary.BigEndian.PutUint32(field[:], value)
 	buf.Write(field[:])
+}
+
+// monorepoFixture lays out a workspace like tiger's: the workspace root is not a
+// Mix project and has no _build, apps/main compiles everything, and
+// libs/remote-library is a path dependency whose application is `remote`.
+func monorepoFixture(t *testing.T) (*Server, string) {
+	t.Helper()
+	server, cleanup := setupTestServer(t)
+	t.Cleanup(cleanup)
+	root := server.projectRoot
+	writeFile := func(relative, content string) {
+		t.Helper()
+		path := filepath.Join(root, relative)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeFile("apps/main/mix.exs", "defmodule Main.MixProject do\n  def project, do: [app: :main, deps: [{:remote, path: \"../../libs/remote-library\"}]]\nend\n")
+	writeFile("libs/remote-library/mix.exs", "defmodule Remote.MixProject do\n  @app :remote\n  def project, do: [app: @app]\nend\n")
+	indexFile(t, server.store, root, "libs/remote-library/lib/remote/thing.ex", "defmodule Remote.Thing do\n  defmacro __using__(_), do: nil\nend\n")
+	return server, root
+}
+
+func writeBeamAt(t *testing.T, ebin, module string, modified time.Time, exports ...beamExport) {
+	t.Helper()
+	if err := os.MkdirAll(ebin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(ebin, "Elixir."+module+".beam")
+	if err := os.WriteFile(path, minimalBeam(exports...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, modified, modified); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A library with no _build of its own is found in the build that compiles it as
+// a path dependency, both for its own modules and for a generated module
+// beneath one of them.
+func TestGeneratedFunctionsFromLibraryCompiledByAnotherProject(t *testing.T) {
+	server, root := monorepoFixture(t)
+	ebin := filepath.Join(root, "apps/main/_build/dev/lib/remote/ebin")
+	writeBeamAt(t, ebin, "Remote.Thing", time.Now(), beamExport{"generated_fn", 1})
+	writeBeamAt(t, ebin, "Remote.Thing.Helpers", time.Now(), beamExport{"helper_path", 2})
+
+	if _, found := server.generatedSymbol("Remote.Thing", "", "generated_fn"); !found {
+		t.Error("generated function of a library compiled by another project was not found")
+	}
+	if _, found := server.generatedSymbol("Remote.Thing.Helpers", "", "helper_path"); !found {
+		t.Error("generated module beneath a library module was not found")
+	}
+}
+
+// When a library is also compiled on its own, the most recently compiled BEAM
+// wins, whichever build holds it.
+func TestGeneratedFunctionsPreferMostRecentBuild(t *testing.T) {
+	older, newer := time.Now().Add(-time.Hour), time.Now()
+	for _, tc := range []struct {
+		name             string
+		consumer, ownLib time.Time
+		want, notWant    string
+	}{
+		{"consumer compiled last", newer, older, "consumer_fn", "standalone_fn"},
+		{"library compiled last", older, newer, "standalone_fn", "consumer_fn"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server, root := monorepoFixture(t)
+			if err := os.MkdirAll(filepath.Join(root, "libs/remote-library/_build"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			writeBeamAt(t, filepath.Join(root, "apps/main/_build/dev/lib/remote/ebin"), "Remote.Thing", tc.consumer, beamExport{"consumer_fn", 0})
+			writeBeamAt(t, filepath.Join(root, "libs/remote-library/_build/dev/lib/remote/ebin"), "Remote.Thing", tc.ownLib, beamExport{"standalone_fn", 0})
+
+			if _, found := server.generatedSymbol("Remote.Thing", "", tc.want); !found {
+				t.Errorf("%s from the newest build was not found", tc.want)
+			}
+			if _, found := server.generatedSymbol("Remote.Thing", "", tc.notWant); found {
+				t.Errorf("%s from the older build was used", tc.notWant)
+			}
+		})
+	}
+}
+
+func TestParseMixApp(t *testing.T) {
+	for source, want := range map[string]string{
+		"def project, do: [app: :remote, version: \"0.1.0\"]":      "remote",
+		"@app :fields_inventory\ndef project, do: [app: @app]":     "fields_inventory",
+		"def project, do: [app: @app]":                             "",
+		"def project, do: [version: \"0.1.0\"]":                    "",
+		"def project do\n  [\n    app:   :ex_jsf_logic,\n  ]\nend": "ex_jsf_logic",
+	} {
+		if got := parseMixApp([]byte(source)); got != want {
+			t.Errorf("parseMixApp(%q) = %q, want %q", source, got, want)
+		}
+	}
 }

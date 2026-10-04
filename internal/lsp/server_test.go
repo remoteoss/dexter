@@ -40,7 +40,7 @@ func setupTestServer(t *testing.T) (*Server, func()) {
 	}
 
 	return server, func() {
-		server.backgroundWork.Wait()
+		server.index.backgroundWork.Wait()
 		if err := s.Close(); err != nil {
 			t.Errorf("failed to close store: %v", err)
 		}
@@ -1688,7 +1688,7 @@ func TestCompletionResolve_StdlibPath(t *testing.T) {
 	defer cleanup()
 
 	stdlibDir := t.TempDir()
-	server.stdlibRoot = stdlibDir
+	server.SetStdlibRoot(stdlibDir)
 
 	stdlibFile := filepath.Join(stdlibDir, "lib", "enum.ex")
 	if err := os.MkdirAll(filepath.Dir(stdlibFile), 0755); err != nil {
@@ -1735,7 +1735,7 @@ func TestCompletion_StdlibModule(t *testing.T) {
 	defer cleanup()
 
 	stdlibDir := t.TempDir()
-	server.stdlibRoot = stdlibDir
+	server.SetStdlibRoot(stdlibDir)
 
 	stdlibFile := filepath.Join(stdlibDir, "elixir", "lib", "enum.ex")
 	if err := os.MkdirAll(filepath.Dir(stdlibFile), 0755); err != nil {
@@ -1795,7 +1795,7 @@ func TestCompletion_StdlibModulePrefix(t *testing.T) {
 	defer cleanup()
 
 	stdlibDir := t.TempDir()
-	server.stdlibRoot = stdlibDir
+	server.SetStdlibRoot(stdlibDir)
 
 	stdlibFile := filepath.Join(stdlibDir, "elixir", "lib", "enum.ex")
 	if err := os.MkdirAll(filepath.Dir(stdlibFile), 0755); err != nil {
@@ -5151,7 +5151,7 @@ func TestWorkspaceSymbol_ExcludesStdlib(t *testing.T) {
 
 	// Simulate stdlib by setting stdlibRoot and indexing a file under it
 	stdlibDir := filepath.Join(server.projectRoot, "stdlib")
-	server.stdlibRoot = stdlibDir
+	server.SetStdlibRoot(stdlibDir)
 
 	indexFile(t, server.store, server.projectRoot, "stdlib/elixir/lib/enum.ex", `defmodule Enum do
   def map(list, fun), do: list
@@ -6524,7 +6524,7 @@ end`)
 	}
 
 	server.backgroundReindex()
-	server.backgroundWork.Wait()
+	server.index.backgroundWork.Wait()
 
 	results, err := server.store.LookupFunction("MyApp.Accounts", "create_user")
 	if err != nil || len(results) == 0 {
@@ -6554,7 +6554,7 @@ func TestServer_backgroundReindex_FullBuildDoesNotPrune(t *testing.T) {
 end`)
 
 	server.backgroundReindex()
-	server.backgroundWork.Wait()
+	server.index.backgroundWork.Wait()
 
 	paths, err := server.store.ListFilePaths()
 	if err != nil {
@@ -6579,7 +6579,7 @@ func TestServer_backgroundReindex_IncrementalStillPrunes(t *testing.T) {
 end`)
 
 	server.backgroundReindex()
-	server.backgroundWork.Wait()
+	server.index.backgroundWork.Wait()
 
 	if results, _ := server.store.LookupFunction("Gone", "bye"); len(results) == 0 {
 		t.Fatal("should be indexed by the full build first")
@@ -6590,7 +6590,7 @@ end`)
 	}
 
 	server.backgroundReindex()
-	server.backgroundWork.Wait()
+	server.index.backgroundWork.Wait()
 
 	if results, _ := server.store.LookupFunction("Gone", "bye"); len(results) != 0 {
 		t.Error("deleted file was not pruned by the incremental path")
@@ -6701,9 +6701,9 @@ func TestServer_IndexUnavailableRejectsIncrementalWrite(t *testing.T) {
 	path := writeTestFile(t, server.projectRoot, "lib/rejected.ex", `defmodule Rejected do
   def value, do: :ok
 end`)
-	server.indexWrites.Lock()
-	server.indexUnavailable = true
-	server.indexWrites.Unlock()
+	server.index.writes.Lock()
+	server.index.unavailable = true
+	server.index.writes.Unlock()
 	server.indexOneFile(path)
 
 	if results, _ := server.store.LookupFunction("Rejected", "value"); len(results) != 0 {
@@ -6722,18 +6722,18 @@ end`)
   def old_name, do: :ok
 end`)
 
-	server.indexWrites.Lock()
+	server.index.writes.Lock()
 	locked := true
 	defer func() {
 		if locked {
-			server.indexWrites.Unlock()
+			server.index.writes.Unlock()
 		}
 	}()
 
-	server.buildTextEdits([]renameSite{{filePath: path, line: 2}}, "old_name", "new_name", false)
+	server.buildTextEdits([]renameSite{{filePath: path, line: 2}}, "old_name", "new_name", nil)
 	done := make(chan struct{})
 	go func() {
-		server.backgroundWork.Wait()
+		server.index.backgroundWork.Wait()
 		close(done)
 	}()
 
@@ -6743,7 +6743,7 @@ end`)
 	case <-time.After(100 * time.Millisecond):
 	}
 
-	server.indexWrites.Unlock()
+	server.index.writes.Unlock()
 	locked = false
 	select {
 	case <-done:
@@ -8318,5 +8318,47 @@ end`
 	}
 	if locs[0].Range.Start.Line != 1 {
 		t.Errorf("jumped to line %d, want line 1", locs[0].Range.Start.Line)
+	}
+}
+
+// The daemon's headless service never receives initialize, so DEXTER_DEBUG has
+// to take effect when the server is constructed.
+func TestDebugEnvironmentAppliesWithoutInitialize(t *testing.T) {
+	for value, want := range map[string]bool{"true": true, "": false, "1": false} {
+		t.Setenv("DEXTER_DEBUG", value)
+		if got := NewServerWithOptions(nil, t.TempDir(), ServerOptions{}).debug; got != want {
+			t.Errorf("DEXTER_DEBUG=%q: debug = %v, want %v", value, got, want)
+		}
+	}
+}
+
+// Paths from editor URIs are stored as the editor spells them, so removing a
+// root's files compares cleaned paths.
+func TestRemoveFilesUnderRootMatchesUncleanStoredPaths(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+	parent := t.TempDir()
+	stdlib := filepath.Join(parent, "stdlib")
+	sep := string(filepath.Separator)
+	unclean := parent + sep + sep + "stdlib" + sep + "lib" + sep + "kernel.ex"
+	kept := filepath.Join(t.TempDir(), "lib", "app.ex")
+	for _, path := range []string{unclean, kept} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("defmodule K do\nend\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := server.store.IndexFileWithRefs(path, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	server.RemoveFilesUnderRoot(stdlib)
+	paths, err := server.store.ListFilePaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 1 || paths[0] != kept {
+		t.Errorf("stored paths = %v, want only %s", paths, kept)
 	}
 }

@@ -73,12 +73,12 @@ jobs:
           cd internal/lsp/testdata/monorepo/apps/app_with_styler && mix deps.get && mix deps.compile && cd -
           cd internal/lsp/testdata/monorepo/apps/app_with_ecto_migration && mix deps.get && mix deps.compile && cd -
           cd internal/lsp/testdata/monorepo/apps/app_basic && mix deps.get && cd -
-      # Every formatter test and the generated-BEAM completion test need mix on
-      # PATH and skip themselves without it, so this job is the only place they
-      # run — the test/test-race jobs have no Elixir. Match the formatter family
-      # and explicitly include the self-contained BEAM regression fixture.
+      # Every formatter test and the generated-BEAM completion and definition
+      # tests need mix on PATH and skip themselves without it, so this job is the
+      # only place they run — the test/test-race jobs have no Elixir. Match the
+      # formatter family and explicitly include the self-contained BEAM fixtures.
       - name: Run integration tests
-        run: go test ./internal/lsp/ -run 'TestFormatter|TestDidSave_Formatter|TestCompletion_GeneratedFunctionsFromConsumerBEAM' -v -timeout 600s
+        run: go test ./internal/lsp/ -run 'TestFormatter|TestDidSave_Formatter|TestCompletion_GeneratedFunctionsFromConsumerBEAM|TestDefinition_GeneratedFunctionsFromCompiler' -v -timeout 600s
 
   lint:
     runs-on: ubuntu-latest
