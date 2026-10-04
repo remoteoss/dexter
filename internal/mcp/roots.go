@@ -47,8 +47,8 @@ func isDriveLetter(c byte) bool {
 // negotiatedRoot resolves a session's workspace root from the MCP roots the
 // client advertises. ok is false when the client offers no usable root (no
 // roots capability, an empty list, or no file:// root): callers fall back to
-// the launch-directory root. A transport failure or an unusable file:// root
-// is an error the caller should surface and retry, not cache.
+// the launch-directory root. A transport failure, or file:// roots that are
+// all unusable, is an error the caller should surface and retry, not cache.
 //
 // A usable root goes through resolve, which finds the project root the same
 // way for every frontend. The spelling the client used is kept: the daemon
@@ -63,25 +63,38 @@ func negotiatedRoot(ctx context.Context, ss *mcp.ServerSession, resolve func(str
 	if err != nil {
 		return "", false, fmt.Errorf("listing client roots: %w", err)
 	}
+	// The first usable file:// root wins. An unusable one (a stale or deleted
+	// directory, a file) is skipped, so it cannot hide a usable root after
+	// it; when no file:// root is usable, the first error is reported.
+	var firstErr error
 	for _, r := range res.Roots {
 		if !strings.HasPrefix(r.URI, "file:") {
 			continue
 		}
-		path, err := fileURIToPath(r.URI)
-		if err != nil {
-			return "", false, err
+		root, err := usableRoot(r.URI, resolve)
+		if err == nil {
+			return root, true, nil
 		}
-		info, err := os.Stat(path)
-		if err != nil || !info.IsDir() {
-			return "", false, fmt.Errorf("client root %q is not a directory", path)
+		if firstErr == nil {
+			firstErr = err
 		}
-		root, err := resolve(path)
-		if err != nil {
-			return "", false, err
-		}
-		return root, true, nil
+	}
+	if firstErr != nil {
+		return "", false, firstErr
 	}
 	return "", false, nil
+}
+
+func usableRoot(uri string, resolve func(string) (string, error)) (string, error) {
+	path, err := fileURIToPath(uri)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(path)
+	if err != nil || !info.IsDir() {
+		return "", fmt.Errorf("client root %q is not a directory", path)
+	}
+	return resolve(path)
 }
 
 // defaultResolveRoot finds the project root above dir with the store's marker

@@ -437,3 +437,16 @@ func TestURIPathDriveLetter(t *testing.T) {
 		}
 	}
 }
+
+// An unusable root before a usable one must not fail the session: the client
+// can list a stale or deleted directory first.
+func TestNegotiation_SkipsUnusableRoot(t *testing.T) {
+	e := setupNegotiation(t)
+	root, uri := projectDir(t)
+	file := filepath.Join(t.TempDir(), "not-a-dir.txt")
+	if err := os.WriteFile(file, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cs, _ := e.connect(nil, "file:///nonexistent/dexter-negotiation-test", fileURI(file), uri)
+	wantContains(t, mustTool(t, cs, "dexter_search", map[string]any{"query": "x"}), "root="+root)
+}
