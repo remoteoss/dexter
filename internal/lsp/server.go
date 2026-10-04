@@ -525,11 +525,20 @@ func (s *Server) detachFromReporter() {
 // reliably or undone on a live pool — leaving WAL needs exclusive access, and
 // the per-connection ones land on whichever pooled connection happens to serve
 // them. They were also the smallest part of the win.
+// testHookFullBuild, when set by a test, makes the fast full build fail with
+// its error, so that the incremental fallback runs.
+var testHookFullBuild func() error
+
 func (s *Server) fullBuild() (stats indexer.Stats, ran bool, err error) {
 	s.index.writes.Lock()
 	defer s.index.writes.Unlock()
 	if !s.store.IsEmpty() {
 		return indexer.Stats{}, false, nil
+	}
+	if testHookFullBuild != nil {
+		if err := testHookFullBuild(); err != nil {
+			return indexer.Stats{}, true, err
+		}
 	}
 
 	var failed buildFailures
@@ -655,7 +664,13 @@ func (s *Server) startBackgroundReindex() <-chan struct{} {
 		// prune lives in the same branch and so cannot run without the walk
 		// that fills `seen`.
 		if !fullBuilt {
-			seen, n, ok := s.reconcileChangedFiles(&progress)
+			// A cold build that fell back to this pass already shows its
+			// own progress; the pass counts its files only when it is warm.
+			var passProgress *reconcileProgress
+			if !coldStart {
+				passProgress = &progress
+			}
+			seen, n, ok := s.reconcileChangedFiles(passProgress)
 			reindexed += n
 			if ok {
 				s.pruneMissingFiles(seen)

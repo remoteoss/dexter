@@ -511,3 +511,31 @@ func TestReconcilePathsReportFailuresAndProgress(t *testing.T) {
 		})
 	}
 }
+
+// When the fast cold build fails, the incremental fallback indexes the files.
+// The build already shows its own progress, so the fallback must not start a
+// second "updating the index" progress for the same work.
+func TestColdBuildFallbackShowsOneProgress(t *testing.T) {
+	oldThreshold := reconcileProgressThreshold
+	reconcileProgressThreshold = 3
+	t.Cleanup(func() { reconcileProgressThreshold = oldThreshold })
+	testHookFullBuild = func() error { return errors.New("bulk load failed") }
+	t.Cleanup(func() { testHookFullBuild = nil })
+
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+	for i := 0; i < 6; i++ {
+		writeTestFile(t, server.projectRoot, fmt.Sprintf("lib/gen%d.ex", i), moduleSource(i, 0))
+	}
+	client := attachFakeEditor(t, server, false)
+	reindexOnce(t, server)
+
+	client.WaitMessage(t, reportWait, protocol.MessageTypeWarning, "Dexter: the fast index build failed")
+	client.WaitMessage(t, reportWait, protocol.MessageTypeInfo, "Dexter: index built")
+	if n := countMessages(client, "updating the index"); n != 0 {
+		t.Errorf("the fallback started a second progress for the cold build:\n%s", client.Dump())
+	}
+	if r, _ := server.store.LookupFunction("MyApp.Gen5", "run_v0"); len(r) != 1 {
+		t.Error("the fallback did not index the files")
+	}
+}
