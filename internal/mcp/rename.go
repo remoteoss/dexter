@@ -34,7 +34,7 @@ func (h *Handler) rename(ctx context.Context, args RenameParams) (string, error)
 	if err := ctx.Err(); err != nil {
 		return "", fmt.Errorf("the rename was canceled before it changed any file: %w", err)
 	}
-	summary, err := renameSymbol(h.lsp, module, function, newName)
+	summary, err := renameSymbol(ctx, h.lsp, module, function, newName)
 	if err != nil {
 		return "", err
 	}
@@ -74,9 +74,9 @@ func (h *Handler) rename(ctx context.Context, args RenameParams) (string, error)
 // write over unsaved editor buffers: write closed files and clean open
 // files, and refuse with an actionable error when an affected file has unsaved
 // changes in an editor), call its headless entry point here instead.
-func renameSymbol(server *lsp.Server, module, function, newName string) (*lsp.RenameSummary, error) {
+func renameSymbol(ctx context.Context, server *lsp.Server, module, function, newName string) (*lsp.RenameSummary, error) {
 	if function != "" {
-		return server.RenameFunction(module, function, newName)
+		return server.RenameFunctionContext(ctx, module, function, newName)
 	}
-	return server.RenameModule(module, newName)
+	return server.RenameModuleContext(ctx, module, newName)
 }

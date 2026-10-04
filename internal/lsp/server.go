@@ -131,13 +131,21 @@ type IndexCoordinator struct {
 }
 
 // lockRename takes renameSerial and waits until the index shows the last
-// rename. It returns the unlock.
-func (ic *IndexCoordinator) lockRename() func() {
+// rename. It returns the unlock. When ctx ends first, it returns ctx's error
+// and holds nothing, so a canceled rename does not start to write.
+func (ic *IndexCoordinator) lockRename(ctx context.Context) (func(), error) {
 	ic.renameSerial.Lock()
 	if ic.renameIndexed != nil {
-		<-ic.renameIndexed
+		select {
+		case <-ic.renameIndexed:
+		case <-ctx.Done():
+		}
 	}
-	return ic.renameSerial.Unlock
+	if err := ctx.Err(); err != nil {
+		ic.renameSerial.Unlock()
+		return nil, fmt.Errorf("the rename was canceled before it changed any file: %w", err)
+	}
+	return ic.renameSerial.Unlock, nil
 }
 
 // CancelWork stops the reconciliation in flight and makes every later one
@@ -5757,7 +5765,7 @@ func (s *Server) RenameEdit(ctx context.Context, params *protocol.RenameParams) 
 				if existing, err := s.store.LookupFunction(fullModule, params.NewName); err == nil && len(existing) > 0 {
 					return nil, fmt.Errorf("function %s.%s already exists", fullModule, params.NewName)
 				}
-				return s.renameFunctionEdits(fullModule, functionName, params.NewName, nil)
+				return s.renameFunctionEdits(ctx, fullModule, functionName, params.NewName, nil)
 			}
 		} else if moduleRef != "" {
 			fullModule := resolveModule(moduleRef, aliases)
@@ -5771,7 +5779,7 @@ func (s *Server) RenameEdit(ctx context.Context, params *protocol.RenameParams) 
 				if !isValidModuleName(newModule) {
 					return nil, fmt.Errorf("invalid module name %q: must be CamelCase segments separated by dots", params.NewName)
 				}
-				return s.renameModuleEdits(fullModule, newModule, nil)
+				return s.renameModuleEdits(ctx, fullModule, newModule, nil)
 			}
 		}
 	}
@@ -5782,8 +5790,12 @@ func (s *Server) RenameEdit(ctx context.Context, params *protocol.RenameParams) 
 // renameFunctionEdits builds a WorkspaceEdit renaming all occurrences of
 // module.functionName to newName across the codebase. When report is not nil,
 // it receives the files the rename changed and the files it could not change.
-func (s *Server) renameFunctionEdits(module, functionName, newName string, report *RenameSummary) (*WorkspaceEdit, error) {
-	defer s.index.lockRename()()
+func (s *Server) renameFunctionEdits(ctx context.Context, module, functionName, newName string, report *RenameSummary) (*WorkspaceEdit, error) {
+	unlock, err := s.index.lockRename(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	// The check before the lock can race another rename to the same name.
 	if existing, err := s.store.LookupFunction(module, newName); err == nil && len(existing) > 0 {
 		return nil, fmt.Errorf("function %s.%s already exists", module, newName)
@@ -5991,8 +6003,12 @@ func (s *Server) renameFunctionEdits(module, functionName, newName string, repor
 // by the server, open ones by the client through rename operations. When
 // report is not nil, it receives the files the rename changed or moved and the
 // files it could not change.
-func (s *Server) renameModuleEdits(oldModule, newModule string, report *RenameSummary) (*WorkspaceEdit, error) {
-	defer s.index.lockRename()()
+func (s *Server) renameModuleEdits(ctx context.Context, oldModule, newModule string, report *RenameSummary) (*WorkspaceEdit, error) {
+	unlock, err := s.index.lockRename(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	mr := s.buildModuleRename(oldModule, newModule)
 
 	// Check for collisions: verify that none of the target module names

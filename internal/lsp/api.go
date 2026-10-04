@@ -1,6 +1,7 @@
 package lsp
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"sync"
@@ -169,6 +170,13 @@ func sortedUnique(paths []string) []string {
 // is written on disk. The workspace daemon calls it on its headless language
 // service, which holds no editor buffers.
 func (s *Server) RenameFunction(module, functionName, newName string) (*RenameSummary, error) {
+	return s.RenameFunctionContext(context.Background(), module, functionName, newName)
+}
+
+// RenameFunctionContext is RenameFunction for a caller that can cancel. A
+// rename canceled before it starts to write changes nothing; one canceled
+// during its writes completes.
+func (s *Server) RenameFunctionContext(ctx context.Context, module, functionName, newName string) (*RenameSummary, error) {
 	if !isValidFunctionName(newName) {
 		return nil, fmt.Errorf("invalid function name %q: must match [a-z_][a-z0-9_?!]*", newName)
 	}
@@ -184,7 +192,7 @@ func (s *Server) RenameFunction(module, functionName, newName string) (*RenameSu
 	}
 
 	summary := &RenameSummary{}
-	edit, err := s.renameFunctionEdits(module, functionName, newName, summary)
+	edit, err := s.renameFunctionEdits(ctx, module, functionName, newName, summary)
 	summary.finish()
 	if err != nil {
 		return nil, err
@@ -200,6 +208,12 @@ func (s *Server) RenameFunction(module, functionName, newName string) (*RenameSu
 // including the moves of files that follow the naming convention. It returns
 // when the index shows the rename.
 func (s *Server) RenameModule(oldModule, newModule string) (*RenameSummary, error) {
+	return s.RenameModuleContext(context.Background(), oldModule, newModule)
+}
+
+// RenameModuleContext is RenameModule for a caller that can cancel, with the
+// same rule as RenameFunctionContext.
+func (s *Server) RenameModuleContext(ctx context.Context, oldModule, newModule string) (*RenameSummary, error) {
 	if !isValidModuleName(newModule) {
 		return nil, fmt.Errorf("invalid module name %q: must be CamelCase segments separated by dots", newModule)
 	}
@@ -212,7 +226,7 @@ func (s *Server) RenameModule(oldModule, newModule string) (*RenameSummary, erro
 	}
 
 	summary := &RenameSummary{}
-	edit, err := s.renameModuleEdits(oldModule, newModule, summary)
+	edit, err := s.renameModuleEdits(ctx, oldModule, newModule, summary)
 	summary.finish()
 	if err != nil {
 		return nil, err

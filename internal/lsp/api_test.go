@@ -1,11 +1,13 @@
 package lsp
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 // A rename without an editor writes every changed file, reports the files, and
@@ -175,5 +177,78 @@ end
 				t.Errorf("error = %v, want %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// Regression: a rename that waited for the rename lock, or for the index to
+// show the previous rename, ignored its context, so a rename that the client
+// had canceled could still start to write.
+func TestRenameContext_CanceledWhileWaitingChangesNothing(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", "defmodule MyApp.Accounts do\n  def fetch_user(id), do: id\nend\n")
+	path := filepath.Join(server.projectRoot, "lib/accounts.ex")
+
+	// Another rename holds the lock, and its index update has not finished.
+	pending := make(chan struct{})
+	server.index.renameSerial.Lock()
+	server.index.renameIndexed = pending
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errc := make(chan error, 1)
+	go func() {
+		_, err := server.RenameFunctionContext(ctx, "MyApp.Accounts", "fetch_user", "get_user")
+		errc <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	server.index.renameSerial.Unlock() // the other rename's writes end; its index update does not
+
+	select {
+	case err := <-errc:
+		if err == nil || !strings.Contains(err.Error(), "canceled before it changed any file") {
+			t.Fatalf("error = %v, want a cancellation", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the canceled rename kept waiting for the previous rename's index update")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "get_user") {
+		t.Fatalf("a canceled rename wrote the file:\n%s", data)
+	}
+	close(pending)
+}
+
+// A rename canceled while another rename held the lock does not write once
+// it gets the lock.
+func TestRenameContext_CanceledWhileLockedChangesNothing(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+	indexFile(t, server.store, server.projectRoot, "lib/accounts.ex", "defmodule MyApp.Accounts do\n  def fetch_user(id), do: id\nend\n")
+	path := filepath.Join(server.projectRoot, "lib/accounts.ex")
+
+	server.index.renameSerial.Lock()
+	ctx, cancel := context.WithCancel(context.Background())
+	errc := make(chan error, 1)
+	go func() {
+		_, err := server.RenameModuleContext(ctx, "MyApp.Accounts", "MyApp.Users")
+		errc <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	server.index.renameSerial.Unlock()
+
+	if err := <-errc; err == nil || !strings.Contains(err.Error(), "canceled before it changed any file") {
+		t.Fatalf("error = %v, want a cancellation", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "MyApp.Users") {
+		t.Fatalf("a canceled rename wrote the file:\n%s", data)
 	}
 }
