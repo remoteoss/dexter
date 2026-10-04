@@ -1,8 +1,11 @@
 package store
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -255,33 +258,7 @@ func migrate(db *sql.DB) error {
 			path TEXT NOT NULL UNIQUE,
 			mtime INTEGER NOT NULL
 		);
-
-		CREATE TABLE IF NOT EXISTS definitions (
-			module TEXT NOT NULL,
-			function TEXT NOT NULL DEFAULT '',
-			arity INTEGER NOT NULL DEFAULT 0,
-			kind TEXT NOT NULL,
-			line INTEGER NOT NULL,
-			file_id INTEGER NOT NULL,
-			delegate_to TEXT NOT NULL DEFAULT '',
-			delegate_as TEXT NOT NULL DEFAULT '',
-			params TEXT NOT NULL DEFAULT '',
-			FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
-		);
-
-		CREATE TABLE IF NOT EXISTS refs (
-			module TEXT NOT NULL,
-			function TEXT NOT NULL DEFAULT '',
-			line INTEGER NOT NULL,
-			file_id INTEGER NOT NULL,
-			kind TEXT NOT NULL DEFAULT 'call'
-			-- No FOREIGN KEY here on purpose. With _foreign_keys=ON every insert
-			-- costs a parent-key lookup, and refs is the table the cold index
-			-- spends most of its writer time on (3.9M rows on a large monorepo).
-			-- Every path that removes a file deletes its refs explicitly first,
-			-- so the cascade was never the thing keeping them consistent.
-		);
-
+	` + createDefinitionsTable("definitions") + createRefsTable("refs") + `
 		CREATE TABLE IF NOT EXISTS metadata (
 			key   TEXT PRIMARY KEY,
 			value TEXT NOT NULL
@@ -301,6 +278,44 @@ func migrate(db *sql.DB) error {
 	return createIndexes(db)
 }
 
+// createDefinitionsTable and createRefsTable return the DDL of the two symbol
+// tables under the given name. migrate creates them, and rebuildWithout creates
+// a copy with the same shape before it swaps the copy in. One definition keeps
+// the two from drifting apart.
+func createDefinitionsTable(name string) string {
+	return `
+		CREATE TABLE IF NOT EXISTS ` + name + ` (
+			module TEXT NOT NULL,
+			function TEXT NOT NULL DEFAULT '',
+			arity INTEGER NOT NULL DEFAULT 0,
+			kind TEXT NOT NULL,
+			line INTEGER NOT NULL,
+			file_id INTEGER NOT NULL,
+			delegate_to TEXT NOT NULL DEFAULT '',
+			delegate_as TEXT NOT NULL DEFAULT '',
+			params TEXT NOT NULL DEFAULT '',
+			FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
+		);
+	`
+}
+
+func createRefsTable(name string) string {
+	return `
+		CREATE TABLE IF NOT EXISTS ` + name + ` (
+			module TEXT NOT NULL,
+			function TEXT NOT NULL DEFAULT '',
+			line INTEGER NOT NULL,
+			file_id INTEGER NOT NULL,
+			kind TEXT NOT NULL DEFAULT 'call'
+			-- No FOREIGN KEY here on purpose. With _foreign_keys=ON every insert
+			-- costs a parent-key lookup, and refs is the table the cold index
+			-- spends most of its writer time on (3.9M rows on a large monorepo).
+			-- Every path that removes a file deletes its refs explicitly first,
+			-- so the cascade was never the thing keeping them consistent.
+		);
+	`
+}
+
 // fileIDSubquery resolves a path argument to files.id inside a WHERE clause, so
 // call sites keep passing paths and only the SQL changes. files.path is UNIQUE,
 // so this is one index probe.
@@ -311,7 +326,11 @@ type dbExecer interface {
 }
 
 func createIndexes(db dbExecer) error {
-	_, err := db.Exec(`
+	_, err := db.Exec(createIndexesSQL)
+	return err
+}
+
+const createIndexesSQL = `
 		CREATE INDEX IF NOT EXISTS idx_definitions_module_function ON definitions(module, function);
 		CREATE INDEX IF NOT EXISTS idx_definitions_file_id_line ON definitions(file_id, line);
 		CREATE INDEX IF NOT EXISTS idx_refs_module_function ON refs(module, function, file_id, line, kind);
@@ -323,9 +342,7 @@ func createIndexes(db dbExecer) error {
 		-- leads with module and cannot be seeked by function alone. The partial
 		-- index holds only the __using__ rows, so the scan becomes a small range.
 		CREATE INDEX IF NOT EXISTS idx_definitions_using ON definitions(module, file_id) WHERE function = '__using__';
-	`)
-	return err
-}
+	`
 
 func (s *Store) DropIndexes() error {
 	_, err := s.db.Exec(`
@@ -515,27 +532,52 @@ const (
 	refChunkRows = maxBindVars / refColumns // 180
 )
 
+// batchMode selects how a Batch writes.
+type batchMode uint8
+
+const (
+	// batchIncremental replaces each file's rows in the live tables: an upsert
+	// of the files row, a DELETE by file id, and buffered INSERTs.
+	batchIncremental batchMode = iota
+	// batchInsertOnly fills empty tables whose indexes the caller has dropped.
+	batchInsertOnly
+	// batchRebuild writes into new, unindexed copies of the symbol tables and
+	// swaps them in at Commit. See BeginRebuild.
+	batchRebuild
+)
+
 // Batch wraps multiple IndexFile operations in a single SQLite transaction
 // with shared prepared statements.
 type Batch struct {
+	ctx        context.Context
 	tx         *sql.Tx
+	mode       batchMode
 	defStmt    *sql.Stmt
 	refStmt    *sql.Stmt
 	fileStmt   *sql.Stmt
-	delDefStmt *sql.Stmt // nil in insert-only mode
-	delRefStmt *sql.Stmt // nil in insert-only mode
-	insertOnly bool
+	delDefStmt *sql.Stmt // incremental mode only
+	delRefStmt *sql.Stmt // incremental mode only
+	skipStmt   *sql.Stmt // rebuild mode only
 
-	// Multi-row INSERT buffers, used in insert-only mode only. A cold index
-	// writes ~4.4M rows through one connection, and the writer is the
-	// bottleneck of the whole indexing pipeline; batching turns ~4.4M cgo
-	// crossings into a few tens of thousands. Incremental reindexing keeps the
-	// row-at-a-time path, where a file's DELETE must stay ordered ahead of its
-	// INSERTs and the row count is far too small to matter.
+	// Multi-row INSERT buffers. A cold index writes ~4.4M rows through one
+	// connection, and the writer is the bottleneck of the whole indexing
+	// pipeline; batching turns ~4.4M cgo crossings into a few tens of
+	// thousands. A large warm change set (a new checkout of a whole tree, for
+	// example) writes as many rows through the other modes, so they buffer
+	// too. Rows buffered for one file never meet another file's DELETE, which
+	// targets only that file's id; a file seen twice in one incremental batch
+	// flushes the buffer first, so its DELETE stays ordered ahead of its earlier
+	// INSERTs.
 	defChunkStmt *sql.Stmt
 	refChunkStmt *sql.Stmt
 	defArgs      []interface{}
 	refArgs      []interface{}
+
+	// written holds the file ids this batch has written, in the incremental and
+	// rebuild modes. An incremental batch flushes before a second write of one
+	// file; a rebuild rejects it, because its new tables have no index to find
+	// the earlier rows by.
+	written map[int64]struct{}
 
 	// Bulk-path file id allocation. Insert-only mode assigns ids in Go from a
 	// counter and writes files rows with an explicit id, so a cold index never
@@ -563,97 +605,125 @@ func multiRowInsert(table, columns string, n, rows int) string {
 }
 
 func (s *Store) BeginBatch() (*Batch, error) {
-	return s.beginBatch(false)
+	return s.beginBatch(context.Background(), batchIncremental)
+}
+
+// BeginBatchContext starts an incremental batch whose transaction rolls back
+// when ctx is canceled. Writes after that fail, and Commit reports the
+// cancellation, so none of the batch's files is left half written.
+func (s *Store) BeginBatchContext(ctx context.Context) (*Batch, error) {
+	return s.beginBatch(ctx, batchIncremental)
 }
 
 // BeginBulkInsert starts a batch optimized for inserting into an empty table.
 // It skips DELETE statements before each insert. Callers should drop indexes
 // before calling this and recreate them after Commit.
 func (s *Store) BeginBulkInsert() (*Batch, error) {
-	return s.beginBatch(true)
+	return s.beginBatch(context.Background(), batchInsertOnly)
 }
 
-func (s *Store) beginBatch(insertOnly bool) (*Batch, error) {
-	tx, err := s.db.Begin()
+// BeginRebuild starts a batch that rewrites the symbol tables in one
+// transaction, for a change set too large to apply row by row to the live
+// indexes. Each index of the live tables sorts rows by name, so the rows of one
+// file land on pages all over it, and a write of a large share of the index
+// touches most of its pages, many times.
+//
+// Files written to the batch go into new tables that have no indexes. Commit
+// then copies in the rows of every file the batch did not write or remove,
+// swaps the new tables in for the old ones, and builds each index with one
+// sort, as a cold build does. Readers keep their snapshot of the old tables
+// until the commit, and a canceled or failed rebuild rolls back to exactly the
+// old state. Each path may be written only once.
+func (s *Store) BeginRebuild(ctx context.Context) (*Batch, error) {
+	return s.beginBatch(ctx, batchRebuild)
+}
+
+const (
+	defInsertColumns = "module, function, arity, kind, line, file_id, delegate_to, delegate_as, params"
+	refInsertColumns = "module, function, line, file_id, kind"
+)
+
+func (s *Store) beginBatch(ctx context.Context, mode batchMode) (_ *Batch, err error) {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
+	b := &Batch{ctx: ctx, tx: tx, mode: mode}
+	defer func() {
+		if err != nil {
+			b.closeStmts()
+			_ = tx.Rollback()
+		}
+	}()
 
-	defStmt, err := tx.Prepare("INSERT INTO definitions (module, function, arity, kind, line, file_id, delegate_to, delegate_as, params) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
-	if err != nil {
-		_ = tx.Rollback()
-		return nil, err
+	defTable, refTable := "definitions", "refs"
+	if mode == batchRebuild {
+		defTable, refTable = "definitions_rebuild", "refs_rebuild"
+		// Take the write lock first. The transaction is deferred, so the
+		// DROP below would open it as a read, and the CREATE after it would
+		// have to upgrade that read to a write. SQLite does not call the busy
+		// handler for that upgrade: with another writer active, the rebuild
+		// would fail at once with "database is locked" instead of waiting
+		// for busy_timeout. A write statement as the first statement waits
+		// like every other writer.
+		if _, err = tx.ExecContext(ctx, "DELETE FROM metadata WHERE key = 'rebuild_lock'"); err != nil {
+			return nil, err
+		}
+		// A rolled-back rebuild leaves nothing behind, but a copy from a
+		// process that died mid-way would make CREATE ... IF NOT EXISTS keep
+		// its rows.
+		if _, err = tx.ExecContext(ctx, `
+			DROP TABLE IF EXISTS temp.rebuild_skip;
+			CREATE TEMP TABLE rebuild_skip (id INTEGER PRIMARY KEY, removed INTEGER NOT NULL DEFAULT 0);
+			DROP TABLE IF EXISTS definitions_rebuild;
+			DROP TABLE IF EXISTS refs_rebuild;
+		`+createDefinitionsTable(defTable)+createRefsTable(refTable)); err != nil {
+			return nil, err
+		}
+		if b.skipStmt, err = tx.Prepare("INSERT OR IGNORE INTO temp.rebuild_skip (id) VALUES (?)"); err != nil {
+			return nil, err
+		}
 	}
 
-	refStmt, err := tx.Prepare("INSERT INTO refs (module, function, line, file_id, kind) VALUES (?, ?, ?, ?, ?)")
-	if err != nil {
-		_ = defStmt.Close()
-		_ = tx.Rollback()
+	if b.defStmt, err = tx.Prepare("INSERT INTO " + defTable + " (" + defInsertColumns + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"); err != nil {
 		return nil, err
 	}
-
+	if b.refStmt, err = tx.Prepare("INSERT INTO " + refTable + " (" + refInsertColumns + ") VALUES (?, ?, ?, ?, ?)"); err != nil {
+		return nil, err
+	}
 	fileSQL := "INSERT INTO files (path, mtime) VALUES (?, ?) ON CONFLICT(path) DO UPDATE SET mtime = excluded.mtime RETURNING id"
-	if insertOnly {
+	if mode == batchInsertOnly {
 		fileSQL = "INSERT INTO files (id, path, mtime) VALUES (?, ?, ?)"
 	}
-	fileStmt, err := tx.Prepare(fileSQL)
-	if err != nil {
-		_ = defStmt.Close()
-		_ = refStmt.Close()
-		_ = tx.Rollback()
+	if b.fileStmt, err = tx.Prepare(fileSQL); err != nil {
 		return nil, err
 	}
-
-	b := &Batch{
-		tx:         tx,
-		defStmt:    defStmt,
-		refStmt:    refStmt,
-		fileStmt:   fileStmt,
-		insertOnly: insertOnly,
+	if mode == batchIncremental {
+		if b.delDefStmt, err = tx.Prepare("DELETE FROM definitions WHERE file_id = ?"); err != nil {
+			return nil, err
+		}
+		if b.delRefStmt, err = tx.Prepare("DELETE FROM refs WHERE file_id = ?"); err != nil {
+			return nil, err
+		}
 	}
-
-	if !insertOnly {
-		b.delDefStmt, err = tx.Prepare("DELETE FROM definitions WHERE file_id = ?")
-		if err != nil {
-			b.closeStmts()
-			_ = tx.Rollback()
-			return nil, err
-		}
-		b.delRefStmt, err = tx.Prepare("DELETE FROM refs WHERE file_id = ?")
-		if err != nil {
-			b.closeStmts()
-			_ = tx.Rollback()
-			return nil, err
-		}
-	} else {
-		b.defChunkStmt, err = tx.Prepare(multiRowInsert(
-			"definitions",
-			"module, function, arity, kind, line, file_id, delegate_to, delegate_as, params",
-			defColumns, defChunkRows))
-		if err != nil {
-			b.closeStmts()
-			_ = tx.Rollback()
-			return nil, err
-		}
-		b.refChunkStmt, err = tx.Prepare(multiRowInsert(
-			"refs", "module, function, line, file_id, kind", refColumns, refChunkRows))
-		if err != nil {
-			b.closeStmts()
-			_ = tx.Rollback()
-			return nil, err
-		}
-		b.defArgs = make([]interface{}, 0, defColumns*defChunkRows)
-		b.refArgs = make([]interface{}, 0, refColumns*refChunkRows)
-
+	if mode != batchInsertOnly {
+		b.written = make(map[int64]struct{})
+	}
+	if b.defChunkStmt, err = tx.Prepare(multiRowInsert(defTable, defInsertColumns, defColumns, defChunkRows)); err != nil {
+		return nil, err
+	}
+	if b.refChunkStmt, err = tx.Prepare(multiRowInsert(refTable, refInsertColumns, refColumns, refChunkRows)); err != nil {
+		return nil, err
+	}
+	b.defArgs = make([]interface{}, 0, defColumns*defChunkRows)
+	b.refArgs = make([]interface{}, 0, refColumns*refChunkRows)
+	if mode == batchInsertOnly {
 		// Bulk mode is used on a freshly created database, but seed from the
 		// table anyway so a non-empty one cannot collide on the primary key.
-		if err := tx.QueryRow("SELECT COALESCE(MAX(id), 0) FROM files").Scan(&b.nextFileID); err != nil {
-			b.closeStmts()
-			_ = tx.Rollback()
+		if err = tx.QueryRow("SELECT COALESCE(MAX(id), 0) FROM files").Scan(&b.nextFileID); err != nil {
 			return nil, err
 		}
 	}
-
 	return b, nil
 }
 
@@ -679,54 +749,75 @@ func (b *Batch) indexFile(path string, mtimeNano int64, defs []parser.Definition
 		return err
 	}
 
-	if !b.insertOnly {
+	switch b.mode {
+	case batchIncremental:
+		if _, again := b.written[fileID]; again {
+			if err := b.flushPending(); err != nil {
+				return err
+			}
+		}
+		b.written[fileID] = struct{}{}
 		if _, err := b.delDefStmt.Exec(fileID); err != nil {
 			return err
 		}
 		if _, err := b.delRefStmt.Exec(fileID); err != nil {
 			return err
 		}
+	case batchRebuild:
+		if _, again := b.written[fileID]; again {
+			return fmt.Errorf("rebuild: %s written twice", path)
+		}
+		b.written[fileID] = struct{}{}
+		// The old rows of this file are not copied into the new tables.
+		if _, err := b.skipStmt.Exec(fileID); err != nil {
+			return err
+		}
 	}
 
-	if b.insertOnly {
-		// Reset the buffer before checking the error: the chunk boundary is an
-		// exact-multiple test, so a buffer left full would never match again and
-		// the rest of the batch would silently fall back to flushPending.
-		for _, d := range defs {
-			b.defArgs = append(b.defArgs, d.Module, d.Function, d.Arity, d.Kind, d.Line, fileID, d.DelegateTo, d.DelegateAs, d.Params)
-			if len(b.defArgs) == defColumns*defChunkRows {
-				_, err := b.defChunkStmt.Exec(b.defArgs...)
-				b.defArgs = b.defArgs[:0]
-				if err != nil {
-					return err
-				}
-			}
-		}
-		for _, r := range refs {
-			b.refArgs = append(b.refArgs, r.Module, r.Function, r.Line, fileID, r.Kind)
-			if len(b.refArgs) == refColumns*refChunkRows {
-				_, err := b.refChunkStmt.Exec(b.refArgs...)
-				b.refArgs = b.refArgs[:0]
-				if err != nil {
-					return err
-				}
-			}
-		}
-		return nil
-	}
-
+	// Reset the buffer before checking the error: the chunk boundary is an
+	// exact-multiple test, so a buffer left full would never match again and
+	// the rest of the batch would silently fall back to flushPending.
 	for _, d := range defs {
-		if _, err := b.defStmt.Exec(d.Module, d.Function, d.Arity, d.Kind, d.Line, fileID, d.DelegateTo, d.DelegateAs, d.Params); err != nil {
-			return err
+		b.defArgs = append(b.defArgs, d.Module, d.Function, d.Arity, d.Kind, d.Line, fileID, d.DelegateTo, d.DelegateAs, d.Params)
+		if len(b.defArgs) == defColumns*defChunkRows {
+			_, err := b.defChunkStmt.Exec(b.defArgs...)
+			b.defArgs = b.defArgs[:0]
+			if err != nil {
+				return err
+			}
 		}
 	}
-
 	for _, r := range refs {
-		if _, err := b.refStmt.Exec(r.Module, r.Function, r.Line, fileID, r.Kind); err != nil {
+		b.refArgs = append(b.refArgs, r.Module, r.Function, r.Line, fileID, r.Kind)
+		if len(b.refArgs) == refColumns*refChunkRows {
+			_, err := b.refChunkStmt.Exec(b.refArgs...)
+			b.refArgs = b.refArgs[:0]
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// RemoveIDs marks files for removal in a rebuild: their rows are not copied
+// into the new tables, and their files rows go at Commit.
+func (b *Batch) RemoveIDs(ids []int64) error {
+	if b.mode != batchRebuild {
+		return errors.New("RemoveIDs needs a rebuild batch")
+	}
+	for start := 0; start < len(ids); start += maxBindVars {
+		chunk := ids[start:min(start+maxBindVars, len(ids))]
+		args := make([]interface{}, len(chunk))
+		for i, id := range chunk {
+			args[i] = id
+		}
+		if _, err := b.tx.ExecContext(b.ctx,
+			"INSERT OR REPLACE INTO temp.rebuild_skip (id, removed) VALUES "+strings.TrimSuffix(strings.Repeat("(?,1),", len(chunk)), ","),
+			args...); err != nil {
 			return err
 		}
 	}
-
 	return nil
 }
 
@@ -735,10 +826,10 @@ func (b *Batch) indexFile(path string, mtimeNano int64, defs []parser.Definition
 // The bulk path allocates ids from a counter and inserts them explicitly: a
 // cold index writes ~70k files, and asking SQLite to hand back each id would
 // add a round trip per file to the one thread that is already the bottleneck.
-// The incremental path upserts, so an existing file keeps the id that its
+// The other modes upsert, so an existing file keeps the id that its
 // definitions and refs already point at.
 func (b *Batch) fileID(path string, mtimeNano int64) (int64, error) {
-	if b.insertOnly {
+	if b.mode == batchInsertOnly {
 		b.nextFileID++
 		if _, err := b.fileStmt.Exec(b.nextFileID, path, mtimeNano); err != nil {
 			return 0, err
@@ -769,13 +860,43 @@ func (b *Batch) flushPending() error {
 }
 
 func (b *Batch) Commit() error {
-	if err := b.flushPending(); err != nil {
-		b.closeStmts()
+	err := b.flushPending()
+	b.closeStmts()
+	if err == nil && b.mode == batchRebuild {
+		err = b.finishRebuild()
+	}
+	if err != nil {
 		_ = b.tx.Rollback()
 		return err
 	}
-	b.closeStmts()
 	return b.tx.Commit()
+}
+
+// finishRebuild copies the rows of every file the rebuild did not write or
+// remove into the new tables, swaps them in, builds the indexes, and deletes
+// the removed files. Every statement runs under the batch context, so a cancel
+// interrupts the one in progress.
+//
+// Dropping a table that only references files (definitions) or nothing (refs)
+// does no foreign key work, and the indexes go with their tables.
+func (b *Batch) finishRebuild() error {
+	const keep = " WHERE file_id NOT IN (SELECT id FROM temp.rebuild_skip)"
+	for _, q := range []string{
+		"INSERT INTO definitions_rebuild (" + defInsertColumns + ") SELECT " + defInsertColumns + " FROM definitions" + keep,
+		"DROP TABLE definitions",
+		"ALTER TABLE definitions_rebuild RENAME TO definitions",
+		"INSERT INTO refs_rebuild (" + refInsertColumns + ") SELECT " + refInsertColumns + " FROM refs" + keep,
+		"DROP TABLE refs",
+		"ALTER TABLE refs_rebuild RENAME TO refs",
+		createIndexesSQL,
+		"DELETE FROM files WHERE id IN (SELECT id FROM temp.rebuild_skip WHERE removed = 1)",
+		"DROP TABLE temp.rebuild_skip",
+	} {
+		if _, err := b.tx.ExecContext(b.ctx, q); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (b *Batch) Rollback() error {
@@ -784,20 +905,10 @@ func (b *Batch) Rollback() error {
 }
 
 func (b *Batch) closeStmts() {
-	_ = b.defStmt.Close()
-	_ = b.refStmt.Close()
-	_ = b.fileStmt.Close()
-	if b.defChunkStmt != nil {
-		_ = b.defChunkStmt.Close()
-	}
-	if b.refChunkStmt != nil {
-		_ = b.refChunkStmt.Close()
-	}
-	if b.delDefStmt != nil {
-		_ = b.delDefStmt.Close()
-	}
-	if b.delRefStmt != nil {
-		_ = b.delRefStmt.Close()
+	for _, st := range []*sql.Stmt{b.defStmt, b.refStmt, b.fileStmt, b.defChunkStmt, b.refChunkStmt, b.delDefStmt, b.delRefStmt, b.skipStmt} {
+		if st != nil {
+			_ = st.Close()
+		}
 	}
 }
 
@@ -865,28 +976,189 @@ func (s *Store) RemoveFile(path string) error {
 	return s.RemoveFiles([]string{path})
 }
 
+// RemoveFiles removes the given paths and every row that belongs to them.
+// Paths that are not indexed are ignored.
 func (s *Store) RemoveFiles(paths []string) error {
+	return s.RemoveFilesContext(context.Background(), paths)
+}
+
+// RemoveFilesContext is RemoveFiles with cancellation. It resolves the paths to
+// file ids with one query per chunk and removes the ids as sets; see
+// RemoveFileIDs.
+func (s *Store) RemoveFilesContext(ctx context.Context, paths []string) error {
 	if len(paths) == 0 {
 		return nil
 	}
-	tx, err := s.db.Begin()
+	ids := make([]int64, 0, len(paths))
+	for start := 0; start < len(paths); start += maxBindVars {
+		chunk := paths[min(start, len(paths)):min(start+maxBindVars, len(paths))]
+		args := make([]interface{}, len(chunk))
+		for i, p := range chunk {
+			args[i] = p
+		}
+		rows, err := s.db.QueryContext(ctx, "SELECT id FROM files WHERE path IN ("+placeholders(len(chunk))+")", args...)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			ids = append(ids, id)
+		}
+		err = rows.Err()
+		_ = rows.Close()
+		if err != nil {
+			return err
+		}
+	}
+	return s.RemoveFileIDs(ctx, ids)
+}
+
+// FileState is what the index records about one file: its row id and the
+// modification time the stored symbols were parsed from.
+type FileState struct {
+	ID    int64
+	Mtime int64
+}
+
+// FileStates returns every indexed file with its id and stored mtime, read in
+// one query. A reconciliation pass compares the walk against it instead of
+// issuing one query per file, and removes the files the walk did not see by id.
+func (s *Store) FileStates() (map[string]FileState, error) {
+	var n int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM files").Scan(&n); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.Query("SELECT path, id, mtime FROM files")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	states := make(map[string]FileState, n)
+	for rows.Next() {
+		var path string
+		var st FileState
+		if err := rows.Scan(&path, &st.ID, &st.Mtime); err != nil {
+			return nil, err
+		}
+		states[path] = st
+	}
+	return states, rows.Err()
+}
+
+// Removal strategy. Deleting a file's rows costs one random B-tree update per
+// row in every index on the table: idx_refs_module_function sorts by name, so
+// the refs of one file are spread over the whole index. Removing a nested
+// checkout of a large monorepo is millions of such updates. Copying the rows
+// that stay into a new table and indexing it afresh costs one sequential read of
+// the table and one sort per index instead, which is far cheaper once a large
+// share of the rows goes. Both are measured on a 280k-file index, where removing
+// 223k files took 31s as set-based DELETEs and 15s as a rebuild (and 66s as the
+// former per-path DELETEs).
+var (
+	// rebuildMinFiles keeps small removals on the DELETE path, whatever the
+	// share: a rebuild always reads both tables in full. A variable so tests
+	// can reach the rebuild with a small index.
+	rebuildMinFiles = 4096
+	// rebuildShare is the share of indexed files, as 1/rebuildShare, at or
+	// above which a removal rebuilds the symbol tables.
+	rebuildShare = 4
+)
+
+const (
+	// deleteGroupIDs is how many files one DELETE transaction removes. Each
+	// group commits on its own, so a canceled removal keeps the groups already
+	// done, and a group is small enough to commit quickly.
+	deleteGroupIDs = 8 * maxBindVars
+)
+
+// RemoveFileIDs removes the files with the given ids and all their rows. Each
+// file goes in one transaction with its definitions and refs, so no file is
+// ever left half removed, also when ctx is canceled part way through.
+//
+// A removal of a large share of the index rebuilds the symbol tables without
+// the removed files (see rebuildWithout); a smaller one deletes by id sets.
+func (s *Store) RemoveFileIDs(ctx context.Context, ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	if len(ids) >= rebuildMinFiles {
+		var total int
+		if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM files").Scan(&total); err != nil {
+			return err
+		}
+		if len(ids)*rebuildShare >= total {
+			err := s.rebuildWithout(ctx, ids)
+			if err == nil || ctx.Err() != nil {
+				return err
+			}
+			// The DELETE path is slower but needs nothing the rebuild did,
+			// so a failed rebuild does not leave the files in the index.
+			log.Printf("Warning: index rebuild for %d removed files failed, deleting them by id: %v", len(ids), err)
+		}
+	}
+	for start := 0; start < len(ids); start += deleteGroupIDs {
+		if err := s.deleteFileIDs(ctx, ids[start:min(start+deleteGroupIDs, len(ids))]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// deleteFileIDs deletes one group of files in one transaction, by id sets of at
+// most maxBindVars. Sorting lets each statement walk idx_refs_file_id and the
+// definitions index in key order.
+func (s *Store) deleteFileIDs(ctx context.Context, ids []int64) error {
+	sorted := append([]int64(nil), ids...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	for _, path := range paths {
-		if _, err = tx.Exec("DELETE FROM definitions WHERE file_id = "+fileIDSubquery, path); err != nil {
-			return err
+	for start := 0; start < len(sorted); start += maxBindVars {
+		chunk := sorted[start:min(start+maxBindVars, len(sorted))]
+		args := make([]interface{}, len(chunk))
+		for i, id := range chunk {
+			args[i] = id
 		}
-		if _, err = tx.Exec("DELETE FROM refs WHERE file_id = "+fileIDSubquery, path); err != nil {
-			return err
-		}
-		if _, err = tx.Exec("DELETE FROM files WHERE path = ?", path); err != nil {
-			return err
+		in := "(" + placeholders(len(chunk)) + ")"
+		for _, q := range []string{
+			"DELETE FROM definitions WHERE file_id IN " + in,
+			"DELETE FROM refs WHERE file_id IN " + in,
+			"DELETE FROM files WHERE id IN " + in,
+		} {
+			if _, err := tx.ExecContext(ctx, q, args...); err != nil {
+				return err
+			}
 		}
 	}
 	return tx.Commit()
+}
+
+// rebuildWithout removes the given files by rebuilding the symbol tables
+// without them. See BeginRebuild.
+func (s *Store) rebuildWithout(ctx context.Context, ids []int64) error {
+	b, err := s.BeginRebuild(ctx)
+	if err != nil {
+		return err
+	}
+	if err := b.RemoveIDs(ids); err != nil {
+		_ = b.Rollback()
+		return err
+	}
+	return b.Commit()
+}
+
+// placeholders returns n comma-separated "?" markers.
+func placeholders(n int) string {
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
 }
 
 type CompletionResult struct {

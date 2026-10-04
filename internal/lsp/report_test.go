@@ -3,6 +3,7 @@ package lsp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -441,5 +442,72 @@ func TestClosedSessionStopsReceivingReports(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 	if n := countMessages(client, "after close"); n != 0 {
 		t.Errorf("a closed session received a report:\n%s", client.Dump())
+	}
+}
+
+// The warm pass writes through the batched writer or the table rebuild. Both
+// must tell the editor about a file whose write fails, show progress for a
+// large change set, and clear the failure once the file is written. The
+// second pass clears it through the same path as the first: on the rebuild
+// path, through a rebuild that succeeds.
+func TestReconcilePathsReportFailuresAndProgress(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		minFiles int
+	}{
+		{"batched", 1 << 30},
+		{"rebuild", 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setReconcileVars(t, 3, tc.minFiles, 4)
+			oldThreshold := reconcileProgressThreshold
+			reconcileProgressThreshold = 3
+			t.Cleanup(func() { reconcileProgressThreshold = oldThreshold })
+
+			server, cleanup := setupTestServer(t)
+			defer cleanup()
+			writeTestFile(t, server.projectRoot, "lib/kept.ex", "defmodule MyApp.Kept do\n  def here, do: :ok\nend\n")
+			reindexOnce(t, server) // cold: full build
+			client := attachFakeEditor(t, server, false)
+
+			var paths []string
+			for i := 0; i < 6; i++ {
+				paths = append(paths, writeTestFile(t, server.projectRoot, fmt.Sprintf("lib/gen%d.ex", i), moduleSource(i, 0)))
+			}
+			failing := paths[2]
+			testHookWrite = func(path string) error {
+				if path == failing {
+					return errors.New("disk I/O error")
+				}
+				return nil
+			}
+			t.Cleanup(func() { testHookWrite = nil })
+			reindexOnce(t, server)
+
+			client.WaitMessage(t, reportWait, protocol.MessageTypeWarning, "Dexter: 1 file could not be indexed: "+failing)
+			client.WaitMessage(t, reportWait, protocol.MessageTypeInfo, "Dexter: updating the index")
+			client.WaitMessage(t, reportWait, protocol.MessageTypeInfo, "Dexter: index updated (5 changed files")
+			if r, _ := server.store.LookupFunction("MyApp.Gen2", "run_v0"); len(r) != 0 {
+				t.Error("the file whose write failed is in the index")
+			}
+
+			// The write works again. Touch every generated file, so that the
+			// rebuild path is taken again where the test asks for it.
+			testHookWrite = nil
+			future := time.Now().Add(time.Hour)
+			for _, path := range paths {
+				if err := os.Chtimes(path, future, future); err != nil {
+					t.Fatal(err)
+				}
+			}
+			reindexOnce(t, server)
+			client.WaitMessage(t, reportWait, protocol.MessageTypeInfo, "all files that could not be indexed are indexed now")
+			if r, _ := server.store.LookupFunction("MyApp.Gen2", "run_v0"); len(r) != 1 {
+				t.Errorf("the file is not indexed after its write works: %d rows", len(r))
+			}
+			if n := countMessages(client, "could not be indexed:"); n != 1 {
+				t.Errorf("got %d failure messages, want 1:\n%s", n, client.Dump())
+			}
+		})
 	}
 }

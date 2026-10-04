@@ -13,6 +13,7 @@ import (
 	"go.lsp.dev/protocol"
 
 	"github.com/remoteoss/dexter/internal/lsp"
+	"github.com/remoteoss/dexter/internal/store"
 	"github.com/remoteoss/dexter/internal/version"
 )
 
@@ -715,5 +716,137 @@ func TestWatchCoverageTransitionsTriggerOneFullReconcileEach(t *testing.T) {
 	case change := <-changes:
 		t.Fatalf("coverage transitions caused a recurring change: %+v", change)
 	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// Close cancels the initial reconciliation instead of waiting for it, so a
+// daemon that is told to stop releases its workspace lock at once. The pass it
+// cancels leaves a consistent index, and the next open finishes it.
+func TestCloseCancelsInitialReconcileAndReopenFinishes(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv("SHELL", "/bin/false")
+	root := t.TempDir()
+	writeTestModule(t, root, "lib/seed.ex", "MyApp.Seed")
+	rt, err := OpenWithOptions(root, Options{NoWatch: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.WaitReady(testContext(t, 30*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	const files = 2000
+	for i := 0; i < files; i++ {
+		writeTestModule(t, root, fmt.Sprintf("lib/gen/mod%d.ex", i), fmt.Sprintf("MyApp.Gen%d", i))
+	}
+
+	rt, err = OpenWithOptions(root, Options{NoWatch: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if err := rt.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Errorf("Close took %s during the initial reconciliation", took)
+	}
+
+	rt, err = OpenWithOptions(root, Options{NoWatch: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rt.Close() })
+	if err := rt.WaitReady(testContext(t, 60*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	paths, err := rt.Store().ListFilePathsUnder(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != files+1 {
+		t.Errorf("after reopen: %d project files indexed, want %d", len(paths), files+1)
+	}
+	for _, module := range []string{"MyApp.Seed", "MyApp.Gen0", fmt.Sprintf("MyApp.Gen%d", files-1)} {
+		if got := countModule(t, rt, module); got != 1 {
+			t.Errorf("%s: %d definitions after reopen, want 1", module, got)
+		}
+	}
+}
+
+// A removal that is queued or running when Close starts is canceled with the
+// rest of the index work, so a large removal (a rebuild of the symbol tables)
+// cannot hold shutdown. The rows it did not remove stay consistent, and the
+// next open prunes them.
+func TestCloseCancelsQueuedRemoval(t *testing.T) {
+	rt, root := newTestRuntime(t)
+	gone := filepath.Join(root, "lib", "gone")
+	for i := 0; i < 20; i++ {
+		writeTestModule(t, root, fmt.Sprintf("lib/gone/mod%d.ex", i), fmt.Sprintf("MyApp.Gone%d", i))
+	}
+	if err := rt.Reindex(testContext(t, 30*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if got := countModule(t, rt, "MyApp.Gone3"); got != 1 {
+		t.Fatalf("MyApp.Gone3 indexed %d times before the removal, want 1", got)
+	}
+	if err := os.RemoveAll(gone); err != nil {
+		t.Fatal(err)
+	}
+
+	// Hold the mutation loop at the removal until Close has started.
+	reached := make(chan struct{})
+	release := make(chan struct{})
+	testHookReconcilePath = func(path string) {
+		if path == gone {
+			close(reached)
+			<-release
+		}
+	}
+	t.Cleanup(func() { testHookReconcilePath = nil })
+	rt.RemoveFile(gone)
+	<-reached
+
+	closed := make(chan error, 1)
+	start := time.Now()
+	go func() { closed <- rt.Close() }()
+	time.Sleep(100 * time.Millisecond) // Close cancels index work first
+	close(release)
+	if err := <-closed; err != nil {
+		t.Fatal(err)
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Errorf("Close took %s", took)
+	}
+	testHookReconcilePath = nil
+
+	// The canceled removal left the rows of the deleted files.
+	s, err := store.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	under, err := s.ListFilePathsUnder(gone)
+	_ = s.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(under) != 20 {
+		t.Errorf("%d rows under the removed directory after Close, want 20 (the removal was not canceled)", len(under))
+	}
+
+	// The next open prunes them.
+	reopened, err := OpenWithOptions(root, Options{NoWatch: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	if err := reopened.WaitReady(testContext(t, 30*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if got := countModule(t, reopened, "MyApp.Gone3"); got != 0 {
+		t.Errorf("MyApp.Gone3 still indexed after reopen: %d", got)
 	}
 }

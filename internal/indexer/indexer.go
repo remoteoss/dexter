@@ -10,6 +10,7 @@
 package indexer
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -39,6 +40,11 @@ type Options struct {
 	// which cannot be applied or undone safely on a live pool. See
 	// store.SetBulkPragmas.
 	InProcess bool
+
+	// Context, when set, cancels the build: parsing stops, the bulk
+	// transaction rolls back, and FullBuild returns the context's error. The
+	// index is left empty, so the next start builds it again. Optional.
+	Context context.Context
 
 	// Warn reports a recoverable per-file failure. Optional.
 	//
@@ -152,6 +158,10 @@ func statFilesParallel(paths []string) []fileEntry {
 func FullBuild(s *store.Store, projectRoot string, opts Options) (Stats, error) {
 	var stats Stats
 	start := time.Now()
+	ctx := opts.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
 	warn := opts.serialWarn()
 
@@ -163,6 +173,12 @@ func FullBuild(s *store.Store, projectRoot string, opts Options) (Stats, error) 
 		}
 	}
 
+	// Nothing is written before the bulk transaction, so a cancel up to that
+	// point returns with the database untouched.
+	if err := ctx.Err(); err != nil {
+		return stats, err
+	}
+
 	// Phase 1: collect file paths and mtimes. Both halves run on all cores:
 	// the traversal fans out per directory, and stat costs one syscall per
 	// file — ~70k on a large monorepo, which dominated this phase.
@@ -171,13 +187,19 @@ func FullBuild(s *store.Store, projectRoot string, opts Options) (Stats, error) 
 	if opts.StdlibRoot != "" {
 		stdlibPaths = dedupeAgainst(parser.CollectElixirFilesParallel(opts.StdlibRoot), filePaths)
 	}
+	if err := ctx.Err(); err != nil {
+		return stats, err
+	}
 	files := statFilesParallel(filePaths)
 	stdlibFiles := statFilesParallel(stdlibPaths)
 	stats.Walk = time.Since(start)
 
 	// Phase 2a: parse stdlib files in parallel. Definitions only — refs are
 	// not indexed for stdlib.
-	stdlibResults := parseStdlib(stdlibFiles)
+	stdlibResults := parseStdlib(ctx, stdlibFiles)
+	if err := ctx.Err(); err != nil {
+		return stats, err
+	}
 
 	// Phase 2b: parse project files in parallel, streaming to the writer.
 	workers := runtime.NumCPU()
@@ -208,8 +230,13 @@ func FullBuild(s *store.Store, projectRoot string, opts Options) (Stats, error) 
 	}
 
 	go func() {
+	feed:
 		for _, f := range files {
-			fileCh <- f
+			select {
+			case fileCh <- f:
+			case <-ctx.Done():
+				break feed
+			}
 		}
 		close(fileCh)
 		wg.Wait()
@@ -251,6 +278,9 @@ func FullBuild(s *store.Store, projectRoot string, opts Options) (Stats, error) 
 
 	var writeNanos time.Duration
 	for res := range resultCh {
+		if err := ctx.Err(); err != nil {
+			return stats, abortBuild(s, batch, resultCh, err)
+		}
 		writeStart := time.Now()
 		err := batch.IndexFileWithMtimeAndRefs(res.path, res.mtimeNano, res.defs, res.refs)
 		writeNanos += time.Since(writeStart)
@@ -264,6 +294,9 @@ func FullBuild(s *store.Store, projectRoot string, opts Options) (Stats, error) 
 	stats.Write = writeNanos
 	stats.Parse = time.Duration(parseNanos.Load())
 
+	if err := ctx.Err(); err != nil {
+		return stats, abortBuild(s, batch, resultCh, err)
+	}
 	commitStart := time.Now()
 	if err := batch.Commit(); err != nil {
 		return stats, restoreIndexes(s, fmt.Errorf("commit: %w", err))
@@ -299,7 +332,7 @@ type stdlibResult struct {
 	defs      []parser.Definition
 }
 
-func parseStdlib(stdlibFiles []fileEntry) []stdlibResult {
+func parseStdlib(ctx context.Context, stdlibFiles []fileEntry) []stdlibResult {
 	if len(stdlibFiles) == 0 {
 		return nil
 	}
@@ -314,6 +347,9 @@ func parseStdlib(stdlibFiles []fileEntry) []stdlibResult {
 		go func() {
 			defer wg.Done()
 			for f := range fileCh {
+				if ctx.Err() != nil {
+					continue
+				}
 				defs, _, err := parser.ParseFile(f.path)
 				if err != nil {
 					continue
@@ -323,8 +359,13 @@ func parseStdlib(stdlibFiles []fileEntry) []stdlibResult {
 		}()
 	}
 	go func() {
+	feed:
 		for _, f := range stdlibFiles {
-			fileCh <- f
+			select {
+			case fileCh <- f:
+			case <-ctx.Done():
+				break feed
+			}
 		}
 		close(fileCh)
 		wg.Wait()

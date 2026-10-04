@@ -42,8 +42,8 @@ const IndexConditionPrefix = "index."
 
 // reconcileProgressThreshold is how many changed files an incremental pass
 // updates before it shows progress. A save or a small branch switch stays
-// silent; a large one, which can take minutes, does not.
-const reconcileProgressThreshold = 1000
+// silent; a large one, which can take minutes, does not. Tests lower it.
+var reconcileProgressThreshold = 1000
 
 // Reporter returns the reporter that every session of this workspace shares.
 func (c *IndexCoordinator) Reporter() *notify.Reporter { return c.reporter }
