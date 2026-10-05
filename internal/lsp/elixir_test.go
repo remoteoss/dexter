@@ -437,6 +437,143 @@ func TestExpressionAtCursor_ExprBounds(t *testing.T) {
 	}
 }
 
+func TestArityAtCallsite_KeywordTailCountsAsOneArgument(t *testing.T) {
+	code := "SharedLib.Repo.insert(changeset, returning: true, on_conflict: :replace)"
+	tf := NewTokenizedFile(code)
+	ctx := tf.ExpressionAtCursor(0, strings.Index(code, "insert")+2)
+	if got := tf.ArityAtCallsite(0, ctx.ExprStart, ctx.ExprEnd); got != 2 {
+		t.Fatalf("ArityAtCallsite() = %d, want 2", got)
+	}
+}
+
+func TestArityAtCallsite_ComplexForms(t *testing.T) {
+	tests := []struct {
+		name string
+		code string
+		want int
+	}{
+		{
+			name: "commas in fn body do not add arguments",
+			code: "SharedLib.Worker.run(fn left, right -> {left, right} end)",
+			want: 1,
+		},
+		{
+			name: "trailing do block is a keyword list argument",
+			code: "SharedLib.Worker.run(:value) do\n  :ok\nend",
+			want: 2,
+		},
+		{
+			name: "inline do keyword tail is one argument",
+			code: "SharedLib.Worker.run(:value, do: :ok, else: :error)",
+			want: 2,
+		},
+		{
+			name: "slash without capture is ambiguous",
+			code: "SharedLib.Worker.run / 2",
+			want: -1,
+		},
+		{
+			name: "capture slash supplies arity",
+			code: "&SharedLib.Worker.run/2",
+			want: 2,
+		},
+		{
+			name: "outer block ownership is ambiguous",
+			code: "if SharedLib.Worker.run(:value) do\n  :ok\nend",
+			want: -1,
+		},
+		{
+			name: "parenthesis-free call is ambiguous",
+			code: "SharedLib.Worker.run :value, mode: :fast",
+			want: -1,
+		},
+		{
+			name: "unparenthesized if owns the following commas",
+			code: "SharedLib.Worker.run(if ready, do: :ok, else: :error)",
+			want: 1,
+		},
+		{
+			name: "unparenthesized for owns its generators",
+			code: "SharedLib.Worker.run(for x <- xs, y <- ys, do: {x, y})",
+			want: 1,
+		},
+		{
+			name: "unparenthesized with owns its clauses",
+			code: "SharedLib.Worker.run(with {:ok, a} <- fetch(), {:ok, b} <- load(a), do: b)",
+			want: 1,
+		},
+		{
+			name: "parenthesis-free remote call owns the following commas",
+			code: "SharedLib.Worker.run(MyApp.Accounts.get user, opts)",
+			want: 1,
+		},
+		{
+			name: "parenthesis-free call after a match owns the following commas",
+			code: "SharedLib.Worker.run(result = fetch user, opts)",
+			want: 1,
+		},
+		{
+			name: "parenthesis-free call as the last argument",
+			code: "SharedLib.Worker.run(:value, fetch user)",
+			want: 2,
+		},
+		{
+			name: "parenthesized if keeps outer arguments",
+			code: "SharedLib.Worker.run(if(ready, do: :ok), :value)",
+			want: 2,
+		},
+		{
+			name: "word operators are not calls",
+			code: "SharedLib.Worker.run(a in b, not c, d and e, f or g)",
+			want: 4,
+		},
+		{
+			name: "binary minus is not a call",
+			code: "SharedLib.Worker.run(a - 1, b - c, d)",
+			want: 3,
+		},
+		{
+			name: "unary minus after a space starts a call",
+			code: "SharedLib.Worker.run(fetch -1, d)",
+			want: 1,
+		},
+		{
+			name: "definition head do block is not an argument",
+			code: "def run(left, right) do\n  :ok\nend",
+			want: 2,
+		},
+		{
+			name: "private macro head do block is not an argument",
+			code: "defmacrop run(left) do\n  :ok\nend",
+			want: 1,
+		},
+		{
+			name: "do block ends a parenthesis-free call",
+			code: "SharedLib.Worker.run(case x do\n  _ -> {1, 2}\nend, y)",
+			want: 2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tf := NewTokenizedFile(tt.code)
+			ctx := tf.ExpressionAtCursor(0, strings.Index(tt.code, "run")+1)
+			if got := tf.ArityAtCallsite(0, ctx.ExprStart, ctx.ExprEnd); got != tt.want {
+				t.Fatalf("ArityAtCallsite() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestArityAtCallsite_InterpolationIsAmbiguous(t *testing.T) {
+	code := `"#{SharedLib.Worker.run(:value)}"`
+	tf := NewTokenizedFile(code)
+	ctx := tf.ExpressionAtCursor(0, strings.Index(code, "run")+1)
+	if got := tf.ArityAtCallsite(0, ctx.ExprStart, ctx.ExprEnd); got != -1 {
+		t.Fatalf("ArityAtCallsite() = %d, want -1", got)
+	}
+}
+
 func TestCursorContext_Expr(t *testing.T) {
 	tests := []struct {
 		mod, fn, want string

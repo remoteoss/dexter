@@ -828,3 +828,51 @@ func TestDefinitionGeneratedFunctionWithoutDeclarationKeepsModuleLine(t *testing
 		})
 	}
 }
+
+// splitArityDefinitions records each arity of get_room_by_slug! on its own
+// line, so a result shows which arity it came from.
+func splitArityDefinitions() []dbgiDefinition {
+	const generator = "deps/ash/lib/ash/code_interface.ex"
+	return []dbgiDefinition{
+		{name: "list_rooms", arity: 0, line: 7, keepFile: generator, keepLine: 1112},
+		{name: "get_room_by_slug!", arity: 1, line: generatedDefineLine, keepFile: generator, keepLine: 1112},
+		{name: "get_room_by_slug!", arity: 2, line: 7, keepFile: generator, keepLine: 1112},
+	}
+}
+
+func TestDefinitionBareGeneratedFunctionFiltersByCallArity(t *testing.T) {
+	server, domainPath := newGeneratedDefinitionFixture(t, generatedDomainRel, splitArityDefinitions()...)
+	locations := generatedDefinitionAt(t, server, generatedDomainRel, generatedDomainSource, 11, 24)
+	expectSingleLocation(t, locations, domainPath, generatedDefineLine)
+}
+
+func TestDefinitionBareGeneratedFunctionAppliesDefinitionStyle(t *testing.T) {
+	server, domainPath := newGeneratedDefinitionFixture(t, generatedDomainRel, splitArityDefinitions()...)
+	// No generated arity matches, so every arity remains a candidate.
+	source := strings.Replace(generatedDomainSource, `get_room_by_slug!("lounge")`, `get_room_by_slug!("lounge", 1, 2)`, 1)
+
+	if locations := generatedDefinitionAt(t, server, generatedDomainRel, source, 11, 24); len(locations) != 2 {
+		t.Fatalf("expected both arities with definitionStyle all, got %#v", locations)
+	}
+
+	server.definitionStyle = "first"
+	locations := generatedDefinitionAt(t, server, generatedDomainRel, source, 11, 24)
+	if len(locations) != 1 || uriToPath(locations[0].URI) != domainPath {
+		t.Fatalf("expected one location with definitionStyle first, got %#v", locations)
+	}
+}
+
+func TestLookupNameGeneratedArityMissFallsBackToModule(t *testing.T) {
+	server, domainPath := newGeneratedDefinitionFixture(t, generatedDomainRel, lineDefinitions()...)
+	locations, err := server.LookupName("MyApp.Chat", "get_room_by_slug!", NameLookupOptions{
+		Arity:            5,
+		ExactArity:       true,
+		FallbackToModule: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(locations) != 1 || locations[0].FilePath != domainPath || locations[0].Line != generatedModuleLine {
+		t.Fatalf("expected module fallback %s:%d, got %#v", domainPath, generatedModuleLine, locations)
+	}
+}

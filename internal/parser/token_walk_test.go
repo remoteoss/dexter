@@ -35,6 +35,26 @@ func TestTrackBlockDepth(t *testing.T) {
 	}
 }
 
+func TestTokenWalker_PreviousSigPos(t *testing.T) {
+	source := []byte("left\n# comment\n|> right")
+	tokens := Tokenize(source)
+	w := NewTokenWalker(source, tokens)
+	right := -1
+	for i, token := range tokens {
+		if TokenText(source, token) == "right" {
+			right = i
+			break
+		}
+	}
+	if right < 0 {
+		t.Fatal("right token not found")
+	}
+	prev := w.PreviousSigPos(right)
+	if prev < 0 || tokens[prev].Kind != TokPipe {
+		t.Fatalf("previous significant token = %d, want pipe", prev)
+	}
+}
+
 func TestAliasShortName(t *testing.T) {
 	tests := []struct {
 		in   string

@@ -68,6 +68,267 @@ func (tf *TokenizedFile) FullExpressionAtCursor(line, col int) CursorContext {
 	return ctx
 }
 
+// ArityAtCallsite returns the call arity at the given expression position, or
+// -1 when arity can't be determined. Handles:
+//   - Foo.bar(a, b)    → 2
+//   - Foo.bar()        → 0
+//   - &Foo.bar/2       → 2 (capture syntax)
+//   - x |> Foo.bar(y)  → 2 (pipe injects one implicit arg)
+//   - Foo.bar          → -1 (no call suffix, arity unknown)
+//
+// line is 0-based. startCol/endCol are the expression's 0-based column bounds
+// (as returned in CursorContext.ExprStart/ExprEnd).
+func (tf *TokenizedFile) ArityAtCallsite(line, startCol, endCol int) int {
+	endOffset := parser.LineColToOffset(tf.lineStarts, line, endCol-1)
+	if endOffset >= 0 && parser.TokenAtOffset(tf.interp, endOffset) >= 0 {
+		// The interpolation stream intentionally contains only references, not
+		// the delimiters required to determine a call's arity.
+		return -1
+	}
+	return arityAtCallsite(tf.tokens, tf.source, tf.lineStarts, line, startCol, endCol)
+}
+
+func arityAtCallsite(tokens []parser.Token, source []byte, lineStarts []int, line, startCol, endCol int) int {
+	n := len(tokens)
+	if n == 0 || endCol <= 0 {
+		return -1
+	}
+
+	// Locate the last token of the expression (index of the char at endCol-1).
+	endOffset := parser.LineColToOffset(lineStarts, line, endCol-1)
+	if endOffset < 0 {
+		return -1
+	}
+	endIdx := parser.TokenAtOffset(tokens, endOffset)
+	if endIdx < 0 {
+		return -1
+	}
+
+	w := parser.NewTokenWalker(source, tokens)
+	w.SetPos(endIdx + 1)
+	w.SkipToNextSig()
+	j := w.Pos()
+
+	arity := -1
+	switch {
+	case j < n && tokens[j].Kind == parser.TokOpenParen:
+		var closeIdx int
+		arity, closeIdx = countCallArgs(source, tokens, j)
+		if arity >= 0 {
+			w.SetPos(closeIdx + 1)
+			w.SkipToNextSig()
+			if w.CurrentKind() == parser.TokDo {
+				startOffset := parser.LineColToOffset(lineStarts, line, startCol)
+				startIdx := parser.TokenAtOffset(tokens, startOffset)
+				prev := w.PreviousSigPos(startIdx)
+				switch {
+				case prev >= 0 && isDefinitionKeyword(tokens[prev].Kind):
+					// `def name(a, b) do` opens the body, not a keyword argument.
+				case prev >= 0 && tokenCanOwnFollowingExpression(tokens[prev].Kind):
+					return -1
+				default:
+					arity++
+				}
+			}
+		}
+	case j < n && tokens[j].Kind == parser.TokOther &&
+		tokens[j].End-tokens[j].Start == 1 && source[tokens[j].Start] == '/':
+		// Capture syntax: &Foo.bar/2
+		startOffset := parser.LineColToOffset(lineStarts, line, startCol)
+		startIdx := parser.TokenAtOffset(tokens, startOffset)
+		prev := w.PreviousSigPos(startIdx)
+		if prev < 0 || tokens[prev].Kind != parser.TokOther ||
+			tokens[prev].End-tokens[prev].Start != 1 || source[tokens[prev].Start] != '&' {
+			return -1
+		}
+		w.SetPos(j + 1)
+		w.SkipToNextSig()
+		k := w.Pos()
+		if k < n && tokens[k].Kind == parser.TokNumber {
+			if a, ok := parseNumberTokenArity(source, tokens[k]); ok {
+				arity = a
+			}
+		}
+	}
+
+	if arity < 0 {
+		return -1
+	}
+
+	// Pipe adjustment: if the expression is the RHS of a |>, add one for the
+	// implicit first argument.
+	startOffset := parser.LineColToOffset(lineStarts, line, startCol)
+	if startOffset >= 0 {
+		startIdx := parser.TokenAtOffset(tokens, startOffset)
+		if prev := w.PreviousSigPos(startIdx); prev >= 0 && tokens[prev].Kind == parser.TokPipe {
+			return arity + 1
+		}
+	}
+
+	return arity
+}
+
+// countCallArgs counts top-level arguments inside a parenthesized call,
+// starting at openIdx which must be a TokOpenParen. It returns the arity and
+// matching close-token index, or -1, -1 when the expression is unbalanced.
+func countCallArgs(source []byte, tokens []parser.Token, openIdx int) (int, int) {
+	if openIdx >= len(tokens) || tokens[openIdx].Kind != parser.TokOpenParen {
+		return -1, -1
+	}
+	w := parser.NewTokenWalker(source, tokens)
+	w.SetPos(openIdx)
+	w.Advance()
+	args := 0
+	hasContent := false
+	keywordTail := false
+	// innerCall marks a parenthesis-free call such as `if ready, do: x` or
+	// `fetch user, opts` inside the argument list: Elixir gives it every
+	// following top-level comma until a do block ends it.
+	innerCall := false
+	for w.More() {
+		pos := w.Pos()
+		kind := w.CurrentKind()
+		switch kind {
+		case parser.TokCloseParen, parser.TokCloseBracket, parser.TokCloseBrace, parser.TokCloseAngle:
+			if w.Depth() == 1 && w.BlockDepth() == 0 {
+				if hasContent {
+					return args + 1, pos
+				}
+				return 0, pos
+			}
+		case parser.TokDo:
+			if w.Depth() == 1 && w.BlockDepth() == 0 {
+				innerCall = false
+			}
+			hasContent = true
+		case parser.TokIdent:
+			if w.Depth() == 1 && w.BlockDepth() == 0 && !innerCall && startsParenFreeCall(source, tokens, pos) {
+				innerCall = true
+			}
+			hasContent = true
+		case parser.TokComma:
+			if w.Depth() == 1 && w.BlockDepth() == 0 {
+				if innerCall {
+					// Only a sole argument may be a parenthesis-free call
+					// followed by commas; anything else is a syntax error.
+					if args > 0 {
+						return -1, -1
+					}
+					w.Advance()
+					continue
+				}
+				// Elixir's trailing keyword syntax is one list argument even
+				// though its entries are separated by top-level commas.
+				if keywordTail {
+					w.Advance()
+					continue
+				}
+				args++
+				hasContent = false
+				w.Advance()
+				continue
+			}
+			hasContent = true
+		case parser.TokColon:
+			prev := w.PreviousSigPos(pos)
+			if w.Depth() == 1 && w.BlockDepth() == 0 && prev > openIdx && tokens[prev].Kind == parser.TokIdent {
+				keywordTail = true
+			}
+			hasContent = true
+		case parser.TokEOL, parser.TokComment:
+			// skip
+		default:
+			hasContent = true
+		}
+		w.Advance()
+	}
+	return -1, -1
+}
+
+// startsParenFreeCall reports whether the identifier at pos is called without
+// parentheses, as in `if ready, ...` or `fetch user`: Elixir parses a name
+// followed by whitespace and the start of an expression as a call. Word
+// operators (`a in b`, `not c`) and binary minus (`a - 1`) are not calls.
+func startsParenFreeCall(source []byte, tokens []parser.Token, pos int) bool {
+	if pos+1 >= len(tokens) {
+		return false
+	}
+	name := string(source[tokens[pos].Start:tokens[pos].End])
+	if isWordOperator(name) {
+		return false
+	}
+	next := tokens[pos+1]
+	if next.Start <= tokens[pos].End {
+		// `foo(`, `foo.`, `foo[` and `foo:` are not parenthesis-free calls.
+		return false
+	}
+	switch next.Kind {
+	case parser.TokIdent:
+		return !isWordOperator(string(source[next.Start:next.End]))
+	case parser.TokModule, parser.TokNumber, parser.TokString, parser.TokHeredoc,
+		parser.TokSigil, parser.TokCharLiteral, parser.TokAtom, parser.TokOpenBracket,
+		parser.TokOpenBrace, parser.TokPercent, parser.TokFn, parser.TokAttr,
+		parser.TokAttrDoc, parser.TokAttrSpec, parser.TokAttrType,
+		parser.TokAttrBehaviour, parser.TokAttrCallback:
+		return true
+	case parser.TokOther:
+		if next.End-next.Start != 1 {
+			return false
+		}
+		switch source[next.Start] {
+		case '&', '^', '!':
+			return true
+		case '-', '+':
+			// `foo -1` is a call; `a - 1` is subtraction.
+			return pos+2 < len(tokens) && tokens[pos+2].Start == next.End
+		}
+	}
+	return false
+}
+
+func isWordOperator(name string) bool {
+	switch name {
+	case "in", "and", "or", "not", "when":
+		return true
+	}
+	return false
+}
+
+func isDefinitionKeyword(kind parser.TokenKind) bool {
+	switch kind {
+	case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
+		parser.TokDefguard, parser.TokDefguardp:
+		return true
+	}
+	return false
+}
+
+func tokenCanOwnFollowingExpression(kind parser.TokenKind) bool {
+	switch kind {
+	case parser.TokIdent, parser.TokModule, parser.TokNumber, parser.TokString,
+		parser.TokHeredoc, parser.TokSigil, parser.TokCharLiteral, parser.TokAtom,
+		parser.TokCloseParen, parser.TokCloseBracket, parser.TokCloseBrace, parser.TokCloseAngle:
+		return true
+	default:
+		return false
+	}
+}
+
+func parseNumberTokenArity(source []byte, t parser.Token) (int, bool) {
+	text := source[t.Start:t.End]
+	n := 0
+	for _, b := range text {
+		if b < '0' || b > '9' {
+			return 0, false
+		}
+		n = n*10 + int(b-'0')
+		if n > 255 { // arity fits in a byte in practice
+			return 0, false
+		}
+	}
+	return n, true
+}
+
 // FirstDefmodule returns the first defmodule name found, or "".
 func (tf *TokenizedFile) FirstDefmodule() string {
 	for i := 0; i < tf.n; i++ {
@@ -114,6 +375,86 @@ func (tf *TokenizedFile) FindFunctionDefinition(functionName string) (int, bool)
 // type rather than to a function of the same name.
 func (tf *TokenizedFile) FindTypeDefinition(functionName string) (int, bool) {
 	return tf.findDefinition(functionName, true)
+}
+
+// FindDefinitionLines returns the callable or type definition lines declared
+// directly in module; declarations in nested or sibling modules belong to
+// those modules. An arity below zero keeps every arity. preferType selects the
+// namespace to prefer when a type and callable share a name.
+func (tf *TokenizedFile) FindDefinitionLines(module, functionName string, arity int, preferType bool) []int {
+	var functionLines, typeLines []int
+	type moduleFrame struct {
+		name       string
+		blockDepth int
+	}
+	var stack []moduleFrame
+	w := parser.NewTokenWalker(tf.source, tf.tokens)
+	for w.More() {
+		i := w.Pos()
+		tok := w.Current()
+		blockDepth := w.BlockDepth()
+		w.Advance()
+		switch tok.Kind {
+		case parser.TokDefmodule, parser.TokDefprotocol, parser.TokDefimpl:
+			parent := ""
+			if len(stack) > 0 {
+				parent = stack[len(stack)-1].name
+			}
+			if name, _, hasDo := tokParseModuleDef(tf.source, tf.tokens, i+1, parent); name != "" && hasDo {
+				// The walker counts the module's do when it reaches it.
+				stack = append(stack, moduleFrame{name: name, blockDepth: blockDepth + 1})
+			}
+			continue
+		case parser.TokEnd:
+			if len(stack) > 0 && stack[len(stack)-1].blockDepth == blockDepth {
+				stack = stack[:len(stack)-1]
+			}
+			continue
+		}
+		if len(stack) == 0 || stack[len(stack)-1].name != module {
+			continue
+		}
+		switch tok.Kind {
+		case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
+			parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate:
+			name, j, ok := parser.StaticDeclarationName(tf.source, tf.tokens, tf.n, i)
+			if !ok || name != functionName {
+				continue
+			}
+			maxArity, defaultCount := 0, 0
+			pj := tokNextSig(tf.tokens, tf.n, j+1)
+			if pj < tf.n && tf.tokens[pj].Kind == parser.TokOpenParen {
+				maxArity, defaultCount, _, _ = parser.CollectParams(tf.source, tf.tokens, tf.n, pj)
+			}
+			if arity < 0 || (arity >= maxArity-defaultCount && arity <= maxArity) {
+				functionLines = append(functionLines, tok.Line)
+			}
+
+		case parser.TokAttrType:
+			name, j, ok := parser.StaticDeclarationName(tf.source, tf.tokens, tf.n, i)
+			if !ok || name != functionName {
+				continue
+			}
+			typeArity := 0
+			pj := tokNextSig(tf.tokens, tf.n, j+1)
+			if pj < tf.n && tf.tokens[pj].Kind == parser.TokOpenParen {
+				typeArity, _, _, _ = parser.CollectParams(tf.source, tf.tokens, tf.n, pj)
+			}
+			if arity < 0 || arity == typeArity {
+				typeLines = append(typeLines, tok.Line)
+			}
+		}
+	}
+	if preferType {
+		if len(typeLines) > 0 {
+			return typeLines
+		}
+		return functionLines
+	}
+	if len(functionLines) > 0 {
+		return functionLines
+	}
+	return typeLines
 }
 
 // findDefinition returns the line of the first matching definition. A module
