@@ -8378,3 +8378,14 @@ func TestRemoveFilesUnderRootMatchesUncleanStoredPaths(t *testing.T) {
 		t.Errorf("stored paths = %v, want only %s", paths, kept)
 	}
 }
+
+// buildTextEdits runs a token rename over sites for an editor, as a rename
+// does: it plans the edits and commits them under the rename lock.
+func (s *Server) buildTextEdits(ctx context.Context, sites []renameSite, module, oldToken, newToken string) (*WorkspaceEdit, error) {
+	end, err := s.beginRename(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer end()
+	return s.commitTextEdits(s.planTextEdits(sites, []string{module}, nil, oldToken, newToken, requesterEditor))
+}

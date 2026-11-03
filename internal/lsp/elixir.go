@@ -2724,20 +2724,9 @@ func FindModuleAttributeDefinition(text string, attrName string) (int, bool) {
 	return FindModuleAttributeDefinitionTokenized(text, attrName)
 }
 
-// FindBareFunctionCalls scans text for unqualified calls to functionName,
-// including direct calls like functionName(...) and pipe calls like |> functionName.
-// Returns 1-based line numbers. Definition lines are excluded.
-func FindBareFunctionCalls(text string, functionName string) []int {
-	if !strings.Contains(text, functionName) {
-		return nil
-	}
-	source := []byte(text)
-	full := parser.TokenizeFull(source)
-	return findBareCallLines(source, full.Tokens, full.Interp, functionName)
-}
-
-// findBareCallLines is FindBareFunctionCalls on tokens the caller already
-// has.
+// findBareCallLines returns the 1-based lines of the unqualified calls to
+// functionName in the tokens of source, direct calls like functionName(...)
+// and pipe calls like |> functionName. Definition lines are excluded.
 func findBareCallLines(source []byte, tokens, interp []parser.Token, functionName string) []int {
 	n := len(tokens)
 

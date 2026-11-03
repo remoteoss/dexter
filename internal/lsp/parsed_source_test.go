@@ -16,7 +16,7 @@ func TestParsedSource_LinesMatchTokenScans(t *testing.T) {
 	root := "testdata"
 	n := 0
 	_ = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() || !(strings.HasSuffix(p, ".ex") || strings.HasSuffix(p, ".exs")) {
+		if err != nil || d.IsDir() || (!strings.HasSuffix(p, ".ex") && !strings.HasSuffix(p, ".exs")) {
 			return nil
 		}
 		data, _ := os.ReadFile(p)

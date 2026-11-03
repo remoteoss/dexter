@@ -286,29 +286,6 @@ func (r *openDocRegistry) heldTexts(owner *DocumentStore, path string) []string 
 	return texts
 }
 
-// openElsewhere returns the paths, of the given ones, that a session other
-// than owner has open.
-func (r *openDocRegistry) openElsewhere(owner *DocumentStore, paths []string) []string {
-	if r == nil {
-		return nil
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if len(r.paths) == 0 {
-		return nil
-	}
-	var out []string
-	for _, path := range paths {
-		for o := range r.paths[pathKey(path)] {
-			if o != owner {
-				out = append(out, path)
-				break
-			}
-		}
-	}
-	return out
-}
-
 func NewDocumentStore() *DocumentStore {
 	p := tree_sitter.NewParser()
 	_ = p.SetLanguage(tree_sitter.NewLanguage(tree_sitter_elixir.Language()))

@@ -1091,3 +1091,6 @@ func TestUnsavedBufferStaysUnsavedAfterADaemonRestart(t *testing.T) {
 		t.Fatalf("a saved buffer is unsaved after the restart: %q", got)
 	}
 }
+
+// retained reports how many message bytes the document keeps.
+func (d *proxyDoc) retained() int { return len(d.open) + len(d.change) }

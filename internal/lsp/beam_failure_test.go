@@ -379,3 +379,9 @@ func TestBeamStampIsReadAtMostOncePerInterval(t *testing.T) {
 		t.Fatal("the changed stamp was not seen after the interval")
 	}
 }
+
+// writeBeamServerScript puts script in dir under a name that holds a hash of
+// its content, and returns the path; see installScript.
+func writeBeamServerScript(dir, script string) (string, error) {
+	return installScript(dir, "beam_server", ".exs", script)
+}

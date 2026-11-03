@@ -25,9 +25,6 @@ type proxyDoc struct {
 	changed bool
 }
 
-// retained reports how many message bytes the document keeps.
-func (d *proxyDoc) retained() int { return len(d.open) + len(d.change) }
-
 type docMessage struct {
 	Params struct {
 		TextDocument struct {

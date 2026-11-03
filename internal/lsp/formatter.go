@@ -792,12 +792,6 @@ func (s *Server) startBeamProcess(buildRoot string) (*beamProcess, error) {
 	return bp, nil
 }
 
-// writeBeamServerScript puts script in dir under a name that holds a hash of
-// its content, and returns the path; see installScript.
-func writeBeamServerScript(dir, script string) (string, error) {
-	return installScript(dir, "beam_server", ".exs", script)
-}
-
 // findBuildRoot walks up from dir looking for a _build directory, bounded by
 // projectRoot. Returns the directory containing _build, or projectRoot if none
 // is found.

@@ -349,7 +349,7 @@ func TestRename_OtherSpellingsOfAnOpenFile(t *testing.T) {
 			if err := b.DidClose(context.Background(), &protocol.DidCloseTextDocumentParams{TextDocument: protocol.TextDocumentIdentifier{URI: protocol.DocumentURI(bURI)}}); err != nil {
 				t.Fatal(err)
 			}
-			if busy := a.index.openDocs.openElsewhere(a.docs, []string{bPath}); len(busy) != 0 {
+			if busy := a.index.openDocs.heldTexts(a.docs, bPath); len(busy) != 0 {
 				t.Errorf("the registry still has %v open after close", busy)
 			}
 		})

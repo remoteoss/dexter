@@ -414,23 +414,16 @@ func TestFormatterFailuresAreKeptForEachProject(t *testing.T) {
 	}
 }
 
-func TestRenameFailuresAreShownToTheRequestingEditor(t *testing.T) {
-	server, cleanup := setupTestServer(t)
-	defer cleanup()
-	client := notifytest.New()
-	server.client = client
+func TestRenameFailuresMessage(t *testing.T) {
 	var failures renameFailures
 	failures.add("/p/lib/b.ex", errors.New("permission denied"))
 	failures.add("/p/lib/a.ex", errors.New("read-only file system"))
-	server.reportRenameFailures(&failures)
-	got := client.WaitMessage(t, reportWait, protocol.MessageTypeError, "the rename could not change 2 files: /p/lib/a.ex and 1 more (permission denied)")
-	if !strings.Contains(got.Message, "still use the old name") {
-		t.Errorf("message does not say what is left: %q", got.Message)
+	got := failures.message()
+	if !strings.Contains(got, "the rename could not change 2 files: /p/lib/a.ex and 1 more (permission denied)") || !strings.Contains(got, "still use the old name") {
+		t.Errorf("message = %q, want the files and what is left", got)
 	}
-	server.reportRenameFailures(&renameFailures{})
-	time.Sleep(20 * time.Millisecond)
-	if n := len(client.Messages()); n != 1 {
-		t.Errorf("a rename without failures sent a message:\n%s", client.Dump())
+	if msg := (&renameFailures{}).message(); msg != "" {
+		t.Errorf("a rename without failures has a message: %q", msg)
 	}
 }
 

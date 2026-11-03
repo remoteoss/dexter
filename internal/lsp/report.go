@@ -483,13 +483,6 @@ func (s *Server) beamStamp(buildRoot string) string {
 // errOTPMismatch marks a mix format that failed with an OTP mismatch.
 var errOTPMismatch = errors.New("Elixir/OTP version mismatch")
 
-// rememberOTPMismatch records that the BEAM of buildRoot failed with an OTP
-// mismatch. It reports nothing: what the mismatch means for the user depends
-// on the mix format fallback, and reportBeamOTP decides that.
-func (s *Server) rememberOTPMismatch(buildRoot string) {
-	s.rememberBeamFailure(buildRoot, nil, true, "")
-}
-
 // rememberBeamFailure records that bp, the BEAM of buildRoot, failed to start,
 // so that it is not started again on each request. The same process is
 // recorded once, however many callers see it fail. A failure other than an
@@ -749,14 +742,6 @@ func (f *renameFailures) note(text string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.notes = append(f.notes, text)
-}
-
-// report tells this editor, and only this editor, that its rename is
-// incomplete: which files did not change, and how many did.
-func (s *Server) reportRenameFailures(f *renameFailures) {
-	if msg := f.message(); msg != "" {
-		s.notifySession(notify.Error, msg)
-	}
 }
 
 // message is the report of f, or "" when every file changed.

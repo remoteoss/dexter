@@ -3002,13 +3002,13 @@ func TestFindBareFunctionCalls(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := FindBareFunctionCalls(tt.text, tt.funcName)
+			got := findBareFunctionCalls(tt.text, tt.funcName)
 			if len(got) != len(tt.want) {
-				t.Fatalf("FindBareFunctionCalls(%q) = %v, want %v", tt.funcName, got, tt.want)
+				t.Fatalf("findBareFunctionCalls(%q) = %v, want %v", tt.funcName, got, tt.want)
 			}
 			for i := range got {
 				if got[i] != tt.want[i] {
-					t.Errorf("FindBareFunctionCalls(%q)[%d] = %d, want %d", tt.funcName, i, got[i], tt.want[i])
+					t.Errorf("findBareFunctionCalls(%q)[%d] = %d, want %d", tt.funcName, i, got[i], tt.want[i])
 				}
 			}
 		})
@@ -3799,4 +3799,16 @@ end`
 	if aliases["U"] != "SharedLib.Accounts.Users" {
 		t.Errorf("expected U -> SharedLib.Accounts.Users, got %q", aliases["U"])
 	}
+}
+
+// findBareFunctionCalls scans text for unqualified calls to functionName,
+// including direct calls like functionName(...) and pipe calls like |> functionName.
+// Returns 1-based line numbers. Definition lines are excluded.
+func findBareFunctionCalls(text string, functionName string) []int {
+	if !strings.Contains(text, functionName) {
+		return nil
+	}
+	source := []byte(text)
+	full := parser.TokenizeFull(source)
+	return findBareCallLines(source, full.Tokens, full.Interp, functionName)
 }

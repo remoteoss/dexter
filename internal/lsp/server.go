@@ -7994,7 +7994,7 @@ func (mr *moduleRename) splitGroupedAlias(fp, lineText, prefix string, prefixCol
 		full := prefix + "." + m
 		newFull := mr.renamed(full)
 		if newMember := strings.TrimPrefix(newFull, prefix+"."); newFull == full ||
-			(newMember != newFull && strings.Count(newMember, ".") == strings.Count(m, ".") && !(alias && mr.keepsShort(fp, moduleLastSegment(m), moduleLastSegment(newFull)))) {
+			(newMember != newFull && strings.Count(newMember, ".") == strings.Count(m, ".") && (!alias || !mr.keepsShort(fp, moduleLastSegment(m), moduleLastSegment(newFull)))) {
 			// It stays, renamed in place if the rename changes it.
 			if newFull != full {
 				m = newMember
@@ -8338,18 +8338,6 @@ func (p *textEditPlan) deny(path string, err error) {
 		p.denied = make(map[string]error)
 	}
 	p.denied[path] = err
-}
-
-// buildTextEdits creates a WorkspaceEdit replacing all whole-token occurrences
-// of oldToken with newToken. Open buffers are returned in the WorkspaceEdit;
-// closed files are written directly to disk in parallel goroutines.
-func (s *Server) buildTextEdits(ctx context.Context, sites []renameSite, module, oldToken, newToken string) (*WorkspaceEdit, error) {
-	end, err := s.beginRename(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer end()
-	return s.commitTextEdits(s.planTextEdits(sites, []string{module}, nil, oldToken, newToken, requesterEditor))
 }
 
 // planTextEdits works out a token rename over sites without changing any

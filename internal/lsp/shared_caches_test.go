@@ -294,3 +294,9 @@ func TestUsingCacheAcceptsDefmoduleWithParentheses(t *testing.T) {
 		}
 	}
 }
+
+func (c *usingCache) len() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.entries)
+}

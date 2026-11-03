@@ -65,12 +65,6 @@ func (c *usingCache) drop(module string, old *usingCacheEntry) {
 	c.mu.Unlock()
 }
 
-func (c *usingCache) len() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return len(c.entries)
-}
-
 // depsCache maps a directory to whether the files in it are dependencies: they
 // are below the deps directory of a Mix project. The answer depends only on
 // where mix.exs files are, so it is cleared when a mix.exs or mix.lock

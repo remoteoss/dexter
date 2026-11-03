@@ -397,3 +397,10 @@ func TestConcurrentFormatsKeepTheOTPWarning(t *testing.T) {
 		t.Errorf("the Warning was sent %d times, want 1:\n%s", n, client.Dump())
 	}
 }
+
+// rememberOTPMismatch records that the BEAM of buildRoot failed with an OTP
+// mismatch. It reports nothing: what the mismatch means for the user depends
+// on the mix format fallback, and reportBeamOTP decides that.
+func (s *Server) rememberOTPMismatch(buildRoot string) {
+	s.rememberBeamFailure(buildRoot, nil, true, "")
+}
