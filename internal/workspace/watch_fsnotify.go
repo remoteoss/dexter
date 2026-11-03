@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -22,9 +23,14 @@ type fsnotifyWatcher struct {
 	onChange         func(string)
 	onFullReconcile  func()
 	onCoverageChange func(bool)
-	add              func(string) error
-	remove           func(string) error
-	watchList        func() []string
+	onCoverageCount  func()
+	callbacks        WatchCallbacks
+	// countChanged is set when the failed set changed without a coverage
+	// edge; reportCountChange sends it once after the event or the tick.
+	countChanged atomic.Bool
+	add          func(string) error
+	remove       func(string) error
+	watchList    func() []string
 	// readDir reads a directory for the walk; nil uses parser.ReadDirUnsorted.
 	// Tests replace it to make a read fail.
 	readDir func(string) ([]fs.DirEntry, error)
@@ -78,6 +84,7 @@ func startFSNotifyWatcher(root string, callbacks WatchCallbacks) (watchBackend, 
 		root:            root,
 		onChange:        callbacks.PathChanged,
 		onFullReconcile: callbacks.FullReconcile,
+		callbacks:       callbacks,
 		add:             fsw.Add,
 		remove:          fsw.Remove,
 		watchList:       fsw.WatchList,
@@ -96,6 +103,7 @@ func startFSNotifyWatcher(root string, callbacks WatchCallbacks) (watchBackend, 
 	// before waiting for the retry timer.
 	w.retryFailed()
 	w.onCoverageChange = callbacks.CoverageChanged
+	w.onCoverageCount = callbacks.CoverageCountChanged
 	w.wg.Add(1)
 	go w.loop()
 	return w, nil
@@ -263,6 +271,21 @@ func (w *fsnotifyWatcher) setFailed(path string, failed bool) {
 	// directory keeps the watcher degraded.
 	if ((!wasDegraded && isDegraded) || (!failed && wasFailed)) && w.onCoverageChange != nil {
 		w.onCoverageChange(isDegraded)
+		return
+	}
+	if failed && !wasFailed {
+		// Another directory failed while the watcher was already degraded.
+		// The report is refreshed once after the event or the tick, not for
+		// each directory of a walk.
+		w.countChanged.Store(true)
+	}
+}
+
+// reportCountChange refreshes the coverage report when the failed set changed
+// without an edge. It costs one atomic operation when nothing changed.
+func (w *fsnotifyWatcher) reportCountChange() {
+	if w.countChanged.Swap(false) && w.onCoverageCount != nil {
+		w.onCoverageCount()
 	}
 }
 
@@ -311,7 +334,11 @@ func (w *fsnotifyWatcher) loop() {
 			if !ok {
 				return
 			}
-			w.handle(ev)
+			w.callbacks.handleSafely(func() { w.handle(ev) })
+			w.reportCountChange()
+			if ev.Name == w.root && (ev.Op.Has(fsnotify.Remove) || ev.Op.Has(fsnotify.Rename)) && rootGone(w.root) && w.callbacks.RootGone != nil {
+				w.callbacks.RootGone()
+			}
 		case err, ok := <-w.fsw.Errors:
 			if !ok {
 				return
@@ -328,6 +355,7 @@ func (w *fsnotifyWatcher) loop() {
 		case <-ticker.C:
 			w.retryFailed()
 			w.checkPending()
+			w.reportCountChange()
 		}
 	}
 }

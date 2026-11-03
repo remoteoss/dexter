@@ -1,19 +1,64 @@
 package workspace
 
 import (
+	"log"
+	"os"
 	"path/filepath"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"sync"
 
+	"github.com/remoteoss/dexter/internal/lsp"
 	"github.com/remoteoss/dexter/internal/parser"
 )
 
 // WatchCallbacks translates platform events into workspace reconciliation work.
 type WatchCallbacks struct {
-	PathChanged     func(string)
-	FullReconcile   func()
+	PathChanged   func(string)
+	FullReconcile func()
+	// CoverageChanged runs when the watcher becomes degraded, and when a
+	// directory that it could not watch is watched again. Both need a
+	// reconciliation.
 	CoverageChanged func(bool)
+	// CoverageCountChanged runs when the set of directories that cannot be
+	// watched changed without such an edge, for example when a second
+	// directory fails. It needs no reconciliation; it keeps the report
+	// current.
+	CoverageCountChanged func()
+	// RootGone reports that the project root is not there any more, for
+	// example because its volume was unmounted. It may be nil.
+	RootGone func()
+	// Panicked reports a panic that the watcher recovered while it handled an
+	// event. The watcher then asks for a full reconcile, because the event is
+	// lost. It may be nil.
+	Panicked func(what string, value any, stack []byte)
+}
+
+// handleSafely runs one event handler and keeps a panic in it from stopping
+// the process; the event is lost, so a full reconcile replaces it.
+func (c WatchCallbacks) handleSafely(handle func()) {
+	defer func() {
+		value := recover()
+		if value == nil {
+			return
+		}
+		if c.Panicked != nil {
+			c.Panicked("the file watcher", value, debug.Stack())
+		} else {
+			log.Printf("Error: panic in the file watcher: %v\n%s", value, debug.Stack())
+		}
+		if c.FullReconcile != nil {
+			c.FullReconcile()
+		}
+	}()
+	handle()
+}
+
+// rootGone reports whether root is not there any more.
+func rootGone(root string) bool {
+	info, err := os.Stat(root)
+	return lsp.IsMissing(err) || (err == nil && !info.IsDir())
 }
 
 type watchBackend interface {

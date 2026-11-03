@@ -3,6 +3,8 @@ package lsp
 import (
 	"context"
 	"fmt"
+	"log"
+	"runtime/debug"
 	"sync/atomic"
 
 	"go.lsp.dev/protocol"
@@ -29,6 +31,11 @@ type clientLog struct {
 func startClientLog(client protocol.Client, done <-chan struct{}) *clientLog {
 	l := &clientLog{lines: make(chan string, clientLogBuffer)}
 	go func() {
+		defer func() {
+			if value := recover(); value != nil {
+				log.Printf("Error: panic while sending log lines to an editor: %v\n%s", value, debug.Stack())
+			}
+		}()
 		for {
 			select {
 			case <-done:

@@ -578,12 +578,12 @@ func cmdStop(projectRoot string, force bool) {
 	// Shutdown is asynchronous: it answers first, then drains and exits. Wait
 	// for the process to go away. A replacement daemon another frontend started
 	// in the meantime has a different pid and counts as stopped.
-	waitCtx, cancelWait := context.WithTimeout(ctx, 5*time.Second)
+	waitCtx, cancelWait := context.WithTimeout(ctx, stopWait)
 	defer cancelWait()
 	replacementPID, waitErr := waitForDaemonStop(waitCtx, pid, func(probeCtx context.Context) stopProbeResult {
 		probe, dialErr := daemon.Dial(probeCtx, projectRoot)
 		if dialErr != nil {
-			return stopProbeResult{running: daemon.ProcessAlive(pid), pid: pid}
+			return stopProbeResult{running: daemon.ProcessAlive(pid) && workspaceOwned(projectRoot), pid: pid}
 		}
 		next, statusErr := probe.DaemonStatus(probeCtx)
 		_ = probe.Close()
@@ -600,6 +600,23 @@ func cmdStop(projectRoot string, force bool) {
 		return
 	}
 	fmt.Fprintf(os.Stderr, "Stopped workspace daemon (pid %d)\n", pid)
+}
+
+// stopWait bounds the wait for a daemon that agreed to stop. Its shutdown
+// drains the mutation queue and checkpoints the index, which takes more than a
+// few seconds on a large workspace or a loaded machine.
+const stopWait = 30 * time.Second
+
+// workspaceOwned reports whether a process holds the workspace lock. A daemon
+// that exited but was not reaped yet (a zombie, as under a container init that
+// reaps late) still looks alive to a signal check, but holds no lock.
+func workspaceOwned(root string) bool {
+	ownership, _, err := daemon.AcquireOwnership(root)
+	if err != nil {
+		return errors.Is(err, daemon.ErrWorkspaceOwned)
+	}
+	_ = ownership.Release()
+	return false
 }
 
 type stopProbeResult struct {

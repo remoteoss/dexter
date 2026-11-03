@@ -178,7 +178,6 @@ func TestListTools(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []string{
-		"dexter_call_hierarchy",
 		"dexter_definition",
 		"dexter_file_outline",
 		"dexter_implementations",

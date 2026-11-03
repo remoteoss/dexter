@@ -50,7 +50,7 @@ end
 
 // A file that the rename cannot write is reported, and is not counted as
 // changed, so the caller can tell the user which files still use the old name.
-func TestRenameFunction_ReportsFilesItCouldNotWrite(t *testing.T) {
+func TestRenameFunction_RefusesWhenAFileCannotBeWritten(t *testing.T) {
 	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
 		t.Skip("needs a file that the process cannot write")
 	}
@@ -71,17 +71,14 @@ end
 	}
 	defer func() { _ = os.Chmod(callerPath, 0644) }()
 
-	summary, err := server.RenameFunction("MyApp.Accounts", "fetch_user", "get_user")
-	if err != nil {
-		t.Fatal(err)
+	// A rename is all or nothing: a file that cannot be written stops it
+	// before any file changes, and the error names the file.
+	_, err := server.RenameFunction("MyApp.Accounts", "fetch_user", "get_user")
+	if err == nil || !strings.Contains(err.Error(), "cannot write 1 of the files it must change: lib/caller.ex") {
+		t.Fatalf("want the refusal that names lib/caller.ex, got %v", err)
 	}
-	if len(summary.FilesFailed) != 1 || summary.FilesFailed[0] != callerPath || summary.FailureReason == "" {
-		t.Errorf("FilesFailed = %v (%q), want %s", summary.FilesFailed, summary.FailureReason, callerPath)
-	}
-	for _, path := range summary.FilesChanged {
-		if path == callerPath {
-			t.Errorf("FilesChanged includes the file that could not be written: %v", summary.FilesChanged)
-		}
+	if data, _ := os.ReadFile(filepath.Join(server.projectRoot, "lib/accounts.ex")); strings.Contains(string(data), "get_user") {
+		t.Errorf("accounts.ex changed although the rename was refused")
 	}
 }
 
@@ -192,7 +189,7 @@ func TestRenameContext_CanceledWhileWaitingChangesNothing(t *testing.T) {
 	// Another rename holds the lock, and its index update has not finished.
 	pending := make(chan struct{})
 	server.index.renameSerial.Lock()
-	server.index.renameIndexed = pending
+	server.index.lastRenameIndexed = pending
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errc := make(chan error, 1)

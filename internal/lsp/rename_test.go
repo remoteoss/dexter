@@ -3654,3 +3654,25 @@ end
 		t.Errorf("SharedLib should be gone, got:\n%s", got)
 	}
 }
+
+func TestConventionalNewPath_MapsTheNamespaceDirectories(t *testing.T) {
+	for _, tc := range []struct {
+		path, old, new, want, root string
+		ok                         bool
+	}{
+		{"/p/lib/ren/probe/mcp1.ex", "Ren.Probe.Mcp1", "Ren.Probe.Renamed.Mcp", "/p/lib/ren/probe/renamed/mcp.ex", "/p/lib", true},
+		{"/p/lib/ren/probe/mcp1.ex", "Ren.Probe.Mcp1", "Ren.Elsewhere.Mcp1", "/p/lib/ren/elsewhere/mcp1.ex", "/p/lib", true},
+		{"/p/lib/ren/probe/mcp1.ex", "Ren.Probe.Mcp1", "Ren.Top", "/p/lib/ren/top.ex", "/p/lib", true},
+		{"/p/lib/ren/probe/mcp1/child.ex", "Ren.Probe.Mcp1.Child", "Ren.Top.Child", "/p/lib/ren/top/child.ex", "/p/lib", true},
+		// A leading segment with no directory must stay the same.
+		{"/p/lib/probe/mcp1.ex", "Ren.Probe.Mcp1", "Ren.Other.Mcp1", "/p/lib/other/mcp1.ex", "/p/lib", true},
+		{"/p/lib/probe/mcp1.ex", "Ren.Probe.Mcp1", "Big.Probe.Mcp2", "/p/lib/probe/mcp2.ex", "/p/lib/probe", true},
+		{"/p/test/ren/probe_test.exs", "Ren.ProbeTest", "Ren.Deep.ProbeTest", "/p/test/ren/deep/probe_test.exs", "/p/test", true},
+		{"/p/lib/ren/other.ex", "Ren.Probe.Mcp1", "Ren.Top", "", "", false},
+	} {
+		got, root, ok := conventionalNewPath(filepath.FromSlash(tc.path), tc.old, tc.new)
+		if ok != tc.ok || got != filepath.FromSlash(tc.want) || root != filepath.FromSlash(tc.root) {
+			t.Errorf("conventionalNewPath(%s, %s, %s) = %s, %s, %v; want %s, %s, %v", tc.path, tc.old, tc.new, got, root, ok, tc.want, tc.root, tc.ok)
+		}
+	}
+}

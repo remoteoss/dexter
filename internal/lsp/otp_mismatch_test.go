@@ -26,6 +26,7 @@ const otpMismatchStderr = "** (UndefinedFunctionError) function :erlang.foo/0 is
 // its input unless a "mixfails" file exists next to it. It returns the server, its editor, and the path of the start log.
 func otpMismatchProject(t *testing.T) (*Server, *notifytest.Client, string) {
 	t.Helper()
+	checkStampEachTime(t)
 	server, cleanup := setupTestServer(t)
 	t.Cleanup(cleanup)
 	bin := t.TempDir()

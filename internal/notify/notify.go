@@ -15,8 +15,11 @@ package notify
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"log"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -91,6 +94,10 @@ const maxQueue = 256
 // workspace, and the editors attached to it. A nil Reporter discards reports,
 // so code that has none needs no checks.
 type Reporter struct {
+	// tag makes the progress tokens of this reporter differ from those of
+	// another daemon: an editor that a proxy moved to a new daemon may still
+	// show a token of the old one.
+	tag   string
 	mu    sync.Mutex
 	logf  func(format string, args ...any)
 	seq   uint64
@@ -107,11 +114,20 @@ type entry struct {
 // New returns a Reporter that logs through the standard logger.
 func New() *Reporter {
 	return &Reporter{
+		tag:   newTag(),
 		logf:  log.Printf,
 		conds: make(map[string]*entry),
 		tasks: make(map[string]*Task),
 		sinks: make(map[*sink]struct{}),
 	}
+}
+
+func newTag() string {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%08x", time.Now().UnixNano()&0xffffffff)
+	}
+	return hex.EncodeToString(b[:])
 }
 
 // SetLogf replaces the log function. Tests use it to keep their output quiet or
@@ -250,7 +266,7 @@ func (r *Reporter) Begin(key, title, message string, fallback bool) *Task {
 	t := &Task{
 		r:        r,
 		key:      key,
-		token:    fmt.Sprintf("dexter/%s/%d", key, r.seq),
+		token:    fmt.Sprintf("dexter/%s/%s/%d", r.tag, key, r.seq),
 		title:    title,
 		message:  message,
 		percent:  -1,
@@ -299,6 +315,30 @@ func (t *Task) End(message string) {
 	r.broadcast(op{kind: opEnd, token: t.token, message: message, fallback: t.fallback})
 }
 
+// Flush waits until every attached editor got the reports made so far, or
+// until timeout. A process that is about to close its connections calls it,
+// so that its last report is not lost.
+func (r *Reporter) Flush(timeout time.Duration) {
+	if r == nil {
+		return
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		r.mu.Lock()
+		busy := false
+		for s := range r.sinks {
+			s.mu.Lock()
+			busy = busy || s.pending > 0
+			s.mu.Unlock()
+		}
+		r.mu.Unlock()
+		if !busy || !time.Now().Before(deadline) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // broadcast queues one op on every sink. The caller holds r.mu, which keeps the
 // order of ops the same in every editor and keeps a replay in step with them.
 func (r *Reporter) broadcast(o op) {
@@ -322,6 +362,7 @@ func (r *Reporter) Attach(client protocol.Client, progress bool) (detach func())
 		stop:     make(chan struct{}),
 		created:  make(map[string]bool),
 	}
+	s.ctx, s.cancel = context.WithCancel(context.Background())
 	r.mu.Lock()
 	entries := make([]*entry, 0, len(r.conds))
 	for _, e := range r.conds {
@@ -350,6 +391,7 @@ func (r *Reporter) Attach(client protocol.Client, progress bool) (detach func())
 			delete(r.sinks, s)
 			r.mu.Unlock()
 			close(s.stop)
+			s.cancel()
 		})
 	}
 }
@@ -378,10 +420,15 @@ type sink struct {
 	client   protocol.Client
 	progress bool
 
-	mu    sync.Mutex
-	queue []op
-	wake  chan struct{}
-	stop  chan struct{}
+	mu      sync.Mutex
+	queue   []op
+	pending int // ops queued or being delivered; guarded by mu
+	wake    chan struct{}
+	stop    chan struct{}
+	// ctx ends when the editor detaches, and with it a request that the
+	// editor did not answer.
+	ctx    context.Context
+	cancel context.CancelFunc
 
 	created map[string]bool // tokens the editor accepted; only run uses it
 }
@@ -393,6 +440,7 @@ func (s *sink) enqueue(o op) {
 		return
 	}
 	s.queue = append(s.queue, o)
+	s.pending++
 	s.mu.Unlock()
 	select {
 	case s.wake <- struct{}{}:
@@ -401,6 +449,13 @@ func (s *sink) enqueue(o op) {
 }
 
 func (s *sink) run() {
+	// A sink has no reporter of its own to tell; a panic here would stop the
+	// daemon, so it ends this editor's reports instead.
+	defer func() {
+		if value := recover(); value != nil {
+			log.Printf("Error: panic while sending reports to an editor: %v\n%s", value, debug.Stack())
+		}
+	}()
 	for {
 		select {
 		case <-s.stop:
@@ -423,13 +478,19 @@ func (s *sink) run() {
 				default:
 				}
 				s.deliver(o)
+				s.mu.Lock()
+				s.pending--
+				s.mu.Unlock()
 			}
 		}
 	}
 }
 
 func (s *sink) deliver(o op) {
-	ctx, cancel := context.WithTimeout(context.Background(), deliveryTimeout)
+	// The request ends when the editor answers, after deliveryTimeout, or when
+	// the editor detaches: a session that closed must not keep this goroutine
+	// waiting for an answer that cannot come.
+	ctx, cancel := context.WithTimeout(s.ctx, deliveryTimeout)
 	defer cancel()
 	switch o.kind {
 	case opShow:
@@ -488,6 +549,38 @@ func Show(ctx context.Context, client protocol.Client, sev Severity, message str
 	if err := client.ShowMessage(ctx, &protocol.ShowMessageParams{Type: sev.messageType(), Message: message}); err != nil {
 		log.Printf("ShowMessage: %v", err)
 	}
+}
+
+// InternalPrefix starts the key of each condition that reports an internal
+// error, one per kind of work.
+const InternalPrefix = "internal."
+
+// Recover stops a panic in the goroutine that defers it, so that one bug cannot
+// stop a daemon that serves every editor of a workspace. It must be deferred
+// directly: `defer reporter.Recover("index", "the background index pass")`.
+// The panic and its stack go to the log, and the condition "internal.<kind>"
+// tells every attached editor, once per kind. then runs after a panic, for
+// example to put the work in a known state again. A nil Reporter only logs.
+func (r *Reporter) Recover(kind, what string, then ...func(value any)) {
+	value := recover()
+	if value == nil {
+		return
+	}
+	r.Panicked(kind, what, value, debug.Stack())
+	for _, fn := range then {
+		fn(value)
+	}
+}
+
+// Panicked reports a panic that the caller recovered itself.
+func (r *Reporter) Panicked(kind, what string, value any, stack []byte) {
+	log.Printf("Error: panic in %s: %v\n%s", what, value, stack)
+	if r == nil {
+		return
+	}
+	r.Set(InternalPrefix+kind, Error, fmt.Sprintf(
+		"Dexter: an internal error occurred in %s (%v). Dexter continues to run, but this part of it can be incomplete until the next restart of the daemon. The error and its stack are in the daemon log; please report it at https://github.com/remoteoss/dexter/issues.",
+		what, value))
 }
 
 // Summarize writes a list of paths the way a message to the user needs it:

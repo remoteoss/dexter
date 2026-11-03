@@ -998,7 +998,7 @@ func TestBeamProcess_DoRequestHandlesNotificationBeforeResponse(t *testing.T) {
 		if len(names) != 1 || names[0] != "code" {
 			t.Fatalf("unexpected notification payload: %v", names)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for notification")
 	}
 

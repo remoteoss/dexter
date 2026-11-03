@@ -2089,3 +2089,43 @@ func TestListFilePathsUnder(t *testing.T) {
 		t.Errorf("ListFilePathsUnder(file) = %v, want none", got)
 	}
 }
+
+// SameDatabaseFile compares the inode of the file at the index path with the
+// one Open opened. A copy at the path, or no file, is not the same file.
+func TestSameDatabaseFile(t *testing.T) {
+	root := t.TempDir()
+	s, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	if same, err := s.SameDatabaseFile(); err != nil || !same {
+		t.Fatalf("SameDatabaseFile() = %v, %v; want true", same, err)
+	}
+	path := DBPath(root)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(path, path+".moved"); err != nil {
+		t.Fatal(err)
+	}
+	if same, err := s.SameDatabaseFile(); err != nil || same {
+		t.Fatalf("with no file at the path: SameDatabaseFile() = %v, %v; want false", same, err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if same, err := s.SameDatabaseFile(); err != nil || same {
+		t.Fatalf("with a copy at the path: SameDatabaseFile() = %v, %v; want false", same, err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(path+".moved", path); err != nil {
+		t.Fatal(err)
+	}
+	if same, err := s.SameDatabaseFile(); err != nil || !same {
+		t.Fatalf("with the file moved back: SameDatabaseFile() = %v, %v; want true", same, err)
+	}
+}

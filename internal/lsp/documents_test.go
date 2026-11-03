@@ -44,7 +44,7 @@ func TestDocumentStore_GetOrLoad_DiskFallback(t *testing.T) {
 
 	// And the entry should be marked transient.
 	ds.mu.RLock()
-	doc := ds.docs[docURI]
+	doc := ds.docs[docKey(docURI)]
 	ds.mu.RUnlock()
 	if doc == nil || !doc.transient {
 		t.Fatalf("expected disk-loaded entry to be transient, got %+v", doc)
@@ -164,7 +164,7 @@ func TestDocumentStore_Set_PromotesTransientToEditorOwned(t *testing.T) {
 
 	// And the entry should no longer be flagged transient.
 	ds.mu.RLock()
-	doc := ds.docs[docURI]
+	doc := ds.docs[docKey(docURI)]
 	ds.mu.RUnlock()
 	if doc == nil {
 		t.Fatalf("entry missing after Set")

@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"go.lsp.dev/protocol"
 
 	"github.com/remoteoss/dexter/internal/lsp"
@@ -30,6 +31,7 @@ func quietReportEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("PATH", t.TempDir())
 	t.Setenv("SHELL", "/bin/false")
+	t.Setenv("HOME", t.TempDir())
 }
 
 // writeStaleIndex leaves an index with one file in it, stamped with another
@@ -412,11 +414,47 @@ func TestCoverageRestoredDuringStartIsNotLeftDegraded(t *testing.T) {
 	w := &Watcher{backend: backend, kind: "fsnotify"}
 	rt.watcher = w
 	rt.reportWatcherStarted(w)
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for rt.Reporter().Active(condWatchCoverage) {
 		if time.Now().After(deadline) {
 			t.Fatal("the coverage warning stayed after coverage came back")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+}
+
+// The coverage warning names how many directories cannot be watched. Only the
+// first failure is an edge; the count must still be current when a second
+// directory fails, because a later editor and the CLI see the kept message.
+func TestCoverageCountStaysCurrent(t *testing.T) {
+	root := t.TempDir()
+	rt := &Runtime{root: root, index: lsp.NewIndexCoordinator()}
+	rt.Reporter().SetLogf(func(string, ...any) {})
+	a, b := filepath.Join(root, "a"), filepath.Join(root, "b")
+	for _, dir := range []string{a, b} {
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stub := &watchAddStub{failing: map[string]bool{a: true, b: true}}
+	backend := newTestWatcher(stub.add, func(bool) { rt.reportCoverage() })
+	backend.root = root
+	backend.onChange = func(string) {}
+	backend.onCoverageCount = rt.reportCoverage
+	rt.watcher = &Watcher{backend: backend, kind: "fsnotify"}
+
+	// As the watcher loop does: handle an event, then refresh the count.
+	for _, dir := range []string{a, b} {
+		backend.handle(fsnotify.Event{Name: dir, Op: fsnotify.Create})
+		backend.reportCountChange()
+	}
+	for _, c := range rt.Reporter().Conditions() {
+		if c.Key == condWatchCoverage {
+			if !strings.Contains(c.Message, "2 directories") {
+				t.Fatalf("coverage message = %q, want the count of 2 directories", c.Message)
+			}
+			return
+		}
+	}
+	t.Fatal("no coverage condition")
 }

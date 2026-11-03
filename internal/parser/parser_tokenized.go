@@ -14,6 +14,7 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 		depth          int
 		savedAliases   map[string]string
 		savedInjectors map[string]bool
+		savedFilters   map[string]importFilter
 	}
 
 	var moduleStack []moduleFrame
@@ -21,26 +22,62 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 
 	aliases := map[string]string{}
 	injectors := map[string]bool{}
+	// importFilters holds the only: or except: names of an imported
+	// injector; an injector without an entry brings in every name.
+	importFilters := map[string]importFilter{}
+	// injected are the refs that emitInjected added, with the module at
+	// their line: a call of a name that the module defines is its own
+	// function, and the ref is dropped at the end.
+	type injectedRef struct {
+		idx    int
+		module string
+		arity  int // -1 when the call does not show it
+	}
+	var injected []injectedRef
 
 	n := len(tokens)
 
-	// A def inside a macro's quote is code the macro generates in its caller,
-	// not a function of the macro's module, so it is not indexed as one. The
-	// compiled caller's BEAM records where it was declared. `__using__` is the
-	// exception: what it injects is resolved through its body, and kept.
-	// macroBodies holds the depth inside each open do-block of such a macro,
+	// A definition inside a quote is code that a macro generates in its
+	// caller, not a function of the module that holds the quote, so it is not
+	// indexed as one. This is true for every quote in a function body: a
+	// macro's, `__using__`'s, and a helper's (`def controller do quote ...`).
+	// What `__using__` and its helpers inject is resolved from the source of
+	// their bodies (parseUsingBody), and the compiled caller's BEAM records
+	// where a generated function was declared. The same rule covers defstruct,
+	// defexception, and a defmodule or defimpl in a quote.
+	// macroBodies holds the depth inside each open do-block of a function body,
 	// innermost last. quoteDepth is the depth inside an open `quote do` block
 	// in one, or zero. quoteLine is the line of an inline `quote do:`.
-	var macroBodies []int
+	// A body is a macro's when its function is a defmacro or defmacrop other
+	// than __using__: a `use` in its quote runs in the caller, while one in a
+	// __using__ or helper quote is a link that the use chain follows.
+	type functionBody struct {
+		depth int
+		macro bool
+	}
+	var macroBodies []functionBody
 	quoteDepth, quoteLine := 0, 0
-	// inlineMacroLine is the line of the last such macro written with `, do:`,
-	// whose quote can follow on the next line.
-	inlineMacroLine := 0
-	markQuote := func(at, depthAt int) {
+	// quoteInMacro is whether the open quote is in a macro's body.
+	quoteInMacro := false
+	// inlineMacroLine is the line of the last function written with `, do:`,
+	// whose quote can follow on the next line; inlineMacro is whether that
+	// function is a macro.
+	inlineMacroLine, inlineMacro := 0, false
+	inQuote := func(line int) bool {
+		return (quoteDepth > 0 && depth >= quoteDepth) || (quoteLine != 0 && quoteLine == line)
+	}
+	// quoteInjectors and quoteFilters are the injectors and import filters
+	// before the open quote block: an import or use in a quote is code for
+	// the caller, so it applies to the quote only and ends with it.
+	var quoteInjectors map[string]bool
+	var quoteFilters map[string]importFilter
+	markQuote := func(at, depthAt int, macro bool) {
+		quoteInMacro = macro
 		switch form, line := quoteForm(source, tokens, n, at+1); form {
 		case quoteBlock:
 			// The do is counted when the walk reaches it.
 			quoteDepth = depthAt + 1
+			quoteInjectors, quoteFilters = copyBoolMap(injectors), copyImportFilters(importFilters)
 		case quoteInline:
 			quoteLine = line
 		}
@@ -48,8 +85,12 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 	leaveBlocks := func() {
 		if quoteDepth > depth {
 			quoteDepth = 0
+			if quoteInjectors != nil {
+				injectors, importFilters = quoteInjectors, quoteFilters
+				quoteInjectors, quoteFilters = nil, nil
+			}
 		}
-		for len(macroBodies) > 0 && macroBodies[len(macroBodies)-1] > depth {
+		for len(macroBodies) > 0 && macroBodies[len(macroBodies)-1].depth > depth {
 			macroBodies = macroBodies[:len(macroBodies)-1]
 		}
 	}
@@ -80,6 +121,15 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 		}
 		return ""
 	}
+	// selfModuleAt is the module that `__MODULE__` names at line: the current
+	// module, or none in a quote, where it is the module that calls the
+	// macro.
+	selfModuleAt := func(line int) string {
+		if inQuote(line) {
+			return ""
+		}
+		return currentModule()
+	}
 
 	// processModuleDef handles defmodule/defprotocol/defimpl.
 	// It collects the module name, scans forward to consume the TokDo token,
@@ -88,6 +138,7 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 	// pushed (no do..end scope to track).
 	processModuleDef := func(i int, kind string) int {
 		kwLine := tokens[i-1].Line
+		quoted := inQuote(kwLine)
 		j := nextSig(i)
 		name, j := collectModuleName(j)
 		if name == "" {
@@ -98,13 +149,17 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 		}
 
 		// Always emit the module definition — even `, do:` one-liners must be
-		// tracked so callers can find the module.
-		defs = append(defs, Definition{
-			Module:   name,
-			Line:     kwLine,
-			FilePath: path,
-			Kind:     kind,
-		})
+		// tracked so callers can find the module. A module in a quote is
+		// defined where the macro expands, not here; its frame is still pushed
+		// so that its do-block is counted.
+		if !quoted {
+			defs = append(defs, Definition{
+				Module:   name,
+				Line:     kwLine,
+				FilePath: path,
+				Kind:     kind,
+			})
+		}
 
 		// Scan forward to find and consume TokDo (skipping "for: Module" etc.).
 		// Do not stop at TokEOL — Elixir allows `defmodule Name` then `do` on the
@@ -113,6 +168,40 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 		// Stop at statement-boundary tokens to avoid stealing a later module's TokDo
 		// when the current module uses the `, do:` keyword form.
 		_, scanPos, hasDo := ScanForwardToBlockDo(tokens, n, j)
+		if kind == "defimpl" {
+			// `defimpl Proto, for: Mod` (or `for: [A, B]`) references each
+			// module it implements the protocol for; the walk below skips
+			// these tokens.
+			for k := j; k+1 < scanPos; k++ {
+				if tokens[k].Kind != TokIdent || tokenText(tokens[k]) != "for" || tokens[k+1].Kind != TokColon {
+					continue
+				}
+				m := nextSig(k + 2)
+				inList := m < n && tokens[m].Kind == TokOpenBracket
+				if inList {
+					m = nextSig(m + 1)
+				}
+				for m < scanPos {
+					mod, next := collectModuleName(m)
+					if mod == "" {
+						break
+					}
+					if resolved := ResolveModuleRef(mod, aliases, currentModule()); resolved != "" {
+						refs = append(refs, Reference{Module: resolved, Line: tokens[m].Line, FilePath: path, Kind: "impl"})
+					}
+					if !inList {
+						break
+					}
+					m = nextSig(next)
+					if m < n && tokens[m].Kind == TokComma {
+						m = nextSig(m + 1)
+						continue
+					}
+					break
+				}
+				break
+			}
+		}
 		if hasDo {
 			depth++
 			moduleStack = append(moduleStack, moduleFrame{
@@ -120,6 +209,7 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 				depth:          depth,
 				savedAliases:   copyMap(aliases),
 				savedInjectors: copyBoolMap(injectors),
+				savedFilters:   copyImportFilters(importFilters),
 			})
 		}
 		return scanPos
@@ -137,6 +227,23 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 			return "typespec"
 		}
 		return "call"
+	}
+
+	// emitInjected records an unqualified call of name as a ref to each
+	// injector that can bring the name in.
+	emitInjected := func(name string, pos int) {
+		cm := currentModule()
+		arity := -2 // not read yet
+		for mod := range injectors {
+			if f, ok := importFilters[mod]; ok && !f.allows(name) {
+				continue
+			}
+			if arity == -2 {
+				arity = callArity(source, tokens, n, pos)
+			}
+			injected = append(injected, injectedRef{len(refs), cm, arity})
+			refs = append(refs, Reference{Module: mod, Function: name, Line: tokens[pos].Line, FilePath: path, Kind: callKind(pos)})
+		}
 	}
 
 	emitModuleRef := func(modName string, line int, kind string) {
@@ -214,7 +321,7 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 	// extractModuleRefs emits call/struct refs for module references in a token range.
 	// Only processes TokModule tokens that start with ASCII uppercase (matching old regex behavior).
 	extractModuleRefs := func(lineStart, lineEnd int) {
-		refs = collectModuleRefs(source, path, tokens, lineStart, lineEnd, aliases, currentModule(), callKind, refs)
+		refs = collectModuleRefs(source, path, tokens, lineStart, lineEnd, aliases, currentModule(), selfModuleAt(tokens[lineStart].Line), callKind, refs)
 	}
 
 	// flushInterpRefs emits the refs written inside a #{} interpolation. The
@@ -229,7 +336,7 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 			interpPos++
 		}
 		if interpPos > start {
-			refs = collectModuleRefs(source, path, interp, start, interpPos, aliases, currentModule(), callRefKind, refs)
+			refs = collectModuleRefs(source, path, interp, start, interpPos, aliases, currentModule(), selfModuleAt(interp[start].Line), callRefKind, refs)
 		}
 	}
 
@@ -248,6 +355,7 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 					moduleStack = moduleStack[:len(moduleStack)-1]
 					aliases = frame.savedAliases
 					injectors = frame.savedInjectors
+					importFilters = frame.savedFilters
 				}
 				leaveBlocks()
 			}
@@ -285,6 +393,7 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 				moduleStack = moduleStack[:len(moduleStack)-1]
 				aliases = frame.savedAliases
 				injectors = frame.savedInjectors
+				importFilters = frame.savedFilters
 			}
 			leaveBlocks()
 			i++
@@ -343,14 +452,15 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 
 				// Decided before the head is scanned below, which can mark a
 				// quote on this same line (`defmacro m, do: quote do: ...`).
-				insideQuote := (quoteDepth > 0 && depth >= quoteDepth) || quoteLine == defLine
-				if (kind == "defmacro" || kind == "defmacrop") && funcName != "__using__" {
+				insideQuote := inQuote(defLine)
+				if kind == "def" || kind == "defp" || kind == "defmacro" || kind == "defmacrop" {
+					macro := (kind == "defmacro" || kind == "defmacrop") && funcName != "__using__"
 					if opensDoBlock(tokens, n, pj) {
 						// The do on this line is counted when the line is walked
 						// below, so the body is one deeper than here.
-						macroBodies = append(macroBodies, depth+1)
+						macroBodies = append(macroBodies, functionBody{depth + 1, macro})
 					} else {
-						inlineMacroLine = defLine
+						inlineMacroLine, inlineMacro = defLine, macro
 					}
 					// The walk below takes the rest of this line, so a quote on
 					// it (`, do: quote do`) is found here.
@@ -363,8 +473,8 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 							case TokEnd:
 								lineDepth--
 							case TokIdent:
-								if tokenText(tokens[k]) == "quote" {
-									markQuote(k, lineDepth)
+								if tokens[k].End-tokens[k].Start == 5 && string(source[tokens[k].Start:tokens[k].End]) == "quote" {
+									markQuote(k, lineDepth, macro)
 								}
 							}
 							if quoteDepth != 0 || quoteLine == defLine {
@@ -399,28 +509,18 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 
 		case TokDefstruct:
 			cm := currentModule()
-			if cm != "" {
-				defs = append(defs, Definition{
-					Module:   cm,
-					Function: "__struct__",
-					Line:     tok.Line,
-					FilePath: path,
-					Kind:     "defstruct",
-				})
+			if cm != "" && !inQuote(tok.Line) {
+				defs = appendStructDefs(defs, cm, path, tok.Line, "defstruct")
 			}
 			i++
 			goto extractRefsForLine
 
 		case TokDefexception:
 			cm := currentModule()
-			if cm != "" {
-				defs = append(defs, Definition{
-					Module:   cm,
-					Function: "__exception__",
-					Line:     tok.Line,
-					FilePath: path,
-					Kind:     "defexception",
-				})
+			// The exception's struct; `__exception__` is a key of it, not a
+			// function.
+			if cm != "" && !inQuote(tok.Line) {
+				defs = appendStructDefs(defs, cm, path, tok.Line, "defexception")
 			}
 			i++
 			goto extractRefsForLine
@@ -482,6 +582,28 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 				if resolved != "" {
 					refs = append(refs, Reference{Module: resolved, Line: importLine, FilePath: path, Kind: "import"})
 					injectors[resolved] = true
+					// `import Mod, only: [fun: 1]` names Mod.fun, on the line
+					// of the key, and brings in only the names of the list;
+					// except: brings in the others.
+					only, except := ScanImportOptionKeys(source, tokens, n, k)
+					switch {
+					case len(only) > 0:
+						f := importFilter{only: map[string]bool{}}
+						for _, key := range only {
+							name := tokenText(tokens[key])
+							f.only[name] = true
+							refs = append(refs, Reference{Module: resolved, Function: name, Line: tokens[key].Line, FilePath: path, Kind: "import_only"})
+						}
+						importFilters[resolved] = f
+					case len(except) > 0:
+						f := importFilter{except: map[string]bool{}}
+						for _, key := range except {
+							f.except[tokenText(tokens[key])] = true
+						}
+						importFilters[resolved] = f
+					default:
+						delete(importFilters, resolved)
+					}
 				}
 			}
 			i = k
@@ -495,8 +617,17 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 			if modName != "" {
 				resolved := ResolveModuleRef(modName, aliases, currentModule())
 				if resolved != "" {
-					refs = append(refs, Reference{Module: resolved, Line: useLine, FilePath: path, Kind: "use"})
-					injectors[resolved] = true
+					if inQuote(useLine) && quoteInMacro {
+						// A `use` in the quote of a macro (not __using__)
+						// runs in the module that calls the macro: it names
+						// the module, but this module does not use it.
+						refs = append(refs, Reference{Module: resolved, Line: useLine, FilePath: path, Kind: "quoted_use"})
+					} else {
+						refs = append(refs, Reference{Module: resolved, Line: useLine, FilePath: path, Kind: "use"})
+						injectors[resolved] = true
+						// What a __using__ imports is not known here.
+						delete(importFilters, resolved)
+					}
 				}
 			}
 			i = k
@@ -578,7 +709,8 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 				j := nextSig(i)
 				modName, k := collectModuleName(j)
 				if modName != "" {
-					resolved := resolveModule(modName, cm)
+					// `alias Ecto.Changeset.Relation` then `@behaviour Relation`.
+					resolved := resolveModule(ExpandAliasPrefix(modName, aliases), cm)
 					if !strings.Contains(resolved, "__MODULE__") {
 						refs = append(refs, Reference{Module: resolved, Line: attrLine, FilePath: path, Kind: "behaviour"})
 					}
@@ -630,6 +762,27 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 			goto extractRefsForLine
 
 		case TokAttrDoc, TokAttr:
+			// @derive Protocol, {Protocol, opts}, or a list of them: each is an
+			// implementation of the protocol for this module, which the
+			// protocol's __deriving__ (or its Any implementation) generates.
+			// The row is a reference to the protocol, with the deriving module
+			// in its function column. In a quote, it derives for the caller.
+			if tok.Kind == TokAttr && tok.End-tok.Start == 7 && string(source[tok.Start:tok.End]) == "@derive" {
+				if cm := currentModule(); cm != "" && !inQuote(tok.Line) {
+					for _, p := range DeriveProtocols(source, tokens, n, i+1) {
+						resolved := ResolveModuleRef(p, aliases, cm)
+						if resolved != "" && !strings.Contains(resolved, "__MODULE__") {
+							refs = append(refs, Reference{Module: resolved, Function: cm, Line: tok.Line, FilePath: path, Kind: "derive"})
+						}
+					}
+				}
+			}
+			// An attribute read inside an expression (`f(@handler, from(x))`)
+			// is a value: the walk goes on, and finds the calls after it.
+			if tok.Kind == TokAttr && i > 0 && tokens[i-1].Kind != TokEOL && tokens[i-1].Kind != TokComment {
+				i++
+				continue
+			}
 			i++
 			goto extractRefsForLine
 
@@ -651,6 +804,19 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 			continue
 
 		case TokModule:
+			// `__MODULE__.fun()` and `__MODULE__.Sub.fun()` call a function of
+			// the module (or of a nested one), which the walk knows.
+			if tokenText(tok) == "__MODULE__" {
+				if ref, k, ok := selfModuleCall(source, tokens, n, i, selfModuleAt(tok.Line)); ok {
+					ref.FilePath, ref.Kind = path, callKind(i)
+					refs = append(refs, ref)
+					i = k
+				} else {
+					// `__MODULE__.Sub` names cm.Sub, not a module Sub.
+					_, i = collectModuleName(i)
+				}
+				continue
+			}
 			// Skip __MODULE__ and other non-ASCII-uppercase module tokens
 			if !isUserModule(source, tok) {
 				i++
@@ -690,15 +856,14 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 			continue
 
 		case TokPipe:
-			cm := currentModule()
-			if cm != "" && len(injectors) > 0 {
+			// Also outside any module: a script's top-level import applies
+			// to its top-level calls.
+			if len(injectors) > 0 {
 				j := nextSig(i + 1)
 				if j < n && tokens[j].Kind == TokIdent {
 					name := tokenText(tokens[j])
 					if !elixirKeyword[name] {
-						for mod := range injectors {
-							refs = append(refs, Reference{Module: mod, Function: name, Line: tokens[j].Line, FilePath: path, Kind: callKind(j)})
-						}
+						emitInjected(name, j)
 					}
 				}
 			}
@@ -706,11 +871,14 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 			continue
 
 		case TokIdent:
-			if quoteDepth == 0 && tokenText(tok) == "quote" && (len(macroBodies) > 0 || followsInlineMacroHead(source, tokens, i, inlineMacroLine)) {
-				markQuote(i, depth)
+			if quoteDepth == 0 && tok.End-tok.Start == 5 && string(source[tok.Start:tok.End]) == "quote" {
+				if len(macroBodies) > 0 {
+					markQuote(i, depth, macroBodies[len(macroBodies)-1].macro)
+				} else if followsInlineMacroHead(source, tokens, i, inlineMacroLine) {
+					markQuote(i, depth, inlineMacro)
+				}
 			}
-			cm := currentModule()
-			if cm != "" && len(injectors) > 0 {
+			if len(injectors) > 0 {
 				isStatementStart := i == 0 || tokens[i-1].Kind == TokEOL || tokens[i-1].Kind == TokComment
 				// A parenthesized bare call can be nested inside another call,
 				// collection, or keyword value. It is still a candidate for a
@@ -718,6 +886,14 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 				// Qualified and anonymous-function calls have a TokDot before the
 				// opening paren and therefore do not match this fast check.
 				isParenthesizedCall := i+1 < n && tokens[i+1].Kind == TokOpenParen
+				if !isParenthesizedCall && captureArity(source, tokens, n, i) >= 0 {
+					// &name/2 captures the imported function.
+					if name := tokenText(tok); !elixirKeyword[name] {
+						emitInjected(name, i)
+					}
+					i++
+					continue
+				}
 				if isStatementStart || isParenthesizedCall {
 					name := tokenText(tok)
 					if !elixirKeyword[name] {
@@ -754,9 +930,7 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 							}
 						}
 						if emit {
-							for mod := range injectors {
-								refs = append(refs, Reference{Module: mod, Function: name, Line: tok.Line, FilePath: path, Kind: callKind(i)})
-							}
+							emitInjected(name, i)
 						}
 					}
 				}
@@ -787,19 +961,39 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 			extractModuleRefs(lineStart, lineEnd)
 
 			// Check for pipe calls on this line
-			if currentModule() != "" && len(injectors) > 0 {
+			if len(injectors) > 0 {
 				for j := lineStart; j < lineEnd; j++ {
 					if tokens[j].Kind == TokPipe {
 						pj := nextSig(j + 1)
 						if pj < lineEnd && tokens[pj].Kind == TokIdent {
 							name := tokenText(tokens[pj])
 							if !elixirKeyword[name] {
-								for mod := range injectors {
-									refs = append(refs, Reference{Module: mod, Function: name, Line: tokens[pj].Line, FilePath: path, Kind: callKind(pj)})
-								}
+								emitInjected(name, pj)
 							}
 						}
 					}
+				}
+			}
+
+			// Unqualified calls with parentheses, and captures, on a def
+			// line: a one-line body (`def f(x), do: cast(x)`), a guard, a
+			// default argument.
+			// The walk skips the rest of the line, and the declared name is
+			// not a call.
+			if len(injectors) > 0 && lineStart < lineEnd && isDefinitionToken(tokens[lineStart].Kind) {
+				_, nameIdx, _ := StaticDeclarationName(source, tokens, n, lineStart)
+				for j := lineStart + 1; j+1 < lineEnd; j++ {
+					if j == nameIdx || tokens[j].Kind != TokIdent || tokens[j-1].Kind == TokDot || tokens[j-1].Kind == TokPipe {
+						continue
+					}
+					if tokens[j+1].Kind != TokOpenParen && captureArity(source, tokens, n, j) < 0 {
+						continue
+					}
+					name := tokenText(tokens[j])
+					if elixirKeyword[name] {
+						continue
+					}
+					emitInjected(name, j)
 				}
 			}
 
@@ -814,6 +1008,43 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 		flushInterpRefs(len(source) + 1)
 	}
 
+	if len(injected) > 0 {
+		type nameArity struct {
+			name  string
+			arity int
+		}
+		defined := map[string]map[nameArity]bool{}
+		for _, d := range defs {
+			switch d.Kind {
+			case "def", "defp", "defmacro", "defmacrop", "defguard", "defguardp", "defdelegate":
+			default:
+				// A @callback or @type of the name is not a function that
+				// a call can reach.
+				continue
+			}
+			if defined[d.Module] == nil {
+				defined[d.Module] = map[nameArity]bool{}
+			}
+			defined[d.Module][nameArity{d.Function, d.Arity}] = true
+		}
+		// A call whose arity the module defines is the module's own
+		// function. A call whose arity is not known stays.
+		drop := map[int]bool{}
+		for _, r := range injected {
+			if r.arity >= 0 && defined[r.module][nameArity{refs[r.idx].Function, r.arity}] {
+				drop[r.idx] = true
+			}
+		}
+		if len(drop) > 0 {
+			kept := refs[:0]
+			for i, r := range refs {
+				if !drop[i] {
+					kept = append(kept, r)
+				}
+			}
+			refs = kept
+		}
+	}
 	return defs, dedupeRefs(refs), nil
 }
 
@@ -827,7 +1058,7 @@ func callRefKind(int) string { return "call" }
 // the interpolation tokens the tokenizer keeps beside them — so the two cannot
 // drift apart. kindAt gives the reference kind for a token index, which is how
 // a typespec reference is told apart from a call.
-func collectModuleRefs(source []byte, path string, toks []Token, from, to int, aliases map[string]string, cm string, kindAt func(int) string, refs []Reference) []Reference {
+func collectModuleRefs(source []byte, path string, toks []Token, from, to int, aliases map[string]string, cm, selfModule string, kindAt func(int) string, refs []Reference) []Reference {
 	tn := len(toks)
 	for j := from; j < to; j++ {
 		tok := toks[j]
@@ -842,6 +1073,19 @@ func collectModuleRefs(source []byte, path string, toks []Token, from, to int, a
 				j = k
 				continue
 			}
+		}
+
+		if tok.Kind == TokModule && TokenText(source, tok) == "__MODULE__" {
+			if ref, k, ok := selfModuleCall(source, toks, tn, j, selfModule); ok && k <= to {
+				ref.FilePath, ref.Kind = path, kindAt(j)
+				refs = append(refs, ref)
+				j = k - 1
+			} else {
+				// `__MODULE__.Sub` names cm.Sub, not a module Sub.
+				_, k := CollectModuleName(source, toks, tn, j)
+				j = k - 1
+			}
+			continue
 		}
 
 		if tok.Kind != TokModule || !isUserModule(source, tok) {
@@ -1165,4 +1409,279 @@ func followsInlineMacroHead(source []byte, tokens []Token, i, line int) bool {
 	}
 	return k >= 1 && tokens[k].Kind == TokColon && tokens[k-1].Kind == TokIdent &&
 		TokenText(source, tokens[k-1]) == "do" && tokens[k-1].Line == line
+}
+
+// isDefinitionToken reports whether kind starts a function definition.
+func isDefinitionToken(kind TokenKind) bool {
+	switch kind {
+	case TokDef, TokDefp, TokDefmacro, TokDefmacrop, TokDefguard, TokDefguardp, TokDefdelegate:
+		return true
+	}
+	return false
+}
+
+// importFilter is the only: or except: list of an import.
+type importFilter struct {
+	only, except map[string]bool
+}
+
+func (f importFilter) allows(name string) bool {
+	if f.only != nil {
+		return f.only[name]
+	}
+	return !f.except[name]
+}
+
+func copyImportFilters(m map[string]importFilter) map[string]importFilter {
+	cp := make(map[string]importFilter, len(m))
+	for k, v := range m {
+		cp[k] = v
+	}
+	return cp
+}
+
+// callArity returns the arity of the unqualified call whose name is at pos:
+// the arguments in its parentheses (trailing keyword pairs are one), one
+// more for a value piped into it and one more for a do block. It returns -1
+// when the call has no parentheses, so the tokens do not show the arity.
+func callArity(source []byte, tokens []Token, n, pos int) int {
+	if a := captureArity(source, tokens, n, pos); a >= 0 {
+		return a
+	}
+	piped := false
+	if prev := prevSigToken(tokens, pos-1); prev >= 0 && tokens[prev].Kind == TokPipe {
+		piped = true
+	}
+	open := pos + 1
+	if open >= n || tokens[open].Kind != TokOpenParen {
+		if piped {
+			return 1 // `value |> name`
+		}
+		return -1
+	}
+	args := CallArgCount(tokens, open)
+	if args < 0 {
+		return -1
+	}
+	if piped {
+		args++
+	}
+	return args
+}
+
+// CallArgCount counts the arguments of the call whose open parenthesis is
+// tokens[open]: trailing keyword pairs (`f(a, b: 1, c: 2)`) are one, and a
+// do block after the parentheses is one more, unless the call is an
+// argument of another call (in `case f(x) do`, the do is case's). It returns
+// -1 when the parentheses do not close.
+func CallArgCount(tokens []Token, open int) int {
+	n := len(tokens)
+	depth := 0
+	args := 0
+	inKeywords := false
+	argStart := true
+	closeIdx := -1
+scan:
+	for i := open + 1; i < n; i++ {
+		t := tokens[i]
+		switch t.Kind {
+		case TokEOL, TokComment:
+			continue
+		case TokEOF:
+			return -1
+		}
+		if argStart && depth == 0 && t.Kind != TokCloseParen {
+			argStart = false
+			isKey := t.Kind == TokIdent && i+1 < n && tokens[i+1].Kind == TokColon
+			if !isKey || !inKeywords {
+				args++
+			}
+			if isKey {
+				inKeywords = true
+			}
+		}
+		switch t.Kind {
+		case TokOpenParen, TokOpenBracket, TokOpenBrace, TokDo, TokFn:
+			depth++
+		case TokCloseParen, TokCloseBracket, TokCloseBrace, TokEnd:
+			if depth == 0 {
+				if t.Kind != TokCloseParen {
+					return -1
+				}
+				closeIdx = i
+				break scan
+			}
+			depth--
+		case TokComma:
+			if depth == 0 {
+				argStart = true
+			}
+		}
+	}
+	if closeIdx < 0 {
+		return -1
+	}
+	if next := closeIdx + 1; next < n && tokens[next].Kind == TokDo && ownsDoBlock(tokens, open-1) {
+		args++
+	}
+	return args
+}
+
+// ownsDoBlock reports whether a do block after the call whose name is
+// tokens[name] (with its qualifier, `Mod.name`) is the call's: the call
+// starts its statement or follows an operator (`x = f(a) do`). After a name
+// (`case f(a) do`), a comma, or an open bracket, the call is an argument of
+// another call, which owns the block.
+func ownsDoBlock(tokens []Token, name int) bool {
+	k := name
+	for k-1 >= 0 && tokens[k-1].Kind == TokDot && k-2 >= 0 && (tokens[k-2].Kind == TokModule || tokens[k-2].Kind == TokIdent) {
+		k -= 2
+	}
+	if k == 0 {
+		return true
+	}
+	switch tokens[k-1].Kind {
+	case TokEOL, TokComment, TokOther, TokPipe:
+		return true
+	}
+	return false
+}
+
+// prevSigToken returns the index of the last token at or before i that is
+// not an end of line or a comment, or -1.
+func prevSigToken(tokens []Token, i int) int {
+	for i >= 0 && (tokens[i].Kind == TokEOL || tokens[i].Kind == TokComment) {
+		i--
+	}
+	return i
+}
+
+// captureArity returns the arity of a capture `&name/2` whose name is at
+// pos, or -1 when the name is not captured that way.
+func captureArity(source []byte, tokens []Token, n, pos int) int {
+	if pos == 0 || tokens[pos-1].Kind != TokOther || TokenText(source, tokens[pos-1]) != "&" {
+		return -1
+	}
+	if pos+2 >= n || tokens[pos+1].Kind != TokOther || TokenText(source, tokens[pos+1]) != "/" || tokens[pos+2].Kind != TokNumber {
+		return -1
+	}
+	a := 0
+	for _, c := range TokenText(source, tokens[pos+2]) {
+		if c < '0' || c > '9' {
+			return -1
+		}
+		a = a*10 + int(c-'0')
+	}
+	return a
+}
+
+// selfModuleCall reads `__MODULE__.fun` or `__MODULE__.Sub.fun` at toks[i],
+// a call of a function of cm (or of a module nested in it). k is the token
+// after the function name. ok is false outside a module and for a
+// `__MODULE__` that no function call follows.
+func selfModuleCall(source []byte, toks []Token, n, i int, cm string) (ref Reference, k int, ok bool) {
+	if cm == "" {
+		return Reference{}, i, false
+	}
+	modName, k := CollectModuleName(source, toks, n, i)
+	if k+1 >= n || toks[k].Kind != TokDot || toks[k+1].Kind != TokIdent {
+		return Reference{}, i, false
+	}
+	funcName := TokenText(source, toks[k+1])
+	if elixirKeyword[funcName] {
+		return Reference{}, i, false
+	}
+	return Reference{Module: cm + strings.TrimPrefix(modName, "__MODULE__"), Function: funcName, Line: toks[i].Line}, k + 2, true
+}
+
+// StructFunctions are the functions that defstruct and defexception define:
+// __struct__/0 and __struct__/1, with the parameter name Kernel gives the
+// second.
+var StructFunctions = [2]struct {
+	Arity  int
+	Params string
+}{{0, ""}, {1, "kv"}}
+
+func appendStructDefs(defs []Definition, module, path string, line int, kind string) []Definition {
+	for _, f := range StructFunctions {
+		defs = append(defs, Definition{
+			Module:   module,
+			Function: "__struct__",
+			Arity:    f.Arity,
+			Line:     line,
+			FilePath: path,
+			Kind:     kind,
+			Params:   f.Params,
+		})
+	}
+	return defs
+}
+
+// DeriveProtocols returns the protocols, as written, that an `@derive` value
+// starting at tokens[from] names: `P`, `{P, opts}`, `[P, {Q, opts}]`, with or
+// without parentheses. Modules in the options are not protocols.
+func DeriveProtocols(source []byte, tokens []Token, n, from int) []string {
+	var out []string
+	// stack holds the open brackets inside the value. A protocol is a module
+	// that is the value itself, an element of the outer list, or the first
+	// element of a tuple in one of those places.
+	var stack []TokenKind
+	outer := func() int {
+		// The number of brackets that do not count: a leading parenthesis.
+		if len(stack) > 0 && stack[0] == TokOpenParen {
+			return 1
+		}
+		return 0
+	}
+	prevSig := TokAttr
+	for k := from; k < n; k++ {
+		kind := tokens[k].Kind
+		switch kind {
+		case TokEOF:
+			return out
+		case TokEOL, TokComment:
+			if len(stack) == 0 {
+				return out
+			}
+			continue
+		case TokOpenParen, TokOpenBracket, TokOpenBrace:
+			stack = append(stack, kind)
+		case TokCloseParen, TokCloseBracket, TokCloseBrace:
+			if len(stack) == 0 {
+				return out
+			}
+			stack = stack[:len(stack)-1]
+		case TokModule:
+			name, next := CollectModuleName(source, tokens, n, k)
+			if name != "" && derivePosition(stack[outer():], prevSig) {
+				out = append(out, name)
+			}
+			if next > k {
+				k = next - 1
+			}
+			prevSig = TokModule
+			continue
+		}
+		prevSig = kind
+	}
+	return out
+}
+
+// derivePosition reports whether a module at this nesting, after prevSig, is
+// a protocol in an @derive value.
+func derivePosition(stack []TokenKind, prevSig TokenKind) bool {
+	switch len(stack) {
+	case 0:
+		return prevSig == TokAttr || prevSig == TokOpenParen
+	case 1:
+		switch stack[0] {
+		case TokOpenBracket:
+			return prevSig == TokOpenBracket || prevSig == TokComma
+		case TokOpenBrace:
+			return prevSig == TokOpenBrace
+		}
+	case 2:
+		return stack[0] == TokOpenBracket && stack[1] == TokOpenBrace && prevSig == TokOpenBrace
+	}
+	return false
 }

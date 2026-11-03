@@ -5,6 +5,7 @@ package workspace
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -38,11 +39,13 @@ func TestFSEventsTranslatesEvents(t *testing.T) {
 	w.handle(fsevents.Event{Path: filepath.Join(root, "lib"), Flags: fsevents.ItemIsDir | fsevents.ItemRenamed})
 	w.handle(fsevents.Event{Path: root, Flags: fsevents.MustScanSubDirs | fsevents.UserDropped})
 
-	if len(paths) != 1 || paths[0] != source {
-		t.Fatalf("changed paths = %v, want [%s]", paths, source)
+	// The renamed directory is gone, so it is reconciled as one path, not
+	// with a walk of the whole workspace. Only lost events need that.
+	if want := []string{source, filepath.Join(root, "lib")}; !slices.Equal(paths, want) {
+		t.Fatalf("changed paths = %v, want %v", paths, want)
 	}
-	if full != 2 {
-		t.Fatalf("full reconciliations = %d, want 2", full)
+	if full != 1 {
+		t.Fatalf("full reconciliations = %d, want 1", full)
 	}
 }
 
@@ -143,9 +146,18 @@ func TestFSEventsIgnoresNestedWorktree(t *testing.T) {
 		t.Fatalf("full reconciliations = %d, tops = %v after removal", full, w.tops.list())
 	}
 
-	w.handle(fsevents.Event{Path: filepath.Join(root, "lib"), Flags: fsevents.ItemIsDir | fsevents.ItemCreated})
-	if full != 1 {
-		t.Fatalf("full reconciliations = %d for a plain directory, want 1", full)
+	plain := filepath.Join(root, "plain")
+	if err := os.MkdirAll(plain, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(plain, "plain.ex")
+	if err := os.WriteFile(source, []byte("defmodule Plain do\nend\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	paths = nil
+	w.handle(fsevents.Event{Path: plain, Flags: fsevents.ItemIsDir | fsevents.ItemCreated})
+	if full != 0 || !slices.Equal(paths, []string{source}) {
+		t.Fatalf("full reconciliations = %d, paths = %v for a plain directory; want 0 and [%s]", full, paths, source)
 	}
 }
 
@@ -394,5 +406,265 @@ func sendWithoutBlocking(changes chan<- string) func(string) {
 		case changes <- path:
 		default:
 		}
+	}
+}
+
+// newRecordingFSEvents returns an FSEvents watcher for handle tests that
+// records what it asks of the runtime.
+func newRecordingFSEvents(root string) (*fseventsWatcher, *[]string, *int) {
+	var paths []string
+	full := 0
+	w := &fseventsWatcher{
+		root:      root,
+		eventRoot: root,
+		callbacks: WatchCallbacks{PathChanged: func(path string) { paths = append(paths, path) }, FullReconcile: func() { full++ }},
+	}
+	return w, &paths, &full
+}
+
+// A directory that is created, moved in, renamed or removed is reconciled as
+// its own subtree. A walk of the whole workspace for each one made a burst of
+// new directories cost one full walk each on a large repository.
+func TestFSEventsReconcilesOnlyTheChangedSubtree(t *testing.T) {
+	root := t.TempDir()
+	w, paths, full := newRecordingFSEvents(root)
+
+	// An empty directory: nothing to index, and no full reconcile.
+	empty := filepath.Join(root, "tmp", "empty")
+	if err := os.MkdirAll(empty, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	w.handle(fsevents.Event{Path: empty, Flags: fsevents.ItemIsDir | fsevents.ItemCreated})
+	if *full != 0 || len(*paths) != 0 {
+		t.Fatalf("empty directory: full = %d, paths = %v; want none", *full, *paths)
+	}
+
+	// A tree moved into place has no file events of its own. Its files are
+	// found by a walk of the tree only, with the rules of the index walks:
+	// build output and nested worktrees are skipped, dependencies are not.
+	moved := filepath.Join(root, "apps", "billing")
+	source := writeTestModule(t, moved, "lib/billing/invoice.ex", "Billing.Invoice")
+	script := writeTestModule(t, moved, "test/invoice_test.exs", "Billing.InvoiceTest")
+	writeTestModule(t, moved, "_build/dev/lib/billing/invoice.ex", "Billing.Build")
+	writeTestModule(t, moved, "deps/library/lib/library.ex", "Library")
+	nested := filepath.Join(moved, "worktrees", "feature")
+	makeLinkedWorktree(t, root, nested)
+	writeTestModule(t, nested, "lib/feature.ex", "Billing.Feature")
+	*paths = nil
+	w.handle(fsevents.Event{Path: moved, Flags: fsevents.ItemIsDir | fsevents.ItemRenamed})
+	got := slices.Clone(*paths)
+	slices.Sort(got)
+	// The oracle is the walk of a full reconcile: what it indexes, the
+	// watcher must report, and nothing more. It walks deps/ and skips
+	// _build/ and the nested worktree.
+	want := []string{moved, nested}
+	_ = parser.WalkElixirFiles(moved, func(path string, _ fs.DirEntry) error {
+		want = append(want, path)
+		return nil
+	})
+	slices.Sort(want)
+	if !slices.Contains(want, source) || !slices.Contains(want, script) || !slices.Contains(want, filepath.Join(moved, "deps/library/lib/library.ex")) {
+		t.Fatalf("the oracle walk missed files: %v", want)
+	}
+	if *full != 0 || !slices.Equal(got, want) {
+		t.Fatalf("moved-in tree: full = %d, paths = %v; want 0 and %v", *full, got, want)
+	}
+	if !w.tops.has(nested) {
+		t.Fatalf("the nested worktree %s is not a top: %v", nested, w.tops.list())
+	}
+
+	// A removed tree is one path: the runtime removes what was indexed below it.
+	if err := os.RemoveAll(moved); err != nil {
+		t.Fatal(err)
+	}
+	*paths = nil
+	w.handle(fsevents.Event{Path: moved, Flags: fsevents.ItemIsDir | fsevents.ItemRemoved})
+	if *full != 0 || !slices.Equal(*paths, []string{moved}) {
+		t.Fatalf("removed tree: full = %d, paths = %v; want 0 and [%s]", *full, *paths, moved)
+	}
+
+	// The root itself and lost events still need the full reconcile.
+	w.handle(fsevents.Event{Path: root, Flags: fsevents.ItemIsDir | fsevents.ItemRenamed})
+	w.handle(fsevents.Event{Path: root, Flags: fsevents.MustScanSubDirs})
+	if *full != 2 {
+		t.Fatalf("full reconciliations = %d for the root and lost events, want 2", *full)
+	}
+}
+
+// The same with the real FSEvents stream: a burst of new directories must not
+// ask for full reconciles, and a module in a new directory is reported.
+func TestFSEventsBurstOfDirectoriesNeedsNoFullReconcile(t *testing.T) {
+	root := t.TempDir()
+	var mu sync.Mutex
+	var paths []string
+	full := 0
+	w, err := startFSEventsWatcher(root, WatchCallbacks{
+		PathChanged: func(path string) {
+			mu.Lock()
+			paths = append(paths, path)
+			mu.Unlock()
+		},
+		FullReconcile: func() {
+			mu.Lock()
+			full++
+			mu.Unlock()
+		},
+	})
+	if err != nil {
+		t.Skipf("FSEvents unavailable: %v", err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+
+	for i := 0; i < 10; i++ {
+		if err := os.MkdirAll(filepath.Join(root, "tmp", fmt.Sprintf("dir%d", i)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	staged := filepath.Join(t.TempDir(), "staged")
+	source := writeTestModule(t, staged, "lib/staged.ex", "Staged.Module")
+	target := filepath.Join(root, "staged")
+	if err := os.Rename(staged, target); err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(target, "lib", "staged.ex")
+	_ = source
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		mu.Lock()
+		found := slices.Contains(paths, want)
+		mu.Unlock()
+		if found {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("FSEvents did not report %s in a directory moved into place", want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Give late events time to arrive.
+	time.Sleep(200 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if full != 0 {
+		t.Fatalf("a burst of new directories asked for %d full reconciles, want 0", full)
+	}
+}
+
+// FSEvents reports paths in the case that the file system stores. A root typed
+// in another case on a case-insensitive volume must still match them; else
+// every event is dropped and watching is broken in silence.
+func TestFSEventsWatchesRootTypedInAnotherCase(t *testing.T) {
+	parent := t.TempDir()
+	disk := filepath.Join(parent, "CaseRoot")
+	if err := os.Mkdir(disk, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	typed := filepath.Join(parent, "caseroot")
+	if _, err := os.Stat(typed); err != nil {
+		t.Skip("the volume is case-sensitive")
+	}
+	changes := make(chan string, 64)
+	w, err := startFSEventsWatcher(typed, WatchCallbacks{
+		PathChanged:   sendWithoutBlocking(changes),
+		FullReconcile: func() {},
+	})
+	if err != nil {
+		t.Skipf("FSEvents unavailable: %v", err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+
+	if err := os.WriteFile(filepath.Join(disk, "created.ex"), []byte("defmodule Created do\nend\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Paths come back under the root that the runtime indexes: the typed one.
+	want := filepath.Join(typed, "created.ex")
+	deadline := time.After(10 * time.Second)
+	for {
+		select {
+		case changed := <-changes:
+			if changed == want {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("FSEvents did not report %s for a root typed in another case", want)
+		}
+	}
+}
+
+// After a rename that changes only the case, FSEvents sends the old spelling
+// too, and a stat of it succeeds. It must be sent as gone, not walked: a walk
+// would report its files in the old spelling again.
+func TestFSEventsCaseOnlyRenameIsNotWalkedInTheOldSpelling(t *testing.T) {
+	root := t.TempDir()
+	skipCaseSensitive(t, root)
+	w, paths, full := newRecordingFSEvents(root)
+	writeTestModule(t, root, "lib/Area/kept.ex", "SharedLib.Area.Kept")
+	oldDir, newDir := filepath.Join(root, "lib", "Area"), filepath.Join(root, "lib", "area")
+	if err := os.Rename(oldDir, newDir); err != nil {
+		t.Fatal(err)
+	}
+	w.handle(fsevents.Event{Path: oldDir, Flags: fsevents.ItemIsDir | fsevents.ItemRenamed})
+	if *full != 0 || !slices.Equal(*paths, []string{oldDir}) {
+		t.Fatalf("old spelling: full = %d, paths = %v; want 0 and [%s]", *full, *paths, oldDir)
+	}
+	*paths = nil
+	w.handle(fsevents.Event{Path: newDir, Flags: fsevents.ItemIsDir | fsevents.ItemRenamed})
+	if want := []string{newDir, filepath.Join(newDir, "kept.ex")}; !slices.Equal(*paths, want) {
+		t.Fatalf("new spelling: paths = %v, want %v", *paths, want)
+	}
+}
+
+// A directory moved into place under another name keeps its dependencies:
+// the full walk indexes deps/ of a directory without mix.exs, so the subtree
+// walk must report them as well. The oracle is the walk of a full reconcile.
+func TestFSEventsMovedDirectoryMatchesTheFullWalk(t *testing.T) {
+	root := t.TempDir()
+	billing := filepath.Join(root, "apps", "billing")
+	writeTestModule(t, billing, "lib/billing.ex", "Billing")
+	writeTestModule(t, billing, "deps/libx/lib/libx.ex", "Libx")
+	var mu sync.Mutex
+	got := map[string]bool{}
+	w, err := startFSEventsWatcher(root, WatchCallbacks{
+		PathChanged: func(path string) {
+			mu.Lock()
+			got[path] = true
+			mu.Unlock()
+		},
+		FullReconcile: func() {},
+	})
+	if err != nil {
+		t.Skipf("FSEvents unavailable: %v", err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+	time.Sleep(100 * time.Millisecond)
+	payments := filepath.Join(root, "apps", "payments")
+	if err := os.Rename(billing, payments); err != nil {
+		t.Fatal(err)
+	}
+	var want []string
+	_ = parser.WalkElixirFiles(payments, func(path string, _ fs.DirEntry) error {
+		want = append(want, path)
+		return nil
+	})
+	if len(want) != 2 {
+		t.Fatalf("oracle = %v, want 2 files", want)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		mu.Lock()
+		missing := []string{}
+		for _, path := range want {
+			if !got[path] {
+				missing = append(missing, path)
+			}
+		}
+		mu.Unlock()
+		if len(missing) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("FSEvents did not report %v after the rename", missing)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

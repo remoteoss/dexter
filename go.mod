@@ -15,6 +15,7 @@ require (
 	go.lsp.dev/uri v0.3.0
 	go.uber.org/zap v1.21.0
 	golang.org/x/sys v0.41.0
+	golang.org/x/text v0.38.0
 )
 
 replace github.com/tree-sitter/tree-sitter-elixir => github.com/elixir-lang/tree-sitter-elixir v0.3.5

@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -19,7 +20,7 @@ import (
 	"github.com/remoteoss/dexter/internal/lsp"
 	"github.com/remoteoss/dexter/internal/notify"
 	"github.com/remoteoss/dexter/internal/parser"
-	"github.com/remoteoss/dexter/internal/stdlib"
+	"github.com/remoteoss/dexter/internal/pathcase"
 	"github.com/remoteoss/dexter/internal/store"
 	"github.com/remoteoss/dexter/internal/version"
 )
@@ -32,6 +33,20 @@ var eventDebounce = 25 * time.Millisecond
 
 var startNativeWatch = Watch
 
+// A pass that leaves the index incomplete (a full disk, an I/O error) is tried
+// again after retryInitialDelay, and each later failure doubles the delay up
+// to retryMaxDelay. A complete full pass resets it. Variables so tests can
+// shrink them.
+var (
+	retryInitialDelay = 30 * time.Second
+	retryMaxDelay     = 10 * time.Minute
+)
+
+// eventQueueSize is how many mutation events wait for the loop. A sender never
+// waits when it is full; see Runtime.overflow. A variable so tests can shrink
+// it.
+var eventQueueSize = 4096
+
 type eventKind uint8
 
 const (
@@ -39,6 +54,9 @@ const (
 	eventFull
 	eventStdlib
 	eventStop
+	// eventBarrier changes nothing. Its done channel is answered after every
+	// event queued before it is applied; see FlushEvents.
+	eventBarrier
 )
 
 type event struct {
@@ -62,10 +80,32 @@ type Runtime struct {
 	ready    chan struct{}
 	readyErr error
 
+	// gone closes when the project root is moved, deleted, or unmounted;
+	// goneErr, written before, says why. The loop then changes nothing more.
+	gone    chan struct{}
+	goneErr error
+
+	// The retry of an incomplete pass. Only the loop goroutine uses them.
+	retryTimer *time.Timer
+	retryDue   time.Time
+	retryDelay time.Duration
+
 	sendMu    sync.Mutex
 	closing   bool
 	closeOnce sync.Once
 	closeErr  error
+	// overflow holds what did not fit in the full event queue: a full
+	// reconcile covers every path event, so senders never wait. Guarded by
+	// sendMu.
+	overflow struct {
+		full     bool
+		stdlib   []string
+		barriers []chan error
+	}
+
+	// faults reports work whose state can be wrong after a recovered panic.
+	faults   chan string
+	goneOnce sync.Once // closes gone; see rootGone
 
 	coverageMu   sync.Mutex // orders coverage reports; see reportCoverage
 	watcherMu    sync.RWMutex
@@ -120,10 +160,9 @@ func OpenWithOptions(root string, opts Options) (*Runtime, error) {
 	}
 
 	previousStdlibRoot, _ := s.GetStdlibRoot()
-	stdlibRoot := ""
-	if resolved, ok := stdlib.Resolve(s, "", root); ok {
-		stdlibRoot = resolved
-	}
+	// The coordinator keeps the result, so the first editor that attaches
+	// does not detect again.
+	stdlibRoot := index.DetectStdlib(s, root)
 	core := lsp.NewServerWithOptions(s, root, lsp.ServerOptions{
 		Index:             index,
 		ManageWorkspace:   false,
@@ -131,16 +170,20 @@ func OpenWithOptions(root string, opts Options) (*Runtime, error) {
 	})
 	core.ReportStdlib()
 	if previousStdlibRoot != "" && previousStdlibRoot != stdlibRoot {
-		core.RemoveFilesUnderRoot(previousStdlibRoot)
+		// When this fails, the first pass's prune removes the rows: they
+		// are below neither root now.
+		_ = core.RemoveFilesUnderRoot(previousStdlibRoot)
 	}
 	r := &Runtime{
 		root:         root,
 		hook:         opts.BeforeInitialReconcile,
 		store:        s,
+		faults:       make(chan string, 1),
 		index:        index,
 		core:         core,
-		events:       make(chan event, 4096),
+		events:       make(chan event, eventQueueSize),
 		ready:        make(chan struct{}),
+		gone:         make(chan struct{}),
 		watcherReady: make(chan struct{}),
 		watcherStop:  make(chan struct{}),
 		gitStop:      make(chan struct{}),
@@ -149,6 +192,8 @@ func OpenWithOptions(root string, opts Options) (*Runtime, error) {
 		sessTag:      newSessionTag(),
 	}
 
+	index.SetEventFlusher(r.FlushEvents)
+	index.OnFault(r.fault)
 	r.startGitWatch()
 	if opts.NoWatch {
 		close(r.watcherReady)
@@ -166,6 +211,22 @@ func (r *Runtime) Root() string { return r.root }
 
 // Ready closes after the initial full-or-incremental reconciliation.
 func (r *Runtime) Ready() <-chan struct{} { return r.ready }
+
+// Gone closes when the project root is moved, deleted, or unmounted while the
+// runtime runs. The runtime then leaves the index as it is and applies no more
+// changes, and its owner must close it: the daemon exits, so the next frontend
+// starts a new one on whatever the root path now names, or fails clearly.
+func (r *Runtime) Gone() <-chan struct{} { return r.gone }
+
+// GoneErr returns why the root is gone, or nil while Gone is open.
+func (r *Runtime) GoneErr() error {
+	select {
+	case <-r.gone:
+		return r.goneErr
+	default:
+		return nil
+	}
+}
 
 // WaitReady waits until the runtime can answer index-dependent requests.
 func (r *Runtime) WaitReady(ctx context.Context) error {
@@ -477,9 +538,39 @@ func (r *Runtime) SetStdlibRoot(ctx context.Context, path string) error {
 	}
 	old, changed := r.core.SetStdlibRoot(path)
 	if changed {
-		r.events <- event{kind: eventStdlib, path: old}
+		r.enqueueLocked(event{kind: eventStdlib, path: old})
 	}
 	return nil
+}
+
+// FlushEvents waits until the index has every file change that happened
+// before the call: it waits for the native watcher to deliver what it has
+// (watcherSettle, the platform's event latency) and then for a queue barrier.
+// A rename uses it when a file it plans from is gone, which is what a move
+// (git mv, git checkout, a file manager) looks like before the watcher has
+// indexed the new path. Without a native watcher there is nothing to wait
+// for, and it returns at once.
+func (r *Runtime) FlushEvents(ctx context.Context) error {
+	if !r.Watching() {
+		return nil
+	}
+	timer := time.NewTimer(watcherSettle)
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
+		timer.Stop()
+		return ctx.Err()
+	}
+	done := make(chan error, 1)
+	if !r.send(event{kind: eventBarrier, done: done}) {
+		return errors.New("workspace is shutting down")
+	}
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // Reindex schedules a full incremental reconciliation and waits for a queue
@@ -506,12 +597,19 @@ func (r *Runtime) Indexes(path string) (bool, error) {
 // ReindexPath reconciles one file and waits for it, schedules a full pass for a
 // directory, and prunes a path that no longer exists. Reconciliation stats the
 // path itself, so create, change, and delete share one idempotent code path.
+//
+// A path below neither the project root nor the stdlib root is refused: the
+// index holds only paths that the full walk yields (see lsp.Server.Indexable).
 func (r *Runtime) ReindexPath(ctx context.Context, path string) error {
+	path = filepath.Clean(path)
+	if path != r.root && !r.core.InWalkRoot(path) {
+		return fmt.Errorf("%s is outside the workspace %s", path, r.root)
+	}
 	info, err := os.Stat(path)
 	switch {
 	case err == nil && info.IsDir():
 		return r.Reindex(ctx)
-	case err != nil && !os.IsNotExist(err):
+	case err != nil && !lsp.IsMissing(err):
 		return err
 	}
 	return r.awaitPath(ctx, path)
@@ -531,6 +629,9 @@ func (r *Runtime) awaitPath(ctx context.Context, path string) error {
 	}
 }
 
+// send queues one mutation event. It never waits: the callers are the file
+// watcher callback and editor notification handlers, and a queue that is full
+// during a long reconcile must not stall them.
 func (r *Runtime) send(ev event) bool {
 	r.sendMu.Lock()
 	defer r.sendMu.Unlock()
@@ -540,17 +641,148 @@ func (r *Runtime) send(ev event) bool {
 		}
 		return false
 	}
-	r.events <- ev
+	r.enqueueLocked(ev)
 	return true
+}
+
+// enqueueLocked queues ev, or folds it into the overflow when the queue is
+// full. A full queue means the loop has at least one more batch to take, and it
+// takes the overflow with that batch, so nothing is lost: a full reconcile
+// covers every path, and barriers are answered after it. The caller holds
+// sendMu.
+func (r *Runtime) enqueueLocked(ev event) {
+	select {
+	case r.events <- ev:
+		return
+	default:
+	}
+	switch ev.kind {
+	case eventStdlib:
+		if ev.path != "" {
+			r.overflow.stdlib = append(r.overflow.stdlib, ev.path)
+		}
+	}
+	r.overflow.full = true
+	if ev.done != nil {
+		r.overflow.barriers = append(r.overflow.barriers, ev.done)
+	}
+}
+
+// testHookBeforeOverflow, when set by a test, runs before the loop reads the
+// overflow of a batch.
+var testHookBeforeOverflow func()
+
+// takeOverflow passes what overflowed the queue to collect.
+func (r *Runtime) takeOverflow(collect func(event)) {
+	r.sendMu.Lock()
+	full, stdlib, barriers := r.overflow.full, r.overflow.stdlib, r.overflow.barriers
+	r.overflow.full, r.overflow.stdlib, r.overflow.barriers = false, nil, nil
+	r.sendMu.Unlock()
+	if !full {
+		return
+	}
+	collect(event{kind: eventFull})
+	for _, path := range stdlib {
+		collect(event{kind: eventStdlib, path: path})
+	}
+	for _, done := range barriers {
+		collect(event{kind: eventFull, done: done})
+	}
+}
+
+// fault reports work whose state can be wrong after a recovered panic. The
+// owner of the runtime restarts it; see Faults.
+func (r *Runtime) fault(what string) {
+	select {
+	case r.faults <- what:
+	default:
+	}
+}
+
+// Faults delivers a description of work whose state can be wrong after a
+// recovered panic, such as an index pass that left a write transaction open.
+// The owner of the runtime should replace it with a new one.
+func (r *Runtime) Faults() <-chan string { return r.faults }
+
+// markGone records a root that the watcher saw go away, for example on an
+// unmount.
+func (r *Runtime) markGone() {
+	_ = r.rootGone(fmt.Errorf("%w: %s is not there any more (volume unmounted, or directory moved or removed)", lsp.ErrRootGone, r.root))
+}
+
+func (r *Runtime) isGone() bool {
+	select {
+	case <-r.gone:
+		return true
+	default:
+		return false
+	}
+}
+
+// CheckRoot marks the runtime gone when its root is not there any more, and
+// reports whether it is.
+func (r *Runtime) CheckRoot() bool {
+	if err := r.core.CheckProjectRoot(); errors.Is(err, lsp.ErrRootGone) {
+		_ = r.rootGone(err)
+	}
+	return r.isGone()
+}
+
+// IndexFileChange tells whether another process replaced or removed the index
+// file that the store has open. Then the store writes to a file that nobody
+// will read again, and every other reader sees another index.
+type IndexFileChange int
+
+const (
+	IndexFileSame IndexFileChange = iota
+	IndexFileReplaced
+	IndexFileRemoved
+)
+
+// CheckIndexFile compares the file at the index path with the one the store
+// opened.
+func (r *Runtime) CheckIndexFile() IndexFileChange {
+	same, err := r.sameDatabaseFile()
+	switch {
+	case lsp.IsMissing(err):
+		return IndexFileRemoved
+	case err != nil:
+		return IndexFileSame
+	case !same:
+		return IndexFileReplaced
+	}
+	return IndexFileSame
+}
+
+// sameDatabaseFile reports whether the file at the index path is the one the
+// store opened, by the rule of store.SameDatabaseFile (the inode, not the
+// device, so that a remount does not count). An error that satisfies
+// os.IsNotExist means the file is gone.
+func (r *Runtime) sameDatabaseFile() (bool, error) {
+	same, err := r.store.SameDatabaseFile()
+	if err != nil || same {
+		return same, err
+	}
+	if _, statErr := os.Stat(store.DBPath(r.root)); statErr != nil {
+		return false, statErr
+	}
+	return false, nil
 }
 
 func (r *Runtime) loop() {
 	defer r.loopWG.Done()
+	defer r.stopRetry()
 	<-r.watcherReady
 	if r.hook != nil {
 		r.hook()
 	}
-	r.core.ReindexWorkspace()
+	var first error
+	if guardErr := r.guard("the first index pass", func() { first = r.core.ReindexWorkspace() }); guardErr != nil {
+		first = guardErr
+	}
+	if err := r.fullPassDone(first); errors.Is(err, lsp.ErrRootGone) {
+		r.readyErr = err
+	}
 	r.publish(Change{Full: true})
 	close(r.ready)
 
@@ -585,6 +817,7 @@ func (r *Runtime) loop() {
 		// editor save is indexed immediately instead of paying a debounce
 		// window; only a burst in flight opens one.
 		burst := r.absorb(collect) > 0
+		r.takeOverflow(collect)
 		if burst && !stop && !full {
 			timer := time.NewTimer(eventDebounce)
 		window:
@@ -607,18 +840,87 @@ func (r *Runtime) loop() {
 			}
 		}
 
+		// A manifest change reindexes the whole workspace. A batch with many
+		// of them (a branch switch in an umbrella project changes every
+		// apps/*/mix.exs) gets one full pass, not one per manifest, and the
+		// pass covers every other path of the batch too.
+		//
+		// The same change also clears the caches that depend on where the
+		// Mix projects are and lets BEAMs that failed to start try again,
+		// once for the batch (lsp.Server.ManifestChanged).
+		if testHookBeforeOverflow != nil {
+			testHookBeforeOverflow()
+		}
+		r.takeOverflow(collect)
+		manifest := !stop && r.hasWorkspaceManifest(paths)
+		if manifest {
+			full = true
+		}
+
 		var batchErr error
-		if full {
-			for root := range oldStdlibRoots {
-				r.core.RemoveFilesUnderRoot(root)
+		applied := true // false when the batch changed nothing and waits
+		switch {
+		case r.isGone():
+			batchErr = r.GoneErr()
+			applied = false
+		case full:
+			// The full pass also covers every other path of the batch: the
+			// index holds only paths that the walk can yield (see
+			// lsp.Server.Indexable).
+			var passErr error
+			if guardErr := r.guard("a full index pass", func() {
+				var removeErr error
+				for root := range oldStdlibRoots {
+					removeErr = errors.Join(removeErr, r.core.RemoveFilesUnderRoot(root))
+				}
+				if manifest {
+					if testHookManifestChanged != nil {
+						testHookManifestChanged()
+					}
+					r.core.ManifestChanged()
+				}
+				passErr = errors.Join(removeErr, r.core.ReindexWorkspace())
+			}); guardErr != nil {
+				passErr = guardErr
 			}
-			r.core.ReindexWorkspace()
-		} else {
-			for path := range paths {
-				batchErr = errors.Join(batchErr, r.reconcilePath(path))
+			batchErr = r.fullPassDone(passErr)
+		case len(paths) > 0:
+			// One stat per batch. A root that went away makes every path
+			// look deleted, and the removals would empty the index. A root
+			// that cannot be read now (a permission or network error) can
+			// come back, so the batch waits for the retry's full pass.
+			if err := r.core.CheckProjectRoot(); err != nil {
+				if errors.Is(err, lsp.ErrRootGone) {
+					batchErr = r.rootGone(err)
+				} else {
+					log.Printf("Warning: %v; the changes wait for the next full pass", err)
+					r.core.ReportStale(err)
+					batchErr = err
+					r.scheduleRetry()
+				}
+				applied = false
+				break
+			}
+			if guardErr := r.guard("an index update", func() {
+				for path := range paths {
+					batchErr = errors.Join(batchErr, r.reconcilePath(path))
+				}
+			}); guardErr != nil {
+				batchErr = errors.Join(batchErr, guardErr)
+			}
+			switch {
+			case errors.Is(batchErr, lsp.ErrRootGone):
+				batchErr = r.rootGone(batchErr)
+			case errors.Is(batchErr, lsp.ErrIncomplete):
+				r.scheduleRetry()
 			}
 		}
-		r.publishBatch(full, paths)
+		// A subscriber hears only about changes that were made. The changes
+		// that wait come with the next full pass, which is published.
+		// A barrier alone (FlushEvents) changed nothing to publish.
+		if applied && (full || len(paths) > 0) {
+			r.publishBatch(full, paths)
+		}
 		for _, done := range barriers {
 			done <- batchErr
 		}
@@ -626,6 +928,109 @@ func (r *Runtime) loop() {
 			return
 		}
 	}
+}
+
+// testHookManifestChanged, when set by a test, runs each time the loop tells
+// the core that a manifest changed.
+var testHookManifestChanged func()
+
+// testHookFullPass, when set by a test, runs after each full pass with its
+// result.
+var testHookFullPass func(err error)
+
+// fullPassDone acts on the result of a full pass and returns it: a root that
+// is gone stops the runtime, an incomplete index schedules a retry, and a
+// complete pass cancels a pending retry.
+func (r *Runtime) fullPassDone(err error) error {
+	if testHookFullPass != nil {
+		testHookFullPass(err)
+	}
+	switch {
+	case errors.Is(err, lsp.ErrRootGone):
+		return r.rootGone(err)
+	case errors.Is(err, lsp.ErrIncomplete):
+		r.scheduleRetry()
+	case err == nil:
+		r.stopRetry()
+		r.retryDelay = 0
+	}
+	return err
+}
+
+// rootGone records that the project root is gone, once, and tells the owner
+// through Gone. It returns the recorded error.
+func (r *Runtime) rootGone(err error) error {
+	// Once: the loop, the watcher (an unmount), and the daemon's root check
+	// can each find it.
+	r.goneOnce.Do(func() {
+		r.index.Reporter().Set(lsp.CondRootGone, notify.Error, fmt.Sprintf(
+			"Dexter: the project directory %s was moved or deleted (or its volume was unmounted), so Dexter stopped. Open the project at its new location, or again when its volume is back.", r.root))
+		log.Printf("Error: workspace root %s is gone (moved, deleted, or unmounted); the index is left unchanged and the workspace stops: %v", r.root, err)
+		r.goneErr = err
+		close(r.gone)
+	})
+	return r.GoneErr()
+}
+
+// scheduleRetry queues a full pass after the current retry delay, unless one
+// is already pending. Each new retry doubles the delay up to retryMaxDelay.
+func (r *Runtime) scheduleRetry() {
+	if r.isGone() || time.Now().Before(r.retryDue) {
+		return
+	}
+	if r.retryDelay == 0 {
+		r.retryDelay = retryInitialDelay
+	} else {
+		r.retryDelay = min(2*r.retryDelay, retryMaxDelay)
+	}
+	r.retryDue = time.Now().Add(r.retryDelay)
+	log.Printf("Warning: the index is incomplete; reconciling again in %s", r.retryDelay)
+	r.retryTimer = time.AfterFunc(r.retryDelay, func() { r.send(event{kind: eventFull}) })
+}
+
+// stopRetry cancels a pending retry.
+func (r *Runtime) stopRetry() {
+	if r.retryTimer != nil {
+		r.retryTimer.Stop()
+		r.retryTimer = nil
+	}
+	r.retryDue = time.Time{}
+}
+
+// hasWorkspaceManifest reports whether paths holds a mix.exs or mix.lock file
+// of this workspace. A nested worktree is a separate checkout the index leaves
+// out, so its manifests do not count. Only a manifest pays a stat.
+func (r *Runtime) hasWorkspaceManifest(paths map[string]struct{}) bool {
+	for path := range paths {
+		if base := filepath.Base(path); base != "mix.exs" && base != "mix.lock" {
+			continue
+		}
+		if !r.core.InWalkRoot(path) {
+			continue // a path dependency's manifest; nothing of it is indexed
+		}
+		info, err := os.Stat(path)
+		if err != nil || info.IsDir() || parser.InLinkedWorktree(r.root, path) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// guard runs one batch of index work. A panic in it is recovered, so that the
+// loop keeps running and every barrier gets its answer; it is reported, and the
+// owner is told to restart the runtime, because the panic can have left a write
+// transaction open.
+func (r *Runtime) guard(what string, work func()) (err error) {
+	defer func() {
+		if value := recover(); value != nil {
+			r.Reporter().Panicked("index", what, value, debug.Stack())
+			r.fault(what)
+			err = fmt.Errorf("internal error in %s: %v", what, value)
+		}
+	}()
+	work()
+	return nil
 }
 
 // absorb drains already-queued events without blocking and reports how many it
@@ -663,6 +1068,10 @@ func (r *Runtime) publishBatch(full bool, paths map[string]struct{}) {
 	r.publish(c)
 }
 
+// spellingCheckAge is how old the mtime of a file in a path event must be
+// before reconcilePath checks its spelling on disk; see reconcilePath.
+const spellingCheckAge = 2 * time.Second
+
 // testHookReconcilePath, when set by a test, runs before each path event is
 // reconciled.
 var testHookReconcilePath func(path string)
@@ -671,48 +1080,79 @@ func (r *Runtime) reconcilePath(path string) error {
 	if testHookReconcilePath != nil {
 		testHookReconcilePath(path)
 	}
+	path = filepath.Clean(path)
+	// The index holds only paths below the roots (see lsp.Server.Indexable).
+	// An editor reports path dependencies too; they are not indexed, and the
+	// next full pass prunes rows that an older version wrote for them.
+	if path != r.root && !r.core.InWalkRoot(path) {
+		return nil
+	}
 	info, err := os.Stat(path)
+	if err == nil && (info.IsDir() || time.Since(info.ModTime()) > spellingCheckAge) && !pathcase.SpelledBelow(r.root, path) {
+		// The old spelling after a rename that changed only the case: a stat
+		// finds the new one. It is gone. A rename keeps the mtime of a file,
+		// while a save makes it new, so a file written in the last moments,
+		// which is what most events are, is not checked: the check costs an
+		// open and an fcntl. The prune of the next full reconcile checks
+		// every path that its walk did not see.
+		err = os.ErrNotExist
+	}
 	if err != nil {
-		if os.IsNotExist(err) {
+		if lsp.IsMissing(err) {
+			if path == r.root {
+				return fmt.Errorf("%w: %v", lsp.ErrRootGone, err)
+			}
+			// The batch checked the root before its first path, but the
+			// root can go after that check, and then every path is missing.
+			// Removals are rare, so each one pays this stat.
+			if err := r.core.CheckProjectRoot(); err != nil {
+				return err
+			}
 			under, listErr := r.store.ListFilePathsUnder(path)
 			if listErr != nil {
 				return listErr
 			}
-			r.core.RemoveFiles(append(under, path))
-			return nil
+			return r.core.RemoveFiles(append(under, path))
 		}
 		return err
 	}
 	if info.IsDir() {
 		// A watcher reports a directory when it turns out to be a nested
-		// worktree. Files indexed from it before its .git file appeared, as cp -r
-		// can do, are removed with one range read of the path index.
-		// A worktree that git is still moving counts too: its .git file can
-		// be empty when the watcher reports it.
-		if path != r.root && parser.GitFile(path).Nested() {
-			under, err := r.store.ListFilePathsUnder(path)
-			if err != nil {
-				return err
-			}
-			if len(under) > 0 {
-				r.core.RemoveFiles(under)
-			}
-		}
-		return nil
-	}
-	base := filepath.Base(path)
-	if base == "mix.lock" || base == "mix.exs" {
-		// A nested worktree is a separate checkout the index leaves out, so its
-		// manifests must not reindex this workspace. Source files need no check
-		// here: the core skips them itself.
-		if parser.InLinkedWorktree(r.root, path) {
+		// worktree, or when it was renamed or removed and is there again.
+		// Files indexed from a worktree before its .git file appeared, as cp -r
+		// can do, are removed with one range read of the path index. A
+		// worktree that git is still moving counts too: its .git file can be
+		// empty when the watcher reports it.
+		if path == r.root {
 			return nil
 		}
-		r.core.ReindexWorkspace()
+		under, err := r.store.ListFilePathsUnder(path)
+		if err != nil || len(under) == 0 {
+			return err
+		}
+		if parser.GitFile(path).Nested() {
+			return r.core.RemoveFiles(under)
+		}
+		// A directory that a watcher reports after a rename or a removal can
+		// be a new one in the place of the old one. The files of the new one
+		// come as their own paths; the indexed files that are gone are
+		// removed here, with one stat each.
+		var gone []string
+		for _, file := range under {
+			if _, err := os.Lstat(file); lsp.IsMissing(err) {
+				gone = append(gone, file)
+			}
+		}
+		if len(gone) > 0 {
+			return r.core.RemoveFiles(gone)
+		}
 		return nil
 	}
+	// A workspace manifest never gets here: the loop turns its batch into one
+	// full pass (see hasWorkspaceManifest). A manifest in a nested worktree
+	// does, and the core skips it as it skips every file there.
 	if parser.IsElixirFile(path) {
-		r.core.ReconcileFile(path)
+		return r.core.ReconcileFile(path)
 	}
 	return nil
 }
@@ -740,12 +1180,19 @@ func (r *Runtime) Close() error {
 		close(r.gitStop)
 		r.gitWG.Wait()
 
+		// closing stops every other sender. The stop event is sent without
+		// sendMu: the queue can be full, and the loop takes sendMu to read the
+		// overflow before it reads the queue again.
 		done := make(chan error, 1)
 		r.sendMu.Lock()
 		r.closing = true
-		r.events <- event{kind: eventStop, done: done}
 		r.sendMu.Unlock()
-		r.closeErr = errors.Join(r.closeErr, <-done)
+		r.events <- event{kind: eventStop, done: done}
+		// A root that is gone is why the owner closes the runtime, so it is
+		// not an error of the close.
+		if err := <-done; !errors.Is(err, lsp.ErrRootGone) {
+			r.closeErr = errors.Join(r.closeErr, err)
+		}
 		r.loopWG.Wait()
 		r.core.WaitForIndexWork()
 		r.closeErr = errors.Join(r.closeErr, r.store.Checkpoint())
@@ -756,6 +1203,14 @@ func (r *Runtime) Close() error {
 
 func (r *Runtime) startNativeWatcher() {
 	defer r.watcherWG.Done()
+	defer r.Reporter().Recover("watch", "the start of the file watcher", func(any) {
+		// Close waits for watcherReady.
+		select {
+		case <-r.watcherReady:
+		default:
+			close(r.watcherReady)
+		}
+	})
 	firstAttempt := true
 	for {
 		started := time.Now()
@@ -765,6 +1220,11 @@ func (r *Runtime) startNativeWatcher() {
 			CoverageChanged: func(degraded bool) {
 				r.reportCoverage()
 				r.watchCoverageChanged(degraded)
+			},
+			CoverageCountChanged: r.reportCoverage,
+			RootGone:             r.markGone,
+			Panicked: func(what string, value any, stack []byte) {
+				r.Reporter().Panicked("watch", what, value, stack)
 			},
 		})
 		if err == nil {
@@ -816,6 +1276,7 @@ func (r *Runtime) startGitWatch() {
 	r.gitWG.Add(1)
 	go func() {
 		defer r.gitWG.Done()
+		defer r.Reporter().Recover("watch", "the Git HEAD poll")
 		ticker := time.NewTicker(gitHeadPollInterval)
 		defer ticker.Stop()
 		for {

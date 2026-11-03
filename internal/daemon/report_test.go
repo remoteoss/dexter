@@ -253,7 +253,9 @@ func TestProxyAnswersInitializeWhenTheDaemonCannotStart(t *testing.T) {
 	quietEnv(t)
 	root := t.TempDir()
 	origSpawn := spawnDaemon
-	spawnDaemon = func(string) error { return errors.New("start workspace daemon: exec format error") }
+	spawnDaemon = func(string) (<-chan error, error) {
+		return nil, errors.New("start workspace daemon: exec format error")
+	}
 	t.Cleanup(func() { spawnDaemon = origSpawn })
 
 	var out bytes.Buffer

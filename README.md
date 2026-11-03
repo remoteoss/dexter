@@ -36,6 +36,7 @@ A fast, full-featured Elixir LSP optimized for large Elixir codebases.
   - [Modules](#modules)
   - [Functions](#functions)
   - [Variables](#variables)
+  - [Renaming with several editors](#renaming-with-several-editors)
 - [Lightning-fast formatting](#lightning-fast-formatting)
 - [LSP options](#lsp-options)
 - [Index database location (.dexter/)](#index-database-location-dexter)
@@ -479,7 +480,7 @@ When running as an LSP server, dexter automatically:
 
 ## MCP server
 
-Dexter includes a built-in [Model Context Protocol](https://modelcontextprotocol.io) server, modeled on `gopls mcp`, so AI agents can navigate Elixir codebases through the index instead of grep. Tools cover symbol search, definitions with docs and specs, references, module API summaries, file outlines, behaviour/protocol implementations, call hierarchy, incremental reindexing, and workspace-wide rename.
+Dexter includes a built-in [Model Context Protocol](https://modelcontextprotocol.io) server, modeled on `gopls mcp`, so AI agents can navigate Elixir codebases through the index instead of grep. Tools cover symbol search, definitions with docs and specs, references, module API summaries, file outlines, behaviour/protocol implementations, callers and callees, incremental reindexing, and workspace-wide rename.
 
 Register it with your MCP client. For Claude Code:
 
@@ -489,7 +490,7 @@ claude mcp add dexter -- dexter mcp
 
 Any client that speaks MCP over stdio works the same way: point it at `dexter mcp`. The server obtains its workspace from the client through MCP roots and resolves it the way the CLI does, so it binds the project the client is working in rather than the directory it was launched from. Clients that provide no roots get the launch directory (when it is a project), and an explicit path argument (`dexter mcp <path>`) overrides negotiation entirely. One session serves one workspace: when a client gives several roots, the session uses the first one that is a usable project (an existing directory inside an Elixir project, not the home directory) and ignores the others. In `--listen` mode each resolved root gets its own workspace, so sessions from different projects can share one server.
 
-`dexter mcp` is a frontend of the workspace daemon, like `dexter lsp` and the CLI: it starts the daemon when necessary and keeps no index of its own. The tools answer from the same index, watchers, and caches as the editor, so edits made directly by an agent are indexed by the daemon's file watcher, and a `dexter_reindex` tool forces an immediate update if a lookup ever seems stale. A tool that answers from an index that is still building or degraded says so in its answer. The tools read file text the way the user sees it: when an editor attached to the same daemon holds a file open with changes it has not saved (and the file on disk has not changed since), outlines, definition snippets, and reference lines come from that buffer (with its line numbers), and the answer says so. The rename tool writes on disk and does not yet look at editor buffers, so save your editor's changes before an agent renames.
+`dexter mcp` is a frontend of the workspace daemon, like `dexter lsp` and the CLI: it starts the daemon when necessary and keeps no index of its own. The tools answer from the same index, watchers, and caches as the editor, so edits made directly by an agent are indexed by the daemon's file watcher, and a `dexter_reindex` tool forces an immediate update if a lookup ever seems stale. A tool that answers from an index that is still building or degraded says so in its answer. The tools read file text the way the user sees it: when an editor attached to the same daemon holds a file open with changes it has not saved (and the file on disk has not changed since), outlines, definition snippets, and reference lines come from that buffer (with its line numbers), and the answer says so. The rename tool follows the rules in [Renaming with several editors](#renaming-with-several-editors): it writes files that an editor has open without unsaved changes (the editor reloads them), and it changes nothing, naming the file, when a file it must change has unsaved changes in an editor.
 
 Useful variants:
 
@@ -533,6 +534,8 @@ Dexter supports renaming modules, functions, and variables across the codebase v
 
 Place your cursor on any segment of a module name and invoke rename. Dexter highlights just the last segment for editing — the parent namespace is preserved automatically. For example, renaming `Accounts` in `MyApp.Accounts` to `Users` renames the module to `MyApp.Users`.
 
+A use through an alias follows the alias. With `alias MyApp.Accounts`, the alias line changes to the new name, and `Accounts.get()` becomes `Users.get()`. When the new short name is already a name in that file (another alias, or a module), the alias line gets `as:` with the old short name, and the uses stay: `as:` changes one line and cannot change what the other name means. With an alias of a namespace above the module (`alias MyApp.Core` and `Core.Accounts`), the use keeps the alias when the new name is still in that namespace; otherwise it gets the full new name, and an alias line that then has no use is removed, because the compiler warns about an unused alias.
+
 **What gets updated:**
 
 - The `defmodule` declaration
@@ -540,11 +543,11 @@ Place your cursor on any segment of a module name and invoke rename. Dexter high
 - All call sites
 - All submodules (renaming `MyApp.Foo` also renames `MyApp.Foo.Bar`, `MyApp.Foo.Baz`, etc.)
 
-**File renaming after a module rename:** If the source file follows the Elixir naming convention (module `MyApp.Accounts` → file `accounts.ex`), dexter renames the file alongside the module. For submodules, the containing directory segment is also renamed to match (e.g., renaming `MyApp.Companies` to `MyApp.Clients` moves `lib/companies/services/do_something.ex` → `lib/clients/services/do_something.ex`). After the rename, dexter opens the new file automatically if your editor supports `window/showDocument`.
+**File renaming after a module rename:** If the source file follows the Elixir naming convention (module `MyApp.Accounts` → file `accounts.ex`), dexter moves the file to the conventional path of the new name. The directories above the file that spell the namespace change with it: `lib/my_app/accounts/user.ex` for `MyApp.Accounts.User` goes to `lib/my_app/billing/user.ex` for `MyApp.Billing.User`, and to `lib/my_app/user.ex` for `MyApp.User`. Submodules in their own files move with the namespace (renaming `MyApp.Companies` to `MyApp.Clients` moves `lib/my_app/companies/services/do_something.ex` → `lib/my_app/clients/services/do_something.ex`). Dexter makes the new directories, and removes an old directory only when the move left it empty. A file whose directories do not spell the namespace keeps its directory and gets the new base name. After the rename, dexter opens the new file automatically if your editor supports `window/showDocument`.
 
 **When path renaming won't happen:** If the file name doesn't match the snake_case form of the module's last segment — for example, a file named `my_custom_name.ex` that defines `MyApp.Accounts` — the file stays in place and only the contents are updated.
 
-Files not open in the editor are written directly to disk; open buffers receive edits via the LSP workspace edit response.
+Files that no editor has open are written directly to disk; files open in an editor receive edits via the LSP workspace edit response (see [Renaming with several editors](#renaming-with-several-editors)).
 
 ### Functions
 
@@ -556,6 +559,8 @@ Place your cursor on a function name (qualified or bare) and invoke rename. Dext
 - `import Module, only: [function_name: ...]` lines
 - Transitive call sites via `__using__` chains
 
+**Behaviour callbacks.** A callback of a behaviour in your project is renamed with its whole family, from the `@callback` line or from any implementation: the `@callback`, every implementation in the project (modules with `@behaviour`, also through a `use` whose `__using__` adds it), their `@spec` lines, the `@optional_callbacks` and `defoverridable` entries, every call to them, and the calls through a variable in the behaviour module itself (`impl.perform(arg)`). Only the callback's arity is renamed. In a module whose implementation has default arguments, the arities that this definition gives are renamed too (`def go(x, opts \\ [])` implements `go/2` and also defines `go/1`, so the calls to that module's `go/1` change); in the other modules of the family, other arities of the same name stay. A definition whose default arguments also give a callback of another behaviour belongs to two families, and the rename is refused. A protocol function is renamed the same way: in the `defprotocol` and in every `defimpl` of the project. Dexter cannot know which module a variable holds elsewhere, so it does not rename such calls in other files; it tells you where they are.
+
 Renaming is blocked for functions defined in stdlib or deps.
 
 ### Variables
@@ -564,6 +569,48 @@ Place your cursor on a local variable and invoke rename. Dexter uses tree-sitter
 enclosing function scope and renames them in a single edit. This is file-local only.
 
 Go-to-definition also works for variables — it jumps to the first occurrence (pattern match or assignment) in scope.
+
+### Renaming with several editors
+
+Several editors can share one Dexter daemon. A rename never overwrites unsaved work in an editor, and never moves a file that another editor has open.
+
+| File | Rename from your editor | Rename from an AI agent through MCP |
+|---|---|---|
+| Not open in any editor | Written to disk | Written to disk |
+| Open in your editor | Edited in your editor | — |
+| Open in another editor, no unsaved changes | Edited in your editor; save it there | Written to disk; the other editor reloads it |
+| Open in another editor, unsaved changes | Edited in your editor; save it there | Refused |
+| Must move, and another editor has it open | Refused | Refused |
+
+The last column is for a rename that has no editor to apply edits: Dexter's MCP rename tool uses these rules.
+
+When a file that another editor has open is edited in your editor, Dexter tells you which files to save. The other editor then sees an ordinary change on disk.
+
+A buffer counts as having no unsaved changes when its text equals the file on disk, or differs only by one final newline or by CRLF against LF line endings (editors such as Neovim add the final newline on load).
+
+When you save a file and rename at once, before Dexter has indexed the save (or right after a `git mv`, a `git checkout`, or a move in your editor), Dexter brings the index up to date itself before it renames. A refused rename changes no file. The messages (the paths are relative to the project), and what to do:
+
+- `lib/my_app/beta.ex is open in another editor; close it there, then rename again.` — the rename must move that file. Close it in the other editor and rename again.
+- `lib/my_app/beta.ex has unsaved changes in an editor; save or discard them there, then retry.` — save or discard the changes in that editor, then rename again.
+- `the rename was not applied, because another editor opened lib/my_app/beta.ex while the rename ran.` — rename again.
+- `the rename was not applied, because lib/my_app/beta.ex changed on disk while the rename ran.` — another program (for example `git checkout` or a formatter) changed the file. Rename again.
+- `the rename was not applied, because lib/my_app/beta.ex changed in this editor since it was saved, and the index has the saved lines.` — save the file, then rename again.
+- `the rename was not applied, because the index is behind the files: lib/my_app/beta.ex changed since Dexter indexed it, or is gone.` — Dexter could not index the file again (for example, it cannot read it). Make the file readable, then rename again.
+- `the rename was not applied, because 250 files changed since Dexter indexed them; Dexter is probably still indexing a large change, such as a branch switch.` — wait until Dexter has indexed the change, then rename again.
+- `the rename was not applied, because the index is still being updated after the last rename.` or `the rename was not applied, because Dexter is still indexing a change.` — wait a moment, then rename again.
+- `the rename was not applied, because Dexter cannot write 1 of the files it must change: lib/my_app/beta.ex (permission denied).` — make the file (or, for a move, its directory) writable, then rename again.
+- `the rename was not applied, because Dexter cannot create a temporary file in lib/my_app (permission denied), and it writes no file in place.` — make the directory writable, then rename again.
+- `the rename was not applied, because lib/my_app/beta.ex is gone, and the file watcher has not reported it.` — if the file was moved, rename again in a moment; Dexter has removed it from the index.
+- `the rename was not applied, because lib/my_app/gamma.ex appeared while the rename ran, and the rename must move a file there.` — another program made the file. Remove or rename it, then rename again.
+- `the rename was not applied, because Dexter could not replace lib/my_app/beta.ex (input/output error). The files it had already replaced were restored; no file was changed.` — fix the cause, then rename again.
+- `the rename was not applied, because handle_call/3 implements the GenServer behaviour from a dependency; Dexter cannot rename it.` — the behaviour is not in your project (a dependency, Elixir, or OTP), so its callback names are fixed.
+- `the rename was not applied, because MyApp.Plugin, which implements MyApp.Worker.perform, is outside the project (in a dependency); Dexter cannot rename it.` — an implementation of your behaviour is in a dependency, which Dexter does not change.
+
+Dexter cannot see a call whose function name is computed at run time or built by a macro in another module (for example `apply(module, :fetch, args)`, or a macro that generates `module.fetch(...)`). Such a call keeps the old name.
+
+Files are written atomically: each new text goes to a temporary file next to the original, and then replaces the original in one step. A failed write (a full disk, for example) never leaves a file empty or half written. Dexter never writes a file in place.
+
+A rename is all or nothing. If one file cannot be replaced, Dexter puts back every file it had already replaced, and the message says that no file was changed. Two rare cases can still leave a rename partly applied, and the message then names each file: a file system that has neither an atomic swap nor hard links (so Dexter keeps no copy of the old file), and a moved file whose old path cannot be removed at the end.
 
 ## Lightning-fast formatting
 
@@ -592,7 +639,7 @@ If the persistent process can't start, dexter falls back to running `mix format`
 Dexter reads `initializationOptions` from your editor configuration:
 
 - **`followDelegates`** (boolean, default: `true`): follow `defdelegate` targets on lookup.
-- **`stdlibPath`** (string): override the Elixir stdlib directory to index. Defaults to auto-detection; use this if your install is non-standard.
+- **`stdlibPath`** (string): override the Elixir stdlib directory to index. Defaults to auto-detection; use this if your install is non-standard. All editors of a project share one index, so the first editor that sets `stdlibPath` decides it until the daemon stops; an editor that sets another value is warned.
 - **`debug`** (boolean, default: `false`): enable verbose logging for this editor session. Logs timing and resolution details for every definition, hover, references, and rename request to your editor's LSP log and to the workspace daemon's log (see [Debugging](#debugging)). Can also be enabled via the `DEXTER_DEBUG=true` environment variable.
 - **`maxTransientDocuments`** (integer, default: `50`): cap on how many lazily-loaded buffers the server retains in memory. When an LSP client (e.g. Claude Code) queries a file it never opened via `didOpen`, dexter reads it from disk and caches it. Editor-owned buffers are unaffected; only disk-loaded entries are subject to LRU eviction. Set to `0` to disable transient caching.
 

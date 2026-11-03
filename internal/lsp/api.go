@@ -2,7 +2,6 @@ package lsp
 
 import (
 	"context"
-	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -69,46 +68,18 @@ func (r *RenameSummary) failed(path string, err error) {
 	r.mu.Unlock()
 }
 
-// recordFailures copies the failures of one rename pass into the summary.
-func (r *RenameSummary) recordFailures(f *renameFailures) {
-	if r == nil {
-		return
-	}
-	f.mu.Lock()
-	paths := append([]string(nil), f.paths...)
-	first := f.first
-	f.mu.Unlock()
-	if len(paths) == 0 {
-		return
-	}
-	r.mu.Lock()
-	if len(r.FilesFailed) == 0 {
-		r.FailureReason = first
-	}
-	r.FilesFailed = append(r.FilesFailed, paths...)
-	r.mu.Unlock()
-}
-
-// recordModuleRename records the files and moves of a module rename.
-func (r *RenameSummary) recordModuleRename(sitesByFile map[string][]moduleEditSite, movedFiles, clientRenames map[string]string, failures *renameFailures) {
+// moved records that the rename moved a file to a new path.
+func (r *RenameSummary) moved(from, to string) {
 	if r == nil {
 		return
 	}
 	r.mu.Lock()
-	for path := range sitesByFile {
-		r.FilesChanged = append(r.FilesChanged, path)
+	if r.FilesMoved == nil {
+		r.FilesMoved = make(map[string]string)
 	}
-	if len(movedFiles)+len(clientRenames) > 0 && r.FilesMoved == nil {
-		r.FilesMoved = make(map[string]string, len(movedFiles)+len(clientRenames))
-	}
-	for from, to := range movedFiles {
-		r.FilesMoved[from] = to
-	}
-	for from, to := range clientRenames {
-		r.FilesMoved[from] = to
-	}
+	r.FilesMoved[from] = to
+	r.FilesChanged = append(r.FilesChanged, to)
 	r.mu.Unlock()
-	r.recordFailures(failures)
 }
 
 // waitFor records an index update that the rename started. finish waits for
@@ -165,12 +136,9 @@ func sortedUnique(paths []string) []string {
 }
 
 // RenameFunction renames module.functionName to newName across the workspace
-// with the same validation and the same machinery as the editor rename. It
-// returns when the index shows the rename.
-//
-// The caller has no editor, so every file that this server does not hold open
-// is written on disk. The workspace daemon calls it on its headless language
-// service, which holds no editor buffers.
+// for a caller without an editor (the MCP tools), with the same rules and the
+// same machinery as the editor rename; see RenameFunctionHeadless. It returns
+// when the index shows the rename.
 func (s *Server) RenameFunction(module, functionName, newName string) (*RenameSummary, error) {
 	return s.RenameFunctionContext(context.Background(), module, functionName, newName)
 }
@@ -179,36 +147,21 @@ func (s *Server) RenameFunction(module, functionName, newName string) (*RenameSu
 // rename canceled before it starts to write changes nothing; one canceled
 // during its writes completes.
 func (s *Server) RenameFunctionContext(ctx context.Context, module, functionName, newName string) (*RenameSummary, error) {
-	if !isValidFunctionName(newName) {
-		return nil, fmt.Errorf("invalid function name %q: must match [a-z_][a-z0-9_?!]*", newName)
-	}
-	defs, err := s.store.LookupFunction(module, functionName)
-	if err != nil {
-		return nil, err
-	}
-	if len(defs) == 0 {
-		return nil, fmt.Errorf("function %s.%s not found in the index", module, functionName)
-	}
-	if existing, err := s.store.LookupFunction(module, newName); err == nil && len(existing) > 0 {
-		return nil, fmt.Errorf("function %s.%s already exists", module, newName)
-	}
-
 	summary := &RenameSummary{}
-	edit, err := s.renameFunctionEdits(ctx, module, functionName, newName, summary)
+	indexed, err := s.renameFunctionHeadless(ctx, module, functionName, newName, summary)
+	if indexed != nil {
+		summary.waitFor(indexed)
+	}
 	summary.finish()
 	if err != nil {
 		return nil, err
-	}
-	if err := requireNoBufferEdits(edit); err != nil {
-		return summary, err
 	}
 	return summary, nil
 }
 
 // RenameModule renames oldModule (and its submodules) to newModule across the
-// workspace, with the same validation and machinery as the editor rename,
-// including the moves of files that follow the naming convention. It returns
-// when the index shows the rename.
+// workspace for a caller without an editor, including the moves of files that
+// follow the naming convention. See RenameFunction.
 func (s *Server) RenameModule(oldModule, newModule string) (*RenameSummary, error) {
 	return s.RenameModuleContext(context.Background(), oldModule, newModule)
 }
@@ -216,36 +169,14 @@ func (s *Server) RenameModule(oldModule, newModule string) (*RenameSummary, erro
 // RenameModuleContext is RenameModule for a caller that can cancel, with the
 // same rule as RenameFunctionContext.
 func (s *Server) RenameModuleContext(ctx context.Context, oldModule, newModule string) (*RenameSummary, error) {
-	if !isValidModuleName(newModule) {
-		return nil, fmt.Errorf("invalid module name %q: must be CamelCase segments separated by dots", newModule)
-	}
-	defs, err := s.store.LookupModule(oldModule)
-	if err != nil {
-		return nil, err
-	}
-	if len(defs) == 0 {
-		return nil, fmt.Errorf("module %s not found in the index", oldModule)
-	}
-
 	summary := &RenameSummary{}
-	edit, err := s.renameModuleEdits(ctx, oldModule, newModule, summary)
+	indexed, err := s.renameModuleHeadless(ctx, oldModule, newModule, summary)
+	if indexed != nil {
+		summary.waitFor(indexed)
+	}
 	summary.finish()
 	if err != nil {
 		return nil, err
 	}
-	if err := requireNoBufferEdits(edit); err != nil {
-		return summary, err
-	}
 	return summary, nil
-}
-
-// requireNoBufferEdits reports an error when the rename machinery left edits
-// for buffers that the server holds open: a caller without an editor cannot
-// apply them. The headless language service holds no buffers, so this is a
-// guard, not an expected path.
-func requireNoBufferEdits(edit *WorkspaceEdit) error {
-	if edit == nil || (len(edit.Changes) == 0 && len(edit.DocumentChanges) == 0) {
-		return nil
-	}
-	return fmt.Errorf("the rename has edits for files that are open in this language service; only an editor can apply them")
 }

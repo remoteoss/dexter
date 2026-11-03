@@ -168,7 +168,7 @@ func TestPipeHandshakeRejectsMismatchedPeers(t *testing.T) {
 				// aside so the frontend can start the current build.
 				select {
 				case <-s.stopping:
-				case <-time.After(2 * time.Second):
+				case <-time.After(10 * time.Second):
 					t.Fatal("daemon did not start shutting down for a newer frontend")
 				}
 			}

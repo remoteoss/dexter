@@ -7,7 +7,11 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
+	"runtime"
+	"strconv"
+	"sync"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -17,12 +21,42 @@ type lockHandle struct {
 	file *os.File
 }
 
-// platformRuntimeDirs returns one environment-independent location. Every
-// process for one user must resolve the same lock and socket or a GUI editor and
-// a shell can each start a daemon over the same index.
+// platformRuntimeDirs returns the runtime directory candidates. Every process
+// for one user must resolve the same lock and socket or a GUI editor and a shell
+// can each start a daemon over the same index, so no candidate depends on the
+// environment: /tmp/dexter-<uid> first, and a directory under the home directory
+// that the user database (not $HOME) names for the case where another user
+// created /tmp/dexter-<uid> first.
 func platformRuntimeDirs() []string {
-	uid := os.Getuid()
-	return []string{filepath.Join("/tmp", fmt.Sprintf("dexter-%d", uid))}
+	dirs := []string{filepath.Join("/tmp", fmt.Sprintf("dexter-%d", os.Getuid()))}
+	if home := passwdHome(); home != "" {
+		dirs = append(dirs, homeRuntimeDir(home))
+	}
+	return dirs
+}
+
+var (
+	passwdHomeOnce  sync.Once
+	passwdHomeValue string
+)
+
+// passwdHome is the home directory that the user database records for this
+// uid. It is read once per process: the lookup can ask a directory service.
+func passwdHome() string {
+	passwdHomeOnce.Do(func() {
+		if u, err := user.LookupId(strconv.Itoa(os.Getuid())); err == nil && filepath.IsAbs(u.HomeDir) {
+			passwdHomeValue = u.HomeDir
+		}
+	})
+	return passwdHomeValue
+}
+
+// homeRuntimeDir is the per-user cache location of the runtime files.
+func homeRuntimeDir(home string) string {
+	if runtime.GOOS == "darwin" {
+		return filepath.Join(home, "Library", "Caches", "dexter", "run")
+	}
+	return filepath.Join(home, ".cache", "dexter", "run")
 }
 
 // checkRuntimeDir rejects a candidate that is not a real directory owned by
@@ -43,19 +77,34 @@ func checkRuntimeDir(dir string) error {
 	return nil
 }
 
+// acquirePlatformLock locks the file at path. After the lock is taken it checks
+// that path still names the locked file: a process that removed a stale lock
+// file between this open and this flock would otherwise leave this process
+// holding a lock that nobody else can see.
 func acquirePlatformLock(path string) (*lockHandle, bool, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return nil, false, err
-	}
-	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		_ = f.Close()
-		if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
-			return nil, false, nil
+	for attempt := 0; ; attempt++ {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+		if err != nil {
+			return nil, false, err
 		}
-		return nil, false, err
+		if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+			_ = f.Close()
+			if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
+				return nil, false, nil
+			}
+			return nil, false, err
+		}
+		held, heldErr := f.Stat()
+		current, currentErr := os.Stat(path)
+		if heldErr == nil && currentErr == nil && os.SameFile(held, current) {
+			return &lockHandle{file: f}, true, nil
+		}
+		_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
+		_ = f.Close()
+		if attempt >= 3 {
+			return nil, false, fmt.Errorf("lock file %s keeps changing", path)
+		}
 	}
-	return &lockHandle{file: f}, true, nil
 }
 
 func releasePlatformLock(handle *lockHandle) error {
@@ -67,16 +116,16 @@ func configureDetachedProcess(attr **syscall.SysProcAttr) {
 	*attr = &syscall.SysProcAttr{Setsid: true}
 }
 
-// findDaemonProcess locates a workspace daemon by command line. It is the
-// fallback for a daemon whose refusal predates the pid field: the workspace is
-// known to be owned (that is why the caller is here), and `daemon <root>` is a
-// specific enough match to identify it safely.
-func findDaemonProcess(root string) (int, bool) {
+// findDaemonProcesses locates the workspace daemons by command line. It is the
+// fallback for a daemon whose refusal predates the pid field, and the way
+// `dexter stop --force` finds every daemon of a root: `daemon <root>` is a
+// specific enough match to identify them safely.
+func findDaemonProcesses(root string) []int {
 	out, err := exec.Command("ps", "-A", "-o", "uid=,pid=,args=").Output()
 	if err != nil {
-		return 0, false
+		return nil
 	}
-	return parseDaemonPid(string(out), root)
+	return parseDaemonPids(string(out), root)
 }
 
 // processAlive reports whether pid names a live process. A pid this user may

@@ -1,6 +1,7 @@
 package notify_test
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"sync"
@@ -198,3 +199,29 @@ func TestSummarize(t *testing.T) {
 }
 
 func sprintf(format string, args ...any) string { return fmt.Sprintf(format, args...) }
+
+// slowClient takes a while to accept each message, as an editor on a busy
+// connection does.
+type slowClient struct {
+	*notifytest.Client
+}
+
+func (c slowClient) ShowMessage(ctx context.Context, params *protocol.ShowMessageParams) error {
+	time.Sleep(100 * time.Millisecond)
+	return c.Client.ShowMessage(ctx, params)
+}
+
+// Flush returns only after every attached editor got the reports so far, so
+// a daemon that is about to close its connections does not lose its last one.
+func TestFlushWaitsForDelivery(t *testing.T) {
+	r := notify.New()
+	r.SetLogf(func(string, ...any) {})
+	client := slowClient{notifytest.New()}
+	detach := r.Attach(client, false)
+	defer detach()
+	r.Set("root.gone", notify.Error, "Dexter: the project directory was moved")
+	r.Flush(5 * time.Second)
+	if len(client.Messages()) != 1 {
+		t.Fatalf("Flush returned before delivery:\n%s", client.Dump())
+	}
+}

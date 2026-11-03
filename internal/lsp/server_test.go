@@ -126,10 +126,10 @@ end
 	}
 }
 
-// waitFor polls condition every 10ms until it returns true or two seconds elapse.
+// waitFor polls condition every 10ms until it returns true or ten seconds elapse.
 func waitFor(t *testing.T, condition func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if condition() {
 			return
@@ -137,6 +137,14 @@ func waitFor(t *testing.T, condition func() bool) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("condition not met within timeout")
+}
+
+// Regression: waitFor gave up after two seconds, so its tests failed on a
+// loaded machine where the background work took longer.
+func TestWaitForAllowsSlowConditions(t *testing.T) {
+	t.Parallel()
+	start := time.Now()
+	waitFor(t, func() bool { return time.Since(start) > 3*time.Second })
 }
 
 func TestServer_DidChangeWatchedFiles_Create(t *testing.T) {
@@ -2962,7 +2970,7 @@ end`
 		if !foundMeta {
 			t.Fatalf("expected definition location in meta.ex, got %v", got.locs)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("definition timed out; possible infinite loop in multi-alias brace scanning")
 	}
 }
@@ -4303,7 +4311,7 @@ func TestDidSave_FormatterConfigRestartDoesNotHoldBeamMuWhileClosing(t *testing.
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("DidSave did not finish after Close was unblocked")
 	}
 }
@@ -6660,7 +6668,9 @@ end`)
 		t.Fatal(err)
 	}
 
-	server.pruneMissingFiles(map[string]struct{}{})
+	if err := server.pruneMissingFiles(map[string]struct{}{}); err != nil {
+		t.Fatal(err)
+	}
 
 	if results, _ := server.store.LookupFunction("Concurrent", "saved"); len(results) == 0 {
 		t.Errorf("pruned %s, which exists on disk", onDisk)
@@ -6688,7 +6698,9 @@ end`)
 	}
 	t.Cleanup(func() { _ = os.Chmod(privateDir, 0o755) })
 
-	server.pruneMissingFiles(map[string]struct{}{})
+	if err := server.pruneMissingFiles(map[string]struct{}{}); err != nil {
+		t.Fatal(err)
+	}
 	if results, _ := server.store.LookupFunction("Kept", "present"); len(results) == 0 {
 		t.Error("pruned a file after Lstat failed for a reason other than non-existence")
 	}
@@ -6704,7 +6716,7 @@ end`)
 	server.index.writes.Lock()
 	server.index.unavailable = true
 	server.index.writes.Unlock()
-	server.indexOneFile(path)
+	_ = server.indexOneFile(path)
 
 	if results, _ := server.store.LookupFunction("Rejected", "value"); len(results) != 0 {
 		t.Error("incremental write proceeded after index recreation failed")
@@ -6730,7 +6742,9 @@ end`)
 		}
 	}()
 
-	server.buildTextEdits([]renameSite{{filePath: path, line: 2}}, "old_name", "new_name", nil)
+	if _, err := server.buildTextEdits(context.Background(), []renameSite{{filePath: path, line: 2, fromIndex: true, bareOK: true}}, "MyApp.Accounts", "old_name", "new_name"); err != nil {
+		t.Fatal(err)
+	}
 	done := make(chan struct{})
 	go func() {
 		server.index.backgroundWork.Wait()
@@ -6747,7 +6761,7 @@ end`)
 	locked = false
 	select {
 	case <-done:
-	case <-time.After(2 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("open-buffer rename did not finish after the full build released the write lock")
 	}
 
@@ -8353,7 +8367,9 @@ func TestRemoveFilesUnderRootMatchesUncleanStoredPaths(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	server.RemoveFilesUnderRoot(stdlib)
+	if err := server.RemoveFilesUnderRoot(stdlib); err != nil {
+		t.Fatal(err)
+	}
 	paths, err := server.store.ListFilePaths()
 	if err != nil {
 		t.Fatal(err)

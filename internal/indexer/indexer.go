@@ -259,6 +259,9 @@ func FullBuild(s *store.Store, projectRoot string, opts Options) (Stats, error) 
 		drain(resultCh)
 		return stats, restoreIndexes(s, fmt.Errorf("begin bulk insert: %w", err))
 	}
+	// A panic must not leave the bulk transaction open with the SQLite write
+	// lock; after Commit or an earlier Rollback this does nothing.
+	defer func() { _ = batch.Rollback() }()
 
 	// A write failure inside the bulk transaction is not recoverable, so it ends
 	// the build rather than being warned about. The files row is written before

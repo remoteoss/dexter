@@ -239,6 +239,52 @@ func ScanKeywordOptionValue(source []byte, tokens []Token, n, from int, key stri
 	return TokenText(source, tokens[afterColon]), afterColon + 1, true
 }
 
+// ScanImportOptionKeys returns the indexes of the keys of the only: and
+// except: lists of an import (`import Mod, only: [a: 1, b: 2]`), which can go
+// over several lines. from is the token after the module name. An only: atom
+// (:functions, :macros) gives no keys.
+func ScanImportOptionKeys(source []byte, tokens []Token, n, from int) (only, except []int) {
+	if from >= n || tokens[from].Kind != TokComma {
+		return nil, nil
+	}
+	depth := 0
+	list := ""
+	lastSig := TokComma
+	for i := from + 1; i < n; i++ {
+		t := tokens[i]
+		switch t.Kind {
+		case TokEOF, TokDo, TokEnd:
+			return only, except
+		case TokEOL, TokComment:
+			// A statement goes on after a comma, a colon, or an open bracket.
+			if depth == 0 && lastSig != TokComma && lastSig != TokColon {
+				return only, except
+			}
+			continue
+		case TokOpenBracket, TokOpenParen, TokOpenBrace:
+			depth++
+		case TokCloseBracket, TokCloseParen, TokCloseBrace:
+			depth--
+			if depth < 0 {
+				return only, except
+			}
+		case TokIdent:
+			if i+1 < n && tokens[i+1].Kind == TokColon {
+				switch name := TokenText(source, t); {
+				case depth == 0:
+					list = name
+				case depth == 1 && list == "only":
+					only = append(only, i)
+				case depth == 1 && list == "except":
+					except = append(except, i)
+				}
+			}
+		}
+		lastSig = t.Kind
+	}
+	return only, except
+}
+
 // ScanMultiAliasChildren collects child module names from `alias Parent.{A, B}`.
 // It expects `from` to point at the token after the parent module expression.
 // When stopAtStatement is true, it aborts on statement keywords inside the brace

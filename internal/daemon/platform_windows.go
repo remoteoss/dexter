@@ -78,10 +78,10 @@ func configureDetachedProcess(attr **syscall.SysProcAttr) {
 	}
 }
 
-// findDaemonProcess is not implemented on Windows: the platform is best-effort,
-// and the pid in a refusal or the idle timeout covers this case.
-func findDaemonProcess(string) (int, bool) {
-	return 0, false
+// findDaemonProcesses is not implemented on Windows: the platform is
+// best-effort, and the pid in a refusal or the idle timeout covers this case.
+func findDaemonProcesses(string) []int {
+	return nil
 }
 
 // processAlive reports whether pid names a live process.

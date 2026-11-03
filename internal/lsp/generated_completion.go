@@ -239,7 +239,7 @@ func (s *Server) generatedFunctionsFor(module, knownBeam string) []beam.Function
 			}
 			s.debugf("Generated BEAM resolve: module=%s source=generated hint=%s build_root=%s", module, hint, buildRoot)
 		} else {
-			sourcePath = moduleResults[0].FilePath
+			sourcePath = firstPath(moduleResults)
 			sourceStamp = statFileStamp(sourcePath)
 			if !sourceStamp.exists {
 				s.debugf("Generated BEAM resolve: module=%s indexed source missing path=%s", module, sourcePath)
@@ -291,7 +291,7 @@ func (s *Server) generatedModuleHint(module string) string {
 		}
 		candidate = candidate[:dot]
 		if results, err := s.store.LookupModule(candidate); err == nil && len(results) > 0 {
-			return results[0].FilePath
+			return firstPath(results)
 		}
 	}
 }
