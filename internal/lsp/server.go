@@ -8306,6 +8306,11 @@ type renameSite struct {
 	// at the line defines itself: an unqualified occurrence with one of
 	// them, or whose arity cannot be read, is that module's own function.
 	localArities map[int]bool
+	// ownArities, when set, are the arities that the renamed module defines
+	// of the name, for a line in the module itself: an unqualified call of
+	// another arity is a function that the module imports, and stays. A
+	// call whose arity cannot be read changes.
+	ownArities map[int]bool
 }
 
 type textReindex struct {
@@ -9017,8 +9022,12 @@ func (s *Server) findBareCallRefs(module, functionName string) []store.Reference
 		return nil
 	}
 	defFilePaths := make(map[string]bool, len(defResults))
+	own := make(map[int]bool, len(defResults))
 	for _, r := range defResults {
+		// A type's arity counts too: its uses in typespecs are references
+		// of the type kind.
 		defFilePaths[r.FilePath] = true
+		own[r.Arity] = true
 	}
 	var refs []store.ReferenceResult
 	for filePath := range defFilePaths {
@@ -9033,7 +9042,9 @@ func (s *Server) findBareCallRefs(module, functionName string) []store.Reference
 		// it is recorded under its own kind — the same split the indexed refs
 		// use. A nested or a sibling module in the file does not see the
 		// module's functions unqualified (see siteCollector.collect).
-		for _, lineNum := range findBareCallLines(p.src, p.tokens, p.interp, functionName) {
+		// A call of an arity that the module does not define is a function
+		// that it imports.
+		for _, lineNum := range ownBareCallLines(p, functionName, own) {
 			if enclosing := p.moduleAt(lineNum); enclosing != "" && enclosing != module {
 				continue
 			}

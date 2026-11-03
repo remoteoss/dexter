@@ -78,6 +78,9 @@ func (c *siteCollector) add(site renameSite) {
 			// row of the line does not.
 			have.localArities = site.localArities
 		}
+		if have.ownArities == nil {
+			have.ownArities = site.ownArities
+		}
 		if siteIsDeclaration(have.kind) && !siteIsDeclaration(site.kind) {
 			have.kind = site.kind
 		}
@@ -258,6 +261,7 @@ func (c *siteCollector) collect(module, functionName string, injectors []string)
 		return fmt.Errorf("cannot rename %s.%s: the index query failed (%v); nothing was renamed", module, functionName, err)
 	}
 	defFilePaths := make(map[string]bool)
+	ownArities := make(map[int]bool)
 	for _, r := range defResults {
 		switch r.Kind {
 		case "type", "typep", "opaque":
@@ -265,6 +269,7 @@ func (c *siteCollector) collect(module, functionName string, injectors []string)
 			continue
 		}
 		defFilePaths[r.FilePath] = true
+		ownArities[r.Arity] = true
 		c.add(renameSite{module: module, filePath: r.FilePath, line: r.Line, fromIndex: true, bareOK: true, kind: siteDefinition})
 	}
 	// An unqualified call on a line of a file that imports the module is the
@@ -381,7 +386,7 @@ func (c *siteCollector) collect(module, functionName string, injectors []string)
 		// the same file can have its own function of the same name.
 		for _, lineNum := range findBareCallLines(p.src, p.tokens, p.interp, functionName) {
 			if inModule(filePath, lineNum) {
-				c.add(renameSite{module: module, filePath: filePath, line: lineNum, bareOK: true, kind: kindAt(p, lineNum)})
+				c.add(renameSite{module: module, filePath: filePath, line: lineNum, bareOK: true, kind: kindAt(p, lineNum), ownArities: ownArities})
 			}
 		}
 	}
@@ -492,4 +497,37 @@ func (c *siteCollector) collect(module, functionName string, injectors []string)
 		c.add(site)
 	}
 	return nil
+}
+
+// ownBareCallLines is findBareCallLines for the file of a module that
+// defines name with the arities own: a line whose calls of name all have a
+// known arity that is not one of them calls a function that the module
+// imports, and is left out. A call whose arity cannot be read stays.
+func ownBareCallLines(p *parsedSource, name string, own map[int]bool) []int {
+	lines := findBareCallLines(p.src, p.tokens, p.interp, name)
+	if len(own) == 0 || len(lines) == 0 {
+		return lines
+	}
+	foreign := make(map[int]bool)
+	mine := make(map[int]bool)
+	for i, t := range p.tokens {
+		if t.Kind != parser.TokIdent || parser.TokenText(p.src, t) != name {
+			continue
+		}
+		if i > 0 && p.tokens[i-1].Kind == parser.TokDot {
+			continue
+		}
+		if lo, hi, known := tokenArity(p.src, p.tokens, i); known && !anyArityIn(own, lo, hi) {
+			foreign[t.Line] = true
+		} else {
+			mine[t.Line] = true
+		}
+	}
+	out := lines[:0:0]
+	for _, l := range lines {
+		if mine[l] || !foreign[l] {
+			out = append(out, l)
+		}
+	}
+	return out
 }

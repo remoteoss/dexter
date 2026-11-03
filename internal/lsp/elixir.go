@@ -2725,8 +2725,8 @@ func FindModuleAttributeDefinition(text string, attrName string) (int, bool) {
 }
 
 // findBareCallLines returns the 1-based lines of the unqualified calls to
-// functionName in the tokens of source, direct calls like functionName(...)
-// and pipe calls like |> functionName. Definition lines are excluded.
+// functionName in the tokens of source: functionName(...), functionName arg,
+// |> functionName, and &functionName/1. Definition lines are excluded.
 func findBareCallLines(source []byte, tokens, interp []parser.Token, functionName string) []int {
 	n := len(tokens)
 
@@ -2779,6 +2779,10 @@ func findBareCallLines(source []byte, tokens, interp []parser.Token, functionNam
 		}
 		// A capture without a module: &functionName/arity
 		if !isCall && i > 0 && tokens[i-1].Kind == parser.TokOther && parser.TokenText(source, tokens[i-1]) == "&" {
+			isCall = true
+		}
+		// A call without parentheses: functionName arg, ...
+		if !isCall && parser.NoParenArgCount(source, tokens, i) >= 0 {
 			isCall = true
 		}
 		// Check for pipe call: |> functionName

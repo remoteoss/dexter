@@ -348,6 +348,21 @@ func (s *Server) siteColumns(sf *siteFile, site renameSite, lineText, token stri
 		}
 		cols = kept
 	}
+	if site.ownArities != nil && len(cols) > 0 {
+		sf.ensureTokens()
+		kept := cols[:0:0]
+		for _, c := range cols {
+			if _, qualified := qualifierBefore(lineText, c); !qualified {
+				if i, ok := sf.tokenIndex[sf.lineStarts[site.line-1]+c]; ok {
+					if lo, hi, known := tokenArity(sf.tf.source, sf.tf.tokens, i); known && !anyArityIn(site.ownArities, lo, hi) {
+						continue
+					}
+				}
+			}
+			kept = append(kept, c)
+		}
+		cols = kept
+	}
 	if sf.arities == nil || len(cols) == 0 {
 		return cols
 	}
@@ -463,6 +478,10 @@ func tokenArity(src []byte, toks []parser.Token, i int) (lo, hi int, known bool)
 		}
 		if piped() {
 			return 1, 1, true // `value |> f`
+		}
+		// Counted as the parser counts it for the index.
+		if n := parser.NoParenArgCount(src, toks, i); n >= 0 {
+			return n, n, true
 		}
 		return 0, 0, false
 	}

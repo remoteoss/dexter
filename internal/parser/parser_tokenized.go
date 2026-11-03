@@ -1441,9 +1441,10 @@ func copyImportFilters(m map[string]importFilter) map[string]importFilter {
 }
 
 // callArity returns the arity of the unqualified call whose name is at pos:
-// the arguments in its parentheses (trailing keyword pairs are one), one
-// more for a value piped into it and one more for a do block. It returns -1
-// when the call has no parentheses, so the tokens do not show the arity.
+// the arguments in its parentheses, or after it with no parentheses
+// (trailing keyword pairs are one), one more for a value piped into it and
+// one more for a do block. It returns -1 when the tokens do not show the
+// arity (a name alone can be a variable or a call with no arguments).
 func callArity(source []byte, tokens []Token, n, pos int) int {
 	if a := captureArity(source, tokens, n, pos); a >= 0 {
 		return a
@@ -1457,7 +1458,7 @@ func callArity(source []byte, tokens []Token, n, pos int) int {
 		if piped {
 			return 1 // `value |> name`
 		}
-		return -1
+		return NoParenArgCount(source, tokens, pos)
 	}
 	args := CallArgCount(tokens, open)
 	if args < 0 {
@@ -1523,6 +1524,86 @@ scan:
 	}
 	if next := closeIdx + 1; next < n && tokens[next].Kind == TokDo && ownsDoBlock(tokens, open-1) {
 		args++
+	}
+	return args
+}
+
+// NoParenArgCount counts the arguments of a call written without
+// parentheses, `name a, b` or `Mod.name a, b` (trailing keyword pairs are
+// one, and a do block that the call owns is one more), with the name at
+// tokens[pos]. It returns -1 when the tokens after the name do not start an
+// argument on the same line after a space, so the name is not surely such a
+// call (`name`, `name.field`, `name[0]`, `name + 1`, `name in list`).
+func NoParenArgCount(source []byte, tokens []Token, pos int) int {
+	n := len(tokens)
+	j := pos + 1
+	if j >= n || tokens[j].Start == tokens[pos].End {
+		return -1
+	}
+	switch tokens[j].Kind {
+	case TokIdent:
+		switch TokenText(source, tokens[j]) {
+		case "in", "and", "or", "not", "when":
+			return -1
+		}
+	case TokModule, TokString, TokHeredoc, TokSigil, TokCharLiteral, TokNumber, TokAtom,
+		TokOpenBracket, TokOpenBrace, TokPercent, TokAttr, TokFn:
+	default:
+		return -1
+	}
+	depth := 0
+	args := 0
+	inKeywords := false
+	argStart := true
+scan:
+	for i := j; i < n; i++ {
+		t := tokens[i]
+		switch t.Kind {
+		case TokComment:
+			continue
+		case TokEOF:
+			break scan
+		case TokEOL:
+			if depth > 0 {
+				continue
+			}
+			// A line that ends with a comma continues the arguments.
+			if prev := prevSigToken(tokens, i-1); prev >= 0 && tokens[prev].Kind == TokComma {
+				continue
+			}
+			break scan
+		}
+		if depth == 0 {
+			switch t.Kind {
+			case TokDo:
+				if ownsDoBlock(tokens, pos) {
+					args++
+				}
+				break scan
+			case TokEnd, TokCloseParen, TokCloseBracket, TokCloseBrace, TokRightArrow, TokWhen:
+				break scan
+			}
+		}
+		if argStart && depth == 0 {
+			argStart = false
+			isKey := t.Kind == TokIdent && i+1 < n && tokens[i+1].Kind == TokColon
+			if !isKey || !inKeywords {
+				args++
+			}
+			if isKey {
+				inKeywords = true
+			}
+		}
+		switch t.Kind {
+		case TokOpenParen, TokOpenBracket, TokOpenBrace, TokDo, TokFn:
+			depth++
+		case TokCloseParen, TokCloseBracket, TokCloseBrace, TokEnd:
+			depth--
+		case TokComma:
+			if depth == 0 {
+				argStart = true
+			}
+		}
 	}
 	return args
 }

@@ -30,6 +30,24 @@ end
 			notWant: []string{"Q.where:5:call"},
 		},
 		{
+			name: "call without parentheses",
+			src: `defmodule A do
+  import Q, only: [from: 2]
+  def from(x), do: x
+
+  def a do
+    from :x
+  end
+
+  def b do
+    from :x, :y
+  end
+end
+`,
+			want:    []string{"Q.from:2:import_only", "Q.from:10:call"},
+			notWant: []string{"Q.from:6:call"},
+		},
+		{
 			name: "only list over several lines",
 			src: `defmodule A do
   import Q,
@@ -222,7 +240,9 @@ func TestCallArity(t *testing.T) {
 		{"g(f(a)) do\n :ok\nend", 1},
 		{"f(fn x -> x end, b)", 2},
 		{"f(\n  a,\n  b\n)", 2},
-		{"f a", -1},
+		{"f a", 1},
+		{"f a, b: 1", 2},
+		{"f", -1},
 		{"&f/3", 3},
 	}
 	for _, tt := range tests {

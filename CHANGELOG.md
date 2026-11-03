@@ -40,6 +40,7 @@
 
 ### Fixed
 
+- **Calls without parentheses have an arity** — `foo a, b` is `foo/2` for the index, references, and rename, as `foo(a, b)` is. In a module that defines `foo/1` and imports another `foo`, a call `foo x` was a reference of the imported function, and a rename of either function changed the wrong calls, so the code did not compile. A rename of a module's own function also changed the unqualified calls of an imported function of the same name with another arity
 - **`import unquote(__MODULE__)` in a `__using__` quote** — `unquote` evaluates `__MODULE__` where the macro is defined, so the quote imports the module that defines `__using__`, but Dexter skipped it: go-to-definition, completion, references, and rename did not reach the unqualified calls of its functions in the modules that use it. It is now read as that module, also as `unquote(__MODULE__).Sub`, in `alias` and `use`, and in the helper bodies of an atom dispatch (`use MyAppWeb, :controller`)
 
 - **Functions after an attribute read with `fn ... end` on one line went to the wrong module** — a line such as `validate_change(:levels, fn f, v -> check(v, @levels) end)` counted its `fn` twice, so the module did not close at its `end` and every later function of the file was indexed under the nested module

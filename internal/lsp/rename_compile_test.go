@@ -92,11 +92,20 @@ func TestRename_CompilesAfterEachRename(t *testing.T) {
 		}
 		after("rename "+from, indexed)
 	}
+	// A module's own fetch/3 next to an imported fetch/1: only the calls of
+	// arity 3 are its own, also without parentheses.
+	headlessFn("Shop.Plain", "fetch", "triple")
+	plain := readFile(t, lib("plain.ex"))
+	for _, want := range []string{"do: fetch(id)", "|> fetch()", "&fetch/1", "    fetch id\n", "do: triple(1, 2, 3)", "    triple 1, 2, 3\n", "defp triple(a, b, c)"} {
+		if !strings.Contains(plain, want) {
+			t.Errorf("plain.ex does not have %q:\n%s", want, plain)
+		}
+	}
 	headlessFn("Shop.Accounts", "fetch", "load")
 	// A plain import: the unqualified calls, the pipe, and the capture of
-	// the imported fetch/1 change; the module's own fetch/3 stays.
-	plain := readFile(t, lib("plain.ex"))
-	for _, want := range []string{"do: load(id)", "|> load()", "&load/1", "do: load(1, a: 1, b: 2)", "id |> load", "case load(id) do", "do: fetch(1, 2, 3)", "defp fetch(a, b, c)"} {
+	// the imported fetch/1 change; the module's own function stays.
+	plain = readFile(t, lib("plain.ex"))
+	for _, want := range []string{"do: load(id)", "|> load()", "&load/1", "do: load(1, a: 1, b: 2)", "id |> load", "case load(id) do", "    load id\n", "do: triple(1, 2, 3)", "    triple 1, 2, 3\n", "defp triple(a, b, c)"} {
 		if !strings.Contains(plain, want) {
 			t.Errorf("plain.ex does not have %q:\n%s", want, plain)
 		}

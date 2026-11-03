@@ -21,5 +21,15 @@ defmodule Shop.Plain do
   end
   def local, do: fetch(1, 2, 3)
 
+  # Calls without parentheses: the arity tells the imported fetch/1 from
+  # the module's own fetch/3.
+  def no_parens(id) do
+    fetch id
+  end
+
+  def no_parens_local do
+    fetch 1, 2, 3
+  end
+
   defp fetch(a, b, c), do: {a, b, c}
 end
