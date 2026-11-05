@@ -15,8 +15,8 @@ import (
 )
 
 // The index after a large rename must equal a cold build of the files on
-// disk, and the batched reindex must be much faster than one transaction for
-// each file.
+// disk, and the reindex must write the files in batches, not in one
+// transaction for each file.
 func TestRename_LargeReindexIsBatchedAndMatchesColdBuild(t *testing.T) {
 	if testing.Short() {
 		t.Skip("writes 2,000 files")
@@ -95,10 +95,12 @@ func TestRename_LargeReindexIsBatchedAndMatchesColdBuild(t *testing.T) {
 		}
 	}
 	touch()
+	gen := st.WriteGeneration()
 	start := time.Now()
 	<-core.reindexAfterRename(nil, paths, nil)
-	batched := time.Since(start)
+	batched, batchedTx := time.Since(start), st.WriteGeneration()-gen
 	touch()
+	gen = st.WriteGeneration()
 	start = time.Now()
 	core.index.reindexing.Lock()
 	core.index.writes.RLock()
@@ -107,9 +109,14 @@ func TestRename_LargeReindexIsBatchedAndMatchesColdBuild(t *testing.T) {
 	}
 	core.index.writes.RUnlock()
 	core.index.reindexing.Unlock()
-	oneByOne := time.Since(start)
-	t.Logf("reindex of %d files: batched %v, one by one %v", len(paths), batched, oneByOne)
-	if batched*2 > oneByOne {
-		t.Errorf("the batched reindex (%v) is not much faster than one by one (%v)", batched, oneByOne)
+	oneByOne, oneByOneTx := time.Since(start), st.WriteGeneration()-gen
+	// Wall time is only logged: under -race on a shared runner, parsing
+	// dominates both runs. The write transactions show the batching.
+	t.Logf("reindex of %d files: batched %v in %d transactions, one by one %v in %d", len(paths), batched, batchedTx, oneByOne, oneByOneTx)
+	if oneByOneTx < uint64(len(paths)) {
+		t.Fatalf("one by one wrote %d transactions for %d files", oneByOneTx, len(paths))
+	}
+	if batchedTx*20 > oneByOneTx {
+		t.Errorf("the batched reindex wrote %d transactions, one by one %d: it is not batched", batchedTx, oneByOneTx)
 	}
 }
