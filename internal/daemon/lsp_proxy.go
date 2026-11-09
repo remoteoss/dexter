@@ -97,15 +97,15 @@ type lspProxy struct {
 	exitOnce sync.Once
 
 	// stateMu guards the session state. It is never held during I/O.
-	stateMu       sync.Mutex
-	initialize    []byte // the initialize request body
-	initID        []byte
-	initAnswered  bool
-	initialized   []byte // the initialized frame
-	config        []byte // the last didChangeConfiguration frame
-	docs          map[string]*proxyDoc
-	docSeq        uint64
-	pending       map[string]string // ids of requests the daemon has not answered → method
+	stateMu      sync.Mutex
+	initialize   []byte // the initialize request body
+	initID       []byte
+	initAnswered bool
+	initialized  []byte // the initialized frame
+	config       []byte // the last didChangeConfiguration frame
+	docs         map[string]*proxyDoc
+	docSeq       uint64
+	pending      map[string]string // ids of requests the daemon has not answered → method
 	// serverPending holds the ids of the daemon's requests that the editor
 	// has not answered, as the editor got them → the daemon's id (nil when
 	// they are the same). After a reconnect the proxy gives the editor ids
