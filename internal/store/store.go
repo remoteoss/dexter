@@ -503,12 +503,20 @@ func (s *Store) IndexFile(path string, defs []parser.Definition) error {
 }
 
 func (s *Store) IndexFileWithRefs(path string, defs []parser.Definition, refs []parser.Reference) error {
-	defer s.wrote()
 	info, err := os.Stat(path)
 	if err != nil {
 		return err
 	}
-	return s.indexFileWithMtime(path, info.ModTime().UnixNano(), defs, refs)
+	return s.IndexFileWithRefsAt(path, info.ModTime().UnixNano(), defs, refs)
+}
+
+// IndexFileWithRefsAt is IndexFileWithRefs with the mtime that the caller
+// read before it parsed the file. A save between that stat and the parse then
+// leaves the row older than the disk, and the next pass reads it again; a stat
+// after the parse would give the old text the new mtime.
+func (s *Store) IndexFileWithRefsAt(path string, mtimeNano int64, defs []parser.Definition, refs []parser.Reference) error {
+	defer s.wrote()
+	return s.indexFileWithMtime(path, mtimeNano, defs, refs)
 }
 
 // BufferMtime is the mtime stored for a file indexed from an editor buffer

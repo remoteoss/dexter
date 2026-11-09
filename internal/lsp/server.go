@@ -975,6 +975,10 @@ func (s *Server) indexOneFile(path string) error {
 // Go's RWMutex is not reentrant, so the two must stay separate. A file that
 // does not parse is not a write failure: no retry can change it, and the next
 // save or pass reads it again.
+// testHookAfterParse, when set by a test, runs in indexOneFileLocked after
+// the parse and before the write.
+var testHookAfterParse func(path string)
+
 func (s *Server) indexOneFileLocked(path string) error {
 	// Watchers and editors report changes in nested worktrees, below
 	// symlinked directories, and outside the roots too. The full walk never
@@ -984,15 +988,26 @@ func (s *Server) indexOneFileLocked(path string) error {
 	if !s.Indexable(path) {
 		return nil
 	}
+	// The stat comes first; see store.IndexFileWithRefsAt. A file that cannot
+	// be read is what the parse reported before: no retry can change it.
+	info, err := os.Stat(path)
+	if err != nil {
+		log.Printf("Error parsing %s: %v", path, err)
+		s.index.failures.fail(path, err)
+		return nil
+	}
 	defs, refs, err := parser.ParseFile(path)
 	if err != nil {
 		log.Printf("Error parsing %s: %v", path, err)
 		s.index.failures.fail(path, err)
 		return nil
 	}
+	if testHookAfterParse != nil {
+		testHookAfterParse(path)
+	}
 	err = testWriteFault(path)
 	if err == nil {
-		err = s.store.IndexFileWithRefs(path, defs, refs)
+		err = s.store.IndexFileWithRefsAt(path, info.ModTime().UnixNano(), defs, refs)
 	}
 	if err != nil {
 		log.Printf("Error indexing %s: %v", path, err)

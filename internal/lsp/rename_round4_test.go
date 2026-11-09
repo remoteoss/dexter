@@ -250,3 +250,31 @@ func TestRename_HeadlessDoesNotWaitForALongIndexPass(t *testing.T) {
 	}
 	a.index.backgroundWork.Wait()
 }
+
+// A save between the parse of a file and the write of its rows must leave the
+// rows older than the disk, so that the next pass reads the file again. A
+// stat after the parse gave the old text the mtime of the new.
+func TestReconcileFile_SaveDuringTheParseIsReadAgain(t *testing.T) {
+	dir := t.TempDir()
+	servers, st := sessionsAt(t, dir, 1)
+	a := servers[0]
+	indexFile(t, st, dir, "lib/alpha.ex", safetyDefA)
+	path := filepath.Join(dir, "lib/alpha.ex")
+	old := time.Now().Add(-time.Minute)
+	_ = os.Chtimes(path, old, old)
+	t.Cleanup(func() { testHookAfterParse = nil })
+	testHookAfterParse = func(string) {
+		testHookAfterParse = nil
+		writeFile(t, path, strings.Replace(safetyDefA, "foo", "saved", 1))
+	}
+	if err := a.ReconcileFile(path); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mtime, ok := st.GetFileMtime(path); !ok || mtime == info.ModTime().UnixNano() {
+		t.Fatalf("stored mtime %d (ok %v) equals the disk's after a save during the parse", mtime, ok)
+	}
+}
