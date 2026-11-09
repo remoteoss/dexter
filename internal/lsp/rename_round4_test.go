@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"go.lsp.dev/uri"
 )
 
 // renameFiles indexes files (rel → before), renames module.foo to bar
@@ -156,4 +158,56 @@ func TestRename_MultiLineImportOptions(t *testing.T) {
 			"defmodule MyApp.Macros do\n  import MyApp.Alpha, only: :macros\n\n  def foo(x), do: x\n  def run, do: foo(1)\nend\n",
 		},
 	})
+}
+
+// A file that the requesting session opens after the plan read it is decided
+// again before the commit, as a file that another editor opens: the editor
+// requester gets a refusal (its buffer would not get the edit), and a
+// headless rename stops for unsaved changes in it.
+func TestRename_FileOpenedInTheRequesterAfterThePlan(t *testing.T) {
+	cases := map[string]struct {
+		headless bool
+		buffer   string
+		want     string // "" when the rename goes on
+	}{
+		"editor":            {buffer: safetyDefA, want: filepath.Join("lib", "alpha.ex") + " while the rename ran"},
+		"headless, unsaved": {headless: true, buffer: safetyDefA + "# unsaved\n", want: filepath.Join("lib", "alpha.ex") + " has unsaved changes in an editor"},
+		"headless, clean":   {headless: true, buffer: safetyDefA},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			servers, st := sessionsAt(t, dir, 1)
+			a := servers[0]
+			indexFile(t, st, dir, "lib/alpha.ex", safetyDefA)
+			indexFile(t, st, dir, "lib/beta.ex", safetyCallB)
+			aPath := filepath.Join(dir, "lib/alpha.ex")
+			bPath := filepath.Join(dir, "lib/beta.ex")
+			t.Cleanup(func() { renameTestHookBeforeStage = nil })
+			renameTestHookBeforeStage = func() { openIn(t, a, aPath, c.buffer) }
+			var err error
+			if c.headless {
+				_, err = a.RenameFunctionHeadless(context.Background(), "MyApp.Alpha", "foo", "bar")
+			} else {
+				openIn(t, a, bPath, safetyCallB)
+				_, err = a.RenameEdit(context.Background(), renameParams(string(uri.File(bPath)), 1, 28, "bar"))
+			}
+			a.index.backgroundWork.Wait()
+			if c.want == "" {
+				if err != nil {
+					t.Fatalf("rename: %v", err)
+				}
+				if got := readFile(t, aPath); !strings.Contains(got, "def bar(") {
+					t.Errorf("alpha.ex was not renamed:\n%s", got)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("want a refusal containing %q, got %v", c.want, err)
+			}
+			if got := readFile(t, aPath); got != safetyDefA {
+				t.Errorf("alpha.ex changed:\n%s", got)
+			}
+		})
+	}
 }

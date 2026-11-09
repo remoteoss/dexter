@@ -706,17 +706,23 @@ func (s *Server) commitDisk(txn *diskTxn, requester renameRequester) (*commitRes
 }
 
 // recheckOpenFiles decides each file of txn again, now that editors cannot
-// open or change documents (the caller holds renameMu). It costs one registry
-// lookup for each file that no other editor has open.
+// open or change documents (the caller holds renameMu): this session's
+// editor, or another, may have opened one since the plan. It costs one
+// registry lookup and one lookup in this session for each file that no
+// editor has open.
 func (s *Server) recheckOpenFiles(txn *diskTxn, requester renameRequester) error {
 	var unsaved unsavedFiles
 	var moved, opened []string
 	for _, c := range txn.changes {
+		here, openHere := s.docs.GetIfOpen(pathKey(c.from))
 		others := s.index.openDocs.heldTexts(s.docs, c.from)
-		if len(others) == 0 {
+		if openHere && requester != requesterEditor {
+			others = append(others, here)
+		}
+		if !openHere && len(others) == 0 {
 			continue
 		}
-		switch renameFileAction(requester, false, others, c.orig, c.from != c.to) {
+		switch renameFileAction(requester, openHere, others, c.orig, c.from != c.to) {
 		case actionDisk:
 		case actionRefuse:
 			unsaved.add(c.from)
@@ -734,7 +740,7 @@ func (s *Server) recheckOpenFiles(txn *diskTxn, requester renameRequester) error
 	}
 	if len(opened) > 0 {
 		sort.Strings(opened)
-		msg := fmt.Sprintf("Dexter: the rename was not applied, because another editor opened %s while the rename ran. No file was changed; rename again.",
+		msg := fmt.Sprintf("Dexter: the rename was not applied, because an editor opened %s while the rename ran. No file was changed; rename again.",
 			notify.Summarize(opened))
 		s.renameNotify(notify.Error, msg)
 		return errors.New(strings.TrimPrefix(msg, "Dexter: "))
