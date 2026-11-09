@@ -146,15 +146,16 @@ func newLSPProxy(ctx context.Context, root string, in io.Reader, out io.Writer, 
 func (p *lspProxy) run(conn net.Conn, reader *bufio.Reader) error {
 	p.conn = conn
 	go p.readEditor()
+	daemonDone := p.startReadDaemon(conn, reader)
 	for {
-		p.readDaemon(conn, reader)
+		<-daemonDone
 		_ = conn.Close()
 		if p.ending() {
 			p.endSession()
 			return nil
 		}
 		var err error
-		conn, reader, err = p.reconnect()
+		conn, daemonDone, err = p.reconnect()
 		if err != nil {
 			if p.ending() {
 				p.endSession()
@@ -431,6 +432,17 @@ func (p *lspProxy) serverResponse(id []byte) (stale bool, daemonID []byte) {
 	return false, nil
 }
 
+// startReadDaemon runs readDaemon and returns a channel that is closed when
+// the daemon stream ends.
+func (p *lspProxy) startReadDaemon(conn net.Conn, reader *bufio.Reader) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		p.readDaemon(conn, reader)
+	}()
+	return done
+}
+
 // readDaemon forwards the daemon's messages to the editor until the daemon
 // stream ends.
 func (p *lspProxy) readDaemon(conn net.Conn, reader *bufio.Reader) {
@@ -602,7 +614,7 @@ func (p *lspProxy) showError(message string) {
 // reconnect answers the requests that the stopped daemon left open, reaches a
 // daemon again, and replays the session on it. On failure it tells the editor
 // why.
-func (p *lspProxy) reconnect() (net.Conn, *bufio.Reader, error) {
+func (p *lspProxy) reconnect() (net.Conn, <-chan struct{}, error) {
 	p.connMu.Lock()
 	p.conn = nil
 	p.connMu.Unlock()
@@ -670,7 +682,7 @@ func (p *lspProxy) reconnect() (net.Conn, *bufio.Reader, error) {
 			}
 			continue
 		}
-		reader, err = p.replay(conn, reader)
+		daemonDone, err := p.replay(conn, reader)
 		if err != nil {
 			_ = conn.Close()
 			lastErr = err
@@ -678,7 +690,7 @@ func (p *lspProxy) reconnect() (net.Conn, *bufio.Reader, error) {
 			continue
 		}
 		log.Printf("LSP proxy: reconnected to the workspace daemon")
-		return conn, reader, nil
+		return conn, daemonDone, nil
 	}
 	if p.ending() {
 		return nil, nil, errors.New("the editor ended the session")
@@ -748,8 +760,11 @@ func splitFrame(frame []byte) ([]byte, []byte, bool) {
 
 // replay rebuilds the session on a new daemon connection and then makes it
 // the current one. The editor's messages wait on connMu meanwhile, so none is
-// lost and none overtakes the replay.
-func (p *lspProxy) replay(conn net.Conn, reader *bufio.Reader) (*bufio.Reader, error) {
+// lost and none overtakes the replay. After the answer to initialize, the
+// daemon's messages are read while the replay writes (the returned channel
+// closes when they end): a daemon that answers each document while the
+// proxy does not read would fill the socket and block both sides.
+func (p *lspProxy) replay(conn net.Conn, reader *bufio.Reader) (<-chan struct{}, error) {
 	p.connMu.Lock()
 	defer p.connMu.Unlock()
 
@@ -796,6 +811,7 @@ func (p *lspProxy) replay(conn net.Conn, reader *bufio.Reader) (*bufio.Reader, e
 			return nil, err
 		}
 	}
+	daemonDone := p.startReadDaemon(conn, reader)
 	for _, frame := range [][]byte{initialized, config} {
 		if frame == nil {
 			continue
@@ -836,7 +852,7 @@ func (p *lspProxy) replay(conn net.Conn, reader *bufio.Reader) (*bufio.Reader, e
 		}
 	}
 	p.conn = conn
-	return reader, nil
+	return daemonDone, nil
 }
 
 // awaitResponse reads the new daemon's messages until the answer to the

@@ -687,6 +687,51 @@ func initializedHarness(t *testing.T) (*proxyHarness, *lspEditor) {
 	return h, daemon
 }
 
+// TestProxyReadsTheDaemonWhileItReplays: a daemon answers each replayed
+// document with diagnostics before it reads the next message. If the proxy
+// did not read while it wrote the documents, both sides would block on the
+// socket (net.Pipe has no buffer, so the first write shows it).
+func TestProxyReadsTheDaemonWhileItReplays(t *testing.T) {
+	h, daemon := initializedHarness(t)
+	const docs = 3
+	for i := range docs {
+		uri := fmt.Sprintf("file:///p/lib/doc%d.ex", i)
+		h.editor.notify("textDocument/didOpen", map[string]any{"textDocument": map[string]any{"uri": uri, "languageId": "elixir", "version": 1, "text": "x"}})
+		expectMethod(t, daemon, "textDocument/didOpen")
+	}
+	next := h.nextDaemonRaw()
+	_ = daemon.w.(net.Conn).Close()
+	opened := make(chan error, 1)
+	go func() {
+		seen := 0
+		for seen < docs {
+			m, err := next.read()
+			if err != nil {
+				opened <- err
+				return
+			}
+			switch m["method"] {
+			case "initialize":
+				next.send(map[string]any{"id": m["id"], "result": map[string]any{}})
+			case "textDocument/didOpen":
+				seen++
+				params, _ := m["params"].(map[string]any)
+				doc, _ := params["textDocument"].(map[string]any)
+				next.send(map[string]any{"method": "textDocument/publishDiagnostics", "params": map[string]any{"uri": doc["uri"], "diagnostics": []any{}}})
+			}
+		}
+		opened <- nil
+	}()
+	select {
+	case err := <-opened:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the replay blocked: the proxy did not read the daemon while it wrote")
+	}
+}
+
 // TestProxyReplayQueueKeepsWhatItCouldNotSend: when the new daemon goes away
 // while the proxy sends it the requests that waited, the request whose write
 // failed is answered, and the ones after it go to the next daemon instead of
