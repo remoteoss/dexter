@@ -476,11 +476,13 @@ func tokenArity(src []byte, toks []parser.Token, i int) (lo, hi int, known bool)
 		if head {
 			return 0, 0, true
 		}
-		if piped() {
-			return 1, 1, true // `value |> f`
-		}
 		// Counted as the parser counts it for the index.
-		if n := parser.NoParenArgCount(src, toks, i); n >= 0 {
+		n := parser.NoParenArgCount(src, toks, i)
+		if piped() {
+			n = 1 + max(n, 0) // `value |> f`, `value |> f arg`
+			return n, n, true
+		}
+		if n >= 0 {
 			return n, n, true
 		}
 		return 0, 0, false
@@ -968,24 +970,12 @@ func isCallToken(src []byte, toks []parser.Token, i int, interp bool) bool {
 			}
 		}
 	}
-	if i+1 < len(toks) {
-		switch toks[i+1].Kind {
-		case parser.TokOpenParen:
-			return true
-		case parser.TokIdent:
-			// A call without parentheses, `foo arg`, but not an operator
-			// word after a variable: `foo in list`, `foo and bar`.
-			switch parser.TokenText(src, toks[i+1]) {
-			case "in", "and", "or", "not", "when":
-				return false
-			}
-			return toks[i+1].Line == t.Line
-		case parser.TokNumber, parser.TokString, parser.TokHeredoc, parser.TokSigil,
-			parser.TokAtom, parser.TokModule, parser.TokPercent, parser.TokCharLiteral:
-			return toks[i+1].Line == t.Line
-		}
+	if i+1 < len(toks) && toks[i+1].Kind == parser.TokOpenParen {
+		return true
 	}
-	return false
+	// A call without parentheses, `foo arg`, by the rule that the parser
+	// and findBareCallLines use, so that the line and the column agree.
+	return parser.NoParenArgCount(src, toks, i) >= 0
 }
 
 // anyArityIn reports whether arities has an arity from lo to hi.

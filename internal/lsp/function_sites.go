@@ -244,10 +244,10 @@ func prevCodeByte(text string, pos int) int {
 // mayStartNoParenArg reports whether c can start the first argument of a
 // call without parentheses: a name, a module, a number, a string, a
 // charlist, a sigil, a character, an atom, a list, a tuple, a map or
-// struct, or an attribute.
+// struct, an attribute, a bitstring, or a capture.
 func mayStartNoParenArg(c byte) bool {
 	switch c {
-	case '"', '\'', '~', '?', ':', '[', '{', '%', '@':
+	case '"', '\'', '~', '?', ':', '[', '{', '%', '@', '<', '&':
 		return true
 	}
 	return isIdentByte(c)

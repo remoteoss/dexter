@@ -984,9 +984,9 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 				}
 			}
 
-			// Unqualified calls with parentheses, and captures, on a def
-			// line: a one-line body (`def f(x), do: cast(x)`), a guard, a
-			// default argument.
+			// Unqualified calls, with or without parentheses, and captures,
+			// on a def line: a one-line body (`def f(x), do: cast(x)`,
+			// `do: cast x`), a guard, a default argument.
 			// The walk skips the rest of the line, and the declared name is
 			// not a call.
 			if len(injectors) > 0 && lineStart < lineEnd && isDefinitionToken(tokens[lineStart].Kind) {
@@ -995,7 +995,7 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 					if j == nameIdx || tokens[j].Kind != TokIdent || tokens[j-1].Kind == TokDot || tokens[j-1].Kind == TokPipe {
 						continue
 					}
-					if tokens[j+1].Kind != TokOpenParen && captureArity(source, tokens, n, j) < 0 {
+					if tokens[j+1].Kind != TokOpenParen && captureArity(source, tokens, n, j) < 0 && NoParenArgCount(source, tokens, j) < 0 {
 						continue
 					}
 					name := tokenText(tokens[j])
@@ -1464,10 +1464,12 @@ func callArity(source []byte, tokens []Token, n, pos int) int {
 	}
 	open := pos + 1
 	if open >= n || tokens[open].Kind != TokOpenParen {
+		args := NoParenArgCount(source, tokens, pos)
 		if piped {
-			return 1 // `value |> name`
+			// `value |> name`, `value |> name arg`
+			return 1 + max(args, 0)
 		}
-		return NoParenArgCount(source, tokens, pos)
+		return args
 	}
 	args := CallArgCount(tokens, open)
 	if args < 0 {
@@ -1491,6 +1493,7 @@ func CallArgCount(tokens []Token, open int) int {
 	inKeywords := false
 	argStart := true
 	closeIdx := -1
+	angles := 0 // open bitstrings, whose commas separate segments
 scan:
 	for i := open + 1; i < n; i++ {
 		t := tokens[i]
@@ -1499,8 +1502,10 @@ scan:
 			continue
 		case TokEOF:
 			return -1
+		case TokOpenAngle, TokCloseAngle:
+			angles = bitstringDepth(tokens, i, angles)
 		}
-		if argStart && depth == 0 && t.Kind != TokCloseParen {
+		if argStart && depth == 0 && angles == 0 && t.Kind != TokCloseParen {
 			argStart = false
 			isKey := t.Kind == TokIdent && i+1 < n && tokens[i+1].Kind == TokColon
 			if !isKey || !inKeywords {
@@ -1523,7 +1528,7 @@ scan:
 			}
 			depth--
 		case TokComma:
-			if depth == 0 {
+			if depth == 0 && angles == 0 {
 				argStart = true
 			}
 		}
@@ -1557,6 +1562,22 @@ func NoParenArgCount(source []byte, tokens []Token, pos int) int {
 		}
 	case TokModule, TokString, TokHeredoc, TokSigil, TokCharLiteral, TokNumber, TokAtom,
 		TokOpenBracket, TokOpenBrace, TokPercent, TokAttr, TokFn:
+	case TokOpenAngle:
+		// `name <<1, 2>>`, but not `name <<< 1`.
+		if bitstringDepth(tokens, j, 0) == 0 {
+			return -1
+		}
+	case TokOther:
+		// A capture, `name &other/1` or `name &(&1 + 1)`. A unary minus
+		// (`name -1`) is left out: after a variable it is a subtraction.
+		if TokenText(source, tokens[j]) != "&" || j+1 >= n || tokens[j+1].Start != tokens[j].End {
+			return -1
+		}
+		switch tokens[j+1].Kind {
+		case TokIdent, TokModule, TokOpenParen, TokNumber:
+		default:
+			return -1
+		}
 	default:
 		return -1
 	}
@@ -1564,9 +1585,14 @@ func NoParenArgCount(source []byte, tokens []Token, pos int) int {
 	args := 0
 	inKeywords := false
 	argStart := true
+	angles := 0
 scan:
 	for i := j; i < n; i++ {
 		t := tokens[i]
+		switch t.Kind {
+		case TokOpenAngle, TokCloseAngle:
+			angles = bitstringDepth(tokens, i, angles)
+		}
 		switch t.Kind {
 		case TokComment:
 			continue
@@ -1582,7 +1608,7 @@ scan:
 			}
 			break scan
 		}
-		if depth == 0 {
+		if depth == 0 && angles == 0 {
 			switch t.Kind {
 			case TokDo:
 				if ownsDoBlock(tokens, pos) {
@@ -1593,7 +1619,7 @@ scan:
 				break scan
 			}
 		}
-		if argStart && depth == 0 {
+		if argStart && depth == 0 && angles == 0 {
 			argStart = false
 			isKey := t.Kind == TokIdent && i+1 < n && tokens[i+1].Kind == TokColon
 			if !isKey || !inKeywords {
@@ -1609,12 +1635,29 @@ scan:
 		case TokCloseParen, TokCloseBracket, TokCloseBrace, TokEnd:
 			depth--
 		case TokComma:
-			if depth == 0 {
+			if depth == 0 && angles == 0 {
 				argStart = true
 			}
 		}
 	}
 	return args
+}
+
+// bitstringDepth returns the count of open bitstrings after tokens[i], a
+// `<<` or `>>`, when angles were open before it. `<<<` and `>>>` (Bitwise)
+// tokenize as `<<` or `>>` with an operator byte right after; they open and
+// close nothing, nor does a `>>` with no `<<` open.
+func bitstringDepth(tokens []Token, i, angles int) int {
+	if i+1 < len(tokens) && tokens[i+1].Kind == TokOther && tokens[i+1].Start == tokens[i].End {
+		return angles
+	}
+	if tokens[i].Kind == TokOpenAngle {
+		return angles + 1
+	}
+	if angles > 0 {
+		return angles - 1
+	}
+	return angles
 }
 
 // ownsDoBlock reports whether a do block after the call whose name is

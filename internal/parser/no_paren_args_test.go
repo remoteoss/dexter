@@ -24,6 +24,16 @@ func TestNoParenArgCount(t *testing.T) {
 		{"foo + 1\n", -1},
 		{"foo in list\n", -1},
 		{"foo(1)\n", -1},
+		// A comma in a bitstring separates segments, not arguments.
+		{"foo x, <<a, b>>\n", 2},
+		{"foo <<1, 2>>\n", 1},
+		{"foo <<< 1\n", -1},
+		{"foo x >>> 1, y\n", 2},
+		// A capture is an argument; a unary minus is not surely one.
+		{"foo &bar/1\n", 1},
+		{"foo &(&1 + 1), x\n", 2},
+		{"foo && bar\n", -1},
+		{"foo -1\n", -1},
 	}
 	for _, tt := range tests {
 		toks := Tokenize([]byte(tt.src))

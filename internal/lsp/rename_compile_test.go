@@ -101,6 +101,24 @@ func TestRename_CompilesAfterEachRename(t *testing.T) {
 			t.Errorf("plain.ex does not have %q:\n%s", want, plain)
 		}
 	}
+	// A module's own function called without parentheses, with each kind of
+	// first argument.
+	headlessFn("Shop.NoParens", "process", "handle")
+	noParens := readFile(t, lib("no_parens.ex"))
+	for _, want := range []string{"def handle(x)", "do: handle [1, 2]", "do: handle {1, 2}", "do: handle @items", "do: handle fn y", "do: handle <<1, 2>>", "    handle [1, 2]\n"} {
+		if !strings.Contains(noParens, want) {
+			t.Errorf("no_parens.ex does not have %q:\n%s", want, noParens)
+		}
+	}
+	// Its own fetch/1 next to the imported fetch/2: the arity of a call with
+	// a bitstring, and of a piped call, tells them apart.
+	headlessFn("Shop.NoParens", "fetch", "unpack")
+	noParens = readFile(t, lib("no_parens.ex"))
+	for _, want := range []string{"do: unpack(<<x, 1>>)", "x |> unpack\n", "do: fetch(<<x, 1>>, [])", "only: [fetch: 2]", "defp unpack(bin)"} {
+		if !strings.Contains(noParens, want) {
+			t.Errorf("no_parens.ex does not have %q:\n%s", want, noParens)
+		}
+	}
 	headlessFn("Shop.Accounts", "fetch", "load")
 	// A plain import: the unqualified calls, the pipe, and the capture of
 	// the imported fetch/1 change; the module's own function stays.
@@ -108,6 +126,12 @@ func TestRename_CompilesAfterEachRename(t *testing.T) {
 	for _, want := range []string{"do: load(id)", "|> load()", "&load/1", "do: load(1, a: 1, b: 2)", "id |> load", "case load(id) do", "    load id\n", "do: triple(1, 2, 3)", "    triple 1, 2, 3\n", "defp triple(a, b, c)"} {
 		if !strings.Contains(plain, want) {
 			t.Errorf("plain.ex does not have %q:\n%s", want, plain)
+		}
+	}
+	noParens = readFile(t, lib("no_parens.ex"))
+	for _, want := range []string{"only: [load: 2]", "do: load(<<x, 1>>, [])", "do: unpack(<<x, 1>>)", "do: load id\n", "only: [load: 1]"} {
+		if !strings.Contains(noParens, want) {
+			t.Errorf("no_parens.ex does not have %q:\n%s", want, noParens)
 		}
 	}
 	// An import from a __using__ quote, where the only call has no

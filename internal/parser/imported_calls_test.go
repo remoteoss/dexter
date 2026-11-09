@@ -65,6 +65,21 @@ end
 			notWant: []string{"S.fetch:10:call", "Q.fetch:10:call"},
 		},
 		{
+			name: "arity of bitstring, piped, and def-line calls without parentheses",
+			src: `defmodule A do
+  import Q
+  def pack(bin), do: bin
+  def cast(a, b), do: {a, b}
+  def a(x), do: pack(<<x, 1>>)
+  def b(x), do: x |> cast :y
+  def c(x), do: cast x
+  def d(x), do: pack(<<x, 1>>, 2)
+end
+`,
+			want:    []string{"Q.cast:7:call", "Q.pack:8:call"},
+			notWant: []string{"Q.pack:5:call", "Q.cast:6:call"},
+		},
+		{
 			name: "only list over several lines",
 			src: `defmodule A do
   import Q,
@@ -261,6 +276,11 @@ func TestCallArity(t *testing.T) {
 		{"f a, b: 1", 2},
 		{"f", -1},
 		{"&f/3", 3},
+		{"f(a, <<b, c>>)", 2},
+		{"f(<<b::size(8), c>>)", 1},
+		{"f(a >>> 1, b <<< 2)", 2},
+		{"x |> f a", 2},
+		{"x |> f a, b", 3},
 	}
 	for _, tt := range tests {
 		src := []byte(tt.src)
