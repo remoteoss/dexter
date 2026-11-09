@@ -63,6 +63,9 @@ type event struct {
 	kind eventKind
 	path string
 	done chan error
+	// checkSpelling asks for the spelling check of path whatever the age of
+	// the file (see reconcilePath).
+	checkSpelling bool
 }
 
 // Runtime owns one workspace store, its index mutation coordinator, its native
@@ -618,7 +621,7 @@ func (r *Runtime) ReindexPath(ctx context.Context, path string) error {
 // awaitPath queues one path mutation and waits for the batch that included it.
 func (r *Runtime) awaitPath(ctx context.Context, path string) error {
 	done := make(chan error, 1)
-	if !r.send(event{kind: eventPath, path: path, done: done}) {
+	if !r.send(event{kind: eventPath, path: path, done: done, checkSpelling: true}) {
 		return errors.New("workspace is shutting down")
 	}
 	select {
@@ -789,6 +792,7 @@ func (r *Runtime) loop() {
 	for {
 		ev := <-r.events
 		paths := make(map[string]struct{})
+		spelling := make(map[string]struct{}) // paths to check the spelling of always
 		oldStdlibRoots := make(map[string]struct{})
 		full := false
 		stop := false
@@ -797,6 +801,9 @@ func (r *Runtime) loop() {
 			switch e.kind {
 			case eventPath:
 				paths[e.path] = struct{}{}
+				if e.checkSpelling {
+					spelling[e.path] = struct{}{}
+				}
 			case eventFull:
 				full = true
 			case eventStdlib:
@@ -903,7 +910,8 @@ func (r *Runtime) loop() {
 			}
 			if guardErr := r.guard("an index update", func() {
 				for path := range paths {
-					batchErr = errors.Join(batchErr, r.reconcilePath(path))
+					_, check := spelling[path]
+					batchErr = errors.Join(batchErr, r.reconcilePath(path, check))
 				}
 			}); guardErr != nil {
 				batchErr = errors.Join(batchErr, guardErr)
@@ -1076,7 +1084,7 @@ const spellingCheckAge = 2 * time.Second
 // reconciled.
 var testHookReconcilePath func(path string)
 
-func (r *Runtime) reconcilePath(path string) error {
+func (r *Runtime) reconcilePath(path string, checkSpelling bool) error {
 	if testHookReconcilePath != nil {
 		testHookReconcilePath(path)
 	}
@@ -1088,14 +1096,24 @@ func (r *Runtime) reconcilePath(path string) error {
 		return nil
 	}
 	info, err := os.Stat(path)
-	if err == nil && (info.IsDir() || time.Since(info.ModTime()) > spellingCheckAge) && !pathcase.SpelledBelow(r.root, path) {
+	disk := ""
+	if err == nil && (checkSpelling || info.IsDir() || time.Since(info.ModTime()) > spellingCheckAge) {
+		if spelled, differs := pathcase.SpellingBelow(r.root, path); differs {
+			disk = spelled
+		}
+	}
+	if disk != "" {
 		// The old spelling after a rename that changed only the case: a stat
 		// finds the new one. It is gone. A rename keeps the mtime of a file,
 		// while a save makes it new, so a file written in the last moments,
 		// which is what most events are, is not checked: the check costs an
-		// open and an fcntl. The prune of the next full reconcile checks
-		// every path that its walk did not see.
+		// open and an fcntl. An explicit request is checked always. The
+		// prune of the next full reconcile checks every path that its walk
+		// did not see.
 		err = os.ErrNotExist
+		if info.IsDir() {
+			disk = "" // the watcher reports the directory's new spelling
+		}
 	}
 	if err != nil {
 		if lsp.IsMissing(err) {
@@ -1112,7 +1130,13 @@ func (r *Runtime) reconcilePath(path string) error {
 			if listErr != nil {
 				return listErr
 			}
-			return r.core.RemoveFiles(append(under, path))
+			removeErr := r.core.RemoveFiles(append(under, path))
+			if disk != "" {
+				// The file is there under its new spelling, maybe with
+				// text that a save under the old one just wrote.
+				return errors.Join(removeErr, r.reconcilePath(disk, false))
+			}
+			return removeErr
 		}
 		return err
 	}

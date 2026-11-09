@@ -1701,6 +1701,11 @@ func (s *Server) DidSave(ctx context.Context, params *protocol.DidSaveTextDocume
 	if !parser.IsElixirFile(path) {
 		return nil
 	}
+	// After a rename that changed only the case (`mv Foo.ex foo.ex`), an
+	// editor can still save its buffer under the old spelling, which a stat
+	// finds. Indexed under that spelling, the file would have two rows. A
+	// save is rare, so it pays the open and fcntl that a watcher event skips.
+	path, _ = pathcase.SpellingBelow(s.projectRoot, path)
 
 	if s.workspaceEvents != nil {
 		s.workspaceEvents.ReconcileFile(path)

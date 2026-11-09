@@ -19,20 +19,29 @@ import (
 // always true and costs nothing. On macOS it costs one open and one fcntl, so
 // callers use it only for paths that are already suspect.
 func SpelledBelow(root, path string) bool {
+	_, differs := SpellingBelow(root, path)
+	return !differs
+}
+
+// SpellingBelow returns path with the components below root in the spelling
+// that the file system stores, and true, when that spelling differs from
+// path in case alone. Otherwise it returns path and false, under the rules
+// and at the cost of SpelledBelow.
+func SpellingBelow(root, path string) (string, bool) {
 	if !caseInsensitive {
-		return true
+		return path, false
 	}
 	rel, err := filepath.Rel(root, path)
 	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return true
+		return path, false
 	}
 	stored, ok := storedPath(path)
 	if !ok || len(stored) <= len(rel) {
-		return true
+		return path, false
 	}
 	tail := stored[len(stored)-len(rel):]
-	if stored[len(stored)-len(rel)-1] != filepath.Separator || tail == rel {
-		return true
+	if stored[len(stored)-len(rel)-1] != filepath.Separator || tail == rel || !strings.EqualFold(tail, rel) {
+		return path, false
 	}
-	return !strings.EqualFold(tail, rel)
+	return filepath.Join(root, tail), true
 }

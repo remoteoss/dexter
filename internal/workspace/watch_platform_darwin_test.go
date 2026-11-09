@@ -3,6 +3,7 @@
 package workspace
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -666,5 +667,50 @@ func TestFSEventsMovedDirectoryMatchesTheFullWalk(t *testing.T) {
 			t.Fatalf("FSEvents did not report %v after the rename", missing)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestReindexPathUsesTheSpellingOnDisk: after a rename that changed only the
+// case, an editor can save its buffer under the old spelling, which a stat
+// finds. The file must keep one row, under the spelling on disk.
+func TestReindexPathUsesTheSpellingOnDisk(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv("SHELL", "/bin/false")
+	root := t.TempDir()
+	skipCaseSensitive(t, root)
+	old := filepath.Join(root, "lib", "Foo.ex")
+	renamed := filepath.Join(root, "lib", "foo.ex")
+	writeTestModule(t, root, "lib/Foo.ex", "SharedLib.Foo")
+	rt, err := OpenWithOptions(root, Options{NoWatch: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rt.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := rt.WaitReady(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(old, renamed); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.ReindexPath(ctx, renamed); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(old, []byte("defmodule SharedLib.Foo do\n  def x, do: 1\nend\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.ReindexPath(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	paths, err := rt.Store().ListFilePathsUnder(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(paths, []string{renamed}) {
+		t.Fatalf("indexed paths = %v, want only %s", paths, renamed)
+	}
+	if defs, _ := rt.Store().LookupFunction("SharedLib.Foo", "x"); len(defs) != 1 {
+		t.Fatalf("SharedLib.Foo.x = %v, want the saved text indexed", defs)
 	}
 }
