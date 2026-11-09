@@ -265,6 +265,24 @@ func TestProxyReplaysAnInitializeThatWasNotAnswered(t *testing.T) {
 	}
 }
 
+// TestProxyAnswersAnOpenInitializeWhenItCannotReconnect: reconnect keeps an
+// unanswered initialize for the replay. When no daemon can be reached, the
+// editor must still get an answer to it, as at a failed start.
+func TestProxyAnswersAnOpenInitializeWhenItCannotReconnect(t *testing.T) {
+	root := t.TempDir()
+	h, daemon := newProxyHarness(t, root)
+	h.editor.request(1, "initialize", map[string]any{"capabilities": map[string]any{}})
+	expectMethod(t, daemon, "initialize")
+	h.dials <- func() (net.Conn, *bufio.Reader, error) {
+		return nil, nil, &IncompatibleDaemonError{Reason: "daemon contract 99", DaemonContract: ContractVersion + 1}
+	}
+	_ = daemon.w.(net.Conn).Close()
+	assertConnectionLost(t, h, "older Dexter build")
+	if res := h.editor.response(1); res["error"] == nil {
+		t.Fatalf("initialize answer = %v, want an error", res)
+	}
+}
+
 // TestProxyTellsTheEditorWhenANewerDaemonTookOver: an older proxy cannot
 // attach to the daemon of a newer build. The editor must be told, and the
 // proxy must exit with an error, not 0.

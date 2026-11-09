@@ -675,9 +675,18 @@ func permanentDialError(err error) bool {
 }
 
 // fail tells the editor that the session cannot continue, answers what is
-// still open, and returns the error to exit with.
+// still open, and returns the error to exit with. What is open includes an
+// initialize that reconnect kept for the replay, and requests that a failed
+// replay sent.
 func (p *lspProxy) fail(message string, err error) error {
 	p.showError(message)
+	p.stateMu.Lock()
+	open := p.pending
+	p.pending = make(map[string]string)
+	if p.initialize != nil && !p.initAnswered {
+		open[string(p.initID)] = "initialize"
+	}
+	p.stateMu.Unlock()
 	p.connMu.Lock()
 	queue := p.queue
 	p.queue = nil
@@ -688,8 +697,11 @@ func (p *lspProxy) fail(message string, err error) error {
 			continue
 		}
 		if msg := peekMessage(body); msg.isRequest() {
-			p.answerError(msg.id, lspInternalError, message)
+			open[string(msg.id)] = msg.method
 		}
+	}
+	for id := range open {
+		p.answerError([]byte(id), lspInternalError, message)
 	}
 	return &LSPConnectionLostError{Message: message, Err: err}
 }
