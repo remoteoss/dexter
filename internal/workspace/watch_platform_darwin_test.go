@@ -401,6 +401,29 @@ func TestFSEventsWorktreeLifecycle(t *testing.T) {
 
 // sendWithoutBlocking is a PathChanged callback that never blocks the timer
 // goroutine that calls it, even after the test stops reading.
+// A renamed file is checked for its spelling on disk even when it is new: a
+// tool that writes a file and renames it in another case at once would leave
+// a row under the old spelling.
+func TestFSEventsSendsARenamedFileToTheSpellingCheck(t *testing.T) {
+	root := t.TempDir()
+	var changed, renamed []string
+	w := &fseventsWatcher{
+		root:      root,
+		eventRoot: root,
+		callbacks: WatchCallbacks{
+			PathChanged: func(path string) { changed = append(changed, path) },
+			PathRenamed: func(path string) { renamed = append(renamed, path) },
+		},
+	}
+	edited := filepath.Join(root, "lib", "edited.ex")
+	old := filepath.Join(root, "lib", "fresh.ex")
+	w.handle(fsevents.Event{Path: edited, Flags: fsevents.ItemIsFile | fsevents.ItemModified})
+	w.handle(fsevents.Event{Path: old, Flags: fsevents.ItemIsFile | fsevents.ItemCreated | fsevents.ItemRenamed})
+	if !slices.Equal(changed, []string{edited}) || !slices.Equal(renamed, []string{old}) {
+		t.Fatalf("changed = %v, renamed = %v; want [%s] and [%s]", changed, renamed, edited, old)
+	}
+}
+
 func sendWithoutBlocking(changes chan<- string) func(string) {
 	return func(path string) {
 		select {

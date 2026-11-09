@@ -446,3 +446,42 @@ func TestEnsureStartsADaemonWhenTheStoppingOneReleasesItsLock(t *testing.T) {
 		t.Fatalf("Ensure took %s, want about the time until the lock is free", elapsed)
 	}
 }
+
+// TestEnsureWaitsForADaemonThatLostItsSocketFile: the socket file of a live
+// daemon was removed. The daemon stops at its next socket check; Ensure waits
+// for its lock and starts a new daemon instead of failing at once.
+func TestEnsureWaitsForADaemonThatLostItsSocketFile(t *testing.T) {
+	socketTestEnv(t)
+	root := t.TempDir()
+	writeModule(t, root, "lib/one.ex", "SharedLib.One")
+	ownership, _, err := AcquireOwnership(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		time.Sleep(1 * time.Second)
+		_ = ownership.Release()
+	}()
+
+	previousFind := daemonProcessFor
+	daemonProcessFor = func(string) (int, bool) { return 4242, true }
+	previousSpawn := spawnDaemon
+	spawns := 0
+	spawnDaemon = func(root string) (<-chan error, error) {
+		spawns++
+		runDaemonInProcess(t, root)
+		return nil, nil
+	}
+	t.Cleanup(func() { daemonProcessFor, spawnDaemon = previousFind, previousSpawn })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	client, err := Ensure(ctx, root)
+	if err != nil {
+		t.Fatalf("Ensure = %v (%d spawns)", err, spawns)
+	}
+	_ = client.Close()
+	if spawns != 1 {
+		t.Fatalf("spawns = %d, want 1 after the lock was free", spawns)
+	}
+}

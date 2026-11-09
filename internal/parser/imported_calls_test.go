@@ -65,6 +65,22 @@ end
 			notWant: []string{"S.fetch:10:call", "Q.fetch:10:call"},
 		},
 		{
+			name: "access on a variable and calls through a variable",
+			src: `defmodule A do
+  import Q
+
+  def a(key, adapter, socket) do
+    config[key]
+    config [key]
+    adapter.insert(1)
+    socket.assigns.helper(2)
+  end
+end
+`,
+			want:    []string{"Q.config:6:call"},
+			notWant: []string{"Q.config:5:call", "Q.insert:7:call", "Q.helper:8:call"},
+		},
+		{
 			name: "arity of bitstring, piped, and def-line calls without parentheses",
 			src: `defmodule A do
   import Q

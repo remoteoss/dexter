@@ -1245,6 +1245,7 @@ func (r *Runtime) startNativeWatcher() {
 		started := time.Now()
 		watcher, err := startNativeWatch(r.root, WatchCallbacks{
 			PathChanged:   r.ReconcileFile,
+			PathRenamed:   r.ReconcileSavedFile,
 			FullReconcile: func() { r.send(event{kind: eventFull}) },
 			CoverageChanged: func(degraded bool) {
 				r.reportCoverage()

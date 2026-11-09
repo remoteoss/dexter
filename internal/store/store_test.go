@@ -2154,3 +2154,35 @@ func TestWriteGenerationMovesOnEveryWrite(t *testing.T) {
 		}
 	}
 }
+
+// TestListSubmodulesMatchesTheExactPrefix: `_` and case are not wildcards. A
+// rename of MyApp.Api_V1 must not take MyApp.ApiXV1.Sub or MyApp.api_v1.Sub
+// along.
+func TestListSubmodulesMatchesTheExactPrefix(t *testing.T) {
+	s, dir := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	path := writeElixirFile(t, dir, "lib/api.ex", `defmodule MyApp.Api_V1 do
+end
+defmodule MyApp.Api_V1.Sub do
+end
+defmodule MyApp.ApiXV1.Sub do
+end
+defmodule MyApp.api_v1.Sub do
+end
+`)
+	defs, _, err := parser.ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IndexFile(path, defs); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.ListSubmodules("MyApp.Api_V1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != "MyApp.Api_V1.Sub" {
+		t.Fatalf("ListSubmodules = %v, want [MyApp.Api_V1.Sub]", got)
+	}
+}

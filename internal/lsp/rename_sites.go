@@ -267,6 +267,9 @@ type siteFile struct {
 	// the main token stream, for arityOK.
 	arities    *arityFilter
 	tokenIndex map[int]int
+	// typeName holds the offsets of the name tokens in a typespec that are
+	// types: all but the name in a @spec or @callback head.
+	typeName map[int]bool
 }
 
 // ensureTokens tokenizes the file once, on the first line that needs it.
@@ -282,6 +285,23 @@ func (sf *siteFile) ensureTokens() {
 	sf.code = make(map[int]bool)
 	sf.call = make(map[int]bool)
 	sf.tokenIndex = make(map[int]int)
+	sf.typeName = make(map[int]bool)
+	toks, n := res.Tokens, len(res.Tokens)
+	for i := 0; i < n; i++ {
+		kind := toks[i].Kind
+		if kind != parser.TokAttrType && kind != parser.TokAttrSpec && kind != parser.TokAttrCallback {
+			continue
+		}
+		end := parser.ScanTypespecEnd(src, toks, n, i)
+		for j := i + 1; j <= end && j < n; j++ {
+			t := toks[j]
+			head := j == i+1 && kind != parser.TokAttrType
+			if !head && t.Kind == parser.TokIdent && t.End-t.Start == len(name) && string(src[t.Start:t.End]) == name {
+				sf.typeName[t.Start] = true
+			}
+		}
+		i = end
+	}
 	for k, toks := range [][]parser.Token{res.Tokens, res.Interp} {
 		for i, t := range toks {
 			if t.Kind == parser.TokIdent && t.End-t.Start == len(name) && string(src[t.Start:t.End]) == name {
@@ -332,6 +352,18 @@ func (sf *siteFile) codeColumns(line int, cols []int) []int {
 // lists, a single occurrence is the one the index resolved.
 func (s *Server) siteColumns(sf *siteFile, site renameSite, lineText, token string) []int {
 	cols := s.siteColumnsAnyArity(sf, site, lineText, token)
+	if len(cols) > 0 && (site.kind == siteSpec || site.kind == siteTypespec || site.kind == "typespec") {
+		// A type of the function's name is not the function: in a
+		// typespec, only the name of a @spec or @callback head is.
+		sf.ensureTokens()
+		kept := cols[:0:0]
+		for _, c := range cols {
+			if !sf.typeName[sf.lineStarts[site.line-1]+c] {
+				kept = append(kept, c)
+			}
+		}
+		cols = kept
+	}
 	if site.localArities != nil && len(cols) > 0 {
 		sf.ensureTokens()
 		kept := cols[:0:0]

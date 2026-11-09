@@ -2211,9 +2211,11 @@ func (s *Store) SearchSymbolsGrouped(query string, limit int, excludePathPrefix 
 // ListSubmodules returns all modules whose name starts with prefix + ".".
 // Used for cascading module renames (e.g. renaming MyApp.Accounts also catches MyApp.Accounts.User).
 func (s *Store) ListSubmodules(prefix string) ([]string, error) {
+	// A range, not LIKE: LIKE ignores case and takes `_` as a wildcard, so
+	// MyApp.Api_V1 would match MyApp.ApiXV1.Sub.
 	rows, err := s.db.Query(
-		"SELECT DISTINCT module FROM definitions WHERE module LIKE ? AND function = '' ORDER BY module",
-		prefix+".%",
+		"SELECT DISTINCT module FROM definitions WHERE module >= ? AND module < ? AND function = '' ORDER BY module",
+		prefix+".", prefix+"/",
 	)
 	if err != nil {
 		return nil, err

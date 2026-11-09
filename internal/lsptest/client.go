@@ -88,6 +88,9 @@ type Client struct {
 	opened map[string]bool
 	closed bool
 	shown  []ShownMessage
+	// stuck is set when a request times out. Its reader still reads the
+	// server's output, so a later request could not get its own reply.
+	stuck error
 }
 
 // ShownMessage is one window/showMessage the server sent.
@@ -255,6 +258,10 @@ func (c *Client) readMessage() (*message, error) {
 // are answered with a null result so the server never blocks on us.
 func (c *Client) Request(method string, params interface{}) (json.RawMessage, error) {
 	c.mu.Lock()
+	if c.stuck != nil {
+		c.mu.Unlock()
+		return nil, fmt.Errorf("%s: %w", method, c.stuck)
+	}
 	c.nextID++
 	id := c.nextID
 	c.mu.Unlock()
@@ -314,7 +321,11 @@ func (c *Client) Request(method string, params interface{}) (json.RawMessage, er
 		}
 		return out.result, nil
 	case <-time.After(c.timeout):
-		return nil, fmt.Errorf("%s timed out after %s", method, c.timeout)
+		err := fmt.Errorf("%s timed out after %s", method, c.timeout)
+		c.mu.Lock()
+		c.stuck = fmt.Errorf("an earlier request failed: %w", err)
+		c.mu.Unlock()
+		return nil, err
 	}
 }
 

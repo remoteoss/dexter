@@ -51,9 +51,17 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 	// A body is a macro's when its function is a defmacro or defmacrop other
 	// than __using__: a `use` in its quote runs in the caller, while one in a
 	// __using__ or helper quote is a link that the use chain follows.
+	// A body's saved scope is the aliases, injectors, and import filters
+	// before its first alias or import, which are lexical: they end with the
+	// function. A body without one copies nothing.
 	type functionBody struct {
 		depth int
 		macro bool
+
+		saved     bool
+		aliases   map[string]string
+		injectors map[string]bool
+		filters   map[string]importFilter
 	}
 	var macroBodies []functionBody
 	quoteDepth, quoteLine := 0, 0
@@ -91,7 +99,21 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 			}
 		}
 		for len(macroBodies) > 0 && macroBodies[len(macroBodies)-1].depth > depth {
+			if b := macroBodies[len(macroBodies)-1]; b.saved {
+				aliases, injectors, importFilters = b.aliases, b.injectors, b.filters
+			}
 			macroBodies = macroBodies[:len(macroBodies)-1]
+		}
+	}
+	// saveBodyScope saves the scope of the innermost function body before an
+	// alias or import in it changes the scope.
+	saveBodyScope := func() {
+		if len(macroBodies) == 0 {
+			return
+		}
+		if b := &macroBodies[len(macroBodies)-1]; !b.saved && depth >= b.depth {
+			b.saved = true
+			b.aliases, b.injectors, b.filters = copyMap(aliases), copyBoolMap(injectors), copyImportFilters(importFilters)
 		}
 	}
 
@@ -144,8 +166,23 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 		if name == "" {
 			return i
 		}
-		if !strings.Contains(name, ".") && currentModule() != "" {
+		if kind == "defimpl" {
+			// The protocol name is resolved like any module reference; it is
+			// not nested (`defimpl Inspect, for: __MODULE__` inside MyApp.User
+			// implements Inspect).
+			if resolved := ResolveModuleRef(name, aliases, currentModule()); resolved != "" {
+				name = resolved
+			}
+		} else if !strings.Contains(name, ".") && currentModule() != "" {
+			short := name
 			name = currentModule() + "." + name
+			// A nested module is an alias in the module around it, from here
+			// to its end, as if it had `alias Outer.Short`. The frame pushed
+			// below saves the aliases with it, so it lasts after this module
+			// ends.
+			if !quoted {
+				aliases[short] = name
+			}
 		}
 
 		// Always emit the module definition — even `, do:` one-liners must be
@@ -458,7 +495,7 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 					if opensDoBlock(tokens, n, pj) {
 						// The do on this line is counted when the line is walked
 						// below, so the body is one deeper than here.
-						macroBodies = append(macroBodies, functionBody{depth + 1, macro})
+						macroBodies = append(macroBodies, functionBody{depth: depth + 1, macro: macro})
 					} else {
 						inlineMacroLine, inlineMacro = defLine, macro
 					}
@@ -526,6 +563,7 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 			goto extractRefsForLine
 
 		case TokAlias:
+			saveBodyScope()
 			aliasLine := tok.Line
 			i++
 			j := nextSig(i)
@@ -573,6 +611,7 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 			continue
 
 		case TokImport:
+			saveBodyScope()
 			importLine := tok.Line
 			i++
 			j := nextSig(i)
@@ -883,9 +922,10 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 				// A parenthesized bare call can be nested inside another call,
 				// collection, or keyword value. It is still a candidate for a
 				// function imported by use/import, just like a statement-level call.
-				// Qualified and anonymous-function calls have a TokDot before the
-				// opening paren and therefore do not match this fast check.
-				isParenthesizedCall := i+1 < n && tokens[i+1].Kind == TokOpenParen
+				// Anonymous-function calls have a TokDot before the opening paren,
+				// and a qualified or variable call (`adapter.insert(1)`) has one
+				// before the name, so neither matches.
+				isParenthesizedCall := i+1 < n && tokens[i+1].Kind == TokOpenParen && (i == 0 || tokens[i-1].Kind != TokDot)
 				if !isParenthesizedCall && captureArity(source, tokens, n, i) >= 0 {
 					// &name/2 captures the imported function.
 					if name := tokenText(tok); !elixirKeyword[name] {
@@ -931,9 +971,13 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 									// assignments and operators such as `value = 1`.
 									switch tokens[j].Kind {
 									case TokIdent, TokModule, TokString, TokHeredoc, TokSigil,
-										TokCharLiteral, TokNumber, TokOpenBracket, TokOpenBrace,
+										TokCharLiteral, TokNumber, TokOpenBrace,
 										TokPercent:
 										emit = true
+									case TokOpenBracket:
+										// `name [1]` is a call; `name[key]` is access on a
+										// variable.
+										emit = tokens[j].Start > tok.End
 									}
 								}
 							}
@@ -1342,13 +1386,32 @@ func FixParamNames(names []string) []string {
 }
 
 // opensDoBlock reports whether the declaration whose head ends before tokens[from]
-// opens a do-block on its line, rather than taking `, do:` or having no body.
+// opens a do-block, rather than taking `, do:` or having no body. The block
+// opens on the head's line, or after a guard that mix format puts on the next
+// line (`defmacro m(x)` then `when is_atom(x) do`).
 func opensDoBlock(tokens []Token, n, from int) bool {
+	parens := 0
 	for k := from; k < n; k++ {
 		switch tokens[k].Kind {
 		case TokDo:
 			return true
-		case TokComma, TokEOL, TokEOF:
+		case TokOpenParen, TokOpenBracket, TokOpenBrace:
+			parens++
+		case TokCloseParen, TokCloseBracket, TokCloseBrace:
+			parens--
+		case TokComma:
+			if parens <= 0 {
+				return false
+			}
+		case TokEOL:
+			if parens > 0 || tokens[k-1].Kind == TokWhen {
+				continue
+			}
+			if next := NextSigToken(tokens, n, k); next < n && tokens[next].Kind == TokWhen {
+				continue
+			}
+			return false
+		case TokEOF:
 			return false
 		}
 	}

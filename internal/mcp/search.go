@@ -33,7 +33,12 @@ func (h *Handler) search(ctx context.Context, args SearchParams) (string, error)
 	}
 	for _, r := range found.Results {
 		if r.Member != nil {
-			fmt.Fprintf(&b, "%s (%s, %s) - %s:%d\n", symbolName(r.Module, r.Function, r.Arity), r.Kind, h.memberOrigin(r.Module, *r.Member), h.relPath(r.FilePath), r.Line)
+			// A generated member can have no source line to point at.
+			where := "no source location"
+			if r.FilePath != "" {
+				where = fmt.Sprintf("%s:%d", h.relPath(r.FilePath), r.Line)
+			}
+			fmt.Fprintf(&b, "%s (%s, %s) - %s\n", symbolName(r.Module, r.Function, r.Arity), r.Kind, h.memberOrigin(r.Module, *r.Member), where)
 			continue
 		}
 		clauses := ""

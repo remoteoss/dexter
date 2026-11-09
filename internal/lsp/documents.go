@@ -42,6 +42,10 @@ type cachedDoc struct {
 	// LRU and evicted once the transient cap is reached. Editor-owned
 	// entries (created via Set) are never transient and never evicted.
 	transient bool
+	// diskSize and diskMtime are the file's stat before a transient load. A
+	// later hit compares them with the file, so a change on disk is read.
+	diskSize  int64
+	diskMtime time.Time
 	// seq orders editor-owned entries across every store in the process:
 	// the higher one was set later. A frontend without an editor uses it to
 	// pick the newest unsaved buffer when several editors hold one file.
@@ -495,19 +499,33 @@ func (ds *DocumentStore) GetOrLoad(rawURI string) (string, bool) {
 	if doc, ok := ds.docs[uri]; ok {
 		text := doc.text
 		isTransient := doc.transient
+		size, mtime := doc.diskSize, doc.diskMtime
 		ds.mu.RUnlock()
-		if isTransient {
-			ds.bumpLRU(uri)
+		if !isTransient {
+			return text, true
 		}
-		return text, true
+		// No editor owns the file, so nothing tells the store when it
+		// changes on disk. Compare the stat from the load.
+		if info, err := os.Stat(path); err == nil && info.Size() == size && info.ModTime().Equal(mtime) {
+			ds.bumpLRU(uri)
+			return text, true
+		}
+		ds.dropTransient(uri, doc)
+	} else {
+		ds.mu.RUnlock()
 	}
-	ds.mu.RUnlock()
 
 	// Miss: read from disk *outside* the write lock so concurrent
 	// requests for other URIs aren't blocked behind file I/O. We only
 	// fall back to disk for file:// URIs; docKeyPath gives no path for
 	// other schemes (e.g. untitled:).
 	if path == "" {
+		return "", false
+	}
+	// Stat before the read: a write after the stat makes the next hit read
+	// the file again.
+	info, err := os.Stat(path)
+	if err != nil {
 		return "", false
 	}
 	data, err := os.ReadFile(path)
@@ -538,7 +556,7 @@ func (ds *DocumentStore) GetOrLoad(rawURI string) (string, bool) {
 		return existing.text, true
 	}
 
-	ds.docs[uri] = &cachedDoc{uri: rawURI, text: text, transient: true}
+	ds.docs[uri] = &cachedDoc{uri: rawURI, text: text, transient: true, diskSize: info.Size(), diskMtime: info.ModTime()}
 	ds.transientIdx[uri] = ds.transientList.PushFront(uri)
 	ds.evictTransientLocked()
 	return text, true
@@ -553,6 +571,19 @@ func (ds *DocumentStore) bumpLRU(uri string) {
 	if elem, ok := ds.transientIdx[uri]; ok {
 		ds.transientList.MoveToFront(elem)
 	}
+}
+
+// dropTransient removes a transient entry whose file changed on disk. It
+// leaves the entry if an editor opened the file or another load replaced it.
+func (ds *DocumentStore) dropTransient(uri string, doc *cachedDoc) {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	if ds.docs[uri] != doc || !doc.transient {
+		return
+	}
+	ds.removeFromLRULocked(uri)
+	doc.tree.retireLocked()
+	delete(ds.docs, uri)
 }
 
 // removeFromLRULocked removes a URI from LRU tracking. Caller must hold

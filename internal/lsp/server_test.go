@@ -2,6 +2,7 @@ package lsp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -4703,6 +4704,40 @@ end
 	}
 }
 
+func TestDocumentSymbol_EndOnTheSameLine(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule MyApp.A do
+  def foo do :ok end
+  def bar, do: 1
+end
+
+defmodule MyApp.B do
+  test "x" do assert true end
+  def baz do
+    :ok
+  end
+end
+`
+	docURI := "file:///test/inline_end.ex"
+	server.docs.Set(docURI, content)
+
+	symbols := documentSymbols(t, server, docURI)
+	if names := collectNames(symbols); len(names) != 2 || names[0] != "MyApp.A" || names[1] != "MyApp.B" {
+		t.Fatalf("top-level symbols = %v, want [MyApp.A MyApp.B]", names)
+	}
+	if names := collectNames(symbols[0].Children); len(names) != 2 || names[0] != "foo/0" || names[1] != "bar/0" {
+		t.Errorf("MyApp.A children = %v, want [foo/0 bar/0]", names)
+	}
+	if foo := findSymbol(symbols[0].Children, "foo/0"); foo != nil && foo.Range.End.Line != 1 {
+		t.Errorf("foo/0 range ends on line %d, want 1", foo.Range.End.Line)
+	}
+	if findSymbol(symbols[1].Children, "baz/0") == nil {
+		t.Errorf("baz/0 not a child of MyApp.B: %v", collectNames(symbols[1].Children))
+	}
+}
+
 func TestDocumentSymbol_FunctionBodyRanges(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
@@ -8388,4 +8423,40 @@ func (s *Server) buildTextEdits(ctx context.Context, sites []renameSite, module,
 	}
 	defer end()
 	return s.commitTextEdits(s.planTextEdits(sites, []string{module}, nil, oldToken, newToken, requesterEditor))
+}
+
+func TestGetFileLine_AfterALongLine(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	path := filepath.Join(t.TempDir(), "long.ex")
+	content := "defmodule Long do\n  @data \"" + strings.Repeat("x", 100*1024) + "\"\n  def foo, do: :ok\nend\n"
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	line, ok := server.getFileLine(path, 3)
+	if !ok || line != "  def foo, do: :ok" {
+		t.Fatalf("getFileLine = %q, %v; want the line after the long one", line, ok)
+	}
+}
+
+// TestColdBuildFallbackStampsTheIndexVersion: a cold build that falls back to
+// the incremental pass leaves a full index in the current format. Without the
+// version, the next start would take it for an unfinished build and delete it.
+func TestColdBuildFallbackStampsTheIndexVersion(t *testing.T) {
+	testHookFullBuild = func() error { return errors.New("bulk load failed") }
+	t.Cleanup(func() { testHookFullBuild = nil })
+
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+	for i := 0; i < 3; i++ {
+		writeTestFile(t, server.projectRoot, fmt.Sprintf("lib/gen%d.ex", i), moduleSource(i, 0))
+	}
+	reindexOnce(t, server)
+	if r, _ := server.store.LookupFunction("MyApp.Gen2", "run_v0"); len(r) != 1 {
+		t.Fatal("the fallback did not index the files")
+	}
+	if got := server.store.GetIndexVersion(); got != version.IndexVersion {
+		t.Fatalf("index version after the fallback = %d, want %d", got, version.IndexVersion)
+	}
 }

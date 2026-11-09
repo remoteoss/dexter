@@ -469,6 +469,13 @@ func expressionAtCursorImpl(tokens []parser.Token, source []byte, lineStarts []i
 		}
 	}
 
+	// A cursor right after an identifier sits on the next token, such as
+	// `(`, `,` or the end of the line. Use the identifier that ends there.
+	if !isExprToken(tok.Kind) && idx > 0 && tokens[idx-1].End == offset && isExprToken(tokens[idx-1].Kind) {
+		idx--
+		tok = tokens[idx]
+	}
+
 	// Reject non-expression tokens (strings, comments, atoms, etc.)
 	if !isExprToken(tok.Kind) {
 		return CursorContext{}

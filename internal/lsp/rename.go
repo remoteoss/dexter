@@ -280,6 +280,32 @@ func updateDelegateAs(lines []string, startLine int, facadeName, newTargetName s
 	return span, spanStart, spanEnd
 }
 
+// elixirReserved are the words that cannot name a variable.
+var elixirReserved = map[string]bool{
+	"true": true, "false": true, "nil": true, "when": true, "and": true, "or": true,
+	"not": true, "in": true, "fn": true, "do": true, "end": true, "catch": true,
+	"rescue": true, "after": true, "else": true,
+}
+
+// isValidVariableName reports whether name can name a variable or a module
+// attribute: a lowercase letter or `_`, then letters, digits, and `_`, and
+// not a reserved word.
+func isValidVariableName(name string) bool {
+	if name == "" || elixirReserved[name] {
+		return false
+	}
+	for i, r := range name {
+		switch {
+		case r == '_':
+		case i == 0 && !unicode.IsLower(r):
+			return false
+		case !unicode.IsLetter(r) && !unicode.IsDigit(r):
+			return false
+		}
+	}
+	return true
+}
+
 // isValidModuleName returns true if name is a valid Elixir module name.
 func isValidModuleName(name string) bool {
 	if len(name) == 0 {

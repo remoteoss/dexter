@@ -1198,3 +1198,145 @@ func TestUnsavedBufferStaysUnsavedAfterADaemonRestart(t *testing.T) {
 
 // retained reports how many message bytes the document keeps.
 func (d *proxyDoc) retained() int { return len(d.open) + len(d.change) }
+
+// TestProxySendsAnInitializeFromAReconnectOnce: the editor sends initialize
+// while the proxy has no daemon. The replay sends the kept initialize; the
+// queue must not send it a second time, or the editor gets two answers.
+func TestProxySendsAnInitializeFromAReconnectOnce(t *testing.T) {
+	h, daemon := newProxyHarness(t, t.TempDir())
+	release := make(chan struct{})
+	proxySide, daemonSide := net.Pipe()
+	h.dials <- func() (net.Conn, *bufio.Reader, error) {
+		<-release
+		return proxySide, bufio.NewReader(proxySide), nil
+	}
+	next := newLSPEditor(t, daemonSide, daemonSide).pump()
+	_ = daemon.w.(net.Conn).Close()
+	time.Sleep(100 * time.Millisecond) // the proxy waits for a daemon
+	h.editor.request(1, "initialize", map[string]any{"capabilities": map[string]any{}})
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+
+	first := expectMethod(t, next, "initialize")
+	next.send(map[string]any{"id": first["id"], "result": map[string]any{"capabilities": map[string]any{}}})
+	if res := h.editor.response(1); res["error"] != nil {
+		t.Fatalf("initialize answer = %v", res)
+	}
+	h.editor.request(2, "textDocument/hover", map[string]any{})
+	if m := expectMethod(t, next, "textDocument/hover"); m != nil {
+		next.send(map[string]any{"id": m["id"], "result": nil})
+	}
+	for {
+		m, err := h.editor.next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if h.editor.handle(m) {
+			continue
+		}
+		id, _ := idAsInt(m["id"])
+		if id == 1 {
+			t.Fatalf("the editor got a second answer to initialize: %v", m)
+		}
+		if id == 2 {
+			return
+		}
+	}
+}
+
+// TestProxyDoesNotReplayASaveAfterLaterChanges: a save that the editor sends
+// while there is no daemon must not reach the new daemon after the replayed
+// buffer, or the daemon takes the newer, unsaved text as saved.
+func TestProxyDoesNotReplayASaveAfterLaterChanges(t *testing.T) {
+	h, daemon := initializedHarness(t)
+	const uri = "file:///p/lib/a.ex"
+	h.editor.notify("textDocument/didOpen", map[string]any{"textDocument": map[string]any{"uri": uri, "languageId": "elixir", "version": 1, "text": "v1"}})
+	expectMethod(t, daemon, "textDocument/didOpen")
+
+	release := make(chan struct{})
+	proxySide, daemonSide := net.Pipe()
+	h.dials <- func() (net.Conn, *bufio.Reader, error) {
+		<-release
+		return proxySide, bufio.NewReader(proxySide), nil
+	}
+	next := newLSPEditor(t, daemonSide, daemonSide).pump()
+	_ = daemon.w.(net.Conn).Close()
+	time.Sleep(100 * time.Millisecond) // the proxy waits for a daemon
+	change := func(version int, text string) {
+		h.editor.notify("textDocument/didChange", map[string]any{
+			"textDocument":   map[string]any{"uri": uri, "version": version},
+			"contentChanges": []any{map[string]any{"text": text}},
+		})
+	}
+	change(2, "v2")
+	h.editor.notify("textDocument/didSave", map[string]any{"textDocument": map[string]any{"uri": uri}})
+	change(3, "v3")
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+
+	init := expectMethod(t, next, "initialize")
+	next.send(map[string]any{"id": init["id"], "result": map[string]any{}})
+	h.editor.request(2, "textDocument/hover", map[string]any{})
+	var last string
+	for {
+		m, err := next.next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch m["method"] {
+		case "textDocument/didSave":
+			t.Fatalf("the new daemon got a save after the replay; the buffer %q is unsaved", last)
+		case "textDocument/didOpen", "textDocument/didChange":
+			last = textOf(t, m)
+		case "textDocument/hover":
+			if last != "v3" {
+				t.Fatalf("the new daemon has %q, want v3", last)
+			}
+			next.send(map[string]any{"id": m["id"], "result": nil})
+			return
+		}
+	}
+}
+
+// TestProxyPassesARegistrationTheEditorNeverGot: when the first daemon stops
+// before it registers for file watching, the next daemon's registration goes
+// to the editor. Later daemons' registrations are answered by the proxy.
+func TestProxyPassesARegistrationTheEditorNeverGot(t *testing.T) {
+	h, daemon := initializedHarness(t)
+	register := func(side *lspEditor, id int) {
+		side.send(map[string]any{"id": id, "method": "client/registerCapability", "params": map[string]any{"registrations": []any{}}})
+	}
+	reconnect := func(old *lspEditor) *lspEditor {
+		next := h.nextDaemon()
+		_ = old.w.(net.Conn).Close()
+		init := expectMethod(t, next, "initialize")
+		next.send(map[string]any{"id": init["id"], "result": map[string]any{}})
+		return next
+	}
+
+	second := reconnect(daemon)
+	register(second, 7)
+	for {
+		m, err := h.editor.next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if m["method"] == "client/registerCapability" {
+			h.editor.send(map[string]any{"id": m["id"], "result": nil})
+			break
+		}
+	}
+	if res, err := second.next(); err != nil || res["error"] != nil {
+		t.Fatalf("answer to the registration = %v, %v", res, err)
+	}
+
+	third := reconnect(second)
+	register(third, 8)
+	res, err := third.next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id, _ := idAsInt(res["id"]); id != 8 || res["error"] != nil {
+		t.Fatalf("the proxy's answer to a repeated registration = %v", res)
+	}
+}

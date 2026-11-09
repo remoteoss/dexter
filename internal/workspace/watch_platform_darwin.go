@@ -33,6 +33,10 @@ type fseventsWatcher struct {
 	wg        sync.WaitGroup
 	closeOnce sync.Once
 	closed    atomic.Bool
+	// stop ends the loop. The events channel stays open: the FSEvents
+	// callback sends on it without a check, so a close could make a late
+	// callback panic.
+	stop chan struct{}
 
 	// tops are the nested worktrees this watcher knows, from git's records at
 	// start and from .git files and directories that appear later. FSEvents
@@ -85,7 +89,7 @@ func startFSEventsWatcher(root string, callbacks WatchCallbacks) (*fseventsWatch
 	if err := stream.Start(); err != nil {
 		return nil, err
 	}
-	w := &fseventsWatcher{root: absRoot, eventRoot: eventRoot, stream: stream, callbacks: callbacks}
+	w := &fseventsWatcher{root: absRoot, eventRoot: eventRoot, stream: stream, callbacks: callbacks, stop: make(chan struct{})}
 	for _, dir := range parser.NestedWorktreeTops(absRoot, eventRoot) {
 		w.tops.add(dir)
 	}
@@ -99,7 +103,7 @@ func (w *fseventsWatcher) Close() error {
 		w.closed.Store(true)
 		w.stream.Flush(true)
 		w.stream.Stop()
-		close(w.stream.Events)
+		close(w.stop)
 		w.wg.Wait()
 	})
 	return nil
@@ -109,9 +113,14 @@ func (w *fseventsWatcher) Degraded() bool { return false }
 
 func (w *fseventsWatcher) loop() {
 	defer w.wg.Done()
-	for events := range w.stream.Events {
-		for _, event := range events {
-			w.callbacks.handleSafely(func() { w.handle(event) })
+	for {
+		select {
+		case events := <-w.stream.Events:
+			for _, event := range events {
+				w.callbacks.handleSafely(func() { w.handle(event) })
+			}
+		case <-w.stop:
+			return
 		}
 	}
 }
@@ -195,6 +204,12 @@ func (w *fseventsWatcher) handle(event fsevents.Event) {
 	base := filepath.Base(path)
 	manifest := base == "mix.lock" || base == "mix.exs"
 	if parser.IsElixirFile(path) || manifest || flags&(fsevents.ItemRemoved|fsevents.ItemRenamed) != 0 {
+		if flags&fsevents.ItemRenamed != 0 && w.callbacks.PathRenamed != nil {
+			// A file renamed soon after a write is too new for the age rule
+			// of the spelling check.
+			w.callbacks.PathRenamed(path)
+			return
+		}
 		w.callbacks.PathChanged(path)
 	}
 }

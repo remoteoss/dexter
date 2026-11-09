@@ -47,6 +47,20 @@ end`)
 	}
 }
 
+func TestFindVariableOccurrences_CursorAtEndOfVariable(t *testing.T) {
+	src := []byte(`defmodule MyApp do
+  def process(data) do
+    transform(data)
+  end
+end`)
+
+	// Cursor right after "data", before ")"
+	occs := FindVariableOccurrences(src, 2, 18)
+	if len(occs) != 2 {
+		t.Fatalf("expected 2 occurrences of 'data', got %d", len(occs))
+	}
+}
+
 func TestFindVariableOccurrences_NotOnVariable(t *testing.T) {
 	src := []byte(`defmodule MyApp do
   def process(data) do

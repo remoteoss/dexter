@@ -70,7 +70,9 @@ func TestReferences_MatchRenameSites(t *testing.T) {
 		if family, err := s.renameFamily(f.module, f.name); err != nil || family.behaviour != "" {
 			continue
 		}
-		locs, err := s.ReferenceNames(f.module, f.name, NameReferenceOptions{FollowDelegates: true, ExcludeStdlib: true})
+		// As the editor asks for a function: a type of the same name is not
+		// the function, and its rename does not change it.
+		locs, err := s.ReferenceNames(f.module, f.name, NameReferenceOptions{Kind: NameKindCallable, FollowDelegates: true, ExcludeStdlib: true})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -78,9 +80,10 @@ func TestReferences_MatchRenameSites(t *testing.T) {
 		delegates, _ := st.LookupDelegatesTo(f.module, f.name)
 		delegates = append(delegates, s.injectedDelegatesTo(f.module, f.name)...)
 		if len(delegates) > 0 {
+			// A facade call, bare or qualified by the facade's module.
 			names := make([]string, 0, len(delegates))
 			for _, d := range delegates {
-				names = append(names, regexp.QuoteMeta(d.Function))
+				names = append(names, `(`+regexp.QuoteMeta(d.Module)+`\.)?`+regexp.QuoteMeta(d.Function))
 			}
 			facadeCall = regexp.MustCompile(`(^|[^.\w])(` + strings.Join(names, "|") + `)(\(|/)`).MatchString
 		}

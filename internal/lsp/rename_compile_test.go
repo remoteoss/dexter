@@ -166,6 +166,38 @@ func TestRename_CompilesAfterEachRename(t *testing.T) {
 	if got := readFile(t, lib("tools.ex")); !strings.Contains(got, "@type tool :: term") || !strings.Contains(got, "@spec use_tool(tool) :: tool") {
 		t.Errorf("tools.ex after the rename:\n%s", got)
 	}
+	// A nested module is an alias in the module around it: its calls by
+	// the short name change too.
+	headlessFn("Shop.Nested.Alpha", "foo", "bar")
+	if got := readFile(t, lib("nested.ex")); strings.Count(got, "Alpha.bar(") != 3 || !strings.Contains(got, "def bar(x)") {
+		t.Errorf("nested.ex after the rename:\n%s", got)
+	}
+	// A type of the same name, written with parentheses, is not the
+	// function, also in another module.
+	headlessFn("Shop.Typed", "count", "measure")
+	if got := readFile(t, lib("typed.ex")); !strings.Contains(got, "@type count :: integer()") ||
+		!strings.Contains(got, "@spec measure(count()) :: count()") ||
+		!strings.Contains(got, "@spec go(Shop.Typed.count()) :: Shop.Typed.count()") ||
+		!strings.Contains(got, "Shop.Typed.measure(x)") {
+		t.Errorf("typed.ex after the rename:\n%s", got)
+	}
+	// A defdelegate facade itself: it keeps its target with as:.
+	headlessFn("Shop.Forward", "run", "start")
+	if got := readFile(t, lib("forward.ex")); !strings.Contains(got, "defdelegate start(x), to: Shop.ForwardImpl, as: :run") ||
+		!strings.Contains(got, "Shop.Forward.start(1)") || !strings.Contains(got, "def run(x)") {
+		t.Errorf("forward.ex after the rename:\n%s", got)
+	}
+	// A variable of the imported function's name, with access syntax.
+	headlessFn("Shop.Settings", "config", "settings")
+	if got := readFile(t, lib("settings.ex")); !strings.Contains(got, "config = settings()") || !strings.Contains(got, "config[key]") {
+		t.Errorf("settings.ex after the rename:\n%s", got)
+	}
+	// A protocol function, with an implementation nested in another module
+	// that names the protocol by its implicit alias.
+	headlessFn("Shop.Shape.Area", "area", "size")
+	if got := readFile(t, lib("shape.ex")); strings.Count(got, "def size(") != 2 || !strings.Contains(got, "Area.size(x)") {
+		t.Errorf("shape.ex after the rename:\n%s", got)
+	}
 	headlessFn("Shop.Accounts.Helpers", "wrap", "wrap_ok")
 	headlessMod("Shop.Accounts.Token", "Shop.Accounts.Ticket")
 	headlessMod("Shop.Repo", "Shop.Storage")

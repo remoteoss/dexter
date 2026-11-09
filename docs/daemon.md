@@ -357,7 +357,9 @@ retries. The failed files keep their old stored mtime, so the retry writes them.
 
 An open connection is a lease: an LSP or long-lived MCP connection keeps the
 daemon alive. After the last connection closes, the daemon exits once the idle
-timeout has passed with no connections and no active work. The default is 15
+timeout has passed with no connections. Work that is still running then, such as
+a cold build that no client waits for, stops, and the next daemon finishes it.
+The default is 15
 minutes; `DEXTER_DAEMON_IDLE_TIMEOUT` sets it for every daemon a machine spawns
 (including one an editor starts), `dexter daemon --idle-timeout` sets it for one
 run, and `0` means never exit. Idle cost is a 2 s `.git/HEAD` stat, so the reason

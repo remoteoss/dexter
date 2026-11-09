@@ -97,6 +97,7 @@ func Ensure(ctx context.Context, root string) (*Client, error) {
 	if err == nil {
 		return client, nil
 	}
+	waitForOwner := false
 	// A daemon built by another version owns this workspace and cannot be
 	// replaced by starting a second one; report it now instead of waiting out
 	// the start timeout for a daemon that will never appear.
@@ -135,7 +136,14 @@ func Ensure(ctx context.Context, root string) (*Client, error) {
 			return nil, ctx.Err()
 		}
 		if !socketExists(root) {
-			return nil, fmt.Errorf("workspace %s is owned by another dexter process that is not serving its daemon socket (a `dexter init` may be rebuilding the index); retry when it finishes: %w", root, dialErr)
+			pid, found := daemonProcessFor(root)
+			if !found {
+				return nil, fmt.Errorf("workspace %s is owned by another dexter process that is not serving its daemon socket (a `dexter init` may be rebuilding the index); retry when it finishes: %w", root, dialErr)
+			}
+			// A daemon whose socket file was removed stops when it next
+			// checks the socket. Wait for its lock, then start a new one.
+			log.Printf("The workspace daemon (pid %d) lost its socket file; waiting for it to stop", pid)
+			waitForOwner = true
 		}
 		// The socket is there but not answering yet. A spawned daemon will lose
 		// the ownership race, but the retry loop below still rides out a slow
@@ -146,18 +154,20 @@ func Ensure(ctx context.Context, root string) (*Client, error) {
 		}
 	}
 
-	exited, err := spawnDaemon(root)
-	if err != nil {
-		return nil, err
+	// lockHeld is true while the spawned daemon has exited because the
+	// workspace was owned, and the owner does not serve: a daemon that stops
+	// holds its lock while it drains, after it closed its socket.
+	lockHeld := waitForOwner
+	var exited <-chan error
+	if !waitForOwner {
+		if exited, err = spawnDaemon(root); err != nil {
+			return nil, err
+		}
 	}
 
 	deadline := time.Now().Add(defaultStartTimeout)
 	backoff := 5 * time.Millisecond
 	respawns := 0
-	// lockHeld is true while the spawned daemon has exited because the
-	// workspace was owned, and the owner does not serve: a daemon that stops
-	// holds its lock while it drains, after it closed its socket.
-	lockHeld := false
 	var lastErr error
 	for time.Now().Before(deadline) {
 		client, err := Dial(ctx, root)
@@ -675,6 +685,9 @@ func parseDaemonPids(psOutput, root string) []int {
 	}
 	return pids
 }
+
+// daemonProcessFor is findDaemonProcess; a test replaces it.
+var daemonProcessFor = findDaemonProcess
 
 // findDaemonProcess reports the first daemon process for root.
 func findDaemonProcess(root string) (int, bool) {

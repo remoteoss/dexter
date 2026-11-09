@@ -1171,6 +1171,15 @@ func (s *Server) startBackgroundReindex() <-chan error {
 				return
 			}
 			result = pruneErr
+			if coldStart && pruneErr == nil {
+				// The cold build fell back to this pass, which wrote every
+				// file in the current format. Without the version, the next
+				// start would take the index for an unfinished build and
+				// delete it.
+				if err := s.store.SetIndexVersion(version.IndexVersion); err != nil {
+					log.Printf("Warning: failed to store index version: %v", err)
+				}
+			}
 		}
 		if result != nil {
 			s.reportStale(result)
@@ -5229,10 +5238,8 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 
 		switch tok.Kind {
 		case parser.TokEnd:
-			if !isLineFirstSignificant(i) {
-				parser.TrackBlockDepth(tok.Kind, &depth)
-				continue
-			}
+			// An `end` after other code on its line, as in `def foo do :ok end`,
+			// closes its frame too.
 			lineIdx := tok.Line - 1
 			endPos := s.outPos(lines, lineIdx, lineEndChar(lineIdx))
 
@@ -5824,6 +5831,16 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 	if moduleRef == "" {
 		if functionName == "" {
 			return nil, nil
+		}
+
+		// A bound variable has no hover. Check it first, as Definition does, so
+		// that a hover on a variable does not wait for the BEAM.
+		if tree, src, release, ok := s.docs.GetTree(docURI); ok {
+			occs := treesitter.FindVariableOccurrencesWithTree(tree.RootNode(), src, uint(lineNum), uint(col))
+			release()
+			if len(occs) > 0 {
+				return nil, nil
+			}
 		}
 
 		currentModule := tf.FirstDefmodule()
@@ -6435,6 +6452,9 @@ func (s *Server) renameEdit(ctx context.Context, params *protocol.RenameParams) 
 		if tree, src, release, ok := s.docs.GetTree(docURI); ok {
 			defer release()
 			if occs := treesitter.FindVariableOccurrencesWithTree(tree.RootNode(), src, uint(lineNum), uint(col)); len(occs) > 0 {
+				if !isValidVariableName(params.NewName) {
+					return nil, fmt.Errorf("invalid variable name %q: it must start with a lowercase letter or _, and have only letters, digits, and _", params.NewName)
+				}
 				if treesitter.NameExistsInScopeOf(tree.RootNode(), src, uint(lineNum), uint(col), params.NewName) {
 					return nil, fmt.Errorf("variable %q already exists in this scope", params.NewName)
 				}
@@ -6466,20 +6486,26 @@ func (s *Server) renameEdit(ctx context.Context, params *protocol.RenameParams) 
 				if !isValidModuleName(params.NewName) {
 					return nil, fmt.Errorf("invalid alias name %q: must start with an uppercase letter", params.NewName)
 				}
-				// Replace all standalone occurrences of the alias in this file
-				// (skip occurrences preceded by '.' — those are part of a
-				// qualified module name, not the alias).
+				// Replace the alias's module tokens in this file, in code and
+				// in #{} interpolations; not in strings, comments, or atoms
+				// (`:Baz`). A token after a '.' is part of a qualified module
+				// name, not the alias.
 				changes := make(map[protocol.DocumentURI][]protocol.TextEdit)
 				fileURI := protocol.DocumentURI(docURI)
-				for i, line := range lines {
-					for _, col := range findAllTokenColumns(line, moduleRef) {
-						if col > 0 && line[col-1] == '.' {
+				for _, toks := range [][]parser.Token{tf.tokens, tf.interp} {
+					for i, tok := range toks {
+						if tok.Kind != parser.TokModule || string(tf.source[tok.Start:tok.End]) != moduleRef {
 							continue
 						}
+						if i > 0 && toks[i-1].Kind == parser.TokDot && toks[i-1].End == tok.Start {
+							continue
+						}
+						line := tok.Line - 1
+						col := tok.Start - tf.lineStarts[line]
 						changes[fileURI] = append(changes[fileURI], protocol.TextEdit{
 							Range: protocol.Range{
-								Start: s.outPos(lines, i, col),
-								End:   s.outPos(lines, i, col+len(moduleRef)),
+								Start: s.outPos(lines, line, col),
+								End:   s.outPos(lines, line, col+len(moduleRef)),
 							},
 							NewText: params.NewName,
 						})
@@ -8339,6 +8365,10 @@ type renameSite struct {
 	// another arity is a function that the module imports, and stays. A
 	// call whose arity cannot be read changes.
 	ownArities map[int]bool
+	// delegateAs, when set, is the name a defdelegate on this line forwards
+	// to without `as:`: the renamed facade itself. The rename adds
+	// `as: :<delegateAs>` so that it still forwards to that function.
+	delegateAs string
 }
 
 type textReindex struct {
@@ -8478,6 +8508,11 @@ func (s *Server) planTextEdits(sites []renameSite, modules []string, arities *ar
 			}
 			lines[site.line-1] = lineText
 		}
+		for _, site := range fileSites {
+			if end, ok := delegateAsLine(lines, site); ok {
+				lines[end] = strings.TrimRight(lines[end], " \t\r") + ", as: :" + site.delegateAs
+			}
+		}
 		return lines
 	}
 
@@ -8508,6 +8543,13 @@ func (s *Server) planTextEdits(sites []renameSite, modules []string, arities *ar
 						NewText: newToken,
 					})
 				}
+				if end, ok := delegateAsLine(fi.lines, site); ok {
+					at := s.outPos(fi.lines, end, len(strings.TrimRight(fi.lines[end], " \t\r")))
+					plan.openChanges[fileURI] = append(plan.openChanges[fileURI], protocol.TextEdit{
+						Range:   protocol.Range{Start: at, End: at},
+						NewText: ", as: :" + site.delegateAs,
+					})
+				}
 			}
 			// A held file is not indexed now: neither the disk nor any
 			// buffer of this editor has the new text yet. The editor's
@@ -8521,6 +8563,16 @@ func (s *Server) planTextEdits(sites []renameSite, modules []string, arities *ar
 		}
 	}
 	return plan
+}
+
+// delegateAsLine returns the 0-based last line of the defdelegate at a site
+// that needs `as:` (see renameSite.delegateAs).
+func delegateAsLine(lines []string, site renameSite) (int, bool) {
+	if site.delegateAs == "" || site.line-1 >= len(lines) || !strings.Contains(lines[site.line-1], "defdelegate") {
+		return 0, false
+	}
+	_, end := delegateStatementSpan(lines, site.line-1)
+	return end - 1, true
 }
 
 // commitTextEdits checks that every planned disk write is safe, writes the
@@ -9015,6 +9067,9 @@ func (s *Server) notifyHeldFiles(h *heldFiles) {
 // buffers. Transient entries loaded via GetOrLoad fall through to the
 // disk path. For closed files, only reads up to the target line instead
 // of the whole file.
+// maxFileLineBytes is the longest line getFileLine reads from disk.
+const maxFileLineBytes = 16 << 20
+
 func (s *Server) getFileLine(filePath string, lineNum int) (string, bool) {
 	// Editor-owned buffer: extract the single line from memory
 	uri := string(uri.File(filePath))
@@ -9032,6 +9087,9 @@ func (s *Server) getFileLine(filePath string, lineNum int) (string, bool) {
 	}
 	defer func() { _ = f.Close() }()
 	scanner := bufio.NewScanner(f)
+	// The default 64 KiB limit stops at a long generated line and hides
+	// every line after it.
+	scanner.Buffer(make([]byte, 0, 64*1024), maxFileLineBytes)
 	current := 0
 	for scanner.Scan() {
 		current++

@@ -81,6 +81,9 @@ func (c *siteCollector) add(site renameSite) {
 		if have.ownArities == nil {
 			have.ownArities = site.ownArities
 		}
+		if have.delegateAs == "" {
+			have.delegateAs = site.delegateAs
+		}
 		if siteIsDeclaration(have.kind) && !siteIsDeclaration(site.kind) {
 			have.kind = site.kind
 		}
@@ -287,7 +290,12 @@ func (c *siteCollector) collect(module, functionName string, injectors []string)
 		}
 		defFilePaths[r.FilePath] = true
 		ownArities[r.Arity] = true
-		c.add(renameSite{module: module, filePath: r.FilePath, line: r.Line, fromIndex: true, bareOK: true, kind: siteDefinition})
+		site := renameSite{module: module, filePath: r.FilePath, line: r.Line, fromIndex: true, bareOK: true, kind: siteDefinition}
+		if r.Kind == "defdelegate" && r.DelegateTo != "" && r.DelegateAs == "" {
+			// The facade itself: without as:, it forwards to its own name.
+			site.delegateAs = functionName
+		}
+		c.add(site)
 	}
 	// An unqualified call on a line of a file that imports the module is the
 	// module's function, except in a module that defines a function of the

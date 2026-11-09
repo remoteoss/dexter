@@ -1096,6 +1096,34 @@ end
 	}
 }
 
+func TestRename_AsAlias_LeavesStringsAndAtoms(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule MyApp.Web do
+  alias MyApp.Deep.Thing, as: Baz
+
+  def show do
+    {Baz.run(), %Baz{}, "Baz is here #{Baz.name()}", :Baz, Other.Baz}
+    # Baz in a comment
+  end
+end
+`
+	path := filepath.Join(server.projectRoot, "lib", "web.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/web.ex", content)
+	indexFile(t, server.store, server.projectRoot, "lib/thing.ex",
+		"defmodule MyApp.Deep.Thing do\n  defstruct []\n  def run, do: nil\n  def name, do: nil\nend\n")
+	docURI := "file://" + path
+	server.docs.Set(docURI, content)
+
+	got := bufferAfterEdits(t, renameAt(t, server, docURI, 4, 5, "Qux"), path, content)
+	want := strings.Replace(content, "as: Baz", "as: Qux", 1)
+	want = strings.Replace(want, `{Baz.run(), %Baz{}, "Baz is here #{Baz.name()}"`, `{Qux.run(), %Qux{}, "Baz is here #{Qux.name()}"`, 1)
+	if got != want {
+		t.Errorf("after the rename:\n%s\nwant:\n%s", got, want)
+	}
+}
+
 func TestRename_AsAlias_NestedModuleWithParentName(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
@@ -2770,6 +2798,42 @@ end
 	err := renameExpectError(t, server, docURI, 2, 4, "output")
 	if !strings.Contains(err.Error(), "already exists") {
 		t.Errorf("expected 'already exists' error, got: %v", err)
+	}
+}
+
+func TestRename_Variable_InvalidNameRefused(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule MyApp do
+  def process(items) do
+    result = transform(items)
+    result
+  end
+end
+`
+	path := filepath.Join(server.projectRoot, "lib", "my_app.ex")
+	docURI := "file://" + path
+	server.docs.Set(docURI, content)
+
+	for _, name := range []string{"Foo", "my var", "do", "nil", "valid?", "1x", ""} {
+		err := renameExpectError(t, server, docURI, 2, 4, name)
+		if !strings.Contains(err.Error(), "invalid variable name") {
+			t.Errorf("rename to %q: expected 'invalid variable name', got: %v", name, err)
+		}
+	}
+}
+
+func TestIsValidVariableName(t *testing.T) {
+	for _, n := range []string{"x", "_", "_unused", "user_id", "café", "x2"} {
+		if !isValidVariableName(n) {
+			t.Errorf("isValidVariableName(%q) should be true", n)
+		}
+	}
+	for _, n := range []string{"", "Foo", "my var", "do", "end", "true", "ok?", "go!", "1x", "a.b"} {
+		if isValidVariableName(n) {
+			t.Errorf("isValidVariableName(%q) should be false", n)
+		}
 	}
 }
 

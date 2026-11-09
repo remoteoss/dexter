@@ -38,6 +38,16 @@
 
 ### Fixed
 
+- **More function renames compile** — a rename now also changes calls of a nested module by its short name (`Alpha.foo()` after `defmodule Alpha` in the module around it), keeps a type of the same name in a `@spec` (`@spec count(count()) :: count()`), adds `as:` when the renamed function is a `defdelegate` facade itself, and renames a protocol function in an implementation that names the protocol through an alias. `defimpl Inspect, for: __MODULE__` inside a module is now an implementation of `Inspect`, not of a nested module, also for go-to-implementation. A module rename of `MyApp.Api_V1` no longer moves `MyApp.ApiXV1.Sub` too
+- **Variable rename** — a module attribute of the same name (`@timeout`), a field or remote call of the same name (`user.name`), a `cond` condition, a `receive ... after` timeout, the context in `test "x", ctx do`, a `for` filter, a `with ... else` clause, and the outer variable around a rebind in a clause body are now handled as Elixir scopes them. A new name that is not a valid variable name is refused. A file with a very long expression chain no longer makes the lookup slow
+- **Renaming the `as:` name of an alias changes only code** — strings, comments, and atoms with the same text stay
+- **Navigation with the cursor right after a name** — definition, hover, references, rename, and the other position requests now use the name that ends at the cursor, as before `(`, `,`, `)`, or at the end of a line
+- **Document symbols with `end` on the same line** — after `def foo do :ok end` or a one-line `test`, every later symbol of the file had the wrong parent
+- **Files that no editor opened are read again after they change** — a request on such a file (from an AI tool, for example) used the text from its first read
+- **Fewer false references** — a call through a variable (`adapter.insert(1)`) is no longer a call of an imported function, and an `alias` or `import` in a function body no longer applies to the functions after it
+- **Hover on a variable answers at once** — it no longer starts or waits for the BEAM
+- **A line longer than 64 KiB no longer hides the lines after it** in call hierarchy
+- **`~S(a\)b)`** — an uppercase sigil ends after an escaped closing delimiter, as Elixir reads it
 - **Rename and references read the arity of calls without parentheses** — `foo a, b` is `foo/2`, as `foo(a, b)` is. A rename of a function changed calls of an imported function of the same name with another arity, and missed calls without parentheses, so the code did not compile
 - **`import unquote(__MODULE__)` in a `__using__` quote** — `unquote` evaluates `__MODULE__` where the macro is defined, so the quote imports the module that defines `__using__`, but Dexter skipped it: go-to-definition, completion, references, and rename did not reach the unqualified calls of its functions in the modules that use it. It is now read as that module, also as `unquote(__MODULE__).Sub`, in `alias` and `use`, and in the helper bodies of an atom dispatch (`use MyAppWeb, :controller`)
 

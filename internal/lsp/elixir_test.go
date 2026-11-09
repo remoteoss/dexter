@@ -104,6 +104,38 @@ func TestExpressionAtCursor(t *testing.T) {
 			wantFunc: "baz",
 		},
 		{
+			name:     "cursor right after function name, before paren",
+			code:     "    Foo.Bar.baz(123)",
+			line:     0,
+			col:      15,
+			wantMod:  "Foo.Bar",
+			wantFunc: "baz",
+		},
+		{
+			name:     "cursor right after function name, before comma",
+			code:     "    f(Foo.bar, 1)",
+			line:     0,
+			col:      13,
+			wantMod:  "Foo",
+			wantFunc: "bar",
+		},
+		{
+			name:     "cursor at end of line after function name",
+			code:     "    Foo.bar\nx",
+			line:     0,
+			col:      11,
+			wantMod:  "Foo",
+			wantFunc: "bar",
+		},
+		{
+			name:     "cursor after closing paren is not an expression",
+			code:     "    foo(x) + 1",
+			line:     0,
+			col:      10,
+			wantMod:  "",
+			wantFunc: "",
+		},
+		{
 			name:     "cursor on first module segment",
 			code:     "    Foo.bar()",
 			line:     0,
@@ -176,12 +208,12 @@ func TestExpressionAtCursor(t *testing.T) {
 			wantFunc: "",
 		},
 		{
-			name:     "cursor on paren",
+			name:     "cursor on paren touches the function name",
 			code:     "    Foo.bar()",
 			line:     0,
 			col:      11, // the open paren
-			wantMod:  "",
-			wantFunc: "",
+			wantMod:  "Foo",
+			wantFunc: "bar",
 		},
 		// --- Token-aware improvements over char-based version ---
 		{

@@ -101,11 +101,14 @@ type lspProxy struct {
 	initialize   []byte // the initialize request body
 	initID       []byte
 	initAnswered bool
-	initialized  []byte // the initialized frame
-	config       []byte // the last didChangeConfiguration frame
-	docs         map[string]*proxyDoc
-	docSeq       uint64
-	pending      map[string]string // ids of requests the daemon has not answered → method
+	// registered is set when a daemon's client/registerCapability went to
+	// the editor. The editor keeps that registration across daemons.
+	registered  bool
+	initialized []byte // the initialized frame
+	config      []byte // the last didChangeConfiguration frame
+	docs        map[string]*proxyDoc
+	docSeq      uint64
+	pending     map[string]string // ids of requests the daemon has not answered → method
 	// serverPending holds the ids of the daemon's requests that the editor
 	// has not answered, as the editor got them → the daemon's id (nil when
 	// they are the same). After a reconnect the proxy gives the editor ids
@@ -285,12 +288,15 @@ func (p *lspProxy) record(frame []byte, body int, msg peeked) bool {
 	defer p.stateMu.Unlock()
 	switch msg.method {
 	case "initialize":
-		if msg.id != nil {
-			p.initialize = append([]byte(nil), frame[body:]...)
-			p.initID = msg.id
-			p.initAnswered = false
+		if msg.id == nil {
+			return false
 		}
-		return false
+		p.initialize = append([]byte(nil), frame[body:]...)
+		p.initID = msg.id
+		p.initAnswered = false
+		// The replay sends the kept initialize, so a queued copy would
+		// reach the next daemon twice.
+		return true
 	case "initialized":
 		p.initialized = frame
 		return true
@@ -316,10 +322,14 @@ func (p *lspProxy) record(frame []byte, body int, msg peeked) bool {
 		delete(p.docs, msg.uri)
 		return true
 	case "textDocument/didSave":
-		if doc := p.docs[msg.uri]; doc != nil {
-			doc.changed = false
+		doc := p.docs[msg.uri]
+		if doc == nil {
+			return false
 		}
-		return false
+		// The replay sends the buffer as saved or changed. A queued save
+		// after the replayed changes would mark newer text as saved.
+		doc.changed = false
+		return true
 	case "shutdown":
 		p.shutdown = true
 		p.endOnce.Do(func() { close(p.ended) })
@@ -518,11 +528,16 @@ func (p *lspProxy) fromDaemon(frame []byte, body int) (action daemonAction, rewr
 	case msg.isRequest():
 		p.stateMu.Lock()
 		defer p.stateMu.Unlock()
-		if p.gen > 0 && msg.method == "client/registerCapability" {
-			// The editor holds this registration from the first session
-			// already, and a second one with the same id is an error in some
-			// editors. The proxy answers it.
-			return answerNull, nil
+		if msg.method == "client/registerCapability" {
+			if p.registered {
+				// The editor holds this registration from an earlier daemon
+				// already, and a second one with the same id is an error in
+				// some editors. The proxy answers it.
+				return answerNull, nil
+			}
+			// The first daemon can stop before it registers. Then the
+			// editor gets the registration from the next one.
+			p.registered = true
 		}
 		if p.gen == 0 {
 			p.serverPending[string(msg.id)] = nil

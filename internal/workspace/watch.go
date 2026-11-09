@@ -15,7 +15,12 @@ import (
 
 // WatchCallbacks translates platform events into workspace reconciliation work.
 type WatchCallbacks struct {
-	PathChanged   func(string)
+	PathChanged func(string)
+	// PathRenamed is PathChanged for a file that an event names as renamed.
+	// A case-only rename can leave the old spelling there on a
+	// case-insensitive volume, so its spelling on disk is checked. It may
+	// be nil.
+	PathRenamed   func(string)
 	FullReconcile func()
 	// CoverageChanged runs when the watcher becomes degraded, and when a
 	// directory that it could not watch is watched again. Both need a
