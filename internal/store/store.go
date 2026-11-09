@@ -522,6 +522,7 @@ const BufferMtime int64 = -1
 // IndexBufferWithRefs indexes text that is not on disk, an editor buffer, for
 // path. The row gets BufferMtime. The file does not have to exist yet.
 func (s *Store) IndexBufferWithRefs(path string, defs []parser.Definition, refs []parser.Reference) error {
+	defer s.wrote()
 	return s.indexFileWithMtime(path, BufferMtime, defs, refs)
 }
 

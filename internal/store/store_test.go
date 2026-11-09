@@ -2129,3 +2129,28 @@ func TestSameDatabaseFile(t *testing.T) {
 		t.Fatalf("with the file moved back: SameDatabaseFile() = %v, %v; want true", same, err)
 	}
 }
+
+// TestWriteGenerationMovesOnEveryWrite: caches keyed by WriteGeneration
+// (use chains, injected delegates) must see each write, also one of an
+// editor buffer, which a rename of open files makes.
+func TestWriteGenerationMovesOnEveryWrite(t *testing.T) {
+	s, dir := setupTestStore(t)
+	path := filepath.Join(dir, "a.ex")
+	if err := os.WriteFile(path, []byte("defmodule A do\nend\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	defs := []parser.Definition{{Module: "A", Line: 1, FilePath: path, Kind: "module"}}
+	for name, write := range map[string]func() error{
+		"file":   func() error { return s.IndexFileWithRefs(path, defs, nil) },
+		"buffer": func() error { return s.IndexBufferWithRefs(path, defs, nil) },
+		"remove": func() error { return s.RemoveFile(path) },
+	} {
+		before := s.WriteGeneration()
+		if err := write(); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if s.WriteGeneration() == before {
+			t.Errorf("%s: WriteGeneration did not move", name)
+		}
+	}
+}

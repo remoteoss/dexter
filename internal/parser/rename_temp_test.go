@@ -35,17 +35,29 @@ func TestRemoveStaleRenameTemps(t *testing.T) {
 	dead := write(RenameTempName("beta.ex", deadPID(t), 1), 0)
 	live := write(RenameTempName("beta.ex", os.Getppid(), 2), 0)
 	own := write(RenameTempName("beta.ex", os.Getpid(), 3), 0)
-	oldLive := write(RenameTempName("gamma.ex", os.Getppid(), 4), 2*StaleRenameTempAge)
+	// A rename backup is the target renamed: it keeps the target's old
+	// modification time, and it is in use.
+	backup := write(RenameTempName("gamma.ex", os.Getppid(), 4), 2*StaleRenameTempAge)
 	other := write(".beta.ex.dexter-notes.tmp", 0)
 	userFile := write(".beta.ex.dexter-12-x.tmp", 0)
-
-	RemoveStaleRenameTemps(dir)
-	for path, want := range map[string]bool{dead: false, live: true, own: true, oldLive: false, other: true, userFile: true} {
-		_, err := os.Stat(path)
-		if exists := err == nil; exists != want {
-			t.Errorf("%s exists = %v, want %v", filepath.Base(path), exists, want)
+	check := func(want map[string]bool) {
+		t.Helper()
+		RemoveStaleRenameTemps(dir)
+		for path, want := range want {
+			_, err := os.Stat(path)
+			if exists := err == nil; exists != want {
+				t.Errorf("%s exists = %v, want %v", filepath.Base(path), exists, want)
+			}
 		}
 	}
+	check(map[string]bool{dead: false, live: true, own: true, backup: true, other: true, userFile: true})
+
+	// Later than StaleRenameTempAge, the pid of a running process can be
+	// another process's; the temp files of this process are still in use.
+	previous := renameTempNow
+	renameTempNow = func() time.Time { return time.Now().Add(2 * StaleRenameTempAge) }
+	t.Cleanup(func() { renameTempNow = previous })
+	check(map[string]bool{live: false, backup: false, own: true, other: true, userFile: true})
 }
 
 // A start's reconciliation walk removes temp files that a stopped rename

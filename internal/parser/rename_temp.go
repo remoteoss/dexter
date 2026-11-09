@@ -18,8 +18,9 @@ import (
 // temp files. The walks remove them as they pass: the reconciliation that
 // every daemon start runs, and the rename itself for the directories it
 // writes. Only a name that matches the pattern exactly is touched, and only
-// when the process that made it is not running, or when the file is older
-// than StaleRenameTempAge.
+// when the process that made it is not running, or when it got its name more
+// than StaleRenameTempAge ago. A rename backup (the target renamed) keeps the
+// target's modification time, so the age is the inode change time.
 
 const renameTempMarker = ".dexter-"
 
@@ -27,6 +28,9 @@ const renameTempMarker = ".dexter-"
 // when a process with its pid runs: a pid can be used again, and no rename
 // takes this long.
 const StaleRenameTempAge = time.Hour
+
+// renameTempNow is the clock of the age check; tests move it.
+var renameTempNow = time.Now
 
 // RenameTempName returns the temp file name for target's base name, made by
 // process pid as its n-th temp file.
@@ -60,8 +64,9 @@ func renameTempPID(name string) (pid int, ok bool) {
 }
 
 // RemoveStaleRenameTemp removes path when its name is a rename temp file name
-// and the file is stale: its process is not running, or it is older than
-// StaleRenameTempAge. A temp file of this process is in use and is kept. It
+// and the file is stale: its process is not running, or it got its name more
+// than StaleRenameTempAge ago. A temp file of this process is in use and is
+// always kept. It
 // reports whether the name matched, so a walk can skip the entry. The first
 // test is one byte compare, so a walk pays nothing for ordinary names.
 func RemoveStaleRenameTemp(path string) bool {
@@ -77,10 +82,12 @@ func RemoveStaleRenameTemp(path string) bool {
 	if err != nil || !info.Mode().IsRegular() {
 		return true
 	}
-	old := time.Since(info.ModTime()) > StaleRenameTempAge
-	if pid == os.Getpid() && !old {
+	if pid == os.Getpid() {
+		// In use by a rename of this process: a backup lives until the
+		// rename ends, however long that takes.
 		return true
 	}
+	old := renameTempNow().Sub(changedAt(path, info)) > StaleRenameTempAge
 	if old || !processRunning(pid) {
 		_ = os.Remove(path)
 	}
