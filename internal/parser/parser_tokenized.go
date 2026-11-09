@@ -894,6 +894,15 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 					i++
 					continue
 				}
+				if !isStatementStart && !isParenthesizedCall && tokens[i-1].Kind != TokDot && NoParenArgCount(source, tokens, i) >= 0 {
+					// A call without parentheses inside an expression:
+					// `value = name arg`, `do: name arg`.
+					if name := tokenText(tok); !elixirKeyword[name] {
+						emitInjected(name, i)
+					}
+					i++
+					continue
+				}
 				if isStatementStart || isParenthesizedCall {
 					name := tokenText(tok)
 					if !elixirKeyword[name] {

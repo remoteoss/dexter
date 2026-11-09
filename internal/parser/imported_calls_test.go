@@ -48,6 +48,23 @@ end
 			notWant: []string{"Q.from:6:call"},
 		},
 		{
+			name: "call without parentheses inside an expression",
+			src: `defmodule A do
+  use S
+  import Q
+
+  def a(id) do
+    value = fetch id
+    {value, where :x, :y}
+  end
+
+  def b(x), do: x.fetch :z
+end
+`,
+			want:    []string{"S.fetch:6:call", "Q.fetch:6:call", "Q.where:7:call"},
+			notWant: []string{"S.fetch:10:call", "Q.fetch:10:call"},
+		},
+		{
 			name: "only list over several lines",
 			src: `defmodule A do
   import Q,

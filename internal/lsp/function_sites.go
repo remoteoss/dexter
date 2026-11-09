@@ -183,8 +183,8 @@ func (c *siteCollector) prefetch(paths []string, name string) {
 }
 
 // mayHoldImportSite reports whether text can hold a site of name in a file
-// that imports the module: a call or a capture (`name(`, `&name/1`,
-// `|> name`, with comment lines between `|>` and the name), or a keyword
+// that imports the module: a call or a capture (`name(`, `name arg`,
+// `&name/1`, `|> name`, with comment lines between `|>` and the name), or a keyword
 // key (`name:`, in an only: or except: list). It is a text check that
 // can say yes for a match in a string or a comment; the tokens decide then.
 func mayHoldImportSite(text, name string) bool {
@@ -207,6 +207,11 @@ func mayHoldImportSite(text, name string) bool {
 			e++
 		}
 		if e < len(text) && (text[e] == '(' || text[e] == ':') {
+			return true
+		}
+		// A call without parentheses: `name arg`, with an argument on the
+		// same line after a space (see parser.NoParenArgCount).
+		if e > end && e < len(text) && mayStartNoParenArg(text[e]) {
 			return true
 		}
 		if b := prevCodeByte(text, start); b >= 0 && (text[b] == '&' || (text[b] == '>' && b > 0 && text[b-1] == '|')) {
@@ -234,6 +239,18 @@ func prevCodeByte(text string, pos int) int {
 		}
 		return b
 	}
+}
+
+// mayStartNoParenArg reports whether c can start the first argument of a
+// call without parentheses: a name, a module, a number, a string, a
+// charlist, a sigil, a character, an atom, a list, a tuple, a map or
+// struct, or an attribute.
+func mayStartNoParenArg(c byte) bool {
+	switch c {
+	case '"', '\'', '~', '?', ':', '[', '{', '%', '@':
+		return true
+	}
+	return isIdentByte(c)
 }
 
 func isIdentByte(c byte) bool {

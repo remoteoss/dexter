@@ -110,6 +110,11 @@ func TestRename_CompilesAfterEachRename(t *testing.T) {
 			t.Errorf("plain.ex does not have %q:\n%s", want, plain)
 		}
 	}
+	// An import from a __using__ quote, where the only call has no
+	// parentheses: the index does not list it, the file scan finds it.
+	if got := readFile(t, lib("bare_schema_user.ex")); !strings.Contains(got, "value = load id\n") {
+		t.Errorf("bare_schema_user.ex call without parentheses not renamed:\n%s", got)
+	}
 	// The target of a defdelegate that a __using__ quote injects: only
 	// as: changes (or is added); the facades keep their names, so the
 	// modules that use the quote keep their calls.
