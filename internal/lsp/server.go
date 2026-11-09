@@ -92,6 +92,10 @@ type erlangRuntimeCache struct {
 // that owns its store leaves it nil and writes directly.
 type WorkspaceEvents interface {
 	ReconcileFile(path string)
+	// ReconcileSavedFile is ReconcileFile for a file that an editor saved:
+	// its spelling is checked whatever its age (a save after a rename that
+	// changed only the case can use the old spelling).
+	ReconcileSavedFile(path string)
 	RemoveFile(path string)
 	SetStdlibRoot(ctx context.Context, path string) error
 }
@@ -1718,23 +1722,27 @@ func (s *Server) DidSave(ctx context.Context, params *protocol.DidSaveTextDocume
 	}
 	// After a rename that changed only the case (`mv Foo.ex foo.ex`), an
 	// editor can still save its buffer under the old spelling, which a stat
-	// finds. Indexed under that spelling, the file would have two rows. A
-	// save is rare, so it pays the open and fcntl that a watcher event skips.
-	path, _ = pathcase.SpellingBelow(s.projectRoot, path)
-
+	// finds. Indexed under that spelling, the file would have two rows: the
+	// old spelling is removed, and the file is indexed under the one on disk.
+	// A save is rare, so it pays the open and fcntl that a watcher event
+	// skips.
 	if s.workspaceEvents != nil {
-		s.workspaceEvents.ReconcileFile(path)
-	} else {
-		// ReconcileFile waits behind a reconciliation pass in flight. With
-		// only the write coordinator's read lock, the save would race the
-		// pass's batches for SQLite's write lock and could fail after
-		// busy_timeout, and then stay unindexed until the next pass. A failed
-		// write is logged, and the file keeps its old mtime for the next pass.
-		go func() {
-			defer s.index.reporter.Recover("index", "a single-file index update")
-			_ = s.ReconcileFile(path)
-		}()
+		s.workspaceEvents.ReconcileSavedFile(path)
+		return nil
 	}
+	// ReconcileFile waits behind a reconciliation pass in flight. With only
+	// the write coordinator's read lock, the save would race the pass's
+	// batches for SQLite's write lock and could fail after busy_timeout, and
+	// then stay unindexed until the next pass. A failed write is logged, and
+	// the file keeps its old mtime for the next pass.
+	go func() {
+		defer s.index.reporter.Recover("index", "a single-file index update")
+		if disk, renamed := pathcase.SpellingBelow(s.projectRoot, path); renamed {
+			s.RemoveFile(path)
+			path = disk
+		}
+		_ = s.ReconcileFile(path)
+	}()
 
 	return nil
 }

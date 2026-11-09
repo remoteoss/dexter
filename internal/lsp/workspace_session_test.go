@@ -18,6 +18,7 @@ type recordingWorkspaceEvents struct {
 }
 
 func (e *recordingWorkspaceEvents) ReconcileFile(path string)                   { e.reconciled <- path }
+func (e *recordingWorkspaceEvents) ReconcileSavedFile(path string)              { e.reconciled <- path }
 func (e *recordingWorkspaceEvents) RemoveFile(path string)                      { e.removed <- path }
 func (e *recordingWorkspaceEvents) SetStdlibRoot(context.Context, string) error { return nil }
 

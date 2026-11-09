@@ -714,3 +714,49 @@ func TestReindexPathUsesTheSpellingOnDisk(t *testing.T) {
 		t.Fatalf("SharedLib.Foo.x = %v, want the saved text indexed", defs)
 	}
 }
+
+// TestSaveUnderTheOldSpellingKeepsOneRow: an editor that still has a buffer
+// under the old spelling saves it, and no watcher reported the rename. The
+// old row is removed, and the saved text is indexed under the spelling on
+// disk.
+func TestSaveUnderTheOldSpellingKeepsOneRow(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv("SHELL", "/bin/false")
+	root := t.TempDir()
+	skipCaseSensitive(t, root)
+	old := filepath.Join(root, "lib", "Foo.ex")
+	renamed := filepath.Join(root, "lib", "foo.ex")
+	writeTestModule(t, root, "lib/Foo.ex", "SharedLib.Foo")
+	rt, err := OpenWithOptions(root, Options{NoWatch: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rt.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := rt.WaitReady(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(old, renamed); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(old, []byte("defmodule SharedLib.Foo do\n  def x, do: 1\nend\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rt.ReconcileSavedFile(old)
+	var paths []string
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		paths, err = rt.Store().ListFilePathsUnder(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defs, _ := rt.Store().LookupFunction("SharedLib.Foo", "x")
+		if slices.Equal(paths, []string{renamed}) && len(defs) == 1 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("indexed paths = %v, SharedLib.Foo.x = %v; want only %s, with the saved text", paths, defs, renamed)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}

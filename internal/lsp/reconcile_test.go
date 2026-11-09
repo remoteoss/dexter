@@ -819,6 +819,7 @@ func (e *recordedEvents) ReconcileFile(path string) {
 	defer e.mu.Unlock()
 	e.reconcile = append(e.reconcile, path)
 }
+func (e *recordedEvents) ReconcileSavedFile(path string)              { e.ReconcileFile(path) }
 func (e *recordedEvents) RemoveFile(string)                           {}
 func (e *recordedEvents) SetStdlibRoot(context.Context, string) error { return nil }
 

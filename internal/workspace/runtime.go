@@ -514,6 +514,11 @@ func (r *Runtime) ReconcileFile(path string) {
 	r.send(event{kind: eventPath, path: path})
 }
 
+// ReconcileSavedFile implements lsp.WorkspaceEvents.
+func (r *Runtime) ReconcileSavedFile(path string) {
+	r.send(event{kind: eventPath, path: path, checkSpelling: true})
+}
+
 // RemoveFile implements lsp.WorkspaceEvents. Reconciliation stats the path, so
 // create/change/delete notifications all share one idempotent code path.
 func (r *Runtime) RemoveFile(path string) {

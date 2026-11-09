@@ -34,6 +34,8 @@ func TestNoParenArgCount(t *testing.T) {
 		{"foo &(&1 + 1), x\n", 2},
 		{"foo && bar\n", -1},
 		{"foo -1\n", -1},
+		{"foo <<\n  1,\n  2\n>>\n", 1},
+		{"foo <<\n  1\n>>, x\n", 2},
 	}
 	for _, tt := range tests {
 		toks := Tokenize([]byte(tt.src))

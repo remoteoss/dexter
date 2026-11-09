@@ -1599,7 +1599,7 @@ scan:
 		case TokEOF:
 			break scan
 		case TokEOL:
-			if depth > 0 {
+			if depth > 0 || angles > 0 {
 				continue
 			}
 			// A line that ends with a comma continues the arguments.
