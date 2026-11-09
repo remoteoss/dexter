@@ -39,6 +39,10 @@ type RenameSummary struct {
 	// the old name. FailureReason is the first error.
 	FilesFailed   []string
 	FailureReason string
+	// IndexPending is true when the files are written but the index update
+	// did not end within renameSummaryWait (it waits behind a long index pass,
+	// such as the one after a branch switch) or before the request ended.
+	IndexPending bool
 
 	mu      sync.Mutex
 	indexed []<-chan struct{}
@@ -93,15 +97,29 @@ func (r *RenameSummary) waitFor(indexed <-chan struct{}) {
 	r.mu.Unlock()
 }
 
-// finish waits for the index updates, sorts the lists, removes duplicates,
-// and removes the failed files from the changed files.
-func (r *RenameSummary) finish() {
+// renameSummaryWait bounds the wait of a headless rename for its index update.
+var renameSummaryWait = 5 * time.Second
+
+// finish waits for the index updates (see IndexPending), sorts the lists,
+// removes duplicates, and removes the failed files from the changed files.
+func (r *RenameSummary) finish(ctx context.Context) {
 	r.mu.Lock()
 	indexed := r.indexed
 	r.indexed = nil
 	r.mu.Unlock()
+	timer := time.NewTimer(renameSummaryWait)
+	defer timer.Stop()
+wait:
 	for _, ch := range indexed {
-		<-ch
+		select {
+		case <-ch:
+		case <-timer.C:
+			r.IndexPending = true
+			break wait
+		case <-ctx.Done():
+			r.IndexPending = true
+			break wait
+		}
 	}
 
 	r.mu.Lock()
@@ -152,7 +170,7 @@ func (s *Server) RenameFunctionContext(ctx context.Context, module, functionName
 	if indexed != nil {
 		summary.waitFor(indexed)
 	}
-	summary.finish()
+	summary.finish(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -174,7 +192,7 @@ func (s *Server) RenameModuleContext(ctx context.Context, oldModule, newModule s
 	if indexed != nil {
 		summary.waitFor(indexed)
 	}
-	summary.finish()
+	summary.finish(ctx)
 	if err != nil {
 		return nil, err
 	}

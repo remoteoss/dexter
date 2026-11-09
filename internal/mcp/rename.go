@@ -40,7 +40,11 @@ func (h *Handler) rename(ctx context.Context, args RenameParams) (string, error)
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "Renamed %s across %d file(s). The index is updated.\n", target, len(summary.FilesChanged))
+	if summary.IndexPending {
+		fmt.Fprintf(&b, "Renamed %s across %d file(s). The files are written; the index update waits behind other index work, so lookups can show the old name until it ends.\n", target, len(summary.FilesChanged))
+	} else {
+		fmt.Fprintf(&b, "Renamed %s across %d file(s). The index is updated.\n", target, len(summary.FilesChanged))
+	}
 	if len(summary.FilesFailed) > 0 {
 		fmt.Fprintf(&b, "\nWARNING: the rename could not change %d file(s) (%s). These files still use the old name; fix them by hand or revert the rename:\n", len(summary.FilesFailed), summary.FailureReason)
 		for _, fp := range summary.FilesFailed {

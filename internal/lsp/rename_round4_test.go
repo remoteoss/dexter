@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"go.lsp.dev/uri"
 )
@@ -210,4 +211,42 @@ func TestRename_FileOpenedInTheRequesterAfterThePlan(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A headless rename whose index update waits behind a long index pass (the
+// one after a branch switch holds the index lock) returns when its files are
+// written, and says that the index update is still pending.
+func TestRename_HeadlessDoesNotWaitForALongIndexPass(t *testing.T) {
+	dir := t.TempDir()
+	servers, st := sessionsAt(t, dir, 1)
+	a := servers[0]
+	indexFile(t, st, dir, "lib/alpha.ex", safetyDefA)
+	indexFile(t, st, dir, "lib/beta.ex", safetyCallB)
+	previous := renameSummaryWait
+	renameSummaryWait = 100 * time.Millisecond
+	t.Cleanup(func() { renameSummaryWait = previous })
+	locked := false
+	t.Cleanup(func() { renameTestHookBeforeCommit = nil })
+	renameTestHookBeforeCommit = func() {
+		a.index.reindexing.Lock()
+		locked = true
+	}
+	start := time.Now()
+	summary, err := a.RenameFunction("MyApp.Alpha", "foo", "bar")
+	if locked {
+		a.index.reindexing.Unlock()
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("the rename took %s", elapsed)
+	}
+	if !summary.IndexPending {
+		t.Error("IndexPending = false, want true while the index lock is held")
+	}
+	if got := readFile(t, filepath.Join(dir, "lib/alpha.ex")); !strings.Contains(got, "def bar(") {
+		t.Errorf("alpha.ex was not renamed:\n%s", got)
+	}
+	a.index.backgroundWork.Wait()
 }
