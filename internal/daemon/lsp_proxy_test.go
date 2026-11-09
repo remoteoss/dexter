@@ -283,6 +283,47 @@ func TestProxyAnswersAnOpenInitializeWhenItCannotReconnect(t *testing.T) {
 	}
 }
 
+// TestProxyDropsALateAnswerToAStoppedDaemonsRequest: a stopped daemon's
+// request has id 7 and no answer; the new daemon sends its own request with
+// id 7. The editor's late answer to the old request must be dropped, and its
+// answer to the new one must reach the new daemon with the daemon's id.
+func TestProxyDropsALateAnswerToAStoppedDaemonsRequest(t *testing.T) {
+	h, daemon := initializedHarness(t)
+	daemon.send(map[string]any{"id": 7, "method": "window/workDoneProgress/create", "params": map[string]any{"token": "old"}})
+	old := expectMethod(t, h.editor, "window/workDoneProgress/create")
+	next := h.nextDaemon()
+	_ = daemon.w.(net.Conn).Close()
+	replayed := expectMethod(t, next, "initialize")
+	next.send(map[string]any{"id": replayed["id"], "result": map[string]any{}})
+	next.send(map[string]any{"id": 7, "method": "window/workDoneProgress/create", "params": map[string]any{"token": "new"}})
+	fresh := expectMethod(t, h.editor, "window/workDoneProgress/create")
+	if fmt.Sprint(fresh["id"]) == fmt.Sprint(old["id"]) {
+		t.Fatalf("the editor got id %v for both daemons' requests", fresh["id"])
+	}
+	// The late answer to the old request, then the answer to the new one
+	// (an error, to tell them apart).
+	h.editor.send(map[string]any{"id": old["id"], "result": nil})
+	h.editor.send(map[string]any{"id": fresh["id"], "error": map[string]any{"code": 1, "message": "new one"}})
+	h.editor.notify("textDocument/didSave", map[string]any{"textDocument": map[string]any{"uri": "file:///x"}})
+	var got []map[string]any
+	for {
+		m, err := next.next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if m["method"] == "textDocument/didSave" {
+			break
+		}
+		got = append(got, m)
+	}
+	if len(got) != 1 || got[0]["error"] == nil {
+		t.Fatalf("the new daemon got %v, want only the answer to its own request", got)
+	}
+	if id, _ := idAsInt(got[0]["id"]); id != 7 {
+		t.Fatalf("the answer has id %v, want the daemon's 7", got[0]["id"])
+	}
+}
+
 // TestProxyTellsTheEditorWhenANewerDaemonTookOver: an older proxy cannot
 // attach to the daemon of a newer build. The editor must be told, and the
 // proxy must exit with an error, not 0.

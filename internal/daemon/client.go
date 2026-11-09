@@ -122,7 +122,7 @@ func Ensure(ctx context.Context, root string) (*Client, error) {
 		}
 	} else if mismatch := new(RootMismatchError); errors.As(err, &mismatch) {
 		return nil, mismatch
-	} else if ownership, _, ownErr := AcquireOwnership(root); errors.Is(ownErr, ErrWorkspaceOwned) {
+	} else if ownership, _, ownErr := acquireOwnershipPatiently(root); errors.Is(ownErr, ErrWorkspaceOwned) {
 		client, dialErr := dialWithin(ctx, root, ownerBindGrace)
 		if client != nil {
 			return client, nil
@@ -154,11 +154,25 @@ func Ensure(ctx context.Context, root string) (*Client, error) {
 	deadline := time.Now().Add(defaultStartTimeout)
 	backoff := 5 * time.Millisecond
 	respawns := 0
+	// lockHeld is true while the spawned daemon has exited because the
+	// workspace was owned, and the owner does not serve: a daemon that stops
+	// holds its lock while it drains, after it closed its socket.
+	lockHeld := false
 	var lastErr error
 	for time.Now().Before(deadline) {
 		client, err := Dial(ctx, root)
 		if err == nil {
 			return client, nil
+		}
+		if lockHeld && respawns < maxRespawns {
+			if ownership, _, ownErr := AcquireOwnership(root); ownErr == nil {
+				_ = ownership.Release()
+				lockHeld = false
+				respawns++
+				if exited, err = spawnDaemon(root); err != nil {
+					return nil, err
+				}
+			}
 		}
 		var mismatch *RootMismatchError
 		if errors.As(err, &mismatch) {
@@ -187,15 +201,11 @@ func Ensure(ctx context.Context, root string) (*Client, error) {
 			}
 			// Status 0 at start means it found the workspace owned. When the
 			// lock is free again, the owner held it only for a moment (a
-			// cleanup, or `dexter stop` that checked for a daemon), so start
-			// one again. Otherwise the owner may still start serving.
-			if ownership, _, ownErr := AcquireOwnership(root); ownErr == nil && respawns < maxRespawns {
-				_ = ownership.Release()
-				respawns++
-				if exited, err = spawnDaemon(root); err != nil {
-					return nil, err
-				}
-			}
+			// cleanup, or `dexter stop` that checked for a daemon), or it
+			// was a daemon that finished stopping, so start one again. The
+			// polls go on checking the lock while the owner may still start
+			// serving or stop.
+			lockHeld = true
 		}
 		if backoff < 250*time.Millisecond {
 			backoff *= 2

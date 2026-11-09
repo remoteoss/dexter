@@ -391,3 +391,58 @@ func TestStopForcedEscalatesToKill(t *testing.T) {
 		t.Fatal("the daemon that ignored SIGTERM was not killed")
 	}
 }
+
+// TestEnsureStartsADaemonWhenTheStoppingOneReleasesItsLock: a daemon that
+// stops closes its socket first and holds its lock while it drains. A daemon
+// that a frontend starts then finds the workspace owned and exits; Ensure must
+// start one again when the lock is free, not wait out its timeout.
+func TestEnsureStartsADaemonWhenTheStoppingOneReleasesItsLock(t *testing.T) {
+	socketTestEnv(t)
+	root := t.TempDir()
+	writeModule(t, root, "lib/one.ex", "SharedLib.One")
+	ownership, endpoint, err := AcquireOwnership(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A socket file that refuses connections: the old listener is closed.
+	listener, err := net.Listen("unix", endpoint.Socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener.(*net.UnixListener).SetUnlinkOnClose(false)
+	_ = listener.Close()
+	go func() {
+		time.Sleep(1 * time.Second)
+		_ = ownership.Release()
+	}()
+
+	previous := spawnDaemon
+	spawns := 0
+	spawnDaemon = func(root string) (<-chan error, error) {
+		spawns++
+		// A real daemon tries for ownershipPatience and exits 0 when owned.
+		time.Sleep(ownershipPatience)
+		if o, _, err := AcquireOwnership(root); errors.Is(err, ErrWorkspaceOwned) {
+			exited := make(chan error, 1)
+			exited <- nil
+			return exited, nil
+		} else if err == nil {
+			_ = o.Release()
+		}
+		runDaemonInProcess(t, root)
+		return nil, nil
+	}
+	t.Cleanup(func() { spawnDaemon = previous })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	start := time.Now()
+	client, err := Ensure(ctx, root)
+	if err != nil {
+		t.Fatalf("Ensure = %v after %s (%d spawns)", err, time.Since(start), spawns)
+	}
+	_ = client.Close()
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("Ensure took %s, want about the time until the lock is free", elapsed)
+	}
+}

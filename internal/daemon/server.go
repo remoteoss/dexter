@@ -563,6 +563,12 @@ func (s *server) checkEndpoint(rt *workspace.Runtime) bool {
 				what = "replaced"
 			}
 			ok, relockErr := s.ownership.relock()
+			// A cleanup of the runtime directory can hold the new file for
+			// a moment; try again for as long as a starting daemon does.
+			for deadline := time.Now().Add(ownershipPatience); !ok && relockErr == nil && time.Now().Before(deadline); {
+				time.Sleep(10 * time.Millisecond)
+				ok, relockErr = s.ownership.relock()
+			}
 			if !ok {
 				log.Printf("Daemon lock file %s was %s and another process holds the new one (%v); exiting so that only one daemon serves %s", s.lockPath, what, relockErr, s.root)
 				s.stop()

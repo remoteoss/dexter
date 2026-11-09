@@ -106,7 +106,12 @@ type lspProxy struct {
 	docs          map[string]*proxyDoc
 	docSeq        uint64
 	pending       map[string]string // ids of requests the daemon has not answered → method
-	serverPending map[string]struct{}
+	// serverPending holds the ids of the daemon's requests that the editor
+	// has not answered, as the editor got them → the daemon's id (nil when
+	// they are the same). After a reconnect the proxy gives the editor ids
+	// of its own, so that a late answer to a stopped daemon's request never
+	// answers the new daemon's request of the same id.
+	serverPending map[string][]byte
 	staleServer   map[string]struct{}
 	replayID      string // id of a replayed initialize whose answer is dropped
 	// progress holds the work-done progress tokens that the daemon began and
@@ -129,7 +134,7 @@ func newLSPProxy(ctx context.Context, root string, in io.Reader, out io.Writer, 
 		exited:          make(chan struct{}),
 		docs:            make(map[string]*proxyDoc),
 		pending:         make(map[string]string),
-		serverPending:   make(map[string]struct{}),
+		serverPending:   make(map[string][]byte),
 		staleServer:     make(map[string]struct{}),
 		progress:        make(map[string]struct{}),
 		answeredLocally: make(map[string]struct{}),
@@ -215,7 +220,7 @@ func (p *lspProxy) readEditor() {
 			return
 		}
 		p.connMu.Lock()
-		msg, covered, drop := p.inspect(frame, body)
+		frame, msg, covered, drop := p.inspect(frame, body)
 		if !drop {
 			p.forwardLocked(frame, msg, covered)
 		}
@@ -227,18 +232,29 @@ func (p *lspProxy) readEditor() {
 // A panic here is a bug in the scan: the message is then forwarded as it is,
 // without state, because losing the editor's message would be worse. The
 // caller holds connMu.
-func (p *lspProxy) inspect(frame []byte, body int) (msg peeked, covered, drop bool) {
+func (p *lspProxy) inspect(frame []byte, body int) (out []byte, msg peeked, covered, drop bool) {
 	defer func() {
 		if value := recover(); value != nil {
 			log.Printf("Error: LSP proxy: panic while reading an editor message: %v\n%s", value, debug.Stack())
-			msg, covered, drop = peeked{}, false, false
+			out, msg, covered, drop = frame, peeked{}, false, false
 		}
 	}()
 	msg = peekMessage(frame[body:])
-	if msg.isResponse() && p.dropServerResponse(msg.id) {
-		return msg, false, true
+	if msg.isResponse() {
+		stale, daemonID := p.serverResponse(msg.id)
+		if stale {
+			return frame, msg, false, true
+		}
+		if daemonID != nil {
+			rewritten, err := withID(frame[body:], string(daemonID))
+			if err != nil {
+				return frame, msg, false, true
+			}
+			frame = frameMessage(rewritten)
+		}
+		return frame, msg, false, false
 	}
-	return msg, p.record(frame, body, msg), false
+	return frame, msg, p.record(frame, body, msg), false
 }
 
 // editorGone ends the session from the editor side: the daemon sees the end of
@@ -397,22 +413,22 @@ func (p *lspProxy) passCancel(frame []byte) bool {
 	return p.conn != nil
 }
 
-// dropServerResponse reports whether an editor response answers a request of
-// a daemon that is gone. Passing it on could answer the new daemon's request
-// that happens to have the same id.
-func (p *lspProxy) dropServerResponse(id []byte) bool {
+// serverResponse reads the id of an editor response. stale reports an answer
+// to a request of a daemon that is gone, which is dropped. daemonID, when not
+// nil, is the id that the current daemon gave the request.
+func (p *lspProxy) serverResponse(id []byte) (stale bool, daemonID []byte) {
 	p.stateMu.Lock()
 	defer p.stateMu.Unlock()
 	key := string(id)
-	if _, ok := p.serverPending[key]; ok {
+	if daemonID, ok := p.serverPending[key]; ok {
 		delete(p.serverPending, key)
-		return false
+		return false, daemonID
 	}
 	if _, ok := p.staleServer[key]; ok {
 		delete(p.staleServer, key)
-		return true
+		return true, nil
 	}
-	return false
+	return false, nil
 }
 
 // readDaemon forwards the daemon's messages to the editor until the daemon
@@ -429,8 +445,12 @@ func (p *lspProxy) readDaemon(conn net.Conn, reader *bufio.Reader) {
 		if cap(frame) <= maxReusedFrame {
 			buf = frame
 		}
-		switch p.fromDaemon(frame, body) {
+		action, rewritten := p.fromDaemon(frame, body)
+		switch action {
 		case toEditor:
+			if rewritten != nil {
+				frame = rewritten
+			}
 			p.writeOut(frame)
 		case answerNull:
 			// The daemon reader must never wait on connMu, which a write to
@@ -460,13 +480,13 @@ func nullResult(id []byte) []byte {
 }
 
 // fromDaemon updates the state with one daemon message and says what to do
-// with it.
-func (p *lspProxy) fromDaemon(frame []byte, body int) (action daemonAction) {
+// with it. rewritten, when not nil, is the frame to send instead.
+func (p *lspProxy) fromDaemon(frame []byte, body int) (action daemonAction, rewritten []byte) {
 	// A panic in the scan is a bug; the message still reaches the editor.
 	defer func() {
 		if value := recover(); value != nil {
 			log.Printf("Error: LSP proxy: panic while reading a daemon message: %v\n%s", value, debug.Stack())
-			action = toEditor
+			action, rewritten = toEditor, nil
 		}
 	}()
 	msg := peekMessage(frame[body:])
@@ -476,13 +496,13 @@ func (p *lspProxy) fromDaemon(frame []byte, body int) (action daemonAction) {
 		p.stateMu.Lock()
 		defer p.stateMu.Unlock()
 		if p.replayID != "" && key == p.replayID {
-			return dropIt
+			return dropIt, nil
 		}
 		delete(p.pending, key)
 		if p.initID != nil && key == string(p.initID) {
 			p.initAnswered = true
 		}
-		return toEditor
+		return toEditor, nil
 	case msg.isRequest():
 		p.stateMu.Lock()
 		defer p.stateMu.Unlock()
@@ -490,14 +510,24 @@ func (p *lspProxy) fromDaemon(frame []byte, body int) (action daemonAction) {
 			// The editor holds this registration from the first session
 			// already, and a second one with the same id is an error in some
 			// editors. The proxy answers it.
-			return answerNull
+			return answerNull, nil
 		}
-		p.serverPending[string(msg.id)] = struct{}{}
-		return toEditor
+		if p.gen == 0 {
+			p.serverPending[string(msg.id)] = nil
+			return toEditor, nil
+		}
+		editorID := strconv.Quote(fmt.Sprintf("dexter-proxy-%d-%s", p.gen, msg.id))
+		body, err := withID(frame[body:], editorID)
+		if err != nil {
+			p.serverPending[string(msg.id)] = nil
+			return toEditor, nil
+		}
+		p.serverPending[editorID] = append([]byte(nil), msg.id...)
+		return toEditor, frameMessage(body)
 	case msg.method == "$/progress":
 		p.trackProgress(frame[body:])
 	}
-	return toEditor
+	return toEditor, nil
 }
 
 // trackProgress keeps the tokens of work-done progress that is open.
@@ -583,7 +613,7 @@ func (p *lspProxy) reconnect() (net.Conn, *bufio.Reader, error) {
 	for id := range p.serverPending {
 		p.staleServer[id] = struct{}{}
 	}
-	p.serverPending = make(map[string]struct{})
+	p.serverPending = make(map[string][]byte)
 	initOpen := p.initialize != nil && !p.initAnswered
 	initID := string(p.initID)
 	p.stateMu.Unlock()
@@ -841,8 +871,12 @@ func (p *lspProxy) awaitResponse(conn net.Conn, reader *bufio.Reader, id []byte,
 			}
 			return nil
 		}
-		switch p.fromDaemon(frame, body) {
+		action, rewritten := p.fromDaemon(frame, body)
+		switch action {
 		case toEditor:
+			if rewritten != nil {
+				frame = rewritten
+			}
 			p.writeOut(frame)
 		case answerNull:
 			// The caller holds connMu, so this goroutine may write.
