@@ -1816,6 +1816,11 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		return nil, nil
 	}
 
+	// A key of a struct literal: `domain` in `%Site{domain: d}`.
+	if loc, ok := s.structKeyLocation(tf, uriToPath(params.TextDocument.URI), lineNum, col); ok {
+		return []protocol.Location{{URI: pathToURI(loc.FilePath), Range: lineRange(loc.Line - 1)}}, nil
+	}
+
 	exprCtx := tf.ExpressionAtCursor(lineNum, col)
 	if exprCtx.Empty() {
 		return nil, nil
@@ -1897,10 +1902,13 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		if tf.InTypespec(lineNum) {
 			kind = NameKindType
 		}
+		arity, hasArity := tf.callArityAt(lineNum, col, functionName)
 		results, err := s.LookupName(fullModule, functionName, NameLookupOptions{
 			Kind:            kind,
 			FollowDelegates: s.followDelegates,
 			External:        fullModule != extractEnclosingModuleFromTokens(tf.source, tf.tokens, lineNum),
+			CallArity:       arity,
+			HasArity:        hasArity,
 		})
 		if err == nil && len(results) > 0 {
 			s.debugf("Definition: found %d semantic result(s) for %s.%s", len(results), fullModule, functionName)
@@ -1937,11 +1945,14 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 		if tf.InTypespec(lineNum) {
 			kind = NameKindType
 		}
+		arity, hasArity := tf.callArityAt(lineNum, col, functionName)
 		results, err := s.LookupName(fullModule, functionName, NameLookupOptions{
 			Kind:             kind,
 			FollowDelegates:  s.followDelegates,
 			External:         fullModule != extractEnclosingModuleFromTokens(tf.source, tf.tokens, lineNum),
 			FallbackToModule: true,
+			CallArity:        arity,
+			HasArity:         hasArity,
 		})
 		if err != nil {
 			return nil, nil
@@ -5903,16 +5914,41 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 	fullModule := s.resolveModuleWithNesting(moduleRef, aliases, uriToPath(protocol.DocumentURI(docURI)), lineNum)
 
 	if functionName != "" {
-		var results []store.LookupResult
-		var err error
-		if s.followDelegates {
-			results, err = s.store.LookupFollowDelegate(fullModule, functionName)
-		} else {
-			results, err = s.store.LookupFunction(fullModule, functionName)
+		results, err := s.store.LookupFunction(fullModule, functionName)
+		if err == nil && s.followDelegates && allDelegates(results) {
+			// A defdelegate with a @doc of its own shows that doc; without
+			// one, the hover is the target's.
+			if doc, spec, signature, ok := s.hoverParts(functionName, results[0]); ok && doc != "" {
+				return hoverOf(doc, spec, signature), nil
+			}
+			if f := results[0]; f.DelegateTo != "" {
+				target := functionName
+				if f.DelegateAs != "" {
+					target = f.DelegateAs
+				}
+				if followed, followErr := s.store.LookupFollowDelegate(f.DelegateTo, target); followErr == nil && len(followed) > 0 {
+					results = followed
+				}
+			}
+		}
+		if err == nil && len(results) == 0 {
+			// A function that a use chain injects, as Definition finds it.
+			// A function that only the compiled module has goes to
+			// hoverFromGenerated below.
+			results = filterOutTypes(s.lookupThroughUseOfWithFollow(fullModule, functionName, s.followDelegates))
 		}
 		if err == nil && len(results) > 0 {
-			hits := byKindForContext(tf, lineNum, results)
-			return s.hoverFromFile(functionName, hits[0])
+			hit := byKindForContext(tf, lineNum, results)[0]
+			doc, spec, signature, ok := s.hoverParts(functionName, hit)
+			if !ok {
+				return nil, nil
+			}
+			if doc == "" {
+				// A def that implements a callback, such as one that a
+				// `use` injects with `@impl true`, has the callback's doc.
+				doc = s.callbackDoc(fullModule, functionName, hit)
+			}
+			return hoverOf(doc, spec, signature), nil
 		}
 		// Nothing in the index: the function may exist only in the compiled module.
 		if hover := s.hoverFromGenerated(fullModule, "", functionName); hover != nil {
@@ -8565,6 +8601,17 @@ func (s *Server) planTextEdits(sites []renameSite, modules []string, arities *ar
 	return plan
 }
 
+// allDelegates reports whether results are all defdelegate rows with a
+// target, as store.LookupFollowDelegate follows them.
+func allDelegates(results []store.LookupResult) bool {
+	for _, r := range results {
+		if r.Kind != "defdelegate" || r.DelegateTo == "" {
+			return false
+		}
+	}
+	return len(results) > 0
+}
+
 // delegateAsLine returns the 0-based last line of the defdelegate at a site
 // that needs `as:` (see renameSite.delegateAs).
 func delegateAsLine(lines []string, site renameSite) (int, bool) {
@@ -9114,6 +9161,21 @@ func (s *Server) findBareCallRefs(module, functionName string) []store.Reference
 		// of the type kind.
 		defFilePaths[r.FilePath] = true
 		own[r.Arity] = true
+	}
+	if len(defResults) == 0 {
+		// A function that a `use` injects has its def in a quote of another
+		// module; the module's own files hold its bare calls. The index
+		// records them as calls of the module that the `use` names.
+		if injected := s.lookupThroughUseOfWithFollow(module, functionName, false); len(injected) > 0 {
+			for _, r := range injected {
+				own[r.Arity] = true
+			}
+			if mods, err := s.store.LookupModule(module); err == nil {
+				for _, m := range mods {
+					defFilePaths[m.FilePath] = true
+				}
+			}
+		}
 	}
 	var refs []store.ReferenceResult
 	for filePath := range defFilePaths {

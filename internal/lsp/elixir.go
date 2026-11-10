@@ -436,6 +436,29 @@ func FullExpressionAtCursor(tokens []parser.Token, source []byte, lineStarts []i
 	return expressionAtCursorImpl(tokens, source, lineStarts, line, col, true)
 }
 
+// callArityAt returns the arity of the call of name at the cursor: the
+// arguments, one more when a pipe gives the first, or the /N of a capture.
+// ok is false when the cursor is not on such a call or its arity cannot be
+// read, and for a definition head.
+func (tf *TokenizedFile) callArityAt(line, col int, name string) (arity int, ok bool) {
+	offset := parser.LineColToOffset(tf.lineStarts, line, col)
+	if offset < 0 {
+		return 0, false
+	}
+	idx := parser.TokenAtOffset(tf.tokens, offset)
+	if (idx < 0 || tf.tokens[idx].Kind != parser.TokIdent) && offset > 0 {
+		idx = parser.TokenAtOffset(tf.tokens, offset-1)
+	}
+	if idx < 0 || tf.tokens[idx].Kind != parser.TokIdent || parser.TokenText(tf.source, tf.tokens[idx]) != name {
+		return 0, false
+	}
+	lo, hi, known := tokenArity(tf.source, tf.tokens, idx)
+	if !known || lo != hi {
+		return 0, false
+	}
+	return lo, true
+}
+
 func expressionAtCursorImpl(tokens []parser.Token, source []byte, lineStarts []int, line, col int, full bool) CursorContext {
 	offset := parser.LineColToOffset(lineStarts, line, col)
 	if offset < 0 {

@@ -44,6 +44,11 @@ type NameLookupOptions struct {
 	// Phoenix route helpers, resolves to the nearest lexical parent with source;
 	// that is a fallback, which a strict lookup must not take.
 	ExactModule bool
+	// CallArity, when HasArity is set, is the arity of the call at the
+	// cursor: only the definitions of that arity are kept, unless none has
+	// it (an arity Dexter reads wrong must not lose the answer).
+	CallArity int
+	HasArity  bool
 }
 
 type NameReferenceOptions struct {
@@ -85,9 +90,10 @@ func (s *Server) LookupName(module, function string, opts NameLookupOptions) ([]
 	if opts.External {
 		results = filterOutPrivate(results)
 	}
+	results = filterArity(results, opts)
 	var also []store.LookupResult
 	if len(results) == 0 {
-		results = filterLookupKind(s.lookupThroughUseOfWithFollow(module, function, opts.FollowDelegates), opts.Kind)
+		results = filterArity(filterLookupKind(s.lookupThroughUseOfWithFollow(module, function, opts.FollowDelegates), opts.Kind), opts)
 		if len(results) > 0 && opts.Kind != NameKindType {
 			if declared := s.declaredLineOfInjected(module, function); len(declared) > 0 {
 				results, also = declared, results
@@ -401,6 +407,24 @@ func (s *Server) lookupLocations(results []store.LookupResult, excludeStdlib boo
 		})
 	}
 	return locations
+}
+
+// filterArity keeps the results of opts.CallArity, or all of them when none
+// has it. A function with default arguments has a row for each arity.
+func filterArity(results []store.LookupResult, opts NameLookupOptions) []store.LookupResult {
+	if !opts.HasArity || len(results) < 2 {
+		return results
+	}
+	var kept []store.LookupResult
+	for _, r := range results {
+		if r.Arity == opts.CallArity {
+			kept = append(kept, r)
+		}
+	}
+	if len(kept) == 0 {
+		return results
+	}
+	return kept
 }
 
 func filterLookupKind(results []store.LookupResult, kind NameKind) []store.LookupResult {
