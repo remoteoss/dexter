@@ -5270,8 +5270,8 @@ func (s *Server) DocumentSymbol(ctx context.Context, params *protocol.DocumentSy
 
 			curMod := currentModule()
 			fullName := name
-			if !strings.Contains(name, ".") && curMod != "" {
-				fullName = curMod + "." + name
+			if keyword != "defimpl" {
+				fullName, _, _ = parser.NestedModuleName(name, curMod)
 			}
 
 			kind := defKindToSymbolKind(keyword)

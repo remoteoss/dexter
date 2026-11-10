@@ -172,6 +172,12 @@ func TestRename_CompilesAfterEachRename(t *testing.T) {
 	if got := readFile(t, lib("nested.ex")); strings.Count(got, "Alpha.bar(") != 3 || !strings.Contains(got, "def bar(x)") {
 		t.Errorf("nested.ex after the rename:\n%s", got)
 	}
+	// A nested module with a dotted name is nested too (Shop.Nested.Deep.Inner),
+	// and its first segment is an alias in the module around it.
+	headlessFn("Shop.Nested.Deep.Inner", "peek", "look")
+	if got := readFile(t, lib("nested.ex")); strings.Count(got, "Deep.Inner.look(") != 2 || !strings.Contains(got, "def look(x)") {
+		t.Errorf("nested.ex after the rename:\n%s", got)
+	}
 	// A type of the same name, written with parentheses, is not the
 	// function, also in another module.
 	headlessFn("Shop.Typed", "count", "measure")

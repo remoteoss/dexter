@@ -8460,3 +8460,35 @@ func TestColdBuildFallbackStampsTheIndexVersion(t *testing.T) {
 		t.Fatalf("index version after the fallback = %d, want %d", got, version.IndexVersion)
 	}
 }
+
+// TestDefinition_DottedNestedModule: Elixir nests `defmodule Deep.Inner`
+// inside Outer as Outer.Deep.Inner and aliases Deep in Outer, so the call
+// `Deep.Inner.foo()` there goes to it. A defimpl in a module is not nested.
+func TestDefinition_DottedNestedModule(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule Outer do
+  defmodule Deep.Inner do
+    def foo, do: :inner
+  end
+
+  def go, do: Deep.Inner.foo()
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/outer.ex", content)
+	docURI := "file://" + filepath.Join(server.projectRoot, "lib/outer.ex")
+	server.docs.Set(docURI, content)
+
+	if aliases := ExtractAliasesInScope(content, 5); aliases["Deep"] != "Outer.Deep" {
+		t.Errorf("aliases at the call = %v, want Deep: Outer.Deep", aliases)
+	}
+	locs := definitionAt(t, server, docURI, 5, 26)
+	if len(locs) != 1 || locs[0].Range.Start.Line != 2 {
+		t.Fatalf("definition of Deep.Inner.foo = %v, want line 2", locs)
+	}
+	symbols := documentSymbols(t, server, docURI)
+	if len(symbols) != 1 || findSymbol(symbols[0].Children, "Deep.Inner") == nil {
+		t.Errorf("document symbols = %v, want Deep.Inner under Outer", collectNames(symbols[0].Children))
+	}
+}

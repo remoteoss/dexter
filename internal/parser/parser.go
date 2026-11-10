@@ -119,6 +119,30 @@ func resolveModule(s, currentModule string) string {
 	return s
 }
 
+// NestedModuleName returns the module that `defmodule raw` (or defprotocol)
+// defines inside the module current, as Elixir names it, and the alias the
+// definition adds in current (empty when it adds none). Elixir always nests:
+// `defmodule Deep.Inner` inside Outer is Outer.Deep.Inner, and it aliases
+// Deep to Outer.Deep; `defmodule MyApp.Fake` inside MyApp.FooTest is
+// MyApp.FooTest.MyApp.Fake. An alias in scope does not change that. Only
+// `__MODULE__.Sub` (Outer.Sub) and `Elixir.Name` (Name) are not nested.
+func NestedModuleName(raw, current string) (name, aliasShort, aliasFull string) {
+	if rest, ok := strings.CutPrefix(raw, "Elixir."); ok {
+		return rest, "", ""
+	}
+	if current == "" {
+		return raw, "", ""
+	}
+	if raw == "__MODULE__" {
+		return current, "", ""
+	}
+	if rest, ok := strings.CutPrefix(raw, "__MODULE__."); ok {
+		return current + "." + rest, "", ""
+	}
+	first, _, _ := strings.Cut(raw, ".")
+	return current + "." + raw, first, current + "." + first
+}
+
 // ExpandAliasPrefix rewrites the leading segment of a module reference using
 // the aliases in scope: after `alias SharedLib.Accounts`, the reference
 // `Accounts.Users` becomes `SharedLib.Accounts.Users`. It leaves __MODULE__

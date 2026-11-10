@@ -156,7 +156,7 @@ end
     :ok
   end
 
-  defmodule MyApp.Outer.Inner do
+  defmodule Inner do
     def inner_func do
       :ok
     end

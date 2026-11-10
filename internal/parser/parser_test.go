@@ -124,14 +124,16 @@ end
 	if !modules["MyApp.Outer"] {
 		t.Error("missing MyApp.Outer module")
 	}
-	if !modules["MyApp.Outer.Inner"] {
-		t.Error("missing MyApp.Outer.Inner module")
+	// Elixir nests a nested defmodule even when its name is a full one:
+	// `defmodule MyApp.Outer.Inner` inside MyApp.Outer is
+	// MyApp.Outer.MyApp.Outer.Inner.
+	const inner = "MyApp.Outer.MyApp.Outer.Inner"
+	if !modules[inner] {
+		t.Errorf("missing %s module; got %v", inner, modules)
 	}
-
-	// inner_func should belong to MyApp.Outer.Inner
 	for _, d := range defs {
-		if d.Function == "inner_func" && d.Module != "MyApp.Outer.Inner" {
-			t.Errorf("inner_func should belong to MyApp.Outer.Inner, got %s", d.Module)
+		if d.Function == "inner_func" && d.Module != inner {
+			t.Errorf("inner_func should belong to %s, got %s", inner, d.Module)
 		}
 	}
 }
@@ -609,8 +611,8 @@ end
 		}
 	}
 
-	if funcs["inner_func"] != "MyApp.Outer.Inner" {
-		t.Errorf("inner_func should belong to MyApp.Outer.Inner, got %s", funcs["inner_func"])
+	if funcs["inner_func"] != "MyApp.Outer.MyApp.Outer.Inner" {
+		t.Errorf("inner_func should belong to MyApp.Outer.MyApp.Outer.Inner (Elixir nests it), got %s", funcs["inner_func"])
 	}
 	if funcs["outer_func"] != "MyApp.Outer" {
 		t.Errorf("outer_func should belong to MyApp.Outer, got %s", funcs["outer_func"])
@@ -4362,6 +4364,72 @@ end
 	for _, notWant := range []string{"MyApp.Deep.Thing.run:12", "MyApp.Helpers.helper:13"} {
 		if got[notWant] {
 			t.Errorf("ref %s: the alias or import of a() leaked into b()", notWant)
+		}
+	}
+}
+
+// TestNestedModuleName follows Elixir: a nested defmodule is always nested and
+// aliases its first segment, except __MODULE__.Sub and Elixir.Name.
+func TestNestedModuleName(t *testing.T) {
+	tests := []struct{ raw, current, name, short, full string }{
+		{"Alpha", "", "Alpha", "", ""},
+		{"MyApp.Alpha", "", "MyApp.Alpha", "", ""},
+		{"Alpha", "Outer", "Outer.Alpha", "Alpha", "Outer.Alpha"},
+		{"Deep.Inner", "Outer", "Outer.Deep.Inner", "Deep", "Outer.Deep"},
+		{"MyApp.Fake", "MyApp.FooTest", "MyApp.FooTest.MyApp.Fake", "MyApp", "MyApp.FooTest.MyApp"},
+		{"__MODULE__.Self", "Outer", "Outer.Self", "", ""},
+		{"Elixir.Absolute", "Outer", "Absolute", "", ""},
+	}
+	for _, tt := range tests {
+		name, short, full := NestedModuleName(tt.raw, tt.current)
+		if name != tt.name || short != tt.short || full != tt.full {
+			t.Errorf("NestedModuleName(%q, %q) = %q, %q, %q; want %q, %q, %q", tt.raw, tt.current, name, short, full, tt.name, tt.short, tt.full)
+		}
+	}
+}
+
+func TestParseText_DottedNestedModule(t *testing.T) {
+	src := `defmodule Outer do
+  defmodule Deep.Inner do
+    def foo, do: :inner
+    def self_call, do: Deep.Inner.foo()
+  end
+
+  defmodule __MODULE__.Self do
+    def bar, do: :self
+  end
+
+  defmodule Elixir.Absolute do
+    def baz, do: :absolute
+  end
+
+  def go, do: {Deep.Inner.foo(), Self.bar()}
+end
+
+defmodule Outer.Later do
+  def go, do: Deep.Inner.foo()
+end
+`
+	defs, refs, err := ParseText("/x.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotDefs := map[string]bool{}
+	for _, d := range defs {
+		gotDefs[d.Module+"."+d.Function] = true
+	}
+	for _, want := range []string{"Outer.Deep.Inner.foo", "Outer.Self.bar", "Absolute.baz"} {
+		if !gotDefs[want] {
+			t.Errorf("missing def %s; got %v", want, gotDefs)
+		}
+	}
+	gotRefs := map[string]bool{}
+	for _, r := range refs {
+		gotRefs[fmt.Sprintf("%s.%s:%d", r.Module, r.Function, r.Line)] = true
+	}
+	for _, want := range []string{"Outer.Deep.Inner.foo:4", "Outer.Deep.Inner.foo:15", "Deep.Inner.foo:19"} {
+		if !gotRefs[want] {
+			t.Errorf("missing ref %s; got %v", want, gotRefs)
 		}
 	}
 }

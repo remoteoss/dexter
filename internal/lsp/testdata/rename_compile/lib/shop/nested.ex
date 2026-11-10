@@ -12,4 +12,12 @@ defmodule Shop.Nested do
     @moduledoc false
     def go, do: Alpha.foo(2)
   end
+
+  defmodule Deep.Inner do
+    @moduledoc false
+    def peek(x), do: x
+    def again, do: Deep.Inner.peek(0)
+  end
+
+  def deep, do: Deep.Inner.peek(1)
 end

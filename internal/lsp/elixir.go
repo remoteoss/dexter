@@ -753,18 +753,30 @@ func extractAliasBlockParentFromTokens(source []byte, tokens []parser.Token, tar
 	return "", false
 }
 
+// tokParseModuleDef reads the defmodule, defprotocol, or defimpl whose
+// keyword is tokens[from-1]: the module it defines inside currentModule (see
+// parser.NestedModuleName), and where its body starts. A defimpl gives the
+// protocol name as written: it is not nested, and its aliases are not
+// resolved here.
 func tokParseModuleDef(source []byte, tokens []parser.Token, from int, currentModule string) (name string, nextPos int, hasDo bool) {
+	name, _, _, nextPos, hasDo = tokParseModuleDefAlias(source, tokens, from, currentModule)
+	return name, nextPos, hasDo
+}
+
+// tokParseModuleDefAlias is tokParseModuleDef that also returns the alias a
+// nested defmodule or defprotocol adds in currentModule.
+func tokParseModuleDefAlias(source []byte, tokens []parser.Token, from int, currentModule string) (name, aliasShort, aliasFull string, nextPos int, hasDo bool) {
 	n := len(tokens)
 	j := tokNextSig(tokens, n, from)
 	name, k := tokCollectModuleName(source, tokens, n, j)
 	if name == "" {
-		return "", from, false
+		return "", "", "", from, false
 	}
-	if !strings.Contains(name, ".") && currentModule != "" {
-		name = currentModule + "." + name
+	if from == 0 || tokens[from-1].Kind != parser.TokDefimpl {
+		name, aliasShort, aliasFull = parser.NestedModuleName(name, currentModule)
 	}
 	_, nextPos, hasDo = parser.ScanForwardToBlockDo(tokens, n, k)
-	return name, nextPos, hasDo
+	return name, aliasShort, aliasFull, nextPos, hasDo
 }
 
 // extractEnclosingModuleFromTokens finds the innermost defmodule enclosing the given 0-based line.
@@ -1121,9 +1133,19 @@ func extractAliasesFromTokens(source []byte, tokens []parser.Token, targetLine i
 	}
 
 	processModuleDef := func(i int) int {
-		name, nextPos, hasDo := tokParseModuleDef(source, tokens, i, currentModule())
+		name, short, full, nextPos, hasDo := tokParseModuleDefAlias(source, tokens, i, currentModule())
 		if name == "" {
 			return i
+		}
+		if i > 0 && tokens[i-1].Kind == parser.TokDefimpl {
+			// The protocol name is a module reference.
+			if resolved := resolveRef(name); !strings.Contains(resolved, "__MODULE__") {
+				name = resolved
+			}
+		} else if short != "" {
+			// A nested module is an alias in the module around it, from
+			// its defmodule line on; the frame below inherits it.
+			record(tokens[i-1].Line, short, full)
 		}
 		if hasDo {
 			depth++

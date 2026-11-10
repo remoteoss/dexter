@@ -173,15 +173,15 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 			if resolved := ResolveModuleRef(name, aliases, currentModule()); resolved != "" {
 				name = resolved
 			}
-		} else if !strings.Contains(name, ".") && currentModule() != "" {
-			short := name
-			name = currentModule() + "." + name
+		} else {
+			var short, full string
+			name, short, full = NestedModuleName(name, currentModule())
 			// A nested module is an alias in the module around it, from here
 			// to its end, as if it had `alias Outer.Short`. The frame pushed
 			// below saves the aliases with it, so it lasts after this module
 			// ends.
-			if !quoted {
-				aliases[short] = name
+			if short != "" && !quoted {
+				aliases[short] = full
 			}
 		}
 
