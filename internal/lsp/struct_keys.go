@@ -106,8 +106,11 @@ scan:
 				break scan
 			}
 		case parser.TokDefmodule:
+			// A one-line `defmodule Short, do: ...` has no end to wait for.
 			if moduleDepth >= 0 && nestedAt < 0 {
-				nestedAt = depth
+				if _, _, hasDo := parser.ScanForwardToBlockDo(toks, len(toks), i+1); hasDo {
+					nestedAt = depth
+				}
 			}
 		}
 		if nestedAt >= 0 {

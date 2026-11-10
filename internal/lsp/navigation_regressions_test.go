@@ -596,7 +596,10 @@ func TestRegression_StructKeyDefinitionShapes(t *testing.T) {
 	self := bbFile{"lib/bb_self.ex", `defmodule BB.Self do
   defmodule Helper do
     defstruct [:other]
+    def one, do: 1
   end
+
+  defmodule Short, do: def(two, do: 2)
 
   defstruct [:domain, :name]
 
@@ -621,12 +624,12 @@ end
 	defer cleanup()
 	uri := bbOpen(t, server, self)
 	l, c := bbPos(t, self.src, "%__MODULE__{domain:", "domain")
-	if got := bbLines(definitionAt(t, server, uri, l, c), server.projectRoot); len(got) != 1 || got[0] != "lib/bb_self.ex:6" {
-		t.Errorf("%%__MODULE__ key = %v, want lib/bb_self.ex:6 (past the nested module's defstruct)", got)
+	if got := bbLines(definitionAt(t, server, uri, l, c), server.projectRoot); len(got) != 1 || got[0] != "lib/bb_self.ex:9" {
+		t.Errorf("%%__MODULE__ key = %v, want lib/bb_self.ex:9 (past the nested modules)", got)
 	}
 	uri = bbOpen(t, server, caller)
 	l, c = bbPos(t, caller.src, "%Self{domain:", "domain")
-	if got := bbLines(definitionAt(t, server, uri, l, c), server.projectRoot); len(got) != 1 || got[0] != "lib/bb_self.ex:6" {
-		t.Errorf("key through a use-injected alias = %v, want lib/bb_self.ex:6", got)
+	if got := bbLines(definitionAt(t, server, uri, l, c), server.projectRoot); len(got) != 1 || got[0] != "lib/bb_self.ex:9" {
+		t.Errorf("key through a use-injected alias = %v, want lib/bb_self.ex:9", got)
 	}
 }
