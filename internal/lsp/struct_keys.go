@@ -106,10 +106,16 @@ scan:
 				break scan
 			}
 		case parser.TokDefmodule:
-			// A one-line `defmodule Short, do: ...` has no end to wait for.
 			if moduleDepth >= 0 && nestedAt < 0 {
-				if _, _, hasDo := parser.ScanForwardToBlockDo(toks, len(toks), i+1); hasDo {
+				// The do of the nested module's own head: the scan stops at
+				// the end of the statement, so a one-line
+				// `defmodule Short, do: ...` does not take a later block's do.
+				if _, _, hasDo := parser.ScanForwardToMacroCallBlockDo(toks, len(toks), i+1); hasDo {
 					nestedAt = depth
+				} else {
+					// A one-line nested module: skip its statement.
+					i = statementEnd(toks, i+1)
+					continue
 				}
 			}
 		}
@@ -154,6 +160,25 @@ scan:
 		return "", 0, false
 	}
 	return def.FilePath, structLine, true
+}
+
+// statementEnd returns the index of the end of line that ends the statement
+// starting at from: the first EOL outside brackets.
+func statementEnd(toks []parser.Token, from int) int {
+	depth := 0
+	for j := from; j < len(toks); j++ {
+		switch toks[j].Kind {
+		case parser.TokOpenParen, parser.TokOpenBracket, parser.TokOpenBrace:
+			depth++
+		case parser.TokCloseParen, parser.TokCloseBracket, parser.TokCloseBrace:
+			depth--
+		case parser.TokEOL:
+			if depth <= 0 {
+				return j
+			}
+		}
+	}
+	return len(toks)
 }
 
 // structKeyLocation is the definition of the struct key at the cursor, or ok

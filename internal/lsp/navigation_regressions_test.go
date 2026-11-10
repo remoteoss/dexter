@@ -600,6 +600,7 @@ func TestRegression_StructKeyDefinitionShapes(t *testing.T) {
   end
 
   defmodule Short, do: def(two, do: 2)
+  defmodule Inline, do: defstruct([:domain])
 
   defstruct [:domain, :name]
 
@@ -624,12 +625,33 @@ end
 	defer cleanup()
 	uri := bbOpen(t, server, self)
 	l, c := bbPos(t, self.src, "%__MODULE__{domain:", "domain")
-	if got := bbLines(definitionAt(t, server, uri, l, c), server.projectRoot); len(got) != 1 || got[0] != "lib/bb_self.ex:9" {
-		t.Errorf("%%__MODULE__ key = %v, want lib/bb_self.ex:9 (past the nested modules)", got)
+	if got := bbLines(definitionAt(t, server, uri, l, c), server.projectRoot); len(got) != 1 || got[0] != "lib/bb_self.ex:10" {
+		t.Errorf("%%__MODULE__ key = %v, want lib/bb_self.ex:10 (past the nested modules)", got)
 	}
 	uri = bbOpen(t, server, caller)
 	l, c = bbPos(t, caller.src, "%Self{domain:", "domain")
-	if got := bbLines(definitionAt(t, server, uri, l, c), server.projectRoot); len(got) != 1 || got[0] != "lib/bb_self.ex:9" {
-		t.Errorf("key through a use-injected alias = %v, want lib/bb_self.ex:9", got)
+	if got := bbLines(definitionAt(t, server, uri, l, c), server.projectRoot); len(got) != 1 || got[0] != "lib/bb_self.ex:10" {
+		t.Errorf("key through a use-injected alias = %v, want lib/bb_self.ex:10", got)
+	}
+}
+
+// A one-line nested module before a schema does not take the schema's do.
+func TestRegression_StructKeyAfterOneLineNestedModule(t *testing.T) {
+	site := bbFile{"lib/bb_site2.ex", `defmodule BB.Site2 do
+  use Ecto.Schema
+  defmodule Short, do: :ok
+  schema "sites" do
+    field :domain, :string
+  end
+
+  def new(d), do: %__MODULE__{domain: d}
+end
+`}
+	server, cleanup := bbServer(t, site)
+	defer cleanup()
+	uri := bbOpen(t, server, site)
+	l, c := bbPos(t, site.src, "%__MODULE__{domain:", "domain")
+	if got := bbLines(definitionAt(t, server, uri, l, c), server.projectRoot); len(got) != 1 || got[0] != "lib/bb_site2.ex:5" {
+		t.Errorf("key after a one-line nested module = %v, want the field line lib/bb_site2.ex:5", got)
 	}
 }
