@@ -163,20 +163,27 @@ scan:
 }
 
 // statementEnd returns the index of the end of line that ends the statement
-// starting at from: the first EOL outside brackets.
+// starting at from: the first EOL outside brackets that does not follow a
+// comma or a colon (`defmodule Short,` and `do:` go on to the next line).
 func statementEnd(toks []parser.Token, from int) int {
 	depth := 0
+	last := parser.TokEOL
 	for j := from; j < len(toks); j++ {
-		switch toks[j].Kind {
+		k := toks[j].Kind
+		switch k {
 		case parser.TokOpenParen, parser.TokOpenBracket, parser.TokOpenBrace:
 			depth++
 		case parser.TokCloseParen, parser.TokCloseBracket, parser.TokCloseBrace:
 			depth--
 		case parser.TokEOL:
-			if depth <= 0 {
+			if depth <= 0 && last != parser.TokComma && last != parser.TokColon {
 				return j
 			}
+			continue
+		case parser.TokComment:
+			continue
 		}
+		last = k
 	}
 	return len(toks)
 }
