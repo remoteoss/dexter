@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	sqlite3 "github.com/mattn/go-sqlite3"
 	"github.com/remoteoss/dexter/internal/parser"
@@ -46,8 +47,26 @@ func registerDriver() {
 }
 
 type Store struct {
-	db *sql.DB
+	db    *sql.DB
+	path  string
+	inode uint64 // of the database file at open; see SameDatabaseFile
+
+	// gen counts the write transactions that ended, committed or not. A
+	// cache that read the index records it before the read, and reads the
+	// index again only when it moved. See WriteGeneration.
+	gen atomic.Uint64
 }
+
+// Path returns the database file this store opened.
+func (s *Store) Path() string { return s.path }
+
+// WriteGeneration returns a number that changes after each write to the
+// files, definitions, or refs tables. It changes after the write ends, so a
+// reader that records it before a read and finds it unchanged later knows
+// that no write landed in between.
+func (s *Store) WriteGeneration() uint64 { return s.gen.Load() }
+
+func (s *Store) wrote() { s.gen.Add(1) }
 
 // DBPath returns the canonical database path for a project root:
 // <root>/.dexter/dexter.db
@@ -149,7 +168,9 @@ func Open(projectRoot string) (*Store, error) {
 		return nil, err
 	}
 
-	return &Store{db: db}, nil
+	s := &Store{db: db, path: dbPath}
+	s.recordInode()
+	return s, nil
 }
 
 // migrateLegacyLayout deletes any pre-.dexter/ folder artifacts so that a
@@ -445,6 +466,38 @@ func (s *Store) GetFileMtime(path string) (int64, bool) {
 	return mtime, true
 }
 
+// FileMtimes returns the stored mtime of each of paths that the index has, in
+// a few queries rather than one for each path.
+func (s *Store) FileMtimes(paths []string) (map[string]int64, error) {
+	out := make(map[string]int64, len(paths))
+	for start := 0; start < len(paths); start += maxBindVars {
+		chunk := paths[start:min(start+maxBindVars, len(paths))]
+		args := make([]interface{}, len(chunk))
+		for i, p := range chunk {
+			args[i] = p
+		}
+		rows, err := s.db.Query("SELECT path, mtime FROM files WHERE path IN ("+placeholders(len(chunk))+")", args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var p string
+			var m int64
+			if err := rows.Scan(&p, &m); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			out[p] = m
+		}
+		err = rows.Err()
+		_ = rows.Close()
+		if err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
 func (s *Store) IndexFile(path string, defs []parser.Definition) error {
 	return s.IndexFileWithRefs(path, defs, nil)
 }
@@ -454,14 +507,41 @@ func (s *Store) IndexFileWithRefs(path string, defs []parser.Definition, refs []
 	if err != nil {
 		return err
 	}
+	return s.IndexFileWithRefsAt(path, info.ModTime().UnixNano(), defs, refs)
+}
 
+// IndexFileWithRefsAt is IndexFileWithRefs with the mtime that the caller
+// read before it parsed the file. A save between that stat and the parse then
+// leaves the row older than the disk, and the next pass reads it again; a stat
+// after the parse would give the old text the new mtime.
+func (s *Store) IndexFileWithRefsAt(path string, mtimeNano int64, defs []parser.Definition, refs []parser.Reference) error {
+	defer s.wrote()
+	return s.indexFileWithMtime(path, mtimeNano, defs, refs)
+}
+
+// BufferMtime is the mtime stored for a file indexed from an editor buffer
+// rather than from disk. No file on disk has it, so the next reconciliation
+// that looks at the file reads it from disk again. A buffer row that carried
+// the disk file's mtime would look current forever: if the editor then threw
+// the buffer away (undo, reload, close without saving), the index would keep
+// text that is on no disk.
+const BufferMtime int64 = -1
+
+// IndexBufferWithRefs indexes text that is not on disk, an editor buffer, for
+// path. The row gets BufferMtime. The file does not have to exist yet.
+func (s *Store) IndexBufferWithRefs(path string, defs []parser.Definition, refs []parser.Reference) error {
+	defer s.wrote()
+	return s.indexFileWithMtime(path, BufferMtime, defs, refs)
+}
+
+func (s *Store) indexFileWithMtime(path string, mtimeNano int64, defs []parser.Definition, refs []parser.Reference) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	fileID, err := upsertFileID(tx, path, info.ModTime().UnixNano())
+	fileID, err := upsertFileID(tx, path, mtimeNano)
 	if err != nil {
 		return err
 	}
@@ -549,6 +629,7 @@ const (
 // Batch wraps multiple IndexFile operations in a single SQLite transaction
 // with shared prepared statements.
 type Batch struct {
+	store      *Store
 	ctx        context.Context
 	tx         *sql.Tx
 	mode       batchMode
@@ -648,7 +729,7 @@ func (s *Store) beginBatch(ctx context.Context, mode batchMode) (_ *Batch, err e
 	if err != nil {
 		return nil, err
 	}
-	b := &Batch{ctx: ctx, tx: tx, mode: mode}
+	b := &Batch{store: s, ctx: ctx, tx: tx, mode: mode}
 	defer func() {
 		if err != nil {
 			b.closeStmts()
@@ -860,6 +941,7 @@ func (b *Batch) flushPending() error {
 }
 
 func (b *Batch) Commit() error {
+	defer b.store.wrote()
 	err := b.flushPending()
 	b.closeStmts()
 	if err == nil && b.mode == batchRebuild {
@@ -989,6 +1071,7 @@ func (s *Store) RemoveFilesContext(ctx context.Context, paths []string) error {
 	if len(paths) == 0 {
 		return nil
 	}
+	defer s.wrote()
 	ids := make([]int64, 0, len(paths))
 	for start := 0; start < len(paths); start += maxBindVars {
 		chunk := paths[min(start, len(paths)):min(start+maxBindVars, len(paths))]
@@ -1086,6 +1169,7 @@ func (s *Store) RemoveFileIDs(ctx context.Context, ids []int64) error {
 	if len(ids) == 0 {
 		return nil
 	}
+	defer s.wrote()
 	if len(ids) >= rebuildMinFiles {
 		var total int
 		if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM files").Scan(&total); err != nil {
@@ -1149,6 +1233,7 @@ func (s *Store) rebuildWithout(ctx context.Context, ids []int64) error {
 	if err != nil {
 		return err
 	}
+	defer func() { _ = b.Rollback() }() // after Commit it does nothing
 	if err := b.RemoveIDs(ids); err != nil {
 		_ = b.Rollback()
 		return err
@@ -1174,6 +1259,30 @@ type CompletionResult struct {
 // SearchModulesBySuffix returns modules whose name ends with the given suffix.
 // For example, "Accounts" matches "MyApp.Accounts" and "RandomAPI.Client"
 // matches "MyApp.RandomAPI.Client".
+// ModuleNamesBySuffix returns up to limit names of modules, protocols, and
+// impls that are segment or end in "."+segment, in order. With no kind
+// filter the scan reads idx_definitions_module_function alone, which is
+// faster than SearchModulesBySuffix on a large index.
+func (s *Store) ModuleNamesBySuffix(segment string, limit int) ([]string, error) {
+	rows, err := s.db.Query(
+		"SELECT DISTINCT module FROM definitions WHERE function = '' AND (module = ? OR module LIKE ?) ORDER BY module LIMIT ?",
+		segment, "%."+segment, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []string
+	for rows.Next() {
+		var m string
+		if err := rows.Scan(&m); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) SearchModulesBySuffix(segment string) ([]CompletionResult, error) {
 	rows, err := s.db.Query(
 		"SELECT DISTINCT module FROM definitions WHERE (module = ? OR module LIKE ?) AND function = '' AND kind IN ('module', 'defprotocol') ORDER BY module LIMIT 20",
@@ -1261,7 +1370,7 @@ func (s *Store) SearchSubmoduleSegments(parentModule string, segmentPrefix strin
 func (s *Store) ListModuleFunctions(module string, publicOnly bool) ([]CompletionResult, error) {
 	query := "SELECT d.module, d.function, d.arity, d.kind, f.path, d.line, d.params FROM definitions d JOIN files f ON f.id = d.file_id WHERE d.module = ? AND d.function != '' AND d.kind NOT IN ('callback', 'macrocallback')"
 	if publicOnly {
-		query += " AND kind IN ('def', 'defmacro', 'defguard', 'defdelegate', 'type', 'opaque')"
+		query += " AND kind IN ('def', 'defmacro', 'defguard', 'defdelegate', 'defstruct', 'defexception', 'type', 'opaque')"
 	}
 	query += " GROUP BY function, arity ORDER BY function, arity LIMIT 100"
 
@@ -1351,7 +1460,7 @@ type FunctionKey struct {
 // idx_definitions_module_function.
 func (s *Store) ModuleFunctionKeys(module string) ([]FunctionKey, error) {
 	rows, err := s.db.Query(
-		"SELECT DISTINCT function, arity FROM definitions WHERE module = ? AND function != '' AND kind IN ('def', 'defmacro', 'defguard', 'defdelegate', 'type', 'opaque')",
+		"SELECT DISTINCT function, arity FROM definitions WHERE module = ? AND function != '' AND kind IN ('def', 'defmacro', 'defguard', 'defdelegate', 'defstruct', 'defexception', 'type', 'opaque')",
 		module,
 	)
 	if err != nil {
@@ -1385,6 +1494,19 @@ func (s *Store) LookupModule(module string) ([]LookupResult, error) {
 		"SELECT f.path, d.line, d.kind, d.arity, d.delegate_to, d.delegate_as FROM definitions d JOIN files f ON f.id = d.file_id WHERE d.module = ? AND d.function = '' AND d.kind IN ('module', 'defprotocol', 'defimpl')",
 		module,
 	)
+}
+
+// ModuleFile returns the file of module's first definition (the one
+// LookupModule lists first) and its indexed mtime. ok is false when the
+// index has no such module.
+func (s *Store) ModuleFile(module string) (path string, mtime int64, ok bool) {
+	err := s.db.QueryRow(
+		"SELECT f.path, f.mtime FROM definitions d JOIN files f ON f.id = d.file_id WHERE d.module = ? AND d.function = '' AND d.kind IN ('module', 'defprotocol', 'defimpl') LIMIT 1",
+		module).Scan(&path, &mtime)
+	if err != nil {
+		return "", 0, false
+	}
+	return path, mtime, true
 }
 
 // LookupModulesInFile returns all module names defined in the given file, in line order.
@@ -1451,7 +1573,7 @@ func (s *Store) LookupFunction(module, function string) ([]LookupResult, error) 
 // not silently become visible through imports, use chains, or Kernel fallback.
 func (s *Store) LookupPublicFunction(module, function string) ([]LookupResult, error) {
 	return s.queryLookup(
-		"SELECT f.path, d.line, d.kind, d.arity, d.delegate_to, d.delegate_as FROM definitions d JOIN files f ON f.id = d.file_id WHERE d.module = ? AND d.function = ? AND d.kind IN ('def', 'defmacro', 'defguard', 'defdelegate', 'type', 'opaque') ORDER BY CASE WHEN d.kind IN ('type', 'opaque') THEN 1 ELSE 0 END, d.line",
+		"SELECT f.path, d.line, d.kind, d.arity, d.delegate_to, d.delegate_as FROM definitions d JOIN files f ON f.id = d.file_id WHERE d.module = ? AND d.function = ? AND d.kind IN ('def', 'defmacro', 'defguard', 'defdelegate', 'defstruct', 'defexception', 'type', 'opaque') ORDER BY CASE WHEN d.kind IN ('type', 'opaque') THEN 1 ELSE 0 END, d.line",
 		module, function,
 	)
 }
@@ -1590,6 +1712,87 @@ func (s *Store) LookupBehaviourImplementors(behaviourModule string) ([]Behaviour
 	return results, rows.Err()
 }
 
+// DeriveResult is an `@derive` of a protocol: the module that derives it and
+// the line of the attribute.
+type DeriveResult struct {
+	Module   string
+	FilePath string
+	Line     int
+}
+
+// LookupDerives returns the modules whose source derives protocol with
+// `@derive`. The parser stores each as a "derive" reference to the protocol
+// with the deriving module in the function column. Covered by
+// idx_refs_module_function.
+func (s *Store) LookupDerives(protocol string) ([]DeriveResult, error) {
+	rows, err := s.db.Query(
+		"SELECT r.function, f.path, r.line FROM refs r JOIN files f ON f.id = r.file_id WHERE r.module = ? AND r.function != '' AND r.kind = 'derive' ORDER BY r.function, f.path, r.line",
+		protocol)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []DeriveResult
+	for rows.Next() {
+		var r DeriveResult
+		if err := rows.Scan(&r.Module, &r.FilePath, &r.Line); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// UseLines returns the lines of the `use` calls in a file (every module of
+// it, and uses inside quotes too). Covered by idx_refs_file_id.
+func (s *Store) UseLines(filePath string) (map[int]bool, error) {
+	rows, err := s.db.Query("SELECT line FROM refs WHERE file_id = "+fileIDSubquery+" AND kind = 'use'", filePath)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	lines := make(map[int]bool)
+	for rows.Next() {
+		var line int
+		if err := rows.Scan(&line); err != nil {
+			return nil, err
+		}
+		lines[line] = true
+	}
+	return lines, rows.Err()
+}
+
+// LookupUseSites returns the `use Module` lines and the module that each is
+// in. It is LookupBehaviourImplementors without @behaviour, and with the line.
+func (s *Store) LookupUseSites(module string) ([]DeriveResult, error) {
+	rows, err := s.db.Query(`
+		SELECT d.module, f.path, r.line
+		FROM refs r
+		JOIN files f ON f.id = r.file_id
+		JOIN definitions d ON d.file_id = r.file_id AND d.function = '' AND d.kind IN ('module', 'defprotocol')
+			AND d.line = (
+				SELECT MAX(d2.line) FROM definitions d2
+				WHERE d2.file_id = r.file_id AND d2.function = '' AND d2.kind IN ('module', 'defprotocol') AND d2.line <= r.line
+			)
+		WHERE r.module = ? AND r.function = '' AND r.kind = 'use'
+		ORDER BY d.module, f.path, r.line`,
+		module,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []DeriveResult
+	for rows.Next() {
+		var r DeriveResult
+		if err := rows.Scan(&r.Module, &r.FilePath, &r.Line); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // LookupFunctionInModules returns definitions of a function across multiple modules in a single query.
 // If arity >= 0, filters by exact arity match.
 func (s *Store) LookupFunctionInModules(modules []string, function string, arity int) ([]LookupResult, error) {
@@ -1639,6 +1842,104 @@ type ReferenceResult struct {
 	FilePath string
 	Line     int
 	Kind     string
+	Function string // set by LookupReferencesInModules only
+}
+
+// LookupReferencesInModules returns the references to function in any of
+// modules, in one query.
+func (s *Store) LookupReferencesInModules(modules []string, function string) ([]ReferenceResult, error) {
+	if len(modules) == 0 {
+		return nil, nil
+	}
+	var results []ReferenceResult
+	// SQLite limits the number of parameters of one statement.
+	for start := 0; start < len(modules); start += 500 {
+		end := min(start+500, len(modules))
+		args := make([]any, 0, end-start+1)
+		args = append(args, function)
+		for _, m := range modules[start:end] {
+			args = append(args, m)
+		}
+		rows, err := s.db.Query(
+			"SELECT f.path, r.line, r.kind, r.function FROM refs r JOIN files f ON f.id = r.file_id WHERE r.function = ? AND r.module IN (?"+strings.Repeat(",?", end-start-1)+")",
+			args...)
+		if err != nil {
+			return nil, err
+		}
+		part, err := scanSortedReferences(rows, true)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, part...)
+	}
+	return results, nil
+}
+
+// ModuleArities returns, for each of modules that defines a function (or a
+// macro, a guard, a delegate; not a callback or a type) named function, the
+// arities it defines, in one query for each 500 modules.
+func (s *Store) ModuleArities(function string, modules []string) (map[string]map[int]bool, error) {
+	out := make(map[string]map[int]bool)
+	for start := 0; start < len(modules); start += 500 {
+		end := min(start+500, len(modules))
+		args := make([]any, 0, end-start+1)
+		args = append(args, function)
+		for _, m := range modules[start:end] {
+			args = append(args, m)
+		}
+		rows, err := s.db.Query(
+			"SELECT DISTINCT module, arity FROM definitions WHERE function = ? AND kind IN ('def', 'defp', 'defmacro', 'defmacrop', 'defguard', 'defguardp', 'defdelegate') AND module IN (?"+strings.Repeat(",?", end-start-1)+")",
+			args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var m string
+			var arity int
+			if err := rows.Scan(&m, &arity); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			if out[m] == nil {
+				out[m] = make(map[int]bool)
+			}
+			out[m][arity] = true
+		}
+		err = rows.Err()
+		_ = rows.Close()
+		if err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+func scanSortedReferences(rows *sql.Rows, withFunction bool) ([]ReferenceResult, error) {
+	defer func() { _ = rows.Close() }()
+	var results []ReferenceResult
+	for rows.Next() {
+		var r ReferenceResult
+		var err error
+		if withFunction {
+			err = rows.Scan(&r.FilePath, &r.Line, &r.Kind, &r.Function)
+		} else {
+			err = rows.Scan(&r.FilePath, &r.Line, &r.Kind)
+		}
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].FilePath != results[j].FilePath {
+			return results[i].FilePath < results[j].FilePath
+		}
+		return results[i].Line < results[j].Line
+	})
+	return results, nil
 }
 
 func (s *Store) LookupReferences(module, function string) ([]ReferenceResult, error) {
@@ -1780,6 +2081,10 @@ func (s *Store) LookupDelegatesTo(targetModule, targetFunction string) ([]Delega
 }
 
 func (s *Store) SearchSymbols(query string, excludePathPrefix ...string) ([]CompletionResult, error) {
+	return s.searchSymbols(query, 50, excludePathPrefix...)
+}
+
+func (s *Store) searchSymbols(query string, limit int, excludePathPrefix ...string) ([]CompletionResult, error) {
 	var (
 		rows *sql.Rows
 		err  error
@@ -1805,19 +2110,19 @@ func (s *Store) SearchSymbols(query string, excludePathPrefix ...string) ([]Comp
 		modulePart := "%" + query[:dotIndex] + "%"
 		suffixPart := "%" + query[dotIndex+1:] + "%"
 		args := append([]interface{}{modulePart, suffixPart, suffixPart}, extraArgs...)
-		args = append(args, query, query)
+		args = append(args, query, query, limit)
 		rows, err = s.db.Query(
 			"SELECT d.module, d.function, d.arity, d.kind, f.path, d.line FROM definitions d JOIN files f ON f.id = d.file_id WHERE d.module LIKE ? AND (d.function LIKE ? OR d.module LIKE ?)"+pathFilter+
-				" ORDER BY CASE WHEN d.module = ? THEN 0 WHEN INSTR(d.module || '.' || d.function, ?) > 0 THEN 1 ELSE 2 END, d.module, d.function LIMIT 50",
+				" ORDER BY CASE WHEN d.module = ? THEN 0 WHEN INSTR(d.module || '.' || d.function, ?) > 0 THEN 1 ELSE 2 END, d.module, d.function, d.arity LIMIT ?",
 			args...,
 		)
 	} else {
 		pattern := "%" + query + "%"
 		args := append([]interface{}{pattern, pattern}, extraArgs...)
-		args = append(args, query, query, query)
+		args = append(args, query, query, query, limit)
 		rows, err = s.db.Query(
 			"SELECT d.module, d.function, d.arity, d.kind, f.path, d.line FROM definitions d JOIN files f ON f.id = d.file_id WHERE (d.module LIKE ? OR d.function LIKE ?)"+pathFilter+
-				" ORDER BY CASE WHEN d.module = ? THEN 0 WHEN INSTR(d.module, ?) > 0 OR INSTR(d.function, ?) > 0 THEN 1 ELSE 2 END, d.module, d.function LIMIT 50",
+				" ORDER BY CASE WHEN d.module = ? THEN 0 WHEN INSTR(d.module, ?) > 0 OR INSTR(d.function, ?) > 0 THEN 1 ELSE 2 END, d.module, d.function, d.arity LIMIT ?",
 			args...,
 		)
 	}
@@ -1838,12 +2143,79 @@ func (s *Store) SearchSymbols(query string, excludePathPrefix ...string) ([]Comp
 	return results, rows.Err()
 }
 
+// SymbolMatch is one function (module, name, arity) in one file that a symbol
+// search matched, with its first line and its number of clauses.
+type SymbolMatch struct {
+	CompletionResult
+	Clauses int
+}
+
+// SearchSymbolsGrouped is SearchSymbols with one row per module, function,
+// arity, and file instead of one per clause; more reports that there are
+// further matches. It reads the same limit rows as SearchSymbols (one more,
+// to know whether there are more), groups them here, and counts the clauses
+// of the functions it shows with one indexed query. A GROUP BY in the search
+// itself, or reading more rows, made a common query on a large index slower.
+func (s *Store) SearchSymbolsGrouped(query string, limit int, excludePathPrefix ...string) (results []SymbolMatch, more bool, err error) {
+	rows, err := s.searchSymbols(query, limit+1, excludePathPrefix...)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(rows) > limit {
+		rows, more = rows[:limit], true
+	}
+	type groupKey struct {
+		module, function string
+		arity            int
+		path             string
+	}
+	index := make(map[groupKey]int)
+	for _, r := range rows {
+		key := groupKey{r.Module, r.Function, r.Arity, r.FilePath}
+		if at, ok := index[key]; ok {
+			results[at].Clauses++
+			if r.Line < results[at].Line {
+				results[at].Line = r.Line
+			}
+			continue
+		}
+		index[key] = len(results)
+		results = append(results, SymbolMatch{CompletionResult: r, Clauses: 1})
+	}
+	// The rows are ordered by module, function, and arity, so every function
+	// but the last one read has all its clauses here. The last one's clauses
+	// can reach past the rows read, so they are counted.
+	for i := range results {
+		r := &results[i]
+		if r.Function == "" {
+			continue
+		}
+		last := rows[len(rows)-1]
+		if r.Module != last.Module || r.Function != last.Function || r.Arity != last.Arity {
+			continue
+		}
+		if !more {
+			continue
+		}
+		var n int
+		if err := s.db.QueryRow(
+			"SELECT COUNT(*) FROM definitions d JOIN files f ON f.id = d.file_id WHERE d.module = ? AND d.function = ? AND d.arity = ? AND f.path = ?",
+			r.Module, r.Function, r.Arity, r.FilePath,
+		).Scan(&n); err == nil && n > 0 {
+			r.Clauses = n
+		}
+	}
+	return results, more, nil
+}
+
 // ListSubmodules returns all modules whose name starts with prefix + ".".
 // Used for cascading module renames (e.g. renaming MyApp.Accounts also catches MyApp.Accounts.User).
 func (s *Store) ListSubmodules(prefix string) ([]string, error) {
+	// A range, not LIKE: LIKE ignores case and takes `_` as a wildcard, so
+	// MyApp.Api_V1 would match MyApp.ApiXV1.Sub.
 	rows, err := s.db.Query(
-		"SELECT DISTINCT module FROM definitions WHERE module LIKE ? AND function = '' ORDER BY module",
-		prefix+".%",
+		"SELECT DISTINCT module FROM definitions WHERE module >= ? AND module < ? AND function = '' ORDER BY module",
+		prefix+".", prefix+"/",
 	)
 	if err != nil {
 		return nil, err

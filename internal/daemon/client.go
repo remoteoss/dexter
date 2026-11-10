@@ -97,6 +97,7 @@ func Ensure(ctx context.Context, root string) (*Client, error) {
 	if err == nil {
 		return client, nil
 	}
+	waitForOwner := false
 	// A daemon built by another version owns this workspace and cannot be
 	// replaced by starting a second one; report it now instead of waiting out
 	// the start timeout for a daemon that will never appear.
@@ -122,7 +123,7 @@ func Ensure(ctx context.Context, root string) (*Client, error) {
 		}
 	} else if mismatch := new(RootMismatchError); errors.As(err, &mismatch) {
 		return nil, mismatch
-	} else if ownership, _, ownErr := AcquireOwnership(root); errors.Is(ownErr, ErrWorkspaceOwned) {
+	} else if ownership, _, ownErr := acquireOwnershipPatiently(root); errors.Is(ownErr, ErrWorkspaceOwned) {
 		client, dialErr := dialWithin(ctx, root, ownerBindGrace)
 		if client != nil {
 			return client, nil
@@ -135,7 +136,14 @@ func Ensure(ctx context.Context, root string) (*Client, error) {
 			return nil, ctx.Err()
 		}
 		if !socketExists(root) {
-			return nil, fmt.Errorf("workspace %s is owned by another dexter process that is not serving its daemon socket (a `dexter init` may be rebuilding the index); retry when it finishes: %w", root, dialErr)
+			pid, found := daemonProcessFor(root)
+			if !found {
+				return nil, fmt.Errorf("workspace %s is owned by another dexter process that is not serving its daemon socket (a `dexter init` may be rebuilding the index); retry when it finishes: %w", root, dialErr)
+			}
+			// A daemon whose socket file was removed stops when it next
+			// checks the socket. Wait for its lock, then start a new one.
+			log.Printf("The workspace daemon (pid %d) lost its socket file; waiting for it to stop", pid)
+			waitForOwner = true
 		}
 		// The socket is there but not answering yet. A spawned daemon will lose
 		// the ownership race, but the retry loop below still rides out a slow
@@ -146,27 +154,68 @@ func Ensure(ctx context.Context, root string) (*Client, error) {
 		}
 	}
 
-	if err := spawnDaemon(root); err != nil {
-		return nil, err
+	// lockHeld is true while the spawned daemon has exited because the
+	// workspace was owned, and the owner does not serve: a daemon that stops
+	// holds its lock while it drains, after it closed its socket.
+	lockHeld := waitForOwner
+	var exited <-chan error
+	if !waitForOwner {
+		if exited, err = spawnDaemon(root); err != nil {
+			return nil, err
+		}
 	}
 
 	deadline := time.Now().Add(defaultStartTimeout)
 	backoff := 5 * time.Millisecond
+	respawns := 0
 	var lastErr error
 	for time.Now().Before(deadline) {
 		client, err := Dial(ctx, root)
 		if err == nil {
 			return client, nil
 		}
+		if lockHeld && respawns < maxRespawns {
+			if ownership, _, ownErr := AcquireOwnership(root); ownErr == nil {
+				_ = ownership.Release()
+				lockHeld = false
+				respawns++
+				if exited, err = spawnDaemon(root); err != nil {
+					return nil, err
+				}
+			}
+		}
 		var mismatch *RootMismatchError
 		if errors.As(err, &mismatch) {
 			return nil, mismatch
+		}
+		// A newer build took the workspace while this one started; waiting
+		// cannot make this build compatible with it.
+		var newer *IncompatibleDaemonError
+		if errors.As(err, &newer) && !newer.ClientNewer {
+			return nil, newer
 		}
 		lastErr = err
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-time.After(backoff):
+		case exitErr := <-exited:
+			// The spawned process ended, so polling longer cannot help;
+			// only another daemon that won the start can answer now.
+			exited = nil
+			if client, err := Dial(ctx, root); err == nil {
+				return client, nil
+			}
+			if exitErr != nil {
+				return nil, &DaemonExitError{Err: exitErr}
+			}
+			// Status 0 at start means it found the workspace owned. When the
+			// lock is free again, the owner held it only for a moment (a
+			// cleanup, or `dexter stop` that checked for a daemon), or it
+			// was a daemon that finished stopping, so start one again. The
+			// polls go on checking the lock while the owner may still start
+			// serving or stop.
+			lockHeld = true
 		}
 		if backoff < 250*time.Millisecond {
 			backoff *= 2
@@ -178,6 +227,22 @@ func Ensure(ctx context.Context, root string) (*Client, error) {
 	}
 	return nil, fmt.Errorf("daemon did not become ready%s: %w", hint, lastErr)
 }
+
+// maxRespawns bounds how often Ensure starts a daemon again after one exited
+// because it found the workspace owned while nobody served it.
+const maxRespawns = 2
+
+// DaemonExitError is a daemon process that exited with a failure while it
+// started. The end of the daemon log says why; ExplainStartupFailure adds it.
+type DaemonExitError struct {
+	Err error
+}
+
+func (e *DaemonExitError) Error() string {
+	return fmt.Sprintf("the workspace daemon exited while it started (%v)", e.Err)
+}
+
+func (e *DaemonExitError) Unwrap() error { return e.Err }
 
 // dialWithin polls for a daemon connection for up to grace. A nil client with a
 // nil error is impossible: the last dial error is returned when the grace runs
@@ -592,14 +657,17 @@ func dialKindTimeout(ctx context.Context, root, kind, session string, timeout ti
 	return conn, reader, res, nil
 }
 
-// parseDaemonPid finds the workspace daemon in `ps -A -o uid=,pid=,args=`
+// parseDaemonPids finds the workspace daemons in `ps -A -o uid=,pid=,args=`
 // output. A daemon's command line ends with "daemon <root>", which is specific
 // enough to locate a process whose handshake could not carry a pid; a lookup or
 // lsp invocation never ends that way. Only this user's processes are eligible,
-// so a shared machine cannot make dexter signal someone else's daemon.
-func parseDaemonPid(psOutput, root string) (int, bool) {
+// so a shared machine cannot make dexter signal someone else's daemon. More
+// than one can match: a daemon whose lock file was removed keeps running next to
+// the one that took the new lock until it notices.
+func parseDaemonPids(psOutput, root string) []int {
 	suffix := "daemon " + root
 	uid := strconv.Itoa(os.Getuid())
+	var pids []int
 	for _, line := range strings.Split(psOutput, "\n") {
 		line = strings.TrimSpace(line)
 		if !strings.HasSuffix(line, suffix) {
@@ -613,9 +681,21 @@ func parseDaemonPid(psOutput, root string) (int, bool) {
 		if err != nil || pid == os.Getpid() {
 			continue
 		}
-		return pid, true
+		pids = append(pids, pid)
 	}
-	return 0, false
+	return pids
+}
+
+// daemonProcessFor is findDaemonProcess; a test replaces it.
+var daemonProcessFor = findDaemonProcess
+
+// findDaemonProcess reports the first daemon process for root.
+func findDaemonProcess(root string) (int, bool) {
+	pids := findDaemonProcesses(root)
+	if len(pids) == 0 {
+		return 0, false
+	}
+	return pids[0], true
 }
 
 // FindDaemonProcess reports the pid of the daemon serving root, located by
@@ -626,16 +706,27 @@ func FindDaemonProcess(root string) (int, bool) { return findDaemonProcess(root)
 // waits use it because the daemon closes its socket before it finishes draining.
 func ProcessAlive(pid int) bool { return processAlive(pid) }
 
-// StopForced terminates the workspace daemon without a protocol handshake by
-// locating its process. It is the recovery path for a wedged daemon and the
-// only path that works when a daemon from another build predates every
+// StopForced terminates every workspace daemon process for root without a
+// protocol handshake. It is the recovery path for a wedged daemon, for two
+// daemons that serve one root after its lock file was removed, and the only
+// path that works when a daemon from another build predates every
 // pid-carrying refusal. It reports whether a matching process was found.
 func StopForced(ctx context.Context, root string) (bool, error) {
-	pid, ok := findDaemonProcess(root)
-	if !ok {
+	pids := findDaemonProcesses(root)
+	if len(pids) == 0 {
 		return false, nil
 	}
-	return true, stopPid(ctx, root, pid, signalGrace)
+	errs := make([]error, len(pids))
+	var wg sync.WaitGroup
+	for i, pid := range pids {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = stopPid(ctx, root, pid, signalGrace)
+		}()
+	}
+	wg.Wait()
+	return true, errors.Join(errs...)
 }
 
 // signalGrace is how long an explicitly forced stop waits for a daemon to exit
@@ -763,18 +854,20 @@ func ReplaceIncompatible(ctx context.Context, root string, e *IncompatibleDaemon
 	return waitForWorkspaceFree(ctx, root, replacementGrace)
 }
 
-// spawnDaemon starts the detached workspace daemon. It is a variable so tests
-// can exercise Ensure's replacement decision without launching a process.
+// spawnDaemon starts the detached workspace daemon. The channel receives the
+// result of the process when it exits; a nil channel never does. It is a
+// variable so tests can exercise Ensure's replacement decision without
+// launching a process.
 var spawnDaemon = spawn
 
-func spawn(root string) error {
+func spawn(root string) (<-chan error, error) {
 	ep, err := ResolveEndpoint(root)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	executable, err := os.Executable()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	// The log is append-only across daemon runs; a debug-heavy editor can make
 	// it grow for as long as the workspace lives, so truncate it when it gets
@@ -784,7 +877,7 @@ func spawn(root string) error {
 	}
 	logFile, err := os.OpenFile(ep.Log, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
-		return fmt.Errorf("open daemon log: %w", err)
+		return nil, fmt.Errorf("open daemon log: %w", err)
 	}
 	cmd := exec.Command(executable, "daemon", ep.Root)
 	cmd.Stdin = nil
@@ -797,26 +890,33 @@ func spawn(root string) error {
 	configureDetachedProcess(&cmd.SysProcAttr)
 	if err := cmd.Start(); err != nil {
 		_ = logFile.Close()
-		return fmt.Errorf("start workspace daemon: %w", err)
+		return nil, fmt.Errorf("start workspace daemon: %w", err)
 	}
 	_ = logFile.Close()
 	// Reap the child if it exits while this frontend is still alive — the loser
 	// of a startup race does exactly that, and an editor can live for hours.
 	// The daemon normally outlives this process and is reparented when it exits.
-	go func() { _ = cmd.Wait() }()
-	return nil
+	exited := make(chan error, 1)
+	go func() { exited <- cmd.Wait() }()
+	return exited, nil
 }
 
 // ProxyLSP connects stdio to a daemon-hosted LSP session. When the session
 // cannot start, the editor must not see only a process that exits: ProxyLSP
 // answers its initialize request with the explanation and returns an
-// *LSPStartupError.
+// *LSPStartupError. When the daemon stops during the session, ProxyLSP
+// reaches a daemon again, starting one when necessary, and rebuilds the
+// session there; when it cannot, it tells the editor why and returns an
+// *LSPConnectionLostError.
 func ProxyLSP(ctx context.Context, root string, in io.Reader, out io.Writer) error {
 	conn, reader, err := connectFrontend(ctx, root, kindLSP, "")
 	if err != nil {
 		return failLSPStartup(ctx, root, err, in, out)
 	}
-	return pipeFrontend(conn, reader, in, out)
+	proxy := newLSPProxy(ctx, root, in, out, func(ctx context.Context) (net.Conn, *bufio.Reader, error) {
+		return connectFrontend(ctx, root, kindLSP, "")
+	})
+	return proxy.run(conn, reader)
 }
 
 // ProxyFrontend connects stdio to a daemon-hosted protocol adapter without

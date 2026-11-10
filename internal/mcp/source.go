@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/remoteoss/dexter/internal/lsp"
+	"github.com/remoteoss/dexter/internal/pathcase"
 )
 
 // maxSourceBytes caps the size of one file that a tool reads. Elixir source
@@ -30,6 +31,9 @@ type sourceCache struct {
 	// conflicts are files read from disk that also have older unsaved
 	// changes in an editor.
 	conflicts map[string]struct{}
+	// unordered are files read from an unsaved buffer although the disk
+	// changed at about the same time.
+	unordered map[string]struct{}
 }
 
 // errNotFound reports a file that does not exist.
@@ -37,7 +41,8 @@ var errNotFound = errors.New("file not found")
 
 // userPath resolves a file path that the agent gave. A relative path is
 // resolved against the project root. The path, with every symlink resolved,
-// must be inside the project root, also with its symlinks resolved. The
+// must be inside the project root, also with its symlinks resolved, in the
+// spelling that the file system stores. The
 // result is spelled under the root as the daemon spells it, so that it names
 // the same file as the index and the editors.
 func (h *Handler) userPath(p string) (string, error) {
@@ -66,7 +71,11 @@ func (h *Handler) userPath(p string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	rel, ok := inside(root, real)
+	// EvalSymlinks keeps the case that the caller typed. On a file system
+	// that ignores case, compare the stored spellings, as the daemon identity
+	// does, so that every spelling of a file inside the root is accepted and
+	// the result has the spelling of the index.
+	rel, ok := inside(pathcase.DiskSpelling(root), pathcase.DiskSpelling(real))
 	if !ok {
 		return "", outsideRootError(p, h.projectRoot)
 	}
@@ -245,35 +254,103 @@ func (h *Handler) view(path string) (*sourceView, error) {
 		}
 		c.unsaved[path] = struct{}{}
 	}
-	if conflict {
+	switch conflict {
+	case diskNewer:
 		if c.conflicts == nil {
 			c.conflicts = make(map[string]struct{})
 		}
 		c.conflicts[path] = struct{}{}
+	case unordered:
+		if c.unordered == nil {
+			c.unordered = make(map[string]struct{})
+		}
+		c.unordered[path] = struct{}{}
 	}
 	return v, err
 }
 
+// sourceConflict says how an editor's unsaved changes and the disk relate.
+type sourceConflict int
+
+const (
+	noConflict sourceConflict = iota
+	// diskNewer: the disk was read, and an editor has older unsaved changes.
+	diskNewer
+	// unordered: the buffer was read, and the disk changed at about the same
+	// time, so which one is newer is not known.
+	unordered
+)
+
 // loadSource reads path as the user sees it. A buffer that an editor holds
 // open is used only when it has changes that the editor has not saved and the
-// file on disk did not change after them. When both changed, the disk wins,
-// because the index follows the disk, and conflict is true.
-func (h *Handler) loadSource(path string) (v *sourceView, conflict bool, err error) {
+// file on disk did not change after them. A dirty buffer with the same text as
+// the disk (an editor that reloaded the file sends a change) counts as clean.
+// When both changed and the disk changed later, the disk wins, because the
+// index follows the disk. When the order is not known, the buffer wins.
+func (h *Handler) loadSource(path string) (v *sourceView, conflict sourceConflict, err error) {
 	disk, mtime, diskErr := readRegularFile(path)
 	if buffer, open := h.rt.UnsavedBuffer(path); open {
-		switch {
-		case diskErr == nil && disk == buffer.Text:
-			return newSourceView(disk, false, "", false), false, nil
-		case diskErr == nil && mtime.After(buffer.ChangedAt):
-			return newSourceView(disk, false, "", false), true, nil
+		if diskErr != nil {
+			return newSourceView(buffer.Text, true, "", false), noConflict, nil
+		}
+		if sameText(disk, buffer.Text) {
+			return newSourceView(disk, false, "", false), noConflict, nil
+		}
+		switch changedOrder(mtime, buffer.ChangedAt) {
+		case diskLater:
+			return newSourceView(disk, false, "", false), diskNewer, nil
+		case orderUnknown:
+			return newSourceView(buffer.Text, true, disk, true), unordered, nil
 		default:
-			return newSourceView(buffer.Text, true, disk, diskErr == nil), false, nil
+			return newSourceView(buffer.Text, true, disk, true), noConflict, nil
 		}
 	}
 	if diskErr != nil {
-		return nil, false, diskErr
+		return nil, noConflict, diskErr
 	}
-	return newSourceView(disk, false, "", false), false, nil
+	return newSourceView(disk, false, "", false), noConflict, nil
+}
+
+// sameText reports whether two texts are equal except for CR characters and
+// one final newline.
+func sameText(a, b string) bool {
+	if a == b {
+		return true
+	}
+	norm := func(s string) string {
+		s = strings.ReplaceAll(s, "\r", "")
+		return strings.TrimSuffix(s, "\n")
+	}
+	return norm(a) == norm(b)
+}
+
+type order int
+
+const (
+	bufferLater order = iota
+	diskLater
+	orderUnknown
+)
+
+// changedOrder compares the time the file on disk changed with the time of a
+// buffer's last change. A file system with one-second timestamps (the
+// fraction is zero) cannot order two changes in the same second.
+func changedOrder(mtime, changedAt time.Time) order {
+	if mtime.Nanosecond() == 0 {
+		ms, cs := mtime.Unix(), changedAt.Unix()
+		switch {
+		case ms > cs:
+			return diskLater
+		case ms == cs:
+			return orderUnknown
+		default:
+			return bufferLater
+		}
+	}
+	if mtime.After(changedAt) {
+		return diskLater
+	}
+	return bufferLater
 }
 
 // sourceLine returns the text of one index position. A file that no editor
@@ -326,10 +403,14 @@ func (h *Handler) unsavedNote() string {
 	c.mu.Lock()
 	unsaved := h.relPaths(c.unsaved)
 	conflicts := h.relPaths(c.conflicts)
+	unordered := h.relPaths(c.unordered)
 	c.mu.Unlock()
 	var notes []string
 	if len(unsaved) > 0 {
 		notes = append(notes, "Note: read from unsaved editor buffers (the files on disk differ; line numbers are the buffer's): "+strings.Join(unsaved, ", "))
+	}
+	if len(unordered) > 0 {
+		notes = append(notes, "Note: the files on disk changed at about the same time as the unsaved editor buffers that were read; the two may conflict: "+strings.Join(unordered, ", "))
 	}
 	if len(conflicts) > 0 {
 		notes = append(notes, "Note: read from disk, but an editor also has unsaved changes to these files, made before the files on disk changed; the two may conflict: "+strings.Join(conflicts, ", "))

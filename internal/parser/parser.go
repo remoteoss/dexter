@@ -1,11 +1,14 @@
 package parser
 
 import (
+	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 )
@@ -50,7 +53,7 @@ type Reference struct {
 	Function string // function name (empty for module-only refs like alias/import/use)
 	Line     int
 	FilePath string
-	Kind     string // "call", "alias", "import", "use"
+	Kind     string // "call", "alias", "import", "use", "quoted_use" (a use in a macro's quote)
 }
 
 func ParseFile(path string) ([]Definition, []Reference, error) {
@@ -63,7 +66,16 @@ func ParseFile(path string) ([]Definition, []Reference, error) {
 
 // ParseText parses Elixir source text and returns definitions and references.
 // The path is used to populate FilePath fields but the text is not read from disk.
-func ParseText(path, text string) ([]Definition, []Reference, error) {
+//
+// A panic in the parser becomes an error for this one file, so that a parser
+// bug on unusual source cannot stop the process that indexes the workspace.
+func ParseText(path, text string) (defs []Definition, refs []Reference, err error) {
+	defer func() {
+		if value := recover(); value != nil {
+			log.Printf("Error: parser panic on %s: %v\n%s", path, value, debug.Stack())
+			defs, refs, err = nil, nil, fmt.Errorf("internal parser error: %v", value)
+		}
+	}()
 	source := []byte(text)
 	result := TokenizeFull(source)
 	return parseTextFromTokens(path, source, result.Tokens, result.Interp)
@@ -105,6 +117,30 @@ func resolveModule(s, currentModule string) string {
 		return strings.ReplaceAll(s, "__MODULE__", currentModule)
 	}
 	return s
+}
+
+// NestedModuleName returns the module that `defmodule raw` (or defprotocol)
+// defines inside the module current, as Elixir names it, and the alias the
+// definition adds in current (empty when it adds none). Elixir always nests:
+// `defmodule Deep.Inner` inside Outer is Outer.Deep.Inner, and it aliases
+// Deep to Outer.Deep; `defmodule MyApp.Fake` inside MyApp.FooTest is
+// MyApp.FooTest.MyApp.Fake. An alias in scope does not change that. Only
+// `__MODULE__.Sub` (Outer.Sub) and `Elixir.Name` (Name) are not nested.
+func NestedModuleName(raw, current string) (name, aliasShort, aliasFull string) {
+	if rest, ok := strings.CutPrefix(raw, "Elixir."); ok {
+		return rest, "", ""
+	}
+	if current == "" {
+		return raw, "", ""
+	}
+	if raw == "__MODULE__" {
+		return current, "", ""
+	}
+	if rest, ok := strings.CutPrefix(raw, "__MODULE__."); ok {
+		return current + "." + rest, "", ""
+	}
+	first, _, _ := strings.Cut(raw, ".")
+	return current + "." + raw, first, current + "." + first
 }
 
 // ExpandAliasPrefix rewrites the leading segment of a module reference using
@@ -171,10 +207,14 @@ func IsElixirFile(path string) bool {
 // the entries below it report a symlinked directory as a non-directory, as in
 // the collector. Paths keep the caller's prefix, which the editor's URIs depend
 // on, instead of the resolved one filepath.EvalSymlinks would give.
+//
+// It returns the error when root cannot be read, because a walk that saw
+// nothing for that reason is not an empty project: the sweep would prune every
+// stored file. A directory below root that cannot be read is skipped.
 func WalkElixirFiles(root string, fn func(path string, d fs.DirEntry) error) error {
 	info, err := os.Stat(root)
 	if err != nil {
-		return nil
+		return err
 	}
 	if !info.IsDir() {
 		if !IsElixirFile(root) {
@@ -191,6 +231,9 @@ func WalkElixirFiles(root string, fn func(path string, d fs.DirEntry) error) err
 		}
 		entries, err := ReadDirUnsorted(dir)
 		if err != nil {
+			if isRoot {
+				return err
+			}
 			return nil
 		}
 		// A worktree that git is still moving has an empty .git file; it is
@@ -214,12 +257,20 @@ func WalkElixirFiles(root string, fn func(path string, d fs.DirEntry) error) err
 				if err := fn(path, e); err != nil {
 					return err
 				}
+			} else if name[0] == '.' {
+				RemoveStaleRenameTemp(path)
 			}
 		}
 		return nil
 	}
 	return walk(root, true)
 }
+
+// SkipDir reports whether the walk skips a directory with this name. A
+// watcher that reports the files of a new directory uses it too, so that it
+// reports what a full walk would index; which directories a watcher watches
+// is another question, with its own rules.
+func SkipDir(name string) bool { return skipDir(name) }
 
 // skipDir reports whether a directory name is excluded from indexing.
 func skipDir(name string) bool {
@@ -427,15 +478,12 @@ func InLinkedWorktree(root, path string) bool {
 // A root without a .git entry costs one stat, so walks of subtrees and of
 // directories outside a repository pay almost nothing.
 func NestedWorktreeTops(root string, aliases ...string) []string {
-	gitDir, ok := GitDir(root)
+	worktrees, ok := WorktreeRecordsDir(root)
 	if !ok {
 		return nil
 	}
-	common := gitDir
-	if b, err := os.ReadFile(filepath.Join(gitDir, "commondir")); err == nil {
-		common = resolveFrom(gitDir, strings.TrimSpace(string(b)))
-	}
-	admins, err := ReadDirUnsorted(filepath.Join(common, "worktrees"))
+	common := filepath.Dir(worktrees)
+	admins, err := ReadDirUnsorted(worktrees)
 	if err != nil || len(admins) == 0 {
 		return nil
 	}
@@ -460,6 +508,22 @@ func NestedWorktreeTops(root string, aliases ...string) []string {
 		}
 	}
 	return tops
+}
+
+// WorktreeRecordsDir returns <common git dir>/worktrees of root's repository,
+// where git records its linked worktrees, and false when root has no .git
+// entry. The directory need not exist. Its mtime changes when git adds or
+// drops a record, so a cache of NestedWorktreeTops can test it with one stat.
+func WorktreeRecordsDir(root string) (string, bool) {
+	gitDir, ok := GitDir(root)
+	if !ok {
+		return "", false
+	}
+	common := gitDir
+	if b, err := os.ReadFile(filepath.Join(gitDir, "commondir")); err == nil {
+		common = resolveFrom(gitDir, strings.TrimSpace(string(b)))
+	}
+	return filepath.Join(common, "worktrees"), true
 }
 
 // NestedWorktreeSet is NestedWorktreeTops as a set, nil when
@@ -556,6 +620,8 @@ func CollectElixirFilesParallel(root string) []string {
 			}
 			if IsElixirFile(path) {
 				local = append(local, path)
+			} else if name[0] == '.' {
+				RemoveStaleRenameTemp(path)
 			}
 		}
 

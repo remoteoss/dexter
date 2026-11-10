@@ -13,12 +13,15 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"go.lsp.dev/protocol"
+
+	"github.com/remoteoss/dexter/internal/notify"
 )
 
 //go:embed beam_server.exs
@@ -289,6 +292,20 @@ func readStatusPayload(r io.Reader) (byte, []byte, error) {
 }
 
 func (bp *beamProcess) readLoop() {
+	// A panic here would stop the daemon. The BEAM process is a helper:
+	// failing its startup and its open requests leaves a formatter that is
+	// started again on the next request.
+	defer func() {
+		if value := recover(); value != nil {
+			log.Printf("Error: panic in the BEAM read loop: %v\n%s", value, debug.Stack())
+			err := fmt.Errorf("BEAM read loop: internal error: %v", value)
+			bp.finishStartup(err)
+			bp.failPending(err)
+			if bp.cmd != nil && bp.cmd.process != nil {
+				_ = bp.cmd.process.Kill()
+			}
+		}
+	}()
 	for {
 		frameType, err := readByte(bp.stdout)
 		if err != nil {
@@ -685,11 +702,15 @@ func (bp *beamProcess) closeWithReason(reason string) {
 	default:
 		close(bp.closed)
 	}
-	bp.finishStartup(fmt.Errorf("BEAM closed"))
+	bp.finishStartup(errBeamClosed)
 	log.Printf("BEAM: closing process (pid %d): %s", bp.cmd.process.Pid, reason)
 	_ = bp.stdin.Close()
 	_ = bp.cmd.process.Kill()
 }
+
+// condFormatterScript is the condition of a formatter script that no
+// directory can hold.
+const condFormatterScript = "formatter.script"
 
 // startBeam starts the persistent BEAM for a build root. A variable so tests
 // can start a fake one.
@@ -699,16 +720,13 @@ var startBeam = (*Server).startBeamProcess
 // immediately. The returned process may not be ready yet — callers must check
 // bp.Ready() before sending requests.
 func (s *Server) startBeamProcess(buildRoot string) (*beamProcess, error) {
-	scriptDir := filepath.Join(os.TempDir(), "dexter")
-	if err := os.MkdirAll(scriptDir, 0755); err != nil {
-		return nil, fmt.Errorf("create script dir: %w", err)
+	scriptPath, err := installScriptAnywhere(scriptDirCandidates(), "beam_server", ".exs", beamServerScript)
+	if err != nil {
+		s.index.reporter.Set(condFormatterScript, notify.Warning, fmt.Sprintf(
+			"Dexter: no directory for its formatter script can be used (%v). Formatting uses `mix format`, which is slower. Remove the directory that another user created, or give it to this user, then restart the editor.", err))
+		return nil, fmt.Errorf("write beam server script: %w", err)
 	}
-	scriptPath := filepath.Join(scriptDir, "beam_server.exs")
-	if existing, err := os.ReadFile(scriptPath); err != nil || string(existing) != beamServerScript {
-		if err := os.WriteFile(scriptPath, []byte(beamServerScript), 0644); err != nil {
-			return nil, fmt.Errorf("write beam server script: %w", err)
-		}
-	}
+	s.index.reporter.Clear(condFormatterScript, "Dexter: the formatter script can be written again; the fast formatter works.")
 
 	elixirBin := filepath.Join(filepath.Dir(s.mixBin), "elixir")
 	cmd := exec.Command(elixirBin, scriptPath, buildRoot)
@@ -754,17 +772,18 @@ func (s *Server) startBeamProcess(buildRoot string) (*beamProcess, error) {
 	go func() {
 		select {
 		case <-bp.ready:
-			if bp.startErr != nil {
-				_ = cmd.Process.Kill()
-				<-done
-				if isOTPMismatch(stderrBuf.String()) {
-					s.rememberOTPMismatch(buildRoot)
-				}
+			if bp.startErr == nil {
+				s.beamStarted(buildRoot)
+				return
 			}
-		case <-time.After(beamStuckTimeout):
-			bp.finishStartup(fmt.Errorf("BEAM startup timed out"))
 			_ = cmd.Process.Kill()
 			<-done
+			s.noteStartFailure(bp, buildRoot)
+		case <-time.After(beamStuckTimeout):
+			bp.finishStartup(errBeamStartTimeout)
+			_ = cmd.Process.Kill()
+			<-done
+			s.noteStartFailure(bp, buildRoot)
 		}
 	}()
 
@@ -798,21 +817,41 @@ func (s *Server) findBuildRoot(dir string) string {
 func (s *Server) getBeamProcess(ctx context.Context, buildRoot string) *beamProcess {
 	s.beamMu.Lock()
 	defer s.beamMu.Unlock()
+	// closeBeams has run, or is about to: a BEAM started now would live as a
+	// child of the daemon until the daemon stops. closeBeams sets this under
+	// beamMu, so no start can slip in after it.
+	if s.beamsClosed || s.sessionClosed.Load() {
+		return nil
+	}
 
 	if bp, ok := s.beams[buildRoot]; ok {
 		if bp.alive() {
 			return bp
 		}
-		log.Printf("BEAM: process for %s is dead, restarting", buildRoot)
+		// A process that died before it was ready failed to start. The
+		// goroutine of startBeamProcess records that too, but a request can
+		// come first, also before the read loop saw the end of the output.
+		select {
+		case <-bp.cmd.done:
+			bp.finishStartup(errors.New("BEAM exited before it was ready"))
+		default:
+		}
+		if bp.startFailed() {
+			s.noteStartFailure(bp, buildRoot)
+		} else {
+			log.Printf("BEAM: process for %s is dead, restarting", buildRoot)
+		}
+		delete(s.beams, buildRoot)
 	}
 
 	if s.mixBin == "" {
 		return nil
 	}
-	if s.otpMismatchHolds(buildRoot) {
+	if s.beamFailureHolds(buildRoot, false) {
 		// The BEAM fails the same way until the Elixir install or the build
-		// changes. Starting it on each save is a slow, failed spawn; the
-		// caller falls back to mix format.
+		// changes, or the retry delay passes. Starting it on each request is
+		// a slow, failed spawn; the caller falls back (mix format for a
+		// format, the index alone for the rest).
 		return nil
 	}
 
@@ -891,7 +930,11 @@ func (s *Server) formatContent(ctx context.Context, mixRoot, path, content strin
 		switch {
 		case age > beamStuckTimeout:
 			log.Printf("Formatting: BEAM process stuck (started %s ago), restarting", age.Truncate(time.Second))
+			// A startup that timed out is a failure: it is recorded before
+			// the eviction, whose close would otherwise be its only cause.
+			bp.finishStartup(errBeamStartTimeout)
 			s.evictBeam(bp, fmt.Sprintf("formatContent: startup exceeded %s without becoming ready", beamStuckTimeout))
+			s.noteStartFailure(bp, buildRoot)
 			return s.formatFallback(ctx, mixRoot, buildRoot, path, content)
 
 		case age > beamWaitTimeout:
@@ -973,17 +1016,52 @@ func (s *Server) formatFallback(ctx context.Context, mixRoot, buildRoot, path, c
 	return out, err
 }
 
-// noteBeamStartFailure records an OTP mismatch of a BEAM that failed to start,
-// before the fallback runs, so that the fallback can report it. The process
+// noteBeamStartFailure records a BEAM that failed to start, before the
+// fallback runs, so that the fallback can report an OTP mismatch. The process
 // was just killed; its stderr is complete when it has exited.
 func (s *Server) noteBeamStartFailure(bp *beamProcess, buildRoot string) {
 	select {
 	case <-bp.cmd.done:
 	case <-time.After(2 * time.Second):
 	}
-	if bp.stderr != nil && isOTPMismatch(bp.stderr.String()) {
-		s.rememberOTPMismatch(buildRoot)
+	s.noteStartFailure(bp, buildRoot)
+}
+
+// errBeamStartTimeout is the startup error of a BEAM that did not become ready
+// within beamStuckTimeout.
+var errBeamStartTimeout = fmt.Errorf("BEAM startup timed out after %s", beamStuckTimeout)
+
+// errBeamClosed is the startup error of a BEAM that Dexter closed itself, for
+// example because the formatter config changed. It is not a failure.
+var errBeamClosed = errors.New("BEAM closed")
+
+// startFailed reports whether bp ended its startup with an error that was not
+// a close by Dexter.
+func (bp *beamProcess) startFailed() bool {
+	select {
+	case <-bp.ready:
+		return bp.startErr != nil && !errors.Is(bp.startErr, errBeamClosed)
+	default:
+		return false
 	}
+}
+
+// noteStartFailure remembers that bp failed to start, with the cause that its
+// output gives. Its caller knows that bp has exited, or that it does not
+// matter: the stderr that is there decides.
+func (s *Server) noteStartFailure(bp *beamProcess, buildRoot string) {
+	if !bp.startFailed() {
+		return
+	}
+	stderr := ""
+	if bp.stderr != nil {
+		stderr = bp.stderr.String()
+	}
+	reason := firstErrorLine(stderr)
+	if reason == "" {
+		reason = bp.startErr.Error()
+	}
+	s.rememberBeamFailure(buildRoot, bp, isOTPMismatch(stderr), reason)
 }
 
 // formatWithMixFormat runs `mix format` in mixRoot. It is the fallback when the
@@ -1179,6 +1257,7 @@ func computeMinimalEdits(original, formatted string) []protocol.TextEdit {
 func (s *Server) closeBeams() {
 	s.beamMu.Lock()
 	defer s.beamMu.Unlock()
+	s.beamsClosed = true
 	for _, bp := range s.beams {
 		bp.closeWithReason("server shutdown")
 	}

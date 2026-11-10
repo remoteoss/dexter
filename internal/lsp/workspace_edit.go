@@ -25,6 +25,10 @@ import (
 type WorkspaceEdit struct {
 	Changes         map[protocol.DocumentURI][]protocol.TextEdit `json:"changes,omitempty"`
 	DocumentChanges []interface{}                                `json:"documentChanges,omitempty"`
+
+	// indexed closes when the index has the rename's changes (see
+	// reindexAfterRename). It is not sent to the editor.
+	indexed <-chan struct{}
 }
 
 // TextDocumentEdit is a documentChanges entry holding text edits for one
@@ -109,5 +113,39 @@ func (s *Server) renameHandler(next jsonrpc2.Handler) jsonrpc2.Handler {
 			return reply(ctx, nil, nil)
 		}
 		return reply(ctx, edit, nil)
+	}
+}
+
+// useEditorURIs rewrites the URI of every document that this editor has open
+// to the spelling the editor sent for it. The edit names files by the paths in
+// the index, and uri.File spells them in one way; an editor can spell the same
+// file in another way (VS Code percent-encodes '@', for example) and compare
+// URIs as strings. An edit under the other spelling could miss the open
+// buffer. Text edits for one document that arrive under two spellings are
+// merged.
+func (s *Server) useEditorURIs(edit *WorkspaceEdit) {
+	editorURI := func(u protocol.DocumentURI) protocol.DocumentURI {
+		if raw, ok := s.docs.EditorURI(string(u)); ok {
+			return protocol.DocumentURI(raw)
+		}
+		return u
+	}
+	if len(edit.Changes) > 0 {
+		changes := make(map[protocol.DocumentURI][]protocol.TextEdit, len(edit.Changes))
+		for u, edits := range edit.Changes {
+			eu := editorURI(u)
+			changes[eu] = append(changes[eu], edits...)
+		}
+		edit.Changes = changes
+	}
+	for i, change := range edit.DocumentChanges {
+		switch c := change.(type) {
+		case TextDocumentEdit:
+			c.TextDocument.URI = editorURI(c.TextDocument.URI)
+			edit.DocumentChanges[i] = c
+		case RenameFile:
+			c.OldURI = editorURI(c.OldURI)
+			edit.DocumentChanges[i] = c
+		}
 	}
 }

@@ -278,6 +278,15 @@ func TestTokenize_SigilBracketNested(t *testing.T) {
 	assertKinds(t, "~s(foo (bar) baz)", []TokenKind{TokSigil})
 }
 
+// TestTokenize_UppercaseSigilEscapedDelimiter: an uppercase sigil takes \ before
+// its closing delimiter as an escape, and \\ as a pair that does not escape.
+func TestTokenize_UppercaseSigilEscapedDelimiter(t *testing.T) {
+	assertKinds(t, `~S(a\)b) x`, []TokenKind{TokSigil, TokIdent})
+	assertText(t, `~S(a\)b) x`, 0, `~S(a\)b)`)
+	assertKinds(t, `~S|p\|q| x`, []TokenKind{TokSigil, TokIdent})
+	assertText(t, `~S(c\\) x`, 0, `~S(c\\)`)
+}
+
 // TestTokenize_SigilModifier verifies sigil with trailing modifier letters.
 func TestTokenize_SigilModifier(t *testing.T) {
 	assertKinds(t, "~r/foo/i", []TokenKind{TokSigil})
@@ -624,10 +633,10 @@ func TestTokenize_SigilInsideInterpolation(t *testing.T) {
 }
 
 func TestTokenize_UppercaseSigilNoEscapes(t *testing.T) {
-	// ~S"contains \" stuff" — uppercase sigil, backslash is NOT escape.
-	// The \" is literal \ then " which closes the sigil.
-	// So ~S"contains \" is the sigil, then stuff" is separate tokens.
-	source := `~S"contains \" stuff`
+	// ~S"contains \" stuff" — an uppercase sigil does not process escapes,
+	// but Elixir still takes \ before the closing delimiter as an escape of
+	// it (deprecated): ~S"x\"y" is "x\"y". The sigil runs to the last ".
+	source := `~S"contains \" stuff"`
 	tokens := tokenizeNoEOF(source)
 	var nonEOL []Token
 	for _, tok := range tokens {
@@ -641,9 +650,8 @@ func TestTokenize_UppercaseSigilNoEscapes(t *testing.T) {
 	if nonEOL[0].Kind != TokSigil {
 		t.Errorf("token[0] = %s, want TokSigil", kindName(nonEOL[0].Kind))
 	}
-	// The sigil should end at the first unescaped " (which is the \" — no escape in uppercase sigil)
 	sigilText := string([]byte(source)[nonEOL[0].Start:nonEOL[0].End])
-	expected := `~S"contains \"`
+	expected := `~S"contains \" stuff"`
 	if sigilText != expected {
 		t.Errorf("sigil text = %q, want %q", sigilText, expected)
 	}

@@ -3,7 +3,11 @@ package lsp
 import (
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io/fs"
+	"log"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -30,10 +34,18 @@ const (
 	CondIndexFallback = "index.fallback"
 	// CondIndexFiles is a set of files that could not be indexed.
 	CondIndexFiles = "index.files"
+	// CondIndexStale is a pass that could not walk or prune: the project
+	// root cannot be read for now, or the index could not be read or
+	// changed. A retry comes, and a complete pass clears it.
+	CondIndexStale = "index.stale"
+	// CondRootGone is a project root that was moved or deleted. The
+	// workspace stops, so nothing clears it.
+	CondRootGone = "root.gone"
 
 	condStdlib    = "stdlib"
 	condFormatter = "formatter"
 	condOTP       = "formatter.otp"
+	condBeamStart = "formatter.beam"
 )
 
 // IndexConditionPrefix starts the key of every condition that describes the
@@ -242,18 +254,51 @@ func (s *Server) indexBuildFellBack(err error) {
 }
 
 // finishReindex ends the reports of one full-or-incremental pass. The clear
-// messages say that the index works fully again.
-func (s *Server) finishReindex(task *notify.Task, files int, elapsed time.Duration) {
+// messages say that the index works fully again, unless some files failed to
+// write: then the rebuild clear is neutral, and the CondIndexFiles report
+// that follows names the files.
+func (s *Server) finishReindex(task *notify.Task, files, failed int, elapsed time.Duration) {
 	r := s.index.reporter
 	built := fmt.Sprintf("Dexter: index built (%d files in %s).", files, elapsed)
+	rebuilt := fmt.Sprintf("Dexter: the index rebuild is complete (%d files in %s); navigation works fully again.", files, elapsed)
+	if failed > 0 {
+		built = fmt.Sprintf("Dexter: index built (%d files in %s); %d files could not be written.", files, elapsed, failed)
+		rebuilt = fmt.Sprintf("Dexter: the index rebuild is complete (%d files in %s), but %d files could not be written; Dexter tries them again.", files, elapsed, failed)
+	}
 	task.End(built)
 	r.Clear(CondIndexFallback, "")
-	if r.Clear(CondIndexRebuild, fmt.Sprintf("Dexter: the index rebuild is complete (%d files in %s); navigation works fully again.", files, elapsed)) {
+	if r.Clear(CondIndexRebuild, rebuilt) {
 		r.Clear(CondIndexBuild, "")
 	} else {
 		r.Clear(CondIndexBuild, built)
 	}
 	s.index.reportFileFailures()
+}
+
+// reportStale tells the user that a pass could not walk or prune, and why.
+//
+// One failure alone is not shown: a flaky mount can fail one stat now and
+// then, and a warning and an "up to date again" for each would only be noise.
+// The second failure in a row shows it.
+func (s *Server) reportStale(err error) {
+	if s.index.staleFailures.Add(1) < 2 {
+		log.Printf("Warning: the index cannot be brought up to date (%v); Dexter tries again later", err)
+		return
+	}
+	s.index.reporter.Set(CondIndexStale, notify.Warning, fmt.Sprintf(
+		"Dexter: the index cannot be brought up to date (%v). Dexter tries again later; until then, answers can be out of date.", err))
+}
+
+// ReportStale is reportStale for the workspace runtime, which holds back a
+// batch of changes when the project root cannot be read.
+func (s *Server) ReportStale(err error) { s.reportStale(err) }
+
+// clearStale ends CondIndexStale after a pass that walked and pruned.
+//
+// A failure that was never shown is forgotten without a message.
+func (s *Server) clearStale() {
+	s.index.staleFailures.Store(0)
+	s.index.reporter.Clear(CondIndexStale, "Dexter: the index is up to date again.")
 }
 
 // reconcileProgress shows progress for an incremental pass that turns out to
@@ -299,23 +344,237 @@ func (s *Server) ReportStdlib() {
 		r.Clear(condStdlib, fmt.Sprintf("Dexter: found the Elixir standard library at %s; navigation into it works now.", root))
 		return
 	}
-	r.Set(condStdlib, notify.Warning, "Dexter: could not find the Elixir standard library, so standard library modules (Enum, String, and so on) do not resolve. Make sure that the Elixir version in .tool-versions or mise.toml is installed (for example `mise install`), or set DEXTER_ELIXIR_LIB_ROOT or the stdlibPath initialization option, then restart the editor.")
+	r.Set(condStdlib, notify.Warning, "Dexter: could not find the Elixir standard library, so standard library modules (Enum, String, and so on) do not resolve. Make sure that the Elixir version in .tool-versions or mise.toml is installed (for example `mise install`), or set DEXTER_ELIXIR_LIB_ROOT or the stdlibPath initialization option. Then restart the editor. When an editor connects, Dexter looks again if a version file (.tool-versions, mise.toml) changed or if 5 minutes passed since it last looked. To make it look at once, or to use a changed DEXTER_ELIXIR_LIB_ROOT, run `dexter stop` in the project directory before you restart the editor.")
 }
 
 // mixMissingMessage tells one editor that its session has no mix binary. Each
 // session finds mix for itself and uses it for its own formatting, so the
 // report goes to that editor only.
-const mixMissingMessage = "Dexter: could not find the `mix` binary, so formatting does not work in this editor. Install the Elixir version of this project (for example `mise install`) or put mix on the PATH of the editor, then restart the editor."
+const mixMissingMessage = "Dexter: could not find the `mix` binary, so formatting does not work in this editor. Install the Elixir version of this project (for example `mise install`), then restart the editor: Dexter looks for mix again when an editor connects. If mix is only on the PATH of the editor, also run `dexter stop` in the project directory first, because the Dexter daemon keeps the PATH that it started with."
 
 // otpMismatchRetry is how long a build root whose BEAM failed with an OTP
 // mismatch uses mix format before Dexter tries the BEAM again, when nothing
 // that can fix the mismatch changed first. A variable so tests can shrink it.
 var otpMismatchRetry = 10 * time.Minute
 
-// otpMismatch remembers a BEAM that failed with an OTP mismatch.
-type otpMismatch struct {
-	at    time.Time
-	stamp string
+// beamStartRetry is the first wait after a BEAM failed to start for another
+// cause than an OTP mismatch, and beamStartRetryMax the longest: the wait
+// doubles after each failure that nothing fixed. The cause can be one that
+// the stamp does not see (a file that a plugin reads, a network share), so the
+// longest wait is short. Variables so tests can shrink them.
+var (
+	beamStartRetry    = 15 * time.Second
+	beamStartRetryMax = time.Minute
+)
+
+// beamFailure remembers a BEAM that failed to start, so that the requests
+// that need it (format, Erlang hover and completion, the prewarm when a
+// document opens) fall back at once instead of starting a VM that fails the
+// same way each time.
+type beamFailure struct {
+	at       time.Time
+	stamp    string // beamStamp when it failed
+	otp      bool   // an OTP mismatch; reportBeamOTP reports it
+	failures int    // consecutive failures with the same stamp
+	proc     *beamProcess
+	// checkedAt is when the stamp was last found unchanged. Guarded by
+	// beamFailures.mu.
+	checkedAt time.Time
+}
+
+// beamStampInterval is how long a stamp that was found unchanged is trusted
+// without a new check. A stamp reads a directory entry for each compiled
+// application, which costs more than 1 ms in a large umbrella, and requests
+// that need the BEAM come often. A fix is seen at most this late. A variable
+// so tests can change it.
+var beamStampInterval = time.Second
+
+// retryAfter is how long the failure holds when nothing that can fix it
+// changes.
+func (f *beamFailure) retryAfter() time.Duration {
+	if f.otp {
+		return otpMismatchRetry
+	}
+	delay := beamStartRetry
+	for i := 1; i < f.failures && delay < beamStartRetryMax; i++ {
+		delay *= 2
+	}
+	return min(delay, beamStartRetryMax)
+}
+
+// beamFailureKey identifies one BEAM: a build root started with one Elixir
+// install. Sessions can find different mix binaries, and the failure of one
+// says nothing about the other.
+type beamFailureKey struct {
+	buildRoot string
+	mixBin    string
+}
+
+// beamFailures are the BEAMs that failed to start. They are shared by every
+// session of the workspace, like the reporter: a failure seen by one editor
+// holds for the others with the same Elixir install. mu is taken after
+// Server.beamMu and is not held while the reporter or otpOutcomes are used.
+type beamFailures struct {
+	mu   sync.Mutex
+	keys map[beamFailureKey]*beamFailure
+	// forgotAt is the time of the last forget. A process that started before
+	// it is not recorded: its failure can be the one that a fix ended, and
+	// its record can come late, from the goroutine that waits for its exit.
+	forgotAt time.Time
+}
+
+// forget drops every remembered failure, so that the next request tries the
+// BEAM again. It runs when something that can fix a failure changes and no
+// stamp sees it reliably (mix.exs, mix.lock, a compile), and when an editor
+// connects, which is what a user does after a fix.
+func (f *beamFailures) forget() {
+	f.mu.Lock()
+	f.keys = nil
+	f.forgotAt = time.Now()
+	f.mu.Unlock()
+}
+
+// otpApplyHook runs between the decision of reportBeamOTP and its Set or Clear.
+// Tests use it to force an order of concurrent formats.
+var otpApplyHook func()
+
+func (s *Server) beamFailureKey(buildRoot string) beamFailureKey {
+	return beamFailureKey{buildRoot: buildRoot, mixBin: s.mixBin}
+}
+
+// beamStartKey is the condition of a BEAM that cannot start for another cause
+// than an OTP mismatch.
+func beamStartKey(k beamFailureKey) string {
+	return condBeamStart + ":" + k.buildRoot + " mix=" + k.mixBin
+}
+
+// beamStamp identifies what can fix a BEAM that cannot start for a build root:
+// the Elixir and mix binaries, the erl that the elixir script runs, the
+// _build directory, and the compiled applications in it (the mtime of each
+// ebin directory moves when a compile writes a BEAM). It reads a few
+// directories and stats one entry for each application, only while a failure
+// is remembered.
+func (s *Server) beamStamp(buildRoot string) string {
+	var b strings.Builder
+	elixir := filepath.Join(filepath.Dir(s.mixBin), "elixir")
+	fmt.Fprint(&b, s.mixBin, statFileStamp(elixir), statFileStamp(s.mixBin))
+	if erl, err := exec.LookPath("erl"); err == nil {
+		if resolved, err := filepath.EvalSymlinks(erl); err == nil {
+			erl = resolved
+		}
+		fmt.Fprint(&b, "|", erl, statFileStamp(erl))
+	}
+	build := filepath.Join(buildRoot, "_build")
+	fmt.Fprint(&b, "|", statFileStamp(build))
+	h := fnv.New64a()
+	envs, _ := os.ReadDir(build)
+	for _, env := range envs {
+		lib := filepath.Join(build, env.Name(), "lib")
+		_, _ = fmt.Fprint(h, env.Name(), statFileStamp(lib))
+		apps, _ := os.ReadDir(lib)
+		for _, app := range apps {
+			_, _ = fmt.Fprint(h, app.Name(), statFileStamp(filepath.Join(lib, app.Name(), "ebin")))
+		}
+	}
+	fmt.Fprintf(&b, "|%x", h.Sum64())
+	return b.String()
+}
+
+// errOTPMismatch marks a mix format that failed with an OTP mismatch.
+var errOTPMismatch = errors.New("Elixir/OTP version mismatch")
+
+// rememberBeamFailure records that bp, the BEAM of buildRoot, failed to start,
+// so that it is not started again on each request. The same process is
+// recorded once, however many callers see it fail. A failure other than an
+// OTP mismatch is reported once, as a Warning for the build root and the
+// Elixir install; a repeated failure only updates its text. A failure with
+// another cause than the last one ends the report of the last one, so that no
+// report keeps a cause that is gone.
+func (s *Server) rememberBeamFailure(buildRoot string, bp *beamProcess, otp bool, reason string) {
+	key := s.beamFailureKey(buildRoot)
+	stamp := s.beamStamp(buildRoot)
+	f := &s.index.beamFailures
+	f.mu.Lock()
+	if f.keys == nil {
+		f.keys = make(map[beamFailureKey]*beamFailure)
+	}
+	if bp != nil && !bp.startedAt.After(f.forgotAt) {
+		f.mu.Unlock()
+		return
+	}
+	previous := f.keys[key]
+	if previous != nil && previous.proc == bp && previous.otp == otp && (bp != nil || time.Since(previous.at) < previous.retryAfter()) {
+		f.mu.Unlock()
+		return
+	}
+	failure := &beamFailure{at: time.Now(), stamp: stamp, otp: otp, failures: 1, proc: bp, checkedAt: time.Now()}
+	if previous != nil && previous.stamp == stamp && previous.otp == otp {
+		failure.failures = previous.failures + 1
+	}
+	f.keys[key] = failure
+	causeChanged := previous != nil && previous.otp != otp
+	f.mu.Unlock()
+
+	if reason == "" {
+		reason = "no reason given"
+	}
+	log.Printf("BEAM: the process for %s (mix %s) failed to start (%s); Dexter tries again when the Elixir or Erlang install, mix.exs, mix.lock, or the compiled files in _build change, when an editor connects, or after %s", buildRoot, s.mixBin, reason, failure.retryAfter())
+	r := s.index.reporter
+	if otp {
+		if causeChanged {
+			r.Clear(beamStartKey(key), "")
+		}
+		return
+	}
+	if causeChanged {
+		o := &s.index.otp
+		o.mu.Lock()
+		delete(o.fallbackWorks, buildRoot)
+		r.Clear(condOTP+":"+buildRoot, "")
+		o.mu.Unlock()
+	}
+	r.Set(beamStartKey(key), notify.Warning, fmt.Sprintf(
+		"Dexter: the persistent formatter BEAM for %s cannot start with the Elixir install of %s (%s); see the log for its output. Formatting uses the slower `mix format` fallback, and the completion and hover of Erlang modules and generated functions are limited. Dexter tries again when the Elixir or Erlang install, mix.exs, mix.lock, or the compiled files in _build change, when an editor connects, or after at most %s.",
+		buildRoot, s.mixBin, reason, beamStartRetryMax))
+}
+
+// beamFailureHolds reports whether the BEAM of buildRoot, with the mix of this
+// session, failed to start, and nothing that can fix it changed since, and it
+// has not been long enough to try again.
+func (s *Server) beamFailureHolds(buildRoot string, otpOnly bool) bool {
+	f := &s.index.beamFailures
+	f.mu.Lock()
+	failure := f.keys[s.beamFailureKey(buildRoot)]
+	if failure == nil || (otpOnly && !failure.otp) || time.Since(failure.at) >= failure.retryAfter() {
+		f.mu.Unlock()
+		return false
+	}
+	if time.Since(failure.checkedAt) < beamStampInterval {
+		f.mu.Unlock()
+		return true
+	}
+	stamp := failure.stamp
+	f.mu.Unlock()
+	if stamp != s.beamStamp(buildRoot) {
+		return false
+	}
+	f.mu.Lock()
+	failure.checkedAt = time.Now()
+	f.mu.Unlock()
+	return true
+}
+
+// beamStarted ends a startup failure of buildRoot, with the mix of this
+// session, after a BEAM became ready.
+func (s *Server) beamStarted(buildRoot string) {
+	key := s.beamFailureKey(buildRoot)
+	f := &s.index.beamFailures
+	f.mu.Lock()
+	if failure := f.keys[key]; failure != nil && !failure.otp {
+		delete(f.keys, key)
+	}
+	f.mu.Unlock()
+	s.index.reporter.Clear(beamStartKey(key), fmt.Sprintf("Dexter: the persistent formatter BEAM for %s starts again.", buildRoot))
 }
 
 // otpOutcomes is the last mix format fallback outcome of each Mix project on a
@@ -331,36 +590,6 @@ type otpOutcomes struct {
 	fallbackWorks map[string]map[string]bool // build root → Mix project → works
 }
 
-// otpApplyHook runs between the decision of reportBeamOTP and its Set or Clear.
-// Tests use it to force an order of concurrent formats.
-var otpApplyHook func()
-
-// otpStamp identifies what can fix an OTP mismatch for a build root: the
-// Elixir and mix binaries, and the _build directory.
-func (s *Server) otpStamp(buildRoot string) string {
-	elixir := filepath.Join(filepath.Dir(s.mixBin), "elixir")
-	return fmt.Sprint(statFileStamp(elixir), statFileStamp(s.mixBin), statFileStamp(filepath.Join(buildRoot, "_build")))
-}
-
-// errOTPMismatch marks a mix format that failed with an OTP mismatch.
-var errOTPMismatch = errors.New("Elixir/OTP version mismatch")
-
-// rememberOTPMismatch records that the BEAM of buildRoot failed with an OTP
-// mismatch, so that it is not started again on each save. It reports nothing:
-// what the mismatch means for the user depends on the mix format fallback,
-// and reportBeamOTP decides that.
-func (s *Server) rememberOTPMismatch(buildRoot string) {
-	s.beamMu.Lock()
-	defer s.beamMu.Unlock()
-	if s.otpMismatches == nil {
-		s.otpMismatches = make(map[string]otpMismatch)
-	}
-	if _, ok := s.otpMismatches[buildRoot]; ok {
-		return
-	}
-	s.otpMismatches[buildRoot] = otpMismatch{at: time.Now(), stamp: s.otpStamp(buildRoot)}
-}
-
 // reportBeamOTP tells the user about an OTP mismatch of the BEAM of buildRoot
 // after the mix format fallback of mixRoot ran with result err.
 //
@@ -373,10 +602,7 @@ func (s *Server) rememberOTPMismatch(buildRoot string) {
 // syntax error, changes nothing. Setting an active Warning sends nothing, so
 // saves in any order do not repeat it.
 func (s *Server) reportBeamOTP(buildRoot, mixRoot string, err error) {
-	s.beamMu.Lock()
-	holds := s.otpMismatchHolds(buildRoot)
-	s.beamMu.Unlock()
-	if !holds {
+	if !s.beamFailureHolds(buildRoot, true) {
 		return
 	}
 
@@ -414,20 +640,6 @@ func (s *Server) reportBeamOTP(buildRoot, mixRoot string, err error) {
 	case known:
 		s.index.reporter.Clear(key, "")
 	}
-}
-
-// otpMismatchHolds reports whether the BEAM of buildRoot failed with an OTP
-// mismatch that nothing has fixed since. The caller holds beamMu.
-func (s *Server) otpMismatchHolds(buildRoot string) bool {
-	m, ok := s.otpMismatches[buildRoot]
-	if !ok {
-		return false
-	}
-	if time.Since(m.at) < otpMismatchRetry && m.stamp == s.otpStamp(buildRoot) {
-		return true
-	}
-	delete(s.otpMismatches, buildRoot)
-	return false
 }
 
 // reportBeamFormatWorks clears the formatter conditions after the persistent
@@ -507,9 +719,11 @@ func firstErrorLine(stderr string) string {
 // renameFailures collects the files that one rename could not change. Writes
 // run in parallel, so it is safe for concurrent use.
 type renameFailures struct {
-	mu    sync.Mutex
-	paths []string
-	first string
+	mu      sync.Mutex
+	paths   []string
+	first   string
+	changed int      // files the rename did change on disk
+	notes   []string // more that the user must know
 }
 
 func (f *renameFailures) add(path string, err error) {
@@ -524,18 +738,33 @@ func (f *renameFailures) add(path string, err error) {
 	f.paths = append(f.paths, path)
 }
 
-// report tells this editor, and only this editor, that its rename is
-// incomplete.
-func (s *Server) reportRenameFailures(f *renameFailures) {
+func (f *renameFailures) note(text string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.notes = append(f.notes, text)
+}
+
+// message is the report of f, or "" when every file changed.
+func (f *renameFailures) message() string {
 	f.mu.Lock()
 	paths := append([]string(nil), f.paths...)
 	first := f.first
+	changed := f.changed
+	notes := append([]string(nil), f.notes...)
 	f.mu.Unlock()
 	if len(paths) == 0 {
-		return
+		return ""
 	}
 	sort.Strings(paths)
-	s.notifySession(notify.Error, fmt.Sprintf(
-		"Dexter: the rename could not change %d files: %s (%s). These files still use the old name; see the log, then fix them by hand or undo the rename.",
-		len(paths), notify.Summarize(paths), first))
+	msg := fmt.Sprintf(
+		"Dexter: the rename could not change %d files: %s (%s). These files still use the old name",
+		len(paths), notify.Summarize(paths), first)
+	if changed > 0 {
+		msg += fmt.Sprintf("; the other %d files on disk have the new name", changed)
+	}
+	msg += ". See the log, then fix them by hand or undo the rename."
+	for _, n := range notes {
+		msg += " " + n + "."
+	}
+	return msg
 }

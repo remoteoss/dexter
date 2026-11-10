@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/remoteoss/dexter/internal/lsp"
 	"github.com/remoteoss/dexter/internal/notify"
+	"github.com/remoteoss/dexter/internal/store"
 	"github.com/remoteoss/dexter/internal/version"
 	"github.com/remoteoss/dexter/internal/workspace"
 )
@@ -48,9 +50,32 @@ const (
 	maxReadyWait = 30 * time.Second
 )
 
-// socketCheckInterval is how often the daemon verifies that its socket file
-// still exists. A variable so tests can shrink it.
-var socketCheckInterval = 30 * time.Second
+// socketCheckInterval is how often the daemon checks that its socket, its lock
+// file, its index file, and its project root are still the ones it uses. Each
+// check is a few stat calls. A variable so tests can shrink it.
+var socketCheckInterval = 10 * time.Second
+
+// touchInterval is how old the socket and the lock file may get before the
+// daemon sets their times again. Age-based temp cleaners, such as
+// systemd-tmpfiles, remove files that nobody touched for days; a daemon that
+// runs for weeks must not lose its runtime files to them.
+var touchInterval = time.Hour
+
+// restartWindow limits how often one cause can restart the workspace runtime.
+// A second restart for the same cause inside it is not made: a process that
+// keeps replacing the index, or a panic that comes back on each pass, would
+// otherwise keep the daemon rebuilding for ever.
+var restartWindow = 10 * time.Minute
+
+// ErrRootGone is returned by Run when the project root went away while the
+// daemon served it, for example because its volume was ejected. The daemon then
+// exits without closing the index: its files were on that volume, and SQLite
+// maps one of them, so any access could end the process with SIGBUS.
+var ErrRootGone = lsp.ErrRootGone
+
+// CondIndexReplaced is the condition of an index file that another process
+// replaced or removed while the daemon had it open.
+const CondIndexReplaced = lsp.IndexConditionPrefix + "replaced"
 
 // Control method names. These are reserved: RegisterMethod refuses them, and
 // they are exported so an adapter or a frontend can call one without
@@ -300,7 +325,14 @@ type Changed struct {
 // Run acquires the workspace lock and serves until ctx is canceled or the
 // workspace has no connections for idleTimeout.
 func Run(ctx context.Context, root string, idleTimeout time.Duration) error {
-	ownership, endpoint, err := AcquireOwnership(root)
+	// A daemon for a root that is not there would create it again when it
+	// opens the index: a mount point of an ejected volume, for example.
+	if info, err := os.Stat(root); err != nil {
+		return fmt.Errorf("project root: %w", err)
+	} else if !info.IsDir() {
+		return fmt.Errorf("project root %s is not a directory", root)
+	}
+	ownership, endpoint, err := acquireOwnershipPatiently(root)
 	if err != nil {
 		return err
 	}
@@ -310,25 +342,79 @@ func Run(ctx context.Context, root string, idleTimeout time.Duration) error {
 	if err != nil {
 		return err
 	}
+	socketInfo, _ := os.Stat(endpoint.Socket)
 	defer func() {
 		_ = listener.Close()
-		_ = os.Remove(endpoint.Socket)
+		// Only this daemon's socket: a daemon that another one replaced must
+		// not remove the socket of its replacement.
+		if current, err := os.Stat(endpoint.Socket); err == nil && socketInfo != nil && os.SameFile(current, socketInfo) {
+			_ = os.Remove(endpoint.Socket)
+		}
 	}()
+	go cleanRuntimeDirSafely(endpoint)
 
 	runtime, err := workspace.Open(endpoint.Root)
 	if err != nil {
 		return err
 	}
+
+	s := newServer(ctx, endpoint, runtime, listener, idleTimeout)
+	s.ownership = ownership
+	s.socketInfo = socketInfo
+	s.lockPath = endpoint.Lock
 	defer func() {
-		if closeErr := runtime.Close(); closeErr != nil {
+		if s.abandoned.Load() {
+			// The index files were on the root's volume; see ErrRootGone.
+			log.Printf("Not closing the index: the project root %s is not there any more", endpoint.Root)
+			return
+		}
+		s.rtMu.Lock()
+		defer s.rtMu.Unlock()
+		if s.runtime == nil {
+			return
+		}
+		if closeErr := s.runtime.Close(); closeErr != nil {
 			log.Printf("Warning: closing workspace: %v", closeErr)
 		}
 	}()
-
-	s := newServer(ctx, endpoint, runtime, listener, idleTimeout)
 	defer s.cancelCtx()
+	go s.watchEndpoint()
 	log.Printf("Dexter daemon v%s listening (root: %s, socket: %s)", version.Version, endpoint.Root, endpoint.Socket)
-	return s.serve()
+	err = s.serve()
+	if goneErr := s.goneErr(); goneErr != nil {
+		return goneErr
+	}
+	return err
+}
+
+// goneErr returns why the project root is gone, or nil.
+func (s *server) goneErr() error {
+	if !s.abandoned.Load() {
+		return nil
+	}
+	if rt := s.currentRuntime(); rt != nil {
+		if err := rt.GoneErr(); err != nil {
+			return err
+		}
+	}
+	return fmt.Errorf("%w: %s", ErrRootGone, s.root)
+}
+
+// ownershipPatience is how long a starting daemon tries again for a lock that
+// is held. A cleanup of the runtime directory, or `dexter stop`, holds the
+// lock of another workspace for a moment; a daemon that started in that moment
+// would exit, and its frontend would find nobody serving.
+var ownershipPatience = 100 * time.Millisecond
+
+func acquireOwnershipPatiently(root string) (*Ownership, Endpoint, error) {
+	deadline := time.Now().Add(ownershipPatience)
+	for {
+		ownership, endpoint, err := AcquireOwnership(root)
+		if !errors.Is(err, ErrWorkspaceOwned) || !time.Now().Before(deadline) {
+			return ownership, endpoint, err
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // listenSocket prepares and binds the workspace's local socket. The caller must
@@ -350,6 +436,12 @@ func listenSocket(endpoint Endpoint) (net.Listener, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listen on daemon socket: %w", err)
 	}
+	// Run removes the socket itself, and only when it is still this one: a
+	// daemon that another one replaced must not unlink the socket of its
+	// replacement when it closes.
+	if unixListener, ok := listener.(*net.UnixListener); ok {
+		unixListener.SetUnlinkOnClose(false)
+	}
 	if err := os.Chmod(endpoint.Socket, 0o600); err != nil {
 		_ = listener.Close()
 		return nil, fmt.Errorf("secure daemon socket: %w", err)
@@ -363,6 +455,7 @@ func newServer(ctx context.Context, endpoint Endpoint, rt *workspace.Runtime, li
 		root:        endpoint.Root,
 		identity:    endpoint.Identity,
 		runtime:     rt,
+		openRuntime: workspace.Open,
 		listener:    listener,
 		socket:      endpoint.Socket,
 		socketCheck: socketCheckInterval,
@@ -371,8 +464,14 @@ func newServer(ctx context.Context, endpoint Endpoint, rt *workspace.Runtime, li
 		activity:    make(chan struct{}, 1),
 		stopping:    make(chan struct{}),
 		connections: make(map[net.Conn]struct{}),
+		restarts:    make(map[string]time.Time),
 	}
 	s.ctx, s.cancelCtx = context.WithCancel(ctx)
+	// A workspace whose root is gone cannot be served: every answer would come
+	// from files that are no longer there. The daemon exits and releases the
+	// workspace, so the next frontend fails clearly or starts a new daemon on
+	// the directory the path now names. watchEndpoint follows Runtime.Gone of the
+	// runtime that serves now.
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -383,29 +482,245 @@ func newServer(ctx context.Context, endpoint Endpoint, rt *workspace.Runtime, li
 	if idleTimeout > 0 {
 		go s.watchIdle()
 	}
-	go s.watchSocket()
 	return s
 }
 
-// watchSocket exits the daemon if its socket disappears from under it: a temp
-// cleaner, or anything else that removes runtime files. Without this the daemon
-// keeps the ownership lock while being unreachable, and nothing can replace it
-// until the idle timeout or a forced stop. Exiting releases the lock, and the
-// next frontend starts a daemon whose socket exists.
-func (s *server) watchSocket() {
+// watchEndpoint checks, every socketCheck, that the files this daemon depends
+// on are still its own, and acts on the reports of the runtime:
+//
+//   - The socket must be the one this daemon bound. A temp cleaner can remove
+//     it, and a second daemon can bind a new one at the path after the lock
+//     file was removed too. Either way this daemon cannot be reached, so it
+//     exits; its editors reconnect to whatever serves the path now.
+//   - The lock file must be the one this daemon locked. When it was removed,
+//     or replaced by a file that nobody holds, the daemon locks the file at the
+//     path again. When another process holds that file, that process owns the
+//     workspace, and this daemon exits.
+//   - The runtime directory must still be the one that a new frontend
+//     resolves, or new frontends would start a second daemon elsewhere.
+//   - The index file must be the one the store opened (see
+//     workspace.CheckIndexFile); the runtime restarts when it is not.
+//   - The project root must be there; see ErrRootGone.
+//
+// Socket and lock file get new times once per touchInterval.
+func (s *server) watchEndpoint() {
+	defer func() {
+		if value := recover(); value != nil {
+			log.Printf("Error: panic in the daemon's endpoint check: %v\n%s", value, debug.Stack())
+			// Without this check nothing notices a replaced lock or socket;
+			// exiting is the safe state, and editors reconnect.
+			s.stop()
+		}
+	}()
 	ticker := time.NewTicker(s.socketCheck)
 	defer ticker.Stop()
 	for {
+		rt := s.currentRuntime()
+		if rt == nil {
+			return
+		}
 		select {
 		case <-s.stopping:
 			return
+		case what := <-rt.Faults():
+			s.restartRuntime("fault", fmt.Sprintf("an internal error in %s", what), nil)
+		case <-rt.Gone():
+			log.Printf("Daemon exiting: %v", rt.GoneErr())
+			// The editors are told why before their connections close.
+			rt.Reporter().Flush(2 * time.Second)
+			s.abandon()
+			return
 		case <-ticker.C:
-			if _, err := os.Stat(s.socket); os.IsNotExist(err) {
-				log.Printf("Daemon socket %s disappeared; exiting so a replacement can start", s.socket)
-				s.stop()
+			if !s.checkEndpoint(rt) {
 				return
 			}
 		}
+	}
+}
+
+// checkEndpoint runs one round of the checks of watchEndpoint. It reports
+// false when the daemon is stopping.
+func (s *server) checkEndpoint(rt *workspace.Runtime) bool {
+	if rt.CheckRoot() {
+		return true // Gone is closed; the next round of watchEndpoint exits
+	}
+	current, err := os.Stat(s.socket)
+	switch {
+	case os.IsNotExist(err):
+		log.Printf("Daemon socket %s disappeared; exiting so a replacement can start", s.socket)
+		s.stop()
+		return false
+	case err == nil && s.socketInfo != nil && !os.SameFile(current, s.socketInfo):
+		log.Printf("Daemon socket %s was replaced by another process; exiting so that only one daemon serves %s", s.socket, s.root)
+		s.stop()
+		return false
+	}
+	if s.ownership != nil {
+		state, stateErr := s.ownership.state()
+		if stateErr == nil && state != lockHeld {
+			what := "removed"
+			if state == lockReplaced {
+				what = "replaced"
+			}
+			ok, relockErr := s.ownership.relock()
+			// A cleanup of the runtime directory can hold the new file for
+			// a moment; try again for as long as a starting daemon does.
+			for deadline := time.Now().Add(ownershipPatience); !ok && relockErr == nil && time.Now().Before(deadline); {
+				time.Sleep(10 * time.Millisecond)
+				ok, relockErr = s.ownership.relock()
+			}
+			if !ok {
+				log.Printf("Daemon lock file %s was %s and another process holds the new one (%v); exiting so that only one daemon serves %s", s.lockPath, what, relockErr, s.root)
+				s.stop()
+				return false
+			}
+			log.Printf("Daemon lock file %s was %s; locked it again", s.lockPath, what)
+		}
+	}
+	if endpoint, err := ResolveEndpoint(s.root); err == nil && endpoint.Socket != s.socket {
+		log.Printf("New frontends resolve the runtime directory of %s to %s now, not %s; exiting so that the next frontend starts a daemon there", s.root, filepath.Dir(endpoint.Socket), filepath.Dir(s.socket))
+		s.stop()
+		return false
+	}
+	s.touchRuntimeFiles()
+	switch rt.CheckIndexFile() {
+	case workspace.IndexFileReplaced:
+		s.indexFileChanged(rt, "replaced")
+	case workspace.IndexFileRemoved:
+		s.indexFileChanged(rt, "removed")
+	}
+	return true
+}
+
+// touchRuntimeFiles keeps age-based temp cleaners away from the socket and the
+// lock file.
+func (s *server) touchRuntimeFiles() {
+	now := time.Now()
+	if now.Sub(s.lastTouch) < touchInterval {
+		return
+	}
+	s.lastTouch = now
+	for _, path := range []string{s.socket, s.lockPath} {
+		if path != "" {
+			_ = os.Chtimes(path, now, now)
+		}
+	}
+}
+
+// indexFileChanged restarts the runtime on the index file that is at the path
+// now, or on a new one, and tells the editors why.
+func (s *server) indexFileChanged(rt *workspace.Runtime, what string) {
+	path := store.DBPath(s.root)
+	message := fmt.Sprintf(
+		"Dexter: the index file %s was %s by another process, for example an older Dexter build that an editor runs in-process, or `git clean`. Dexter restarted its index on the file that is there now and brings it up to date. Do not let Dexter builds without the workspace daemon (0.7.x and earlier) and later builds serve one project at the same time.",
+		path, what)
+	restarted := s.restartRuntime("index file "+what, "the index file was "+what, func(r *notify.Reporter) {
+		r.Set(CondIndexReplaced, notify.Warning, message)
+	})
+	if !restarted {
+		rt.Reporter().Set(CondIndexReplaced, notify.Error, fmt.Sprintf(
+			"Dexter: another process keeps replacing or removing the index file %s, for example an older Dexter build that an editor runs in-process. Dexter does not restart its index again and answers from the copy it has open, which other processes do not see. Stop the other process, then run `dexter stop --force` in the project directory and restart the editors.",
+			path))
+	}
+}
+
+// currentRuntime returns the runtime that serves now.
+func (s *server) currentRuntime() *workspace.Runtime {
+	s.rtMu.RLock()
+	defer s.rtMu.RUnlock()
+	return s.runtime
+}
+
+// restartRuntime closes the workspace runtime and opens a new one on the same
+// root. Every connection is closed first, because each holds the runtime it
+// started with; editors reconnect, and the LSP proxy rebuilds their sessions.
+// It reports false when restartWindow refused the restart. report runs on the
+// new runtime's reporter before any frontend can attach.
+func (s *server) restartRuntime(cause, reason string, report func(*notify.Reporter)) bool {
+	s.restartMu.Lock()
+	defer s.restartMu.Unlock()
+	if last, ok := s.restarts[cause]; ok && time.Since(last) < restartWindow {
+		log.Printf("Not restarting the workspace runtime for %s again within %s", reason, restartWindow)
+		return false
+	}
+	s.restarts[cause] = time.Now()
+	log.Printf("Restarting the workspace runtime: %s", reason)
+
+	// A pending writer stops new readers, so connections that arrive now wait
+	// for the new runtime; the ones that hold the old runtime are closed until
+	// the lock is free.
+	acquired := make(chan struct{})
+	go func() {
+		s.rtMu.Lock()
+		close(acquired)
+	}()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for waiting := true; waiting; {
+		s.closeConnections()
+		select {
+		case <-acquired:
+			waiting = false
+		case <-ticker.C:
+		}
+	}
+	defer s.rtMu.Unlock()
+	// A daemon that stops while this waited closes the runtime itself; a new
+	// one opened now would outlive it.
+	select {
+	case <-s.stopping:
+		return true
+	default:
+	}
+
+	old := s.runtime
+	s.runtime = nil
+	if err := old.Close(); err != nil {
+		log.Printf("Warning: closing the workspace runtime: %v", err)
+	}
+	rt, err := s.openRuntime(s.root)
+	if err != nil {
+		log.Printf("Error: the workspace runtime did not open again (%v); the daemon exits", err)
+		go s.stop()
+		return true
+	}
+	if report != nil {
+		report(rt.Reporter())
+	}
+	if report != nil {
+		// Editors reconnect within a second or two; they see the condition
+		// when they attach. It ends when the new runtime is ready, but not
+		// before a reconnecting editor can see it.
+		go func() {
+			select {
+			case <-rt.Ready():
+			case <-s.stopping:
+				return
+			}
+			select {
+			case <-time.After(time.Minute):
+				rt.Reporter().Clear(CondIndexReplaced, "")
+			case <-s.stopping:
+			}
+		}()
+	}
+	s.runtime = rt
+	return true
+}
+
+// abandon stops the daemon when its root went away, without touching the index.
+func (s *server) abandon() {
+	s.abandoned.Store(true)
+	log.Printf("Error: the project root %s is not there any more (volume ejected, or directory moved or removed); the daemon exits without closing the index", s.root)
+	s.stop()
+}
+
+// closeConnections closes every open connection.
+func (s *server) closeConnections() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for conn := range s.connections {
+		_ = conn.Close()
 	}
 }
 
@@ -482,11 +797,24 @@ func (s *server) serve() error {
 type server struct {
 	// root is the spelling the daemon indexes; identity is its symlink-resolved
 	// form, which is what a handshake presents.
-	root        string
-	identity    string
+	root     string
+	identity string
+	// runtime serves the workspace. A connection holds rtMu for reading for
+	// as long as it runs, so that restartRuntime, which takes it for writing,
+	// never swaps the runtime under a request.
+	rtMu        sync.RWMutex
 	runtime     *workspace.Runtime
+	openRuntime func(root string) (*workspace.Runtime, error)
+	restartMu   sync.Mutex
+	restarts    map[string]time.Time
+	abandoned   atomic.Bool
+
 	listener    net.Listener
 	socket      string
+	socketInfo  os.FileInfo
+	lockPath    string
+	ownership   *Ownership
+	lastTouch   time.Time
 	socketCheck time.Duration
 	idleTimeout time.Duration
 	started     time.Time
@@ -652,6 +980,12 @@ func (c *conn) dropAllSubs() {
 }
 
 func (s *server) serveConn(raw net.Conn) error {
+	// Held for the whole connection: see server.rtMu.
+	s.rtMu.RLock()
+	defer s.rtMu.RUnlock()
+	if s.runtime == nil {
+		return errors.New("the workspace runtime is not open")
+	}
 	_ = raw.SetReadDeadline(time.Now().Add(serverHandshakeTimeout))
 	reader := bufio.NewReader(raw)
 	var h hello
@@ -959,6 +1293,7 @@ func (s *server) handleRequest(c *conn, mc MethodContext, req request) (any, err
 		}
 		s.waitReady(mc.Context, req.Method, params.WaitReadyMs)
 		locations, err := mc.LSP().ReferenceNames(params.Module, params.Function, lsp.NameReferenceOptions{
+			Context:         mc.Context, // a client that disconnects stops the search
 			FollowDelegates: true,
 			ExcludeStdlib:   true,
 		})
@@ -978,7 +1313,7 @@ func (s *server) handleRequest(c *conn, mc MethodContext, req request) (any, err
 			err = s.runtime.Reindex(mc.Context)
 		} else {
 			// Checked before the reindex, which prunes whatever was indexed.
-			if _, statErr := os.Stat(params.Target); os.IsNotExist(statErr) {
+			if _, statErr := os.Stat(params.Target); lsp.IsMissing(statErr) {
 				indexed, indexErr := s.runtime.Indexes(params.Target)
 				if indexErr != nil {
 					return nil, indexErr
@@ -1024,6 +1359,11 @@ func (s *server) watch(c *conn, mc MethodContext, params WatchParams) (any, erro
 	})
 	go func() {
 		defer cancel()
+		defer func() {
+			if value := recover(); value != nil {
+				log.Printf("Error: panic in a workspace/watch subscription: %v\n%s", value, debug.Stack())
+			}
+		}()
 		for {
 			select {
 			case <-ctx.Done():

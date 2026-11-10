@@ -291,7 +291,7 @@ end
 	out := e.callTool("dexter_implementations", map[string]any{"module": "MyApp.Size"})
 	wantContains(t, out,
 		"MyApp.Size is a protocol",
-		"Implementations (2)",
+		"defimpl implementations (2)",
 		"lib/my_app/size_impls.ex:1",
 		"lib/my_app/size_impls.ex:5",
 	)
@@ -303,24 +303,6 @@ end
 		"lib/my_app/size_impls.ex:6",
 	)
 	wantNotContains(t, out, "lib/my_app/size_impls.ex:1", "lib/my_app/size_impls.ex:5")
-}
-
-func TestCallHierarchyTool(t *testing.T) {
-	e := setupProject(t)
-	out := e.callTool("dexter_call_hierarchy", map[string]any{"module": "MyApp.Accounts", "function": "fetch_user"})
-	wantContains(t, out,
-		"Call hierarchy for MyApp.Accounts.fetch_user",
-		"Incoming (callers)",
-		"MyApp.Worker.run/0",
-		"lib/my_app/worker.ex",
-	)
-
-	out = e.callTool("dexter_call_hierarchy", map[string]any{"module": "MyApp.Worker", "function": "run", "direction": "outgoing"})
-	wantContains(t, out, "Outgoing (callees)", "MyApp.Accounts.fetch_user")
-	wantNotContains(t, out, "Incoming")
-
-	errText := e.callToolExpectError("dexter_call_hierarchy", map[string]any{"module": "MyApp.Worker", "function": "run", "direction": "sideways"})
-	wantContains(t, errText, "direction must be")
 }
 
 func TestReindexTool(t *testing.T) {
@@ -418,4 +400,105 @@ end
 `)
 	out := e.callTool("dexter_references", map[string]any{"module": "MyApp.Repo", "function": "all"})
 	wantContains(t, out, "lib/my_app/users.ex", "4: def list, do: Repo.all(:users)")
+}
+
+// MCP tools run in the daemon on the headless service, which shares the
+// __using__ cache of every editor. A module that moves (git mv) must still
+// resolve through use chains in a tool call: the cache follows the index.
+func TestReferencesTool_UseInjectedAliasAfterModuleMoved(t *testing.T) {
+	e := setupProject(t)
+	repo := `defmodule MyApp.Repo do
+  defmacro __using__(_) do
+    quote do
+      alias MyApp.Repo
+    end
+  end
+
+  def all(q), do: q
+end
+`
+	oldPath := e.indexFile("lib/my_app/repo.ex", repo)
+	e.indexFile("lib/my_app/users.ex", `defmodule MyApp.Users do
+  use MyApp.Repo
+
+  def list, do: Repo.all(:users)
+end
+`)
+	out := e.callTool("dexter_references", map[string]any{"module": "MyApp.Repo", "function": "all"})
+	wantContains(t, out, "lib/my_app/users.ex")
+
+	if err := os.Remove(oldPath); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := e.rt.ReindexPath(ctx, oldPath); err != nil {
+		t.Fatal(err)
+	}
+	e.indexFile("lib/my_app/data/repo.ex", repo)
+
+	out = e.callTool("dexter_references", map[string]any{"module": "MyApp.Repo", "function": "all"})
+	wantContains(t, out, "lib/my_app/users.ex", "4: def list, do: Repo.all(:users)")
+}
+
+// A lookup that finds nothing does not send the agent to dexter_reindex: the
+// index follows file changes. Only when file watching is off does the answer
+// say so, and name the tool.
+func TestNotFoundNamesReindexOnlyWithoutWatching(t *testing.T) {
+	e := setupProject(t)
+	for _, out := range []string{
+		e.callTool("dexter_definition", map[string]any{"module": "MyApp.Missing"}),
+		e.callTool("dexter_definition", map[string]any{"module": "MyApp.Accounts", "function": "missing"}),
+		e.callTool("dexter_module_api", map[string]any{"module": "MyApp.Missing"}),
+		e.callTool("dexter_references", map[string]any{"module": "MyApp.Missing", "function": "missing"}),
+	} {
+		// The test runtime does not watch files.
+		wantContains(t, out, "File watching is not active, so call dexter_reindex after changing files.")
+	}
+}
+
+// A lookup that finds nothing waits for the watcher's events only up to
+// settleWait: behind a long reconcile (a git checkout of thousands of files)
+// it answers at once and says that the index is still applying changes.
+func TestNotFoundWaitIsBounded(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("DEXTER_ELIXIR_LIB_ROOT", t.TempDir())
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv("SHELL", "/bin/false")
+	release := make(chan struct{})
+	// The held initial reconcile stands in for a long one: the barrier that
+	// settled queues waits behind it.
+	rt, err := workspace.OpenWithOptions(root, workspace.Options{BeforeInitialReconcile: func() { <-release }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rt.Close() })
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	// The watcher starts a moment after Open.
+	for deadline := time.Now().Add(5 * time.Second); !rt.Watching() && time.Now().Before(deadline); {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !rt.Watching() {
+		t.Skip("no native watcher on this system")
+	}
+	old := settleWait
+	settleWait = 50 * time.Millisecond
+	t.Cleanup(func() { settleWait = old })
+	h := NewHandler(rt, rt.LanguageServices())
+
+	start := time.Now()
+	out, err := h.Call(context.Background(), "dexter_definition", json.RawMessage(`{"module":"MyApp.Missing"}`), 10*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if el := time.Since(start); el > 5*time.Second {
+		t.Fatalf("answer took %s behind a held reconcile", el)
+	}
+	wantContains(t, out, "is not in the index", "still applying file changes")
 }

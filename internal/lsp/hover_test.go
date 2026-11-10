@@ -1322,3 +1322,27 @@ end`
 		t.Errorf("hover missing the doc: %q", h.Contents.Value)
 	}
 }
+
+func TestHover_BoundVariableStartsNoBEAM(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	docURI := "file://" + filepath.Join(server.projectRoot, "lib/vars.ex")
+	server.docs.Set(docURI, `defmodule MyApp.Vars do
+  def run(list) do
+    length = Enum.count(list)
+    length + 1
+  end
+end
+`)
+
+	if hover := hoverAt(t, server, docURI, 3, 5); hover != nil {
+		t.Errorf("hover on a variable = %q, want none", hover.Contents.Value)
+	}
+	server.beamMu.Lock()
+	started := len(server.beams)
+	server.beamMu.Unlock()
+	if started != 0 {
+		t.Errorf("hover on a variable started %d BEAM processes, want 0", started)
+	}
+}

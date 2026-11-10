@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -172,7 +173,9 @@ func TestFileFailuresAreAggregated(t *testing.T) {
 		if err := os.Chmod(path, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		server.ReconcileFile(path)
+		if err := server.ReconcileFile(path); err != nil {
+			t.Fatal(err)
+		}
 		if i < len(bad)-1 && !server.index.reporter.Active(CondIndexFiles) {
 			t.Fatal("condition cleared while files still fail")
 		}
@@ -213,7 +216,9 @@ func TestRemovedDirectoryEndsItsFileFailures(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server.RemoveFiles(append(under, gen))
+	if err := server.RemoveFiles(append(under, gen)); err != nil {
+		t.Fatal(err)
+	}
 	client.WaitMessage(t, reportWait, protocol.MessageTypeInfo, "all files that could not be indexed are indexed now")
 }
 
@@ -409,23 +414,16 @@ func TestFormatterFailuresAreKeptForEachProject(t *testing.T) {
 	}
 }
 
-func TestRenameFailuresAreShownToTheRequestingEditor(t *testing.T) {
-	server, cleanup := setupTestServer(t)
-	defer cleanup()
-	client := notifytest.New()
-	server.client = client
+func TestRenameFailuresMessage(t *testing.T) {
 	var failures renameFailures
 	failures.add("/p/lib/b.ex", errors.New("permission denied"))
 	failures.add("/p/lib/a.ex", errors.New("read-only file system"))
-	server.reportRenameFailures(&failures)
-	got := client.WaitMessage(t, reportWait, protocol.MessageTypeError, "the rename could not change 2 files: /p/lib/a.ex and 1 more (permission denied)")
-	if !strings.Contains(got.Message, "still use the old name") {
-		t.Errorf("message does not say what is left: %q", got.Message)
+	got := failures.message()
+	if !strings.Contains(got, "the rename could not change 2 files: /p/lib/a.ex and 1 more (permission denied)") || !strings.Contains(got, "still use the old name") {
+		t.Errorf("message = %q, want the files and what is left", got)
 	}
-	server.reportRenameFailures(&renameFailures{})
-	time.Sleep(20 * time.Millisecond)
-	if n := len(client.Messages()); n != 1 {
-		t.Errorf("a rename without failures sent a message:\n%s", client.Dump())
+	if msg := (&renameFailures{}).message(); msg != "" {
+		t.Errorf("a rename without failures has a message: %q", msg)
 	}
 }
 
@@ -475,13 +473,13 @@ func TestReconcilePathsReportFailuresAndProgress(t *testing.T) {
 				paths = append(paths, writeTestFile(t, server.projectRoot, fmt.Sprintf("lib/gen%d.ex", i), moduleSource(i, 0)))
 			}
 			failing := paths[2]
-			testHookWrite = func(path string) error {
+			restore := SetTestWriteFault(func(path string) error {
 				if path == failing {
 					return errors.New("disk I/O error")
 				}
 				return nil
-			}
-			t.Cleanup(func() { testHookWrite = nil })
+			})
+			t.Cleanup(restore)
 			reindexOnce(t, server)
 
 			client.WaitMessage(t, reportWait, protocol.MessageTypeWarning, "Dexter: 1 file could not be indexed: "+failing)
@@ -493,7 +491,7 @@ func TestReconcilePathsReportFailuresAndProgress(t *testing.T) {
 
 			// The write works again. Touch every generated file, so that the
 			// rebuild path is taken again where the test asks for it.
-			testHookWrite = nil
+			restore()
 			future := time.Now().Add(time.Hour)
 			for _, path := range paths {
 				if err := os.Chtimes(path, future, future); err != nil {
@@ -537,5 +535,129 @@ func TestColdBuildFallbackShowsOneProgress(t *testing.T) {
 	}
 	if r, _ := server.store.LookupFunction("MyApp.Gen5", "run_v0"); len(r) != 1 {
 		t.Error("the fallback did not index the files")
+	}
+}
+
+// A prune that fails keeps its files in the index. They stayed listed as
+// failures before the pass, and the pass must not drop them: before, it did,
+// and the editor heard "all files that could not be indexed are indexed now"
+// while the stale rows stayed. The failed prune is also reported.
+func TestReport_FailedPruneKeepsFailures(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+	path := writeTestFile(t, server.projectRoot, "lib/gone.ex", moduleSource(0, 0))
+	writeTestFile(t, server.projectRoot, "lib/kept.ex", moduleSource(1, 0))
+	reindexOnce(t, server)
+	client := attachFakeEditor(t, server, false)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	restore := SetTestWriteFault(func(string) error { return errors.New("database or disk is full") })
+	t.Cleanup(restore)
+	if err := server.RemoveFiles([]string{path}); !errors.Is(err, ErrIncomplete) {
+		t.Fatalf("removal on a full disk = %v, want ErrIncomplete", err)
+	}
+	client.WaitMessage(t, reportWait, protocol.MessageTypeWarning, "could not be indexed")
+
+	// The stale warning comes with the second failed pass in a row.
+	for i := 0; i < 2; i++ {
+		if err := reindexResult(t, server); !errors.Is(err, ErrIncomplete) {
+			t.Fatalf("pass with a failed prune = %v, want ErrIncomplete", err)
+		}
+	}
+	if !server.index.reporter.Active(CondIndexFiles) {
+		t.Fatalf("the failed removal is no longer reported:\n%s", client.Dump())
+	}
+	client.WaitMessage(t, reportWait, protocol.MessageTypeWarning, "the index cannot be brought up to date")
+	restore()
+	if err := reindexResult(t, server); err != nil {
+		t.Fatal(err)
+	}
+	client.WaitMessage(t, reportWait, protocol.MessageTypeInfo, "the index is up to date again")
+}
+
+// A rebuild that fell back to the incremental pass and could not write some
+// files is not "fully working again". Before, its clear message said so, and
+// the failed-files warning came after it.
+func TestReport_RebuildWithFailedWritesIsNotCalledComplete(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+	bad := writeTestFile(t, server.projectRoot, "lib/bad.ex", moduleSource(0, 0))
+	writeTestFile(t, server.projectRoot, "lib/good.ex", moduleSource(1, 0))
+	server.index.reporter.Set(CondIndexRebuild, notify.Warning, "Dexter: rebuilding the index.")
+	client := attachFakeEditor(t, server, false)
+	testHookFullBuild = func() error { return errors.New("bulk load failed") }
+	t.Cleanup(func() { testHookFullBuild = nil })
+	restore := SetTestWriteFault(func(path string) error {
+		if path == bad {
+			return errors.New("database or disk is full")
+		}
+		return nil
+	})
+	t.Cleanup(restore)
+	if err := reindexResult(t, server); !errors.Is(err, ErrIncomplete) {
+		t.Fatalf("pass = %v, want ErrIncomplete", err)
+	}
+	got := client.WaitMessage(t, reportWait, protocol.MessageTypeInfo, "the index rebuild is complete")
+	if strings.Contains(got.Message, "works fully again") || !strings.Contains(got.Message, "1 files could not be written") {
+		t.Fatalf("rebuild clear message = %q", got.Message)
+	}
+}
+
+// A root that cannot be read for now stops the pass with no change. When it
+// stays so for a second pass, the editor is told, and told again when a pass
+// works. Before, only the log said it.
+func TestReport_UnreadableRootIsShownAndCleared(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+	writeTestFile(t, server.projectRoot, "lib/gen0.ex", moduleSource(0, 0))
+	reindexOnce(t, server)
+	client := attachFakeEditor(t, server, false)
+	prev := statRoot
+	statRoot = func(string) (os.FileInfo, error) {
+		return nil, &os.PathError{Op: "stat", Path: server.projectRoot, Err: syscall.EACCES}
+	}
+	t.Cleanup(func() { statRoot = prev })
+	for i := 0; i < 2; i++ {
+		if err := reindexResult(t, server); !errors.Is(err, ErrIncomplete) {
+			t.Fatalf("pass = %v, want ErrIncomplete", err)
+		}
+	}
+	client.WaitMessage(t, reportWait, protocol.MessageTypeWarning, "permission denied")
+	statRoot = prev
+	if err := reindexResult(t, server); err != nil {
+		t.Fatal(err)
+	}
+	client.WaitMessage(t, reportWait, protocol.MessageTypeInfo, "the index is up to date again")
+}
+
+// One failed root stat on a flaky mount, followed by a pass that works, shows
+// nothing: a warning and an "up to date again" for each flap would be noise in
+// every editor.
+func TestReport_OneTransientRootErrorIsNotShown(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+	writeTestFile(t, server.projectRoot, "lib/gen0.ex", moduleSource(0, 0))
+	reindexOnce(t, server)
+	client := attachFakeEditor(t, server, false)
+	prev := statRoot
+	t.Cleanup(func() { statRoot = prev })
+	for flap := 0; flap < 3; flap++ {
+		statRoot = func(string) (os.FileInfo, error) {
+			return nil, &os.PathError{Op: "stat", Path: server.projectRoot, Err: syscall.EIO}
+		}
+		if err := reindexResult(t, server); !errors.Is(err, ErrIncomplete) {
+			t.Fatalf("pass = %v, want ErrIncomplete", err)
+		}
+		statRoot = prev
+		if err := reindexResult(t, server); err != nil {
+			t.Fatal(err)
+		}
+	}
+	server.index.reporter.Flush(reportWait)
+	for _, m := range client.Messages() {
+		if strings.Contains(m.Message, "brought up to date") || strings.Contains(m.Message, "up to date again") {
+			t.Fatalf("a transient root error was shown:\n%s", client.Dump())
+		}
 	}
 }

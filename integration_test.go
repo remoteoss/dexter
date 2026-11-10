@@ -156,7 +156,7 @@ end
     :ok
   end
 
-  defmodule MyApp.Outer.Inner do
+  defmodule Inner do
     def inner_func do
       :ok
     end
@@ -1008,7 +1008,7 @@ func TestIntegration_MCPStdio(t *testing.T) {
 	for _, tool := range tools.Tools {
 		names[tool.Name] = true
 	}
-	for _, want := range []string{"dexter_workspace", "dexter_search", "dexter_definition", "dexter_references", "dexter_module_api", "dexter_file_outline", "dexter_implementations", "dexter_call_hierarchy", "dexter_reindex", "dexter_rename_symbol"} {
+	for _, want := range []string{"dexter_workspace", "dexter_search", "dexter_definition", "dexter_references", "dexter_module_api", "dexter_file_outline", "dexter_implementations", "dexter_reindex", "dexter_rename_symbol"} {
 		if !names[want] {
 			t.Errorf("tool %s not advertised; got %v", want, names)
 		}

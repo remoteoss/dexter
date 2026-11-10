@@ -2,6 +2,7 @@ package lsp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -126,10 +127,10 @@ end
 	}
 }
 
-// waitFor polls condition every 10ms until it returns true or two seconds elapse.
+// waitFor polls condition every 10ms until it returns true or ten seconds elapse.
 func waitFor(t *testing.T, condition func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if condition() {
 			return
@@ -137,6 +138,14 @@ func waitFor(t *testing.T, condition func() bool) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("condition not met within timeout")
+}
+
+// Regression: waitFor gave up after two seconds, so its tests failed on a
+// loaded machine where the background work took longer.
+func TestWaitForAllowsSlowConditions(t *testing.T) {
+	t.Parallel()
+	start := time.Now()
+	waitFor(t, func() bool { return time.Since(start) > 3*time.Second })
 }
 
 func TestServer_DidChangeWatchedFiles_Create(t *testing.T) {
@@ -2962,7 +2971,7 @@ end`
 		if !foundMeta {
 			t.Fatalf("expected definition location in meta.ex, got %v", got.locs)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("definition timed out; possible infinite loop in multi-alias brace scanning")
 	}
 }
@@ -4303,7 +4312,7 @@ func TestDidSave_FormatterConfigRestartDoesNotHoldBeamMuWhileClosing(t *testing.
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("DidSave did not finish after Close was unblocked")
 	}
 }
@@ -4692,6 +4701,40 @@ end
 	}
 	if findSymbol(grandChild.Children, "grandchild_func/0") == nil {
 		t.Error("grandchild_func/0 not found in GrandChild")
+	}
+}
+
+func TestDocumentSymbol_EndOnTheSameLine(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule MyApp.A do
+  def foo do :ok end
+  def bar, do: 1
+end
+
+defmodule MyApp.B do
+  test "x" do assert true end
+  def baz do
+    :ok
+  end
+end
+`
+	docURI := "file:///test/inline_end.ex"
+	server.docs.Set(docURI, content)
+
+	symbols := documentSymbols(t, server, docURI)
+	if names := collectNames(symbols); len(names) != 2 || names[0] != "MyApp.A" || names[1] != "MyApp.B" {
+		t.Fatalf("top-level symbols = %v, want [MyApp.A MyApp.B]", names)
+	}
+	if names := collectNames(symbols[0].Children); len(names) != 2 || names[0] != "foo/0" || names[1] != "bar/0" {
+		t.Errorf("MyApp.A children = %v, want [foo/0 bar/0]", names)
+	}
+	if foo := findSymbol(symbols[0].Children, "foo/0"); foo != nil && foo.Range.End.Line != 1 {
+		t.Errorf("foo/0 range ends on line %d, want 1", foo.Range.End.Line)
+	}
+	if findSymbol(symbols[1].Children, "baz/0") == nil {
+		t.Errorf("baz/0 not a child of MyApp.B: %v", collectNames(symbols[1].Children))
 	}
 }
 
@@ -6660,7 +6703,9 @@ end`)
 		t.Fatal(err)
 	}
 
-	server.pruneMissingFiles(map[string]struct{}{})
+	if err := server.pruneMissingFiles(map[string]struct{}{}); err != nil {
+		t.Fatal(err)
+	}
 
 	if results, _ := server.store.LookupFunction("Concurrent", "saved"); len(results) == 0 {
 		t.Errorf("pruned %s, which exists on disk", onDisk)
@@ -6688,7 +6733,9 @@ end`)
 	}
 	t.Cleanup(func() { _ = os.Chmod(privateDir, 0o755) })
 
-	server.pruneMissingFiles(map[string]struct{}{})
+	if err := server.pruneMissingFiles(map[string]struct{}{}); err != nil {
+		t.Fatal(err)
+	}
 	if results, _ := server.store.LookupFunction("Kept", "present"); len(results) == 0 {
 		t.Error("pruned a file after Lstat failed for a reason other than non-existence")
 	}
@@ -6704,7 +6751,7 @@ end`)
 	server.index.writes.Lock()
 	server.index.unavailable = true
 	server.index.writes.Unlock()
-	server.indexOneFile(path)
+	_ = server.indexOneFile(path)
 
 	if results, _ := server.store.LookupFunction("Rejected", "value"); len(results) != 0 {
 		t.Error("incremental write proceeded after index recreation failed")
@@ -6730,7 +6777,9 @@ end`)
 		}
 	}()
 
-	server.buildTextEdits([]renameSite{{filePath: path, line: 2}}, "old_name", "new_name", nil)
+	if _, err := server.buildTextEdits(context.Background(), []renameSite{{filePath: path, line: 2, fromIndex: true, bareOK: true}}, "MyApp.Accounts", "old_name", "new_name"); err != nil {
+		t.Fatal(err)
+	}
 	done := make(chan struct{})
 	go func() {
 		server.index.backgroundWork.Wait()
@@ -6747,7 +6796,7 @@ end`)
 	locked = false
 	select {
 	case <-done:
-	case <-time.After(2 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("open-buffer rename did not finish after the full build released the write lock")
 	}
 
@@ -8353,12 +8402,93 @@ func TestRemoveFilesUnderRootMatchesUncleanStoredPaths(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	server.RemoveFilesUnderRoot(stdlib)
+	if err := server.RemoveFilesUnderRoot(stdlib); err != nil {
+		t.Fatal(err)
+	}
 	paths, err := server.store.ListFilePaths()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(paths) != 1 || paths[0] != kept {
 		t.Errorf("stored paths = %v, want only %s", paths, kept)
+	}
+}
+
+// buildTextEdits runs a token rename over sites for an editor, as a rename
+// does: it plans the edits and commits them under the rename lock.
+func (s *Server) buildTextEdits(ctx context.Context, sites []renameSite, module, oldToken, newToken string) (*WorkspaceEdit, error) {
+	end, err := s.beginRename(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer end()
+	return s.commitTextEdits(s.planTextEdits(sites, []string{module}, nil, oldToken, newToken, requesterEditor))
+}
+
+func TestGetFileLine_AfterALongLine(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	path := filepath.Join(t.TempDir(), "long.ex")
+	content := "defmodule Long do\n  @data \"" + strings.Repeat("x", 100*1024) + "\"\n  def foo, do: :ok\nend\n"
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	line, ok := server.getFileLine(path, 3)
+	if !ok || line != "  def foo, do: :ok" {
+		t.Fatalf("getFileLine = %q, %v; want the line after the long one", line, ok)
+	}
+}
+
+// TestColdBuildFallbackStampsTheIndexVersion: a cold build that falls back to
+// the incremental pass leaves a full index in the current format. Without the
+// version, the next start would take it for an unfinished build and delete it.
+func TestColdBuildFallbackStampsTheIndexVersion(t *testing.T) {
+	testHookFullBuild = func() error { return errors.New("bulk load failed") }
+	t.Cleanup(func() { testHookFullBuild = nil })
+
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+	for i := 0; i < 3; i++ {
+		writeTestFile(t, server.projectRoot, fmt.Sprintf("lib/gen%d.ex", i), moduleSource(i, 0))
+	}
+	reindexOnce(t, server)
+	if r, _ := server.store.LookupFunction("MyApp.Gen2", "run_v0"); len(r) != 1 {
+		t.Fatal("the fallback did not index the files")
+	}
+	if got := server.store.GetIndexVersion(); got != version.IndexVersion {
+		t.Fatalf("index version after the fallback = %d, want %d", got, version.IndexVersion)
+	}
+}
+
+// TestDefinition_DottedNestedModule: Elixir nests `defmodule Deep.Inner`
+// inside Outer as Outer.Deep.Inner and aliases Deep in Outer, so the call
+// `Deep.Inner.foo()` there goes to it. A defimpl in a module is not nested.
+func TestDefinition_DottedNestedModule(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule Outer do
+  defmodule Deep.Inner do
+    def foo, do: :inner
+  end
+
+  def go, do: Deep.Inner.foo()
+end
+`
+	indexFile(t, server.store, server.projectRoot, "lib/outer.ex", content)
+	docURI := "file://" + filepath.Join(server.projectRoot, "lib/outer.ex")
+	server.docs.Set(docURI, content)
+
+	if aliases := ExtractAliasesInScope(content, 5); aliases["Deep"] != "Outer.Deep" {
+		t.Errorf("aliases at the call = %v, want Deep: Outer.Deep", aliases)
+	}
+	locs := definitionAt(t, server, docURI, 5, 26)
+	if len(locs) != 1 || locs[0].Range.Start.Line != 2 {
+		t.Fatalf("definition of Deep.Inner.foo = %v, want line 2", locs)
+	}
+	symbols := documentSymbols(t, server, docURI)
+	if len(symbols) != 1 || findSymbol(symbols[0].Children, "Deep.Inner") == nil {
+		t.Errorf("document symbols = %v, want Deep.Inner under Outer", collectNames(symbols[0].Children))
 	}
 }

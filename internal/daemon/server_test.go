@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/remoteoss/dexter/internal/lsp"
+	"github.com/remoteoss/dexter/internal/store"
 	"github.com/remoteoss/dexter/internal/version"
 )
 
@@ -46,7 +48,7 @@ func TestServerControlWatcherAndIdleShutdown(t *testing.T) {
 
 	assertLookup(t, client, "SharedLib.One", true)
 	writeModule(t, root, "lib/two.ex", "SharedLib.Two")
-	eventually(t, 5*time.Second, func() bool {
+	eventually(t, 10*time.Second, func() bool {
 		return lookupFound(client, "SharedLib.Two")
 	})
 
@@ -100,7 +102,7 @@ func TestRunReplacesStaleSocketOnlyAfterTakingOwnership(t *testing.T) {
 	}
 }
 
-func waitForClient(t *testing.T, root string, runErr <-chan error) *Client {
+func waitForClient(t testing.TB, root string, runErr <-chan error) *Client {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	var lastErr error
@@ -291,7 +293,7 @@ func TestConnectionPanicDoesNotKillTheDaemon(t *testing.T) {
 	}
 	// The panic unwinds after the handshake, so give it a moment and then check
 	// that the same daemon is still answering on the control connection.
-	eventually(t, 5*time.Second, func() bool {
+	eventually(t, 10*time.Second, func() bool {
 		var status Status
 		return client.Call(context.Background(), MethodStatus, struct{}{}, &status) == nil
 	})
@@ -305,7 +307,7 @@ func (panicFrontend) Serve(FrontendConn) error { panic("frontend exploded on pur
 // startDaemon runs a daemon for root in the background and returns a control
 // client. Cleanup stops the daemon and waits for Run to return, so a test cannot
 // leak a process holding the workspace lock.
-func startDaemon(t *testing.T, root string, idle time.Duration) *Client {
+func startDaemon(t testing.TB, root string, idle time.Duration) *Client {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	runErr := make(chan error, 1)
@@ -327,10 +329,12 @@ func startDaemon(t *testing.T, root string, idle time.Duration) *Client {
 }
 
 // quietEnv keeps stdlib and version-manager detection from spawning shells.
-func quietEnv(t *testing.T) {
+func quietEnv(t testing.TB) {
 	t.Helper()
 	t.Setenv("PATH", t.TempDir())
 	t.Setenv("SHELL", "/bin/false")
+	// Stdlib detection also looks below HOME (mise, asdf).
+	t.Setenv("HOME", t.TempDir())
 }
 
 // requireSocketSupport skips a test where the OS or a sandbox refuses AF_UNIX
@@ -343,7 +347,7 @@ func quietEnv(t *testing.T) {
 // could listen fine.
 func requireSocketSupport(t *testing.T) {
 	t.Helper()
-	dirs := platformRuntimeDirs()
+	dirs := runtimeDirs()
 	if len(dirs) == 0 {
 		t.Skip("no daemon runtime directory candidates")
 	}
@@ -734,12 +738,12 @@ func TestConnectionWaitsForControlRequestsBeforeRuntimeClose(t *testing.T) {
 	close(state.release)
 	select {
 	case <-served:
-	case <-time.After(time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("connection did not wait for its request")
 	}
 	select {
 	case <-callDone:
-	case <-time.After(time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("client call did not finish")
 	}
 }
@@ -920,5 +924,47 @@ func TestContractBumpedForRequestCancel(t *testing.T) {
 	}
 	if response.OK || !response.Incompatible || response.Exiting {
 		t.Fatalf("handshake from contract %d = %+v, want an incompatible refusal that keeps the daemon", lastContractWithoutCancel, response)
+	}
+}
+
+// A daemon whose project root is moved away must not empty the index that
+// moved with it, and must exit, so the next frontend does not get empty answers
+// from a daemon that looks healthy.
+func TestDaemonExitsWithIndexIntactWhenRootIsMoved(t *testing.T) {
+	socketTestEnv(t)
+	root := t.TempDir()
+	writeModule(t, root, "lib/one.ex", "SharedLib.One")
+	writeModule(t, root, "lib/two.ex", "SharedLib.Two")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runErr := make(chan error, 1)
+	go func() { runErr <- Run(ctx, root, time.Minute) }()
+	client := waitForClient(t, root, runErr)
+	defer func() { _ = client.Close() }()
+	assertLookup(t, client, "SharedLib.Two", true)
+
+	moved := root + "-moved"
+	if err := os.Rename(root, moved); err != nil {
+		t.Fatal(err)
+	}
+	// A watcher reports this as a root change, which starts a full pass. The
+	// test starts the pass itself, so it does not depend on the platform.
+	_ = client.Call(context.Background(), MethodReindex, ReindexParams{}, nil)
+
+	select {
+	case err := <-runErr:
+		if !errors.Is(err, lsp.ErrRootGone) {
+			t.Fatalf("daemon exit = %v, want ErrRootGone", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("daemon kept running after its root was moved")
+	}
+	s, err := store.Open(moved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	if paths, _ := s.ListFilePathsUnder(root); len(paths) != 2 {
+		t.Fatalf("the moved index holds %d files, want 2", len(paths))
 	}
 }

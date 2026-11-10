@@ -3,6 +3,7 @@ package lsp
 import (
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -177,21 +178,41 @@ func moduleToExpectedBase(module string) string {
 	return camelToSnake(moduleLastSegment(module))
 }
 
-// fileMatchesModuleConvention returns true if the file's base name (ignoring
-// extension) matches the expected snake_case name for the module. Handles
-// both .ex and .exs files.
-func fileMatchesModuleConvention(filePath, module string) bool {
-	base := filepath.Base(filePath)
-	ext := filepath.Ext(base)
-	nameWithoutExt := strings.TrimSuffix(base, ext)
-	return nameWithoutExt == moduleToExpectedBase(module)
-}
-
-// conventionalNewPath returns the new file path after a module rename,
-// preserving the original file extension (.ex or .exs).
-func conventionalNewPath(filePath, oldModule, newModule string) string {
+// conventionalNewPath returns the new file path after a module rename, with
+// the original extension (.ex or .exs). ok is false when the file name does
+// not follow the convention for oldModule; such a file does not move.
+//
+// The longest run of directories above the file that spells the namespace of
+// oldModule (lib/ren/probe/mcp1.ex for Ren.Probe.Mcp1) is replaced with the
+// namespace of newModule: lib/ren/probe/renamed/mcp.ex for
+// Ren.Probe.Renamed.Mcp, lib/ren/top.ex for Ren.Top. Leading segments that
+// have no directory (lib/probe/mcp1.ex) must be the same in both names, or
+// the file keeps its directory and only gets the new base name. root is the
+// directory above the namespace directories: a move never removes it or a
+// directory above it.
+func conventionalNewPath(filePath, oldModule, newModule string) (newPath, root string, ok bool) {
 	ext := filepath.Ext(filePath)
-	return filepath.Join(filepath.Dir(filePath), moduleToExpectedBase(newModule)+ext)
+	dir := filepath.Dir(filePath)
+	if strings.TrimSuffix(filepath.Base(filePath), ext) != moduleToExpectedBase(oldModule) {
+		return "", "", false
+	}
+	oldSegs := strings.Split(oldModule, ".")
+	newSegs := strings.Split(newModule, ".")
+	root = dir
+	matched := 1 // the base name
+	for matched < len(oldSegs) && filepath.Base(root) == camelToSnake(oldSegs[len(oldSegs)-1-matched]) && filepath.Dir(root) != root {
+		root = filepath.Dir(root)
+		matched++
+	}
+	lead := len(oldSegs) - matched
+	if lead >= len(newSegs) || !slices.Equal(oldSegs[:lead], newSegs[:lead]) {
+		return filepath.Join(dir, moduleToExpectedBase(newModule)+ext), dir, true
+	}
+	parts := []string{root}
+	for _, seg := range newSegs[lead:] {
+		parts = append(parts, camelToSnake(seg))
+	}
+	return filepath.Join(parts...) + ext, root, true
 }
 
 // isValidFunctionName returns true if name is a valid Elixir function name.
@@ -257,6 +278,32 @@ func updateDelegateAs(lines []string, startLine int, facadeName, newTargetName s
 	trimmed := strings.TrimRight(span[lastIdx], " \t\r\n")
 	span[lastIdx] = trimmed + ", as: :" + newTargetName
 	return span, spanStart, spanEnd
+}
+
+// elixirReserved are the words that cannot name a variable.
+var elixirReserved = map[string]bool{
+	"true": true, "false": true, "nil": true, "when": true, "and": true, "or": true,
+	"not": true, "in": true, "fn": true, "do": true, "end": true, "catch": true,
+	"rescue": true, "after": true, "else": true,
+}
+
+// isValidVariableName reports whether name can name a variable or a module
+// attribute: a lowercase letter or `_`, then letters, digits, and `_`, and
+// not a reserved word.
+func isValidVariableName(name string) bool {
+	if name == "" || elixirReserved[name] {
+		return false
+	}
+	for i, r := range name {
+		switch {
+		case r == '_':
+		case i == 0 && !unicode.IsLower(r):
+			return false
+		case !unicode.IsLetter(r) && !unicode.IsDigit(r):
+			return false
+		}
+	}
+	return true
 }
 
 // isValidModuleName returns true if name is a valid Elixir module name.

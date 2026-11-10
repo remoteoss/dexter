@@ -40,7 +40,11 @@ func (h *Handler) rename(ctx context.Context, args RenameParams) (string, error)
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "Renamed %s across %d file(s). The index is updated.\n", target, len(summary.FilesChanged))
+	if summary.IndexPending {
+		fmt.Fprintf(&b, "Renamed %s across %d file(s). The files are written; the index update waits behind other index work, so lookups can show the old name until it ends.\n", target, len(summary.FilesChanged))
+	} else {
+		fmt.Fprintf(&b, "Renamed %s across %d file(s). The index is updated.\n", target, len(summary.FilesChanged))
+	}
 	if len(summary.FilesFailed) > 0 {
 		fmt.Fprintf(&b, "\nWARNING: the rename could not change %d file(s) (%s). These files still use the old name; fix them by hand or revert the rename:\n", len(summary.FilesFailed), summary.FailureReason)
 		for _, fp := range summary.FilesFailed {
@@ -67,13 +71,14 @@ func (h *Handler) rename(ctx context.Context, args RenameParams) (string, error)
 }
 
 // renameSymbol is the only place where the MCP rename calls the rename
-// machinery in internal/lsp.
-//
-// TODO: The workspace daemon is shared with editors. When the shared rule for
-// renames from a frontend without an editor lands in internal/lsp (do not
-// write over unsaved editor buffers: write closed files and clean open
-// files, and refuse with an actionable error when an affected file has unsaved
-// changes in an editor), call its headless entry point here instead.
+// machinery in internal/lsp. RenameFunctionContext and RenameModuleContext are
+// the headless entry points: the rename gets every rule of the editor rename
+// (one rename at a time, an index that is brought up to date first, atomic
+// writes that are all or nothing, callback families) and the rule for a
+// caller without an editor: a file that an editor has open without unsaved
+// changes is written (the editor reloads it), and a file with unsaved changes
+// in an editor, or a file to move that an editor has open, stops the whole
+// rename before any change, with an error that names the file.
 func renameSymbol(ctx context.Context, server *lsp.Server, module, function, newName string) (*lsp.RenameSummary, error) {
 	if function != "" {
 		return server.RenameFunctionContext(ctx, module, function, newName)

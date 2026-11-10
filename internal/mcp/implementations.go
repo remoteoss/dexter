@@ -4,7 +4,11 @@ import (
 	"context"
 	"fmt"
 	"strings"
+
+	"github.com/remoteoss/dexter/internal/lsp"
 )
+
+const maxProtocolImpls = 100
 
 type ImplementationsParams struct {
 	Module   string `json:"module" jsonschema:"behaviour or protocol module, fully qualified"`
@@ -22,74 +26,57 @@ func (h *Handler) implementations(ctx context.Context, args ImplementationsParam
 		return "", fmt.Errorf("looking up module: %w", err)
 	}
 
-	// Protocol: implementations are the defimpl rows indexed under the protocol name.
-	isProtocol := false
-	var impls, decls []int
+	// Protocol: defimpl blocks and @derive, as the editor finds them.
+	var decl *int
 	for i, r := range modResults {
-		switch r.Kind {
-		case "defprotocol":
-			isProtocol = true
-			decls = append(decls, i)
-		case "defimpl":
-			impls = append(impls, i)
+		if r.Kind == "defprotocol" {
+			decl = &i
+			break
 		}
 	}
-	if isProtocol {
+	if decl != nil {
+		impls, _ := h.lsp.ProtocolImplementations(module)
+		var defimpls, derives []lsp.ProtocolImpl
+		for _, impl := range impls {
+			if impl.Kind == "derive" {
+				derives = append(derives, impl)
+			} else {
+				defimpls = append(defimpls, impl)
+			}
+		}
 		var b strings.Builder
-		fmt.Fprintf(&b, "%s is a protocol (defprotocol at %s:%d).\n", module, h.relPath(modResults[decls[0]].FilePath), modResults[decls[0]].Line)
+		fmt.Fprintf(&b, "%s is a protocol (defprotocol at %s:%d).\n", module, h.relPath(modResults[*decl].FilePath), modResults[*decl].Line)
 		if function := strings.TrimSpace(args.Function); function != "" {
-			defs, err := h.store.LookupFunction(module, function)
-			if err != nil {
-				return "", fmt.Errorf("looking up protocol function: %w", err)
-			}
-
-			// Functions in defprotocol and defimpl blocks share the protocol's
-			// module name in the index. Attribute each definition to the nearest
-			// preceding declaration in its file so a declaration and one or more
-			// implementations can safely coexist in the same file.
-			scopeKind := func(filePath string, line int) string {
-				kind, scopeLine := "", -1
-				for _, r := range modResults {
-					if r.FilePath == filePath && r.Line <= line && r.Line > scopeLine {
-						kind, scopeLine = r.Kind, r.Line
-					}
-				}
-				return kind
-			}
-			arities := make(map[int]bool)
-			for _, d := range defs {
-				if scopeKind(d.FilePath, d.Line) == "defprotocol" {
-					arities[d.Arity] = true
-				}
-			}
-			if len(arities) == 0 {
+			defs, declared := h.lsp.ProtocolFunctionImpls(module, function)
+			if !declared {
 				return fmt.Sprintf("%s does not define a protocol function named %s. List its functions with dexter_module_api.", module, function), nil
 			}
-
 			fmt.Fprintf(&b, "\nImplementations of protocol function %s.%s:\n", module, function)
-			found := 0
 			for _, d := range defs {
-				if !arities[d.Arity] || scopeKind(d.FilePath, d.Line) != "defimpl" {
-					continue
-				}
 				fmt.Fprintf(&b, "  %s - %s:%d\n", symbolName(module, function, d.Arity), h.relPath(d.FilePath), d.Line)
-				found++
 			}
-			if found == 0 {
+			if len(defs) == 0 {
 				fmt.Fprintf(&b, "  (no indexed defimpl defines %s)\n", function)
 			}
+			h.writeDerives(&b, derives)
 			return b.String(), nil
 		}
-		if len(impls) == 0 {
-			fmt.Fprintf(&b, "No defimpl implementations found in the index.\n")
+		if len(defimpls) == 0 && len(derives) == 0 {
+			fmt.Fprintf(&b, "No defimpl or @derive implementations found in the index.\n")
 			return b.String(), nil
 		}
-		fmt.Fprintf(&b, "\nImplementations (%d):\n", len(impls))
-		for _, i := range impls {
-			r := modResults[i]
-			fmt.Fprintf(&b, "  %s:%d\n", h.relPath(r.FilePath), r.Line)
+		if len(defimpls) > 0 {
+			fmt.Fprintf(&b, "\ndefimpl implementations (%d):\n", len(defimpls))
+			for i, impl := range defimpls {
+				if i == maxProtocolImpls {
+					fmt.Fprintf(&b, "  ... and %d more\n", len(defimpls)-maxProtocolImpls)
+					break
+				}
+				fmt.Fprintf(&b, "  %s:%d\n", h.relPath(impl.FilePath), impl.Line)
+			}
+			fmt.Fprintf(&b, "Note: the defimpl target type is on the cited line (defimpl %s, for: Type).\n", module)
 		}
-		fmt.Fprintf(&b, "\nNote: the defimpl target type is on the cited line (defimpl %s, for: Type).\n", module)
+		h.writeDerives(&b, derives)
 		return b.String(), nil
 	}
 
@@ -158,4 +145,32 @@ func (h *Handler) implementations(ctx context.Context, args ImplementationsParam
 		}
 	}
 	return b.String(), nil
+}
+
+// writeDerives lists the modules that derive a protocol. The protocol
+// generates their implementation, so it has no source in the module; the line
+// cited is the @derive, or the `use` that brings one in.
+func (h *Handler) writeDerives(b *strings.Builder, derives []lsp.ProtocolImpl) {
+	if len(derives) == 0 {
+		return
+	}
+	fmt.Fprintf(b, "\nDerived with @derive (%d; the protocol generates these implementations, through its __deriving__ macro or its Any implementation):\n", len(derives))
+	for i, d := range derives {
+		if i == maxProtocolImpls {
+			fmt.Fprintf(b, "  ... and %d more\n", len(derives)-maxProtocolImpls)
+			break
+		}
+		unsure := ""
+		switch {
+		case d.Conditional:
+			unsure = " (unsure: the @derive is in a branch of the __using__ body, which the options of the use decide)"
+		case d.Unsure:
+			unsure = " (unsure: no struct found in its source and no compiled module; Elixir ignores a @derive with no struct after it)"
+		}
+		if d.Via != "" {
+			fmt.Fprintf(b, "  %s - %s:%d (`use %s`, whose __using__ has the @derive)%s\n", d.Module, h.relPath(d.FilePath), d.Line, d.Via, unsure)
+			continue
+		}
+		fmt.Fprintf(b, "  %s - %s:%d%s\n", d.Module, h.relPath(d.FilePath), d.Line, unsure)
+	}
 }

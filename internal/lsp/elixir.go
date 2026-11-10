@@ -436,6 +436,29 @@ func FullExpressionAtCursor(tokens []parser.Token, source []byte, lineStarts []i
 	return expressionAtCursorImpl(tokens, source, lineStarts, line, col, true)
 }
 
+// callArityAt returns the arity of the call of name at the cursor: the
+// arguments, one more when a pipe gives the first, or the /N of a capture.
+// ok is false when the cursor is not on such a call or its arity cannot be
+// read, and for a definition head.
+func (tf *TokenizedFile) callArityAt(line, col int, name string) (arity int, ok bool) {
+	offset := parser.LineColToOffset(tf.lineStarts, line, col)
+	if offset < 0 {
+		return 0, false
+	}
+	idx := parser.TokenAtOffset(tf.tokens, offset)
+	if (idx < 0 || tf.tokens[idx].Kind != parser.TokIdent) && offset > 0 {
+		idx = parser.TokenAtOffset(tf.tokens, offset-1)
+	}
+	if idx < 0 || tf.tokens[idx].Kind != parser.TokIdent || parser.TokenText(tf.source, tf.tokens[idx]) != name {
+		return 0, false
+	}
+	lo, hi, known := tokenArity(tf.source, tf.tokens, idx)
+	if !known || lo != hi {
+		return 0, false
+	}
+	return lo, true
+}
+
 func expressionAtCursorImpl(tokens []parser.Token, source []byte, lineStarts []int, line, col int, full bool) CursorContext {
 	offset := parser.LineColToOffset(lineStarts, line, col)
 	if offset < 0 {
@@ -467,6 +490,13 @@ func expressionAtCursorImpl(tokens []parser.Token, source []byte, lineStarts []i
 		} else {
 			return CursorContext{}
 		}
+	}
+
+	// A cursor right after an identifier sits on the next token, such as
+	// `(`, `,` or the end of the line. Use the identifier that ends there.
+	if !isExprToken(tok.Kind) && idx > 0 && tokens[idx-1].End == offset && isExprToken(tokens[idx-1].Kind) {
+		idx--
+		tok = tokens[idx]
 	}
 
 	// Reject non-expression tokens (strings, comments, atoms, etc.)
@@ -746,18 +776,30 @@ func extractAliasBlockParentFromTokens(source []byte, tokens []parser.Token, tar
 	return "", false
 }
 
+// tokParseModuleDef reads the defmodule, defprotocol, or defimpl whose
+// keyword is tokens[from-1]: the module it defines inside currentModule (see
+// parser.NestedModuleName), and where its body starts. A defimpl gives the
+// protocol name as written: it is not nested, and its aliases are not
+// resolved here.
 func tokParseModuleDef(source []byte, tokens []parser.Token, from int, currentModule string) (name string, nextPos int, hasDo bool) {
+	name, _, _, nextPos, hasDo = tokParseModuleDefAlias(source, tokens, from, currentModule)
+	return name, nextPos, hasDo
+}
+
+// tokParseModuleDefAlias is tokParseModuleDef that also returns the alias a
+// nested defmodule or defprotocol adds in currentModule.
+func tokParseModuleDefAlias(source []byte, tokens []parser.Token, from int, currentModule string) (name, aliasShort, aliasFull string, nextPos int, hasDo bool) {
 	n := len(tokens)
 	j := tokNextSig(tokens, n, from)
 	name, k := tokCollectModuleName(source, tokens, n, j)
 	if name == "" {
-		return "", from, false
+		return "", "", "", from, false
 	}
-	if !strings.Contains(name, ".") && currentModule != "" {
-		name = currentModule + "." + name
+	if from == 0 || tokens[from-1].Kind != parser.TokDefimpl {
+		name, aliasShort, aliasFull = parser.NestedModuleName(name, currentModule)
 	}
 	_, nextPos, hasDo = parser.ScanForwardToBlockDo(tokens, n, k)
-	return name, nextPos, hasDo
+	return name, aliasShort, aliasFull, nextPos, hasDo
 }
 
 // extractEnclosingModuleFromTokens finds the innermost defmodule enclosing the given 0-based line.
@@ -1114,9 +1156,19 @@ func extractAliasesFromTokens(source []byte, tokens []parser.Token, targetLine i
 	}
 
 	processModuleDef := func(i int) int {
-		name, nextPos, hasDo := tokParseModuleDef(source, tokens, i, currentModule())
+		name, short, full, nextPos, hasDo := tokParseModuleDefAlias(source, tokens, i, currentModule())
 		if name == "" {
 			return i
+		}
+		if i > 0 && tokens[i-1].Kind == parser.TokDefimpl {
+			// The protocol name is a module reference.
+			if resolved := resolveRef(name); !strings.Contains(resolved, "__MODULE__") {
+				name = resolved
+			}
+		} else if short != "" {
+			// A nested module is an alias in the module around it, from
+			// its defmodule line on; the frame below inherits it.
+			record(tokens[i-1].Line, short, full)
 		}
 		if hasDo {
 			depth++
@@ -1313,11 +1365,11 @@ func skipToEndOfStatement(tokens []parser.Token, n, from int) int {
 // its `quote do` block, and extracts imports/uses/inline-defs/aliases from it.
 // Uses the tokenizer for correct heredoc and multi-line handling.
 func parseHelperQuoteBlock(lines []string, helperName string, fileAliases map[string]string) (imported []string, inlineDefs map[string][]inlineDef, transUses []string, optBindings []optBinding, aliases map[string]string) {
-	imported, inlineDefs, transUses, _, optBindings, aliases = parseHelperQuoteBlockDetailed(lines, helperName, fileAliases, make(map[string]bool))
+	imported, inlineDefs, transUses, _, optBindings, aliases, _ = parseHelperQuoteBlockDetailed(lines, helperName, fileAliases, make(map[string]bool))
 	return
 }
 
-func parseHelperQuoteBlockDetailed(lines []string, helperName string, fileAliases map[string]string, visited map[string]bool) (imported []string, inlineDefs map[string][]inlineDef, transUses []string, transUseCalls []UseCall, optBindings []optBinding, aliases map[string]string) {
+func parseHelperQuoteBlockDetailed(lines []string, helperName string, fileAliases map[string]string, visited map[string]bool) (imported []string, inlineDefs map[string][]inlineDef, transUses []string, transUseCalls []UseCall, optBindings []optBinding, aliases map[string]string, derives []string) {
 	if visited[helperName] {
 		return
 	}
@@ -1375,6 +1427,8 @@ func parseHelperQuoteBlockDetailed(lines []string, helperName string, fileAliase
 	if quoteBodyStart < 0 {
 		return
 	}
+	// unquote(__MODULE__) in the quote is the module that defines the helper.
+	definingModule := extractEnclosingModuleFromTokens(source, tokens, tokens[helperStart].Line-1)
 
 	// Walk the quote do block (depth 1 = inside quote do, 0 = we hit its end)
 	inlineDefs = make(map[string][]inlineDef)
@@ -1386,6 +1440,11 @@ func parseHelperQuoteBlockDetailed(lines []string, helperName string, fileAliase
 
 		case parser.TokImport:
 			j := tokNextSig(tokens, n, i+1)
+			if self, k, ok := unquotedSelfModule(source, tokens, j, definingModule); ok {
+				imported = append(imported, self)
+				i = k - 1
+				continue
+			}
 			mod, _ := tokCollectModuleName(source, tokens, n, j)
 			if mod != "" {
 				imported = append(imported, resolveAlias(mod))
@@ -1393,9 +1452,16 @@ func parseHelperQuoteBlockDetailed(lines []string, helperName string, fileAliase
 
 		case parser.TokUse:
 			j := tokNextSig(tokens, n, i+1)
-			mod, k := tokCollectModuleName(source, tokens, n, j)
+			self, k, isSelf := unquotedSelfModule(source, tokens, j, definingModule)
+			mod := self
+			if !isSelf {
+				mod, k = tokCollectModuleName(source, tokens, n, j)
+			}
 			if mod != "" {
-				resolved := resolveAlias(mod)
+				resolved := mod
+				if !isSelf {
+					resolved = resolveAlias(mod)
+				}
 				transUses = append(transUses, resolved)
 				call := UseCall{Module: resolved}
 				nk := tokNextSig(tokens, n, k)
@@ -1408,6 +1474,19 @@ func parseHelperQuoteBlockDetailed(lines []string, helperName string, fileAliase
 
 		case parser.TokAlias:
 			j := tokNextSig(tokens, n, i+1)
+			if self, k, ok := unquotedSelfModule(source, tokens, j, definingModule); ok {
+				if aliases == nil {
+					aliases = make(map[string]string)
+				}
+				if asName, nextPos, ok := parser.ScanKeywordOptionValue(source, tokens, n, k, "as"); ok {
+					aliases[asName] = self
+					k = nextPos
+				} else {
+					aliases[parser.AliasShortName(self)] = self
+				}
+				i = k - 1
+				continue
+			}
 			modName, k := tokCollectModuleName(source, tokens, n, j)
 			if modName == "" {
 				continue
@@ -1478,15 +1557,38 @@ func parseHelperQuoteBlockDetailed(lines []string, helperName string, fileAliase
 				paramNames = parser.FixParamNames(paramNames)
 			}
 			minArity := maxArity - defaultCount
+			end := skipToEndOfStatement(tokens, n, nextPos)
+			var delegateTo, delegateAs string
+			if kind == "defdelegate" {
+				delegateTo, delegateAs = delegateOptions(source, tokens, nextPos, end, resolveAlias)
+			}
 			for arity := minArity; arity <= maxArity; arity++ {
 				inlineDefs[funcName] = append(inlineDefs[funcName], inlineDef{
-					line:   defLine,
-					arity:  arity,
-					kind:   kind,
-					params: parser.JoinParams(paramNames, arity),
+					line:       defLine,
+					arity:      arity,
+					kind:       kind,
+					params:     parser.JoinParams(paramNames, arity),
+					delegateTo: delegateTo,
+					delegateAs: delegateAs,
 				})
 			}
-			i = skipToEndOfStatement(tokens, n, nextPos) - 1
+			i = end - 1
+
+		case parser.TokDefstruct, parser.TokDefexception:
+			addStructInlineDefs(inlineDefs, tok, source)
+
+		case parser.TokAttr:
+			if parser.TokenText(source, tok) == "@derive" {
+				for _, p := range parser.DeriveProtocols(source, tokens, n, i+1) {
+					derive := resolveAlias(p)
+					// Inside a block of the quote (an if, a case, a fn), or
+					// in an inline `if ..., do:`: the caller's options decide.
+					if depth > 1 || inBranchStatement(source, tokens, i) {
+						derive = conditionalDerivePrefix + derive
+					}
+					derives = append(derives, derive)
+				}
+			}
 
 		case parser.TokIdent:
 			if parser.TokenText(source, tok) != "unquote" {
@@ -1505,8 +1607,9 @@ func parseHelperQuoteBlockDetailed(lines []string, helperName string, fileAliase
 			if k >= n || tokens[k].Kind != parser.TokOpenParen {
 				continue
 			}
-			nestedImports, nestedDefs, nestedUses, nestedCalls, nestedBindings, nestedAliases := parseHelperQuoteBlockDetailed(lines, nestedName, fileAliases, visited)
+			nestedImports, nestedDefs, nestedUses, nestedCalls, nestedBindings, nestedAliases, nestedDerives := parseHelperQuoteBlockDetailed(lines, nestedName, fileAliases, visited)
 			imported = append(imported, nestedImports...)
+			derives = append(derives, nestedDerives...)
 			for name, defs := range nestedDefs {
 				inlineDefs[name] = append(inlineDefs[name], defs...)
 			}
@@ -1579,6 +1682,108 @@ func (u UseCall) dispatchAtom() string {
 func ExtractUsesWithOpts(text string, aliases map[string]string) []UseCall {
 	source := []byte(text)
 	return extractUsesWithOptsFromTokens(source, parser.Tokenize(source), aliases)
+}
+
+// ExtractModuleUsesWithOpts is ExtractUsesWithOpts without the uses in a
+// function body. A `use` in a __using__ quote (or in any other def) is code
+// for the caller, not a use by the module whose file holds it, so a question
+// about what a module itself uses must not see it.
+func ExtractModuleUsesWithOpts(text string, aliases map[string]string) []UseCall {
+	source := []byte(text)
+	tokens := parser.Tokenize(source)
+	calls := extractUsesWithOptsFromTokens(source, tokens, aliases)
+	if len(calls) == 0 {
+		return calls
+	}
+	// A use before the first definition is at module level; the usual file
+	// has only those and needs no scan of its function bodies.
+	firstDef := len(tokens)
+	for i, t := range tokens {
+		if t.Kind == parser.TokDef || t.Kind == parser.TokDefp || t.Kind == parser.TokDefmacro || t.Kind == parser.TokDefmacrop {
+			firstDef = i
+			break
+		}
+	}
+	if calls[len(calls)-1].token < firstDef {
+		return calls
+	}
+	bodies := functionBodySpans(tokens)
+	if len(bodies) == 0 {
+		return calls
+	}
+	kept := calls[:0]
+	for _, c := range calls {
+		inside := false
+		for _, b := range bodies {
+			if c.token > b[0] && c.token < b[1] {
+				inside = true
+				break
+			}
+		}
+		if !inside {
+			kept = append(kept, c)
+		}
+	}
+	return kept
+}
+
+// usesVisibleAt keeps the use calls whose functions code at the 1-based line
+// can call: a use at module level, and a use in the function body that holds
+// the line. A use in a body (the quote of __using__ or of a helper) is code
+// for the module that calls the macro, and reaches only that quote.
+func usesVisibleAt(tokens []parser.Token, calls []UseCall, line int) []UseCall {
+	if len(calls) == 0 {
+		return calls
+	}
+	// The usual file has its uses before its first definition: nothing to do.
+	firstDef := len(tokens)
+	for i, t := range tokens {
+		if t.Kind == parser.TokDef || t.Kind == parser.TokDefp || t.Kind == parser.TokDefmacro || t.Kind == parser.TokDefmacrop {
+			firstDef = i
+			break
+		}
+	}
+	if calls[len(calls)-1].token < firstDef {
+		return calls
+	}
+	bodies := functionBodySpans(tokens)
+	lineOf := func(i int) int {
+		if i >= len(tokens) {
+			i = len(tokens) - 1
+		}
+		return tokens[i].Line
+	}
+	kept := make([]UseCall, 0, len(calls))
+	for _, c := range calls {
+		visible := true
+		for _, b := range bodies {
+			if c.token > b[0] && c.token < b[1] {
+				visible = line >= lineOf(b[0]) && line <= lineOf(b[1])
+				break
+			}
+		}
+		if c.token == 0 || visible {
+			kept = append(kept, c)
+		}
+	}
+	return kept
+}
+
+// functionBodySpans returns the token spans [def, end] of the bodies of
+// def, defp, defmacro, and defmacrop, outermost only.
+func functionBodySpans(tokens []parser.Token) [][2]int {
+	var spans [][2]int
+	for i := 0; i < len(tokens); i++ {
+		switch tokens[i].Kind {
+		case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop:
+			end := blockEnd(tokens, i)
+			spans = append(spans, [2]int{i, end})
+			if end > i {
+				i = end - 1
+			}
+		}
+	}
+	return spans
 }
 
 func extractUsesWithOptsFromTokens(source []byte, tokens []parser.Token, aliases map[string]string) []UseCall {
@@ -1731,6 +1936,8 @@ type usingBody struct {
 	transCalls  []UseCall              // transitive uses with dispatch atom and opts preserved
 	optBindings []optBinding           // dynamic imports/uses resolved from opts
 	aliases     map[string]string      // alias short name → full module
+	derives     []string               // protocols an @derive in the body derives for the caller
+	branchUses  []string               // transUses inside a branch of the body
 }
 
 func (b *usingBody) isEmpty() bool {
@@ -1909,7 +2116,7 @@ func parseDispatchBodies(text string) map[string]*usingBody {
 		}
 		seen[name] = true
 
-		imported, inlineDefs, transUses, transCalls, optBindings, aliases := parseHelperQuoteBlockDetailed(lines, name, fileAliases, make(map[string]bool))
+		imported, inlineDefs, transUses, transCalls, optBindings, aliases, derives := parseHelperQuoteBlockDetailed(lines, name, fileAliases, make(map[string]bool))
 		body := &usingBody{
 			imports:     imported,
 			inlineDefs:  inlineDefs,
@@ -1917,6 +2124,7 @@ func parseDispatchBodies(text string) map[string]*usingBody {
 			transCalls:  transCalls,
 			optBindings: optBindings,
 			aliases:     aliases,
+			derives:     derives,
 		}
 		if !body.isEmpty() {
 			bodies[name] = body
@@ -1936,6 +2144,23 @@ type inlineDef struct {
 	arity  int
 	kind   string // "def", "defp", "defmacro", etc.
 	params string // comma-separated parameter names
+	// For a defdelegate: the module of its to: (aliases resolved; empty for
+	// `to: __MODULE__`, which in a quote is the calling module) and its as:.
+	delegateTo, delegateAs string
+}
+
+// conditionalDerivePrefix marks a derive in usingBody.derives that is inside
+// a branch of the __using__ body, so the caller's options decide it.
+const conditionalDerivePrefix = "?"
+
+// addStructInlineDefs records the functions that a defstruct or defexception
+// in an injected body defines in the module that uses it, as the parser does
+// for one in a module's own source.
+func addStructInlineDefs(inlineDefs map[string][]inlineDef, tok parser.Token, source []byte) {
+	kind := string(source[tok.Start:tok.End])
+	for _, f := range parser.StructFunctions {
+		inlineDefs["__struct__"] = append(inlineDefs["__struct__"], inlineDef{line: tok.Line, arity: f.Arity, kind: kind, params: f.Params})
+	}
 }
 
 // parseUsingBody finds the defmacro __using__ block in text and scans its body
@@ -1947,11 +2172,14 @@ type inlineDef struct {
 // Uses the tokenizer so that heredocs, multi-line expressions, and comments are
 // handled correctly without line-joining heuristics.
 func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inlineDef, transUses []string, optBindings []optBinding, aliases map[string]string) {
-	imported, inlineDefs, transUses, _, optBindings, aliases = parseUsingBodyDetailed(text)
+	imported, inlineDefs, transUses, _, optBindings, aliases, _, _ = parseUsingBodyDetailed(text)
 	return
 }
 
-func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[string][]inlineDef, transUses []string, transCalls []UseCall, optBindings []optBinding, aliases map[string]string) {
+// parseUsingBodyDetailed also returns the protocols that an `@derive` in the
+// body derives for each module that uses it, and the transitive uses that are
+// inside a branch (if, case, ...) of the body.
+func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[string][]inlineDef, transUses []string, transCalls []UseCall, optBindings []optBinding, aliases map[string]string, derives []string, branchUses []string) {
 	source := []byte(text)
 	tokens := parser.Tokenize(source)
 	n := len(tokens)
@@ -2011,6 +2239,9 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 	if usingBodyStart < 0 {
 		return
 	}
+	// unquote(__MODULE__) in the quote is the module that defines __using__:
+	// unquote evaluates it where the macro is defined.
+	definingModule := extractEnclosingModuleFromTokens(source, tokens, tokens[usingBodyStart].Line-1)
 
 	// Extract file-level aliases for resolution (reuse already-tokenized data)
 	lines := strings.Split(text, "\n")
@@ -2031,8 +2262,9 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 	}
 	varToOpt := make(map[string]varBinding)
 	mergeHelperQuote := func(helperName string) {
-		helperImported, helperDefs, helperTransUses, helperCalls, helperBindings, helperAliases := parseHelperQuoteBlockDetailed(lines, helperName, fileAliases, make(map[string]bool))
+		helperImported, helperDefs, helperTransUses, helperCalls, helperBindings, helperAliases, helperDerives := parseHelperQuoteBlockDetailed(lines, helperName, fileAliases, make(map[string]bool))
 		imported = append(imported, helperImported...)
+		derives = append(derives, helperDerives...)
 		for name, defs := range helperDefs {
 			inlineDefs[name] = append(inlineDefs[name], defs...)
 		}
@@ -2134,12 +2366,19 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 	// Walk tokens inside the __using__ body
 	depth := usingDepth
 	i := usingBodyStart
+	// branches holds the depth inside each open if/unless/case/cond/with
+	// block: what is inside one is injected only when the branch is taken,
+	// which depends on the caller's options.
+	var branches []int
 	for i < n && depth > 0 {
 		tok := tokens[i]
 
 		switch tok.Kind {
 		case parser.TokDo, parser.TokFn, parser.TokEnd:
 			parser.TrackBlockDepth(tok.Kind, &depth)
+			for len(branches) > 0 && branches[len(branches)-1] > depth {
+				branches = branches[:len(branches)-1]
+			}
 			i++
 		case parser.TokEOL, parser.TokComment, parser.TokString, parser.TokHeredoc,
 			parser.TokSigil, parser.TokAtom, parser.TokNumber, parser.TokCharLiteral,
@@ -2149,6 +2388,12 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 		case parser.TokImport:
 			i++
 			j := nextSig(i)
+			// import unquote(__MODULE__), or unquote(__MODULE__).Sub
+			if self, k, ok := unquotedSelfModule(source, tokens, j, definingModule); ok {
+				imported = append(imported, self)
+				i = k
+				continue
+			}
 			// import unquote(var)
 			if j < n && tokens[j].Kind == parser.TokIdent && string(source[tokens[j].Start:tokens[j].End]) == "unquote" {
 				if j+2 < n && tokens[j+1].Kind == parser.TokOpenParen && tokens[j+2].Kind == parser.TokIdent {
@@ -2170,8 +2415,9 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 		case parser.TokUse:
 			i++
 			j := nextSig(i)
+			self, selfEnd, isSelf := unquotedSelfModule(source, tokens, j, definingModule)
 			// use unquote(var)
-			if j < n && tokens[j].Kind == parser.TokIdent && string(source[tokens[j].Start:tokens[j].End]) == "unquote" {
+			if !isSelf && j < n && tokens[j].Kind == parser.TokIdent && string(source[tokens[j].Start:tokens[j].End]) == "unquote" {
 				if j+2 < n && tokens[j+1].Kind == parser.TokOpenParen && tokens[j+2].Kind == parser.TokIdent {
 					varName := source[tokens[j+2].Start:tokens[j+2].End]
 					if b, ok := varToOpt[string(varName)]; ok {
@@ -2183,9 +2429,18 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 			}
 			// use Module
 			modName, k := collectModuleName(j)
+			if isSelf {
+				modName, k = self, selfEnd
+			}
 			if modName != "" {
-				resolved := resolveAlias(modName)
+				resolved := modName
+				if !isSelf {
+					resolved = resolveAlias(modName)
+				}
 				transUses = append(transUses, resolved)
+				if len(branches) > 0 {
+					branchUses = append(branchUses, resolved)
+				}
 				call := UseCall{Module: resolved}
 				nk := nextSig(k)
 				if nk < n && tokens[nk].Kind == parser.TokComma {
@@ -2199,6 +2454,19 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 		case parser.TokAlias:
 			i++
 			j := nextSig(i)
+			if self, k, ok := unquotedSelfModule(source, tokens, j, definingModule); ok {
+				if aliases == nil {
+					aliases = make(map[string]string)
+				}
+				if asName, nextPos, ok := parser.ScanKeywordOptionValue(source, tokens, n, k, "as"); ok {
+					aliases[asName] = self
+					k = nextPos
+				} else {
+					aliases[parser.AliasShortName(self)] = self
+				}
+				i = k
+				continue
+			}
 			modName, k := collectModuleName(j)
 			if modName == "" {
 				i = k
@@ -2272,16 +2540,40 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 				paramNames = parser.FixParamNames(paramNames)
 			}
 			minArity := maxArity - defaultCount
+			end := skipToEndOfStatement(tokens, n, nextPos)
+			var delegateTo, delegateAs string
+			if kind == "defdelegate" {
+				delegateTo, delegateAs = delegateOptions(source, tokens, nextPos, end, resolveAlias)
+			}
 			for arity := minArity; arity <= maxArity; arity++ {
 				inlineDefs[funcName] = append(inlineDefs[funcName], inlineDef{
-					line:   defLine,
-					arity:  arity,
-					kind:   kind,
-					params: parser.JoinParams(paramNames, arity),
+					line:       defLine,
+					arity:      arity,
+					kind:       kind,
+					params:     parser.JoinParams(paramNames, arity),
+					delegateTo: delegateTo,
+					delegateAs: delegateAs,
 				})
 			}
-			i = skipToEndOfStatement(tokens, n, nextPos)
+			i = end
 			continue
+
+		case parser.TokDefstruct, parser.TokDefexception:
+			addStructInlineDefs(inlineDefs, tok, source)
+			i++
+
+		case parser.TokAttr:
+			if tok.End-tok.Start == 7 && string(source[tok.Start:tok.End]) == "@derive" {
+				for _, p := range parser.DeriveProtocols(source, tokens, n, i+1) {
+					derive := resolveAlias(p)
+					if len(branches) > 0 || inBranchStatement(source, tokens, i) {
+						// Marked: the caller's options decide.
+						derive = conditionalDerivePrefix + derive
+					}
+					derives = append(derives, derive)
+				}
+			}
+			i++
 
 		case parser.TokModule:
 			// Check for Keyword.put/put_new(opts, :key, Module) heuristic
@@ -2311,6 +2603,13 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 
 		case parser.TokIdent:
 			identName := string(source[tok.Start:tok.End])
+			switch identName {
+			case "if", "unless", "case", "cond", "with":
+				if _, _, hasDo := parser.ScanForwardToMacroCallBlockDo(tokens, n, i+1); hasDo {
+					// The do is counted when the walk reaches it.
+					branches = append(branches, depth+1)
+				}
+			}
 			isStmtStart := i == 0 || tokens[i-1].Kind == parser.TokEOL || tokens[i-1].Kind == parser.TokComment
 			j := nextSig(i + 1)
 
@@ -2477,12 +2776,10 @@ func FindModuleAttributeDefinition(text string, attrName string) (int, bool) {
 	return FindModuleAttributeDefinitionTokenized(text, attrName)
 }
 
-// FindBareFunctionCalls scans text for unqualified calls to functionName,
-// including direct calls like functionName(...) and pipe calls like |> functionName.
-// Returns 1-based line numbers. Definition lines are excluded.
-func FindBareFunctionCalls(text string, functionName string) []int {
-	source := []byte(text)
-	tokens := parser.Tokenize(source)
+// findBareCallLines returns the 1-based lines of the unqualified calls to
+// functionName in the tokens of source: functionName(...), functionName arg,
+// |> functionName, and &functionName/1. Definition lines are excluded.
+func findBareCallLines(source []byte, tokens, interp []parser.Token, functionName string) []int {
 	n := len(tokens)
 
 	seenLines := make(map[int]bool)
@@ -2532,6 +2829,14 @@ func FindBareFunctionCalls(text string, functionName string) []int {
 		if j < n && tokens[j].Kind == parser.TokOpenParen {
 			isCall = true
 		}
+		// A capture without a module: &functionName/arity
+		if !isCall && i > 0 && tokens[i-1].Kind == parser.TokOther && parser.TokenText(source, tokens[i-1]) == "&" {
+			isCall = true
+		}
+		// A call without parentheses: functionName arg, ...
+		if !isCall && parser.NoParenArgCount(source, tokens, i) >= 0 {
+			isCall = true
+		}
 		// Check for pipe call: |> functionName
 		if !isCall && i > 0 {
 			// Look back for |> (may have EOL/comments between)
@@ -2547,6 +2852,25 @@ func FindBareFunctionCalls(text string, functionName string) []int {
 		}
 
 		if isCall && !seenLines[tok.Line] {
+			seenLines[tok.Line] = true
+		}
+	}
+
+	// Calls inside #{} interpolations. The interpolation stream holds no
+	// parentheses, so a call is an identifier followed by '(' in the source;
+	// without one it can be a variable of the same name, and it stays.
+	for i, tok := range interp {
+		if tok.Kind != parser.TokIdent || parser.TokenText(source, tok) != functionName {
+			continue
+		}
+		if i > 0 && interp[i-1].Kind == parser.TokDot && interp[i-1].End == tok.Start {
+			continue
+		}
+		j := tok.End
+		for j < len(source) && (source[j] == ' ' || source[j] == '\t') {
+			j++
+		}
+		if j < len(source) && source[j] == '(' {
 			seenLines[tok.Line] = true
 		}
 	}
@@ -2813,4 +3137,99 @@ func extractParamNames(lines []string, defIdx int) []string {
 		}
 	}
 	return nil
+}
+
+// delegateOptions reads the to: and as: options of a defdelegate in
+// tokens[from:to]. resolve resolves the module through the aliases in scope.
+func delegateOptions(source []byte, tokens []parser.Token, from, to int, resolve func(string) string) (delegateTo, delegateAs string) {
+	n := len(tokens)
+	for i := from; i < to && i+1 < n; i++ {
+		if tokens[i].Kind != parser.TokIdent || tokens[i+1].Kind != parser.TokColon {
+			continue
+		}
+		switch parser.TokenText(source, tokens[i]) {
+		case "to":
+			if mod, _ := tokCollectModuleName(source, tokens, n, tokNextSig(tokens, n, i+2)); mod != "" && !strings.Contains(mod, "__MODULE__") {
+				delegateTo = resolve(mod)
+			}
+		case "as":
+			if j := tokNextSig(tokens, n, i+2); j < n && tokens[j].Kind == parser.TokAtom {
+				delegateAs = strings.TrimPrefix(parser.TokenText(source, tokens[j]), ":")
+			}
+		}
+	}
+	return delegateTo, delegateAs
+}
+
+// inBranchStatement reports whether the token at i is in a statement that
+// an if, unless, case, cond, or with starts, as in the inline form `if
+// unquote(json), do: @derive(Jason.Encoder)`: whether it runs depends on
+// the condition. The block form is found by the depth of its do.
+func inBranchStatement(source []byte, tokens []parser.Token, i int) bool {
+	depth := 0
+	j := i - 1
+	for ; j >= 0; j-- {
+		switch tokens[j].Kind {
+		case parser.TokCloseParen, parser.TokCloseBracket, parser.TokCloseBrace:
+			depth++
+		case parser.TokOpenParen, parser.TokOpenBracket, parser.TokOpenBrace:
+			depth--
+		case parser.TokDo, parser.TokEnd, parser.TokFn:
+			if depth <= 0 {
+				// A block starts or ends before the statement.
+				return false
+			}
+		case parser.TokEOL:
+			if depth > 0 {
+				continue
+			}
+			// A statement goes on after a comma or a keyword colon.
+			if k := prevSigTokenIndex(tokens, j-1); k >= 0 && (tokens[k].Kind == parser.TokComma || tokens[k].Kind == parser.TokColon) {
+				continue
+			}
+			return startsBranch(source, tokens, j+1)
+		}
+	}
+	return startsBranch(source, tokens, 0)
+}
+
+func startsBranch(source []byte, tokens []parser.Token, i int) bool {
+	for i < len(tokens) && (tokens[i].Kind == parser.TokEOL || tokens[i].Kind == parser.TokComment) {
+		i++
+	}
+	if i >= len(tokens) || tokens[i].Kind != parser.TokIdent {
+		return false
+	}
+	switch parser.TokenText(source, tokens[i]) {
+	case "if", "unless", "case", "cond", "with":
+		return true
+	}
+	return false
+}
+
+func prevSigTokenIndex(tokens []parser.Token, i int) int {
+	for i >= 0 && (tokens[i].Kind == parser.TokEOL || tokens[i].Kind == parser.TokComment) {
+		i--
+	}
+	return i
+}
+
+// unquotedSelfModule reads `unquote(__MODULE__)`, with an optional `.Sub`
+// after it, at tokens[j] in a quote: the module that defines the macro
+// (definingModule), since unquote evaluates __MODULE__ where the macro is
+// defined. A plain __MODULE__ in a quote is the calling module, and is not
+// read here. k is the token after the name.
+func unquotedSelfModule(source []byte, tokens []parser.Token, j int, definingModule string) (module string, k int, ok bool) {
+	n := len(tokens)
+	if definingModule == "" || j+3 >= n || tokens[j].Kind != parser.TokIdent || parser.TokenText(source, tokens[j]) != "unquote" ||
+		tokens[j+1].Kind != parser.TokOpenParen || tokens[j+2].Kind != parser.TokModule ||
+		parser.TokenText(source, tokens[j+2]) != "__MODULE__" || tokens[j+3].Kind != parser.TokCloseParen {
+		return "", j, false
+	}
+	module, k = definingModule, j+4
+	for k+1 < n && tokens[k].Kind == parser.TokDot && tokens[k+1].Kind == parser.TokModule && tokens[k+1].Start == tokens[k].End {
+		module += "." + parser.TokenText(source, tokens[k+1])
+		k += 2
+	}
+	return module, k, true
 }

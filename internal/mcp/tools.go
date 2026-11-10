@@ -45,6 +45,12 @@ type Handler struct {
 	// sources caches the files that one tool call reads. Call gives each call
 	// its own Handler, so the cache never outlives the call.
 	sources sourceCache
+	// flushed is set once the call has waited for the watcher's events; see
+	// settled.
+	flushed bool
+	// behind is set when settled stopped waiting before the index had the
+	// watcher's events.
+	behind bool
 }
 
 // NewHandler returns a Handler over the runtime's store and the given language
@@ -101,7 +107,7 @@ func toolSpecs() []toolSpec {
 		newToolSpec(mcp.Tool{
 			Name:        "dexter_search",
 			Annotations: readOnly,
-			Description: "Locate Elixir modules and functions by fuzzy name match. More precise than grep for finding symbols: results are exact definitions with file:line.",
+			Description: "Locate Elixir modules and functions by fuzzy name match. More precise than grep for finding symbols: results are exact definitions with file:line. A Module.function query also finds the functions that `use` injects into that module or that its macros generate.",
 		}, (*Handler).search),
 		newToolSpec(mcp.Tool{
 			Name:        "dexter_definition",
@@ -111,12 +117,12 @@ func toolSpecs() []toolSpec {
 		newToolSpec(mcp.Tool{
 			Name:        "dexter_references",
 			Annotations: readOnly,
-			Description: "All call sites of an Elixir module or function, resolved through aliases, imports, and use-chain injection that grep cannot see. Use for any 'who calls or uses X' question.",
+			Description: "All call sites of an Elixir module or function, resolved through aliases, imports, and use-chain injection that grep cannot see, each with the function (or test block) that holds it. Use for any 'who calls or uses X' question; pass callees: true to also list what the function calls.",
 		}, (*Handler).references),
 		newToolSpec(mcp.Tool{
 			Name:        "dexter_module_api",
 			Annotations: readOnly,
-			Description: "A module's public API in one call: moduledoc, functions with signatures and doc summaries, macros, delegates, types, callbacks, and submodules. Use before reading a module's source.",
+			Description: "A module's public API in one call: moduledoc, functions with signatures and doc summaries, macros, delegates, types, callbacks, submodules, and the public functions that `use` injects or macros generate. Use before reading a module's source.",
 		}, (*Handler).moduleAPI),
 		newToolSpec(mcp.Tool{
 			Name:        "dexter_file_outline",
@@ -126,21 +132,16 @@ func toolSpecs() []toolSpec {
 		newToolSpec(mcp.Tool{
 			Name:        "dexter_implementations",
 			Annotations: readOnly,
-			Description: "Implementations of an Elixir behaviour (@behaviour/use) or protocol (defimpl), optionally locating one callback in each implementor. Grep cannot resolve these relationships.",
+			Description: "Implementations of an Elixir behaviour (@behaviour/use) or protocol (defimpl, and @derive in a module or in what its use injects), optionally locating one callback in each implementor. Grep cannot resolve these relationships.",
 		}, (*Handler).implementations),
-		newToolSpec(mcp.Tool{
-			Name:        "dexter_call_hierarchy",
-			Annotations: readOnly,
-			Description: "Incoming callers and outgoing callees of an Elixir function, with file:line locations. Use to trace execution paths without reading files.",
-		}, (*Handler).callHierarchy),
 		newToolSpec(mcp.Tool{
 			Name:        "dexter_reindex",
 			Annotations: &mcp.ToolAnnotations{DestructiveHint: new(bool), IdempotentHint: true, OpenWorldHint: new(bool)},
-			Description: "Force an immediate incremental reindex. The index already updates automatically as files change; use this only when a lookup seems stale. It writes only dexter's own index database.",
+			Description: "Force an immediate incremental reindex. The index updates automatically as files change, and a lookup that finds nothing first waits for pending changes; use this only when dexter_workspace says file watching is not active. It writes only dexter's own index database.",
 		}, (*Handler).reindex),
 		newToolSpec(mcp.Tool{
 			Name:        renameToolName,
-			Description: "Rename an Elixir module or function across the whole workspace, exactly like an editor rename: writes the changes to disk, moves files that follow the naming convention, and updates the index. Reports every file changed; review with git diff.",
+			Description: "Rename an Elixir module or function across the whole workspace, exactly like an editor rename: writes the changes to disk (all files or none), moves files that follow the naming convention, renames a behaviour callback together with its implementations, and updates the index. Files open in an editor without unsaved changes are written too; if a file it must change has unsaved changes in an editor, nothing is changed and the error names the file to save. Reports every file changed; review with git diff.",
 			Annotations: &mcp.ToolAnnotations{OpenWorldHint: new(bool)},
 		}, (*Handler).rename),
 	}
@@ -179,6 +180,9 @@ func (h *Handler) Call(ctx context.Context, name string, args json.RawMessage, w
 		if n := h.indexNotes(); n != "" {
 			noteList = append(noteList, n)
 		}
+	}
+	if n := call.behindNote(); n != "" {
+		noteList = append(noteList, n)
 	}
 	if n := call.unsavedNote(); n != "" {
 		noteList = append(noteList, n)

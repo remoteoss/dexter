@@ -2,7 +2,9 @@ package lsp
 
 import (
 	"container/list"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -10,7 +12,9 @@ import (
 
 	tree_sitter "github.com/tree-sitter/go-tree-sitter"
 	tree_sitter_elixir "github.com/tree-sitter/tree-sitter-elixir/bindings/go"
-	"go.lsp.dev/protocol"
+	"go.lsp.dev/uri"
+
+	"golang.org/x/text/unicode/norm"
 
 	"github.com/remoteoss/dexter/internal/parser"
 )
@@ -21,6 +25,11 @@ import (
 const defaultMaxTransient = 50
 
 type cachedDoc struct {
+	// uri is the spelling of the document URI that the editor sent. The store
+	// files the document under its canonical key (see docKey); edits sent
+	// back to the editor use this spelling, because an editor can compare
+	// URIs as strings.
+	uri        string
 	text       string
 	tree       *refTree
 	src        []byte         // source bytes the tree references - must stay alive
@@ -33,6 +42,10 @@ type cachedDoc struct {
 	// LRU and evicted once the transient cap is reached. Editor-owned
 	// entries (created via Set) are never transient and never evicted.
 	transient bool
+	// diskSize and diskMtime are the file's stat before a transient load. A
+	// later hit compares them with the file, so a change on disk is read.
+	diskSize  int64
+	diskMtime time.Time
 	// seq orders editor-owned entries across every store in the process:
 	// the higher one was set later. A frontend without an editor uses it to
 	// pick the newest unsaved buffer when several editors hold one file.
@@ -106,6 +119,175 @@ type DocumentStore struct {
 	transientList *list.List
 	transientIdx  map[string]*list.Element
 	maxTransient  int
+
+	// registry, when set, receives every editor-owned open and close, so
+	// that a rename in one session can see the files that another session
+	// of the same workspace has open. See openDocRegistry.
+	registry *openDocRegistry
+}
+
+// docKey returns the key the store files a document URI under: the file URI
+// that uri.File builds from the path the URI names. Editors spell one file in
+// more than one way. VS Code percent-encodes characters such as '@', '+', '('
+// and ')' and writes a Windows drive as "c%3A"; uri.File, which builds the URI
+// of every path Dexter finds in the index, does not. If the store used the raw
+// string, a lookup by path could not find a buffer that the editor has open,
+// and a rename would write that file on disk under the open buffer.
+//
+// The key decodes percent escapes, cleans the path, writes a Windows drive
+// letter in upper case, and, on macOS, puts the path in Unicode normalization
+// form C (APFS and HFS+ ignore the normalization, and an editor can send the
+// decomposed form). Elsewhere two normalizations are two files, so the key
+// keeps the bytes. On a volume that ignores case (the macOS default), the
+// key also folds case, because the editor and the index can spell a file with
+// different case; on a volume that keeps case apart, it does not. The
+// returned path is the cleaned path without case folding: the index stores
+// paths with their own spelling, so store queries use it. A URI that is not a
+// file URI is its own key.
+func docKey(u string) string {
+	key, _ := docKeyPath(u)
+	return key
+}
+
+// docKeyPath returns the key of u and the clean file path it names. The path
+// is empty for a URI that is not a file URI or that cannot be parsed.
+func docKeyPath(u string) (key, path string) {
+	const scheme = "file://"
+	if !strings.HasPrefix(u, scheme) {
+		return u, ""
+	}
+	if rest := u[len(scheme):]; isCanonicalURIPath(rest) {
+		// The usual case: nothing to decode, normalize or clean. uri.File
+		// would give the same string back, so skip the parse.
+		path = filepath.FromSlash(rest)
+		if foldsCase(filepath.Dir(path)) {
+			return scheme + strings.ToLower(rest), path
+		}
+		return u, path
+	}
+	parsed, err := url.ParseRequestURI(u)
+	if err != nil || parsed.Scheme != "file" || parsed.Path == "" {
+		return u, ""
+	}
+	p := parsed.Path
+	if len(p) >= 3 && p[0] == '/' && p[2] == ':' && isASCIILetter(p[1]) {
+		// "/c:/x" names the Windows path "C:/x".
+		p = strings.ToUpper(p[1:2]) + p[2:]
+	}
+	p = filepath.Clean(filepath.FromSlash(p))
+	k := p
+	if ignoresNormalization {
+		k = norm.NFC.String(p)
+	}
+	if foldsCase(filepath.Dir(p)) {
+		k = strings.ToLower(k)
+	}
+	return string(uri.File(k)), p
+}
+
+// isCanonicalURIPath reports whether the path part of a file URI is already
+// what uri.File would produce: absolute, clean, and made only of characters
+// that URL path escaping leaves alone.
+func isCanonicalURIPath(p string) bool {
+	if len(p) < 2 || p[0] != '/' || p[len(p)-1] == '/' {
+		return false
+	}
+	for i := 1; i < len(p); i++ {
+		c := p[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '_' || c == '-' || c == '~':
+		case c == '.':
+			// "/./", "/../" and a trailing "/." or "/.." need cleaning. A dot
+			// that starts a name (".formatter.exs") takes the slow path too;
+			// that is rare and still correct.
+			if p[i-1] == '/' {
+				return false
+			}
+		case c == '/':
+			if p[i-1] == '/' {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// openDocRegistry records, for one workspace, which sessions have which files
+// open. Every session keeps its own document store, so without it a rename in
+// one editor cannot know that another editor attached to the same daemon has
+// a file open, possibly with unsaved changes, and would write that file on
+// disk under the other editor's buffer. Only editor-owned documents (didOpen)
+// count; buffers loaded from disk for a query do not.
+type openDocRegistry struct {
+	mu    sync.Mutex
+	paths map[string]map[*DocumentStore]struct{} // document key (docKey) → stores that hold it open
+}
+
+func newOpenDocRegistry() *openDocRegistry {
+	return &openDocRegistry{paths: make(map[string]map[*DocumentStore]struct{})}
+}
+
+func (r *openDocRegistry) open(owner *DocumentStore, key string) {
+	if r == nil || key == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	owners := r.paths[key]
+	if owners == nil {
+		owners = make(map[*DocumentStore]struct{}, 1)
+		r.paths[key] = owners
+	}
+	owners[owner] = struct{}{}
+}
+
+func (r *openDocRegistry) close(owner *DocumentStore, keys ...string) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, key := range keys {
+		owners := r.paths[key]
+		delete(owners, owner)
+		if len(owners) == 0 {
+			delete(r.paths, key)
+		}
+	}
+}
+
+// pathKey is the document key of a file path from the index.
+func pathKey(path string) string { return docKey(string(uri.File(path))) }
+
+// heldTexts returns the buffer text of path in every session other than
+// owner that has it open. The stores are read after the registry lock is
+// released: DocumentStore.Set takes its own lock and then the registry's.
+func (r *openDocRegistry) heldTexts(owner *DocumentStore, path string) []string {
+	if r == nil {
+		return nil
+	}
+	key := pathKey(path)
+	r.mu.Lock()
+	var others []*DocumentStore
+	for o := range r.paths[key] {
+		if o != owner {
+			others = append(others, o)
+		}
+	}
+	r.mu.Unlock()
+	if len(others) == 0 {
+		return nil
+	}
+	texts := make([]string, 0, len(others))
+	for _, o := range others {
+		if text, ok := o.GetIfOpen(key); ok {
+			texts = append(texts, text)
+		}
+	}
+	return texts
 }
 
 func NewDocumentStore() *DocumentStore {
@@ -147,53 +329,85 @@ func (ds *DocumentStore) Count() int {
 	return len(ds.docs)
 }
 
-func (ds *DocumentStore) Set(uri string, text string) {
+// Set stores the editor's text for a document and makes the document
+// editor-owned. rawURI keeps the spelling the editor sent; see EditorURI.
+func (ds *DocumentStore) Set(rawURI string, text string) {
+	key, path := docKeyPath(rawURI)
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	if ds.closed {
 		return
 	}
-	if doc, ok := ds.docs[uri]; ok {
+	doc, ok := ds.docs[key]
+	if ok {
 		doc.tree.retireLocked()
 	}
+	if (!ok || doc.transient) && path != "" {
+		ds.registry.open(ds, key)
+	}
 	// Editor took ownership of this URI - drop any LRU tracking for it.
-	ds.removeFromLRULocked(uri)
-	ds.docs[uri] = &cachedDoc{text: text, seq: docSeq.Add(1)}
+	ds.removeFromLRULocked(key)
+	ds.docs[key] = &cachedDoc{uri: rawURI, text: text, seq: docSeq.Add(1)}
 }
 
 // SetChanged is Set for an edit in the editor: the buffer has unsaved changes
 // until MarkSaved.
-func (ds *DocumentStore) SetChanged(uri string, text string) {
+func (ds *DocumentStore) SetChanged(rawURI string, text string) {
+	key, path := docKeyPath(rawURI)
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	if ds.closed {
 		return
 	}
-	if doc, ok := ds.docs[uri]; ok {
+	doc, ok := ds.docs[key]
+	if ok {
 		doc.tree.retireLocked()
 	}
-	ds.removeFromLRULocked(uri)
-	ds.docs[uri] = &cachedDoc{text: text, seq: docSeq.Add(1), dirty: true, changedAt: time.Now()}
+	if (!ok || doc.transient) && path != "" {
+		ds.registry.open(ds, key)
+	}
+	ds.removeFromLRULocked(key)
+	ds.docs[key] = &cachedDoc{uri: rawURI, text: text, seq: docSeq.Add(1), dirty: true, changedAt: time.Now()}
 }
 
 // MarkSaved records that the editor saved the buffer, so it has no unsaved
 // changes.
 func (ds *DocumentStore) MarkSaved(uri string) {
+	key := docKey(uri)
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
-	if doc, ok := ds.docs[uri]; ok && !doc.transient {
+	if doc, ok := ds.docs[key]; ok && !doc.transient {
 		doc.dirty = false
 	}
 }
 
 func (ds *DocumentStore) Close(uri string) {
+	key := docKey(uri)
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
-	if doc, ok := ds.docs[uri]; ok {
+	doc, ok := ds.docs[key]
+	if ok {
 		doc.tree.retireLocked()
+		if !doc.transient {
+			ds.registry.close(ds, key)
+		}
 	}
-	ds.removeFromLRULocked(uri)
-	delete(ds.docs, uri)
+	ds.removeFromLRULocked(key)
+	delete(ds.docs, key)
+}
+
+// EditorURI returns the URI spelling the editor used for a document it has
+// open, given any spelling of that document's URI. ok is false when the
+// editor does not have the document open.
+func (ds *DocumentStore) EditorURI(uri string) (string, bool) {
+	key := docKey(uri)
+	ds.mu.RLock()
+	defer ds.mu.RUnlock()
+	doc, ok := ds.docs[key]
+	if !ok || doc.transient {
+		return "", false
+	}
+	return doc.uri, true
 }
 
 // CloseAll frees all cached trees and the shared parser. Trees still
@@ -210,9 +424,14 @@ func (ds *DocumentStore) CloseAll() {
 		return
 	}
 	ds.closed = true
-	for _, doc := range ds.docs {
+	var open []string
+	for key, doc := range ds.docs {
 		doc.tree.retireLocked()
+		if !doc.transient {
+			open = append(open, key)
+		}
 	}
+	ds.registry.close(ds, open...)
 	ds.docs = nil
 	ds.transientList = nil
 	ds.transientIdx = nil
@@ -220,6 +439,7 @@ func (ds *DocumentStore) CloseAll() {
 }
 
 func (ds *DocumentStore) Get(uri string) (string, bool) {
+	uri = docKey(uri)
 	ds.mu.RLock()
 	defer ds.mu.RUnlock()
 	doc, ok := ds.docs[uri]
@@ -236,6 +456,7 @@ func (ds *DocumentStore) Get(uri string) (string, bool) {
 // distinct from calling HasOpen followed by Get, which would be a
 // TOCTOU race if Close interleaves between the two RLock acquisitions.
 func (ds *DocumentStore) GetIfOpen(uri string) (string, bool) {
+	uri = docKey(uri)
 	ds.mu.RLock()
 	defer ds.mu.RUnlock()
 	doc, ok := ds.docs[uri]
@@ -249,9 +470,10 @@ func (ds *DocumentStore) GetIfOpen(uri string) (string, bool) {
 // not saved, with its sequence number (see cachedDoc.seq) and the time of its
 // last change.
 func (ds *DocumentStore) UnsavedBuffer(uri string) (text string, seq uint64, changedAt time.Time, ok bool) {
+	key := docKey(uri)
 	ds.mu.RLock()
 	defer ds.mu.RUnlock()
-	doc, found := ds.docs[uri]
+	doc, found := ds.docs[key]
 	if !found || doc.transient || !doc.dirty {
 		return "", 0, time.Time{}, false
 	}
@@ -268,7 +490,8 @@ func (ds *DocumentStore) UnsavedBuffer(uri string) (text string, seq uint64, cha
 //
 // Editor-owned entries (added via Set) are never evicted and are not
 // reordered in the LRU - only transient entries participate.
-func (ds *DocumentStore) GetOrLoad(uri string) (string, bool) {
+func (ds *DocumentStore) GetOrLoad(rawURI string) (string, bool) {
+	uri, path := docKeyPath(rawURI)
 	// Fast path: lookup under RLock. We avoid the LRU bump here so
 	// repeated hits on editor-owned buffers don't contend on the write
 	// lock at all.
@@ -276,23 +499,33 @@ func (ds *DocumentStore) GetOrLoad(uri string) (string, bool) {
 	if doc, ok := ds.docs[uri]; ok {
 		text := doc.text
 		isTransient := doc.transient
+		size, mtime := doc.diskSize, doc.diskMtime
 		ds.mu.RUnlock()
-		if isTransient {
-			ds.bumpLRU(uri)
+		if !isTransient {
+			return text, true
 		}
-		return text, true
+		// No editor owns the file, so nothing tells the store when it
+		// changes on disk. Compare the stat from the load.
+		if info, err := os.Stat(path); err == nil && info.Size() == size && info.ModTime().Equal(mtime) {
+			ds.bumpLRU(uri)
+			return text, true
+		}
+		ds.dropTransient(uri, doc)
+	} else {
+		ds.mu.RUnlock()
 	}
-	ds.mu.RUnlock()
 
 	// Miss: read from disk *outside* the write lock so concurrent
 	// requests for other URIs aren't blocked behind file I/O. We only
-	// fall back to disk for file:// URIs - uri.Filename() panics on
-	// other schemes (e.g. untitled:), so guard before calling it.
-	if !strings.HasPrefix(uri, "file://") {
+	// fall back to disk for file:// URIs; docKeyPath gives no path for
+	// other schemes (e.g. untitled:).
+	if path == "" {
 		return "", false
 	}
-	path := uriToPath(protocol.DocumentURI(uri))
-	if path == "" {
+	// Stat before the read: a write after the stat makes the next hit read
+	// the file again.
+	info, err := os.Stat(path)
+	if err != nil {
 		return "", false
 	}
 	data, err := os.ReadFile(path)
@@ -323,7 +556,7 @@ func (ds *DocumentStore) GetOrLoad(uri string) (string, bool) {
 		return existing.text, true
 	}
 
-	ds.docs[uri] = &cachedDoc{text: text, transient: true}
+	ds.docs[uri] = &cachedDoc{uri: rawURI, text: text, transient: true, diskSize: info.Size(), diskMtime: info.ModTime()}
 	ds.transientIdx[uri] = ds.transientList.PushFront(uri)
 	ds.evictTransientLocked()
 	return text, true
@@ -338,6 +571,19 @@ func (ds *DocumentStore) bumpLRU(uri string) {
 	if elem, ok := ds.transientIdx[uri]; ok {
 		ds.transientList.MoveToFront(elem)
 	}
+}
+
+// dropTransient removes a transient entry whose file changed on disk. It
+// leaves the entry if an editor opened the file or another load replaced it.
+func (ds *DocumentStore) dropTransient(uri string, doc *cachedDoc) {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	if ds.docs[uri] != doc || !doc.transient {
+		return
+	}
+	ds.removeFromLRULocked(uri)
+	doc.tree.retireLocked()
+	delete(ds.docs, uri)
 }
 
 // removeFromLRULocked removes a URI from LRU tracking. Caller must hold
@@ -384,6 +630,7 @@ func (ds *DocumentStore) evictTransientLocked() {
 //
 // When ok is false, release is nil and must not be called.
 func (ds *DocumentStore) GetTree(uri string) (*tree_sitter.Tree, []byte, func(), bool) {
+	uri = docKey(uri)
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	doc, ok := ds.docs[uri]
@@ -412,6 +659,7 @@ func (ds *DocumentStore) GetTree(uri string) (*tree_sitter.Tree, []byte, func(),
 // Tokenizes on first access and caches the result. The cache is invalidated on
 // the next Set() call.
 func (ds *DocumentStore) GetTokens(uri string) ([]parser.Token, []byte, bool) {
+	uri = docKey(uri)
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	doc, ok := ds.docs[uri]
@@ -433,6 +681,7 @@ func (ds *DocumentStore) GetTokens(uri string) ([]parser.Token, []byte, bool) {
 // conversion, and the interpolation stream — the code inside #{}, which the
 // main stream keeps folded into one string token.
 func (ds *DocumentStore) GetTokensFull(uri string) ([]parser.Token, []byte, []int, []parser.Token, bool) {
+	uri = docKey(uri)
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	doc, ok := ds.docs[uri]

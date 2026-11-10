@@ -112,7 +112,7 @@ func TestTools_SeeUnsavedEditorBuffers(t *testing.T) {
 	// marked as such.
 	change("lib/my_app/worker.ex", strings.Replace(workerSource, "MyApp.Accounts.fetch_user(1)", "MyApp.Accounts.fetch_user(id)", 1))
 	refs = e.callTool("dexter_references", map[string]any{"module": "MyApp.Accounts", "function": "fetch_user"})
-	wantContains(t, refs, "3: MyApp.Accounts.fetch_user(1) (saved text; this part is changed in an unsaved editor buffer)", "8: MyApp.Accounts.fetch_user(2)\n")
+	wantContains(t, refs, "3: MyApp.Accounts.fetch_user(1) (saved text; this part is changed in an unsaved editor buffer)", "8: MyApp.Accounts.fetch_user(2)  [in MyApp.Worker.run_all/0]\n")
 
 	// A definition below an inserted function: the head, @spec, and @doc come
 	// from the buffer at the moved line.
@@ -336,6 +336,15 @@ func TestLineMapRandomEdits(t *testing.T) {
 		if want := lcsLen(a, b); mapped != want {
 			t.Fatalf("round %d: %d lines mapped, want the LCS length %d", round, mapped, want)
 		}
+		// The fallback is not minimal, but each pair it reports is equal and
+		// in order.
+		lastI, lastJ := -1, -1
+		anchorLines(a, b, func(i, j int) {
+			if i <= lastI || j <= lastJ || a[i] != b[j] {
+				t.Fatalf("round %d: anchorLines matched %d to %d after %d to %d", round, i, j, lastI, lastJ)
+			}
+			lastI, lastJ = i, j
+		})
 	}
 }
 
@@ -392,4 +401,148 @@ func BenchmarkLineMap10kManyEdits(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		newLineMap(disk, text)
 	}
+}
+
+// Regression: an editor that reloads a file after the agent wrote it sends a
+// change with the disk text, often with other line endings or without the
+// final newline. That buffer was taken for unsaved work.
+func TestTools_DirtyBufferWithDiskTextIsClean(t *testing.T) {
+	e := setupProject(t)
+	ed := attachEditor(t, e)
+	ed.open("lib/my_app/worker.ex", workerSource)
+	writeLater(t, filepath.Join(e.root, "lib/my_app/worker.ex"), agentWorkerSource)
+	reloaded := strings.TrimSuffix(strings.ReplaceAll(agentWorkerSource, "\n", "\r\n"), "\r\n")
+	ed.change("lib/my_app/worker.ex", reloaded)
+
+	out := e.callTool("dexter_file_outline", map[string]any{"file": "lib/my_app/worker.ex"})
+	wantContains(t, out, "defmodule MyApp.AgentAdded")
+	wantNotContains(t, out, "unsaved", "conflict")
+}
+
+// Regression: with one-second file times, a disk write in the same second as
+// the buffer's last change looked older than the change, so the buffer was
+// read with no word about the disk.
+func TestTools_SameSecondChangesAreNotOrdered(t *testing.T) {
+	e := setupProject(t)
+	ed := attachEditor(t, e)
+	path := filepath.Join(e.root, "lib/my_app/worker.ex")
+	ed.open("lib/my_app/worker.ex", workerSource)
+	ed.change("lib/my_app/worker.ex", workerSource+"\ndefmodule MyApp.Typed do\nend\n")
+	buffer, ok := e.rt.UnsavedBuffer(path)
+	if !ok {
+		t.Fatal("no unsaved buffer")
+	}
+	if err := os.WriteFile(path, []byte(agentWorkerSource), 0644); err != nil {
+		t.Fatal(err)
+	}
+	second := buffer.ChangedAt.Truncate(time.Second)
+	if err := os.Chtimes(path, second, second); err != nil {
+		t.Fatal(err)
+	}
+
+	out := e.callTool("dexter_file_outline", map[string]any{"file": "lib/my_app/worker.ex"})
+	wantContains(t, out, "defmodule MyApp.Typed", "changed at about the same time", "may conflict")
+}
+
+func TestChangedOrder(t *testing.T) {
+	change := time.Date(2026, 1, 2, 3, 4, 5, 500_000_000, time.UTC)
+	for _, tc := range []struct {
+		mtime time.Time
+		want  order
+	}{
+		{change.Add(time.Millisecond), diskLater},
+		{change.Add(-time.Millisecond), bufferLater},
+		{change.Truncate(time.Second), orderUnknown},                  // coarse, same second
+		{change.Truncate(time.Second).Add(time.Second), diskLater},    // coarse, next second
+		{change.Truncate(time.Second).Add(-time.Second), bufferLater}, // coarse, second before
+	} {
+		if got := changedOrder(tc.mtime, change); got != tc.want {
+			t.Errorf("changedOrder(%v) = %v, want %v", tc.mtime, got, tc.want)
+		}
+	}
+}
+
+// Regression: above the bounds of the exact diff, every line between the first
+// and the last change was labeled as changed. Only changed lines may be.
+func TestLineMapAboveDiffBounds(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		lines int
+		every int
+	}{
+		{"too many edits", 10000, 7},    // about 1,400 changed lines: more than maxDiffEdits
+		{"too many lines", 30000, 1000}, // 60,000 lines in the region: more than maxDiffLines
+		{"too many of both", 30000, 13},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var disk, text []string
+			changed := map[int]bool{}
+			for i := 0; i < tc.lines; i++ {
+				line := fmt.Sprintf("  def f%d(x), do: x + %d", i, i)
+				disk = append(disk, line)
+				if i == 0 || i == tc.lines-1 || i%tc.every == 0 {
+					changed[i+1] = true
+					text = append(text, "  # changed")
+					continue
+				}
+				text = append(text, line)
+			}
+			m := newLineMap(strings.Join(disk, "\n"), strings.Join(text, "\n"))
+			for line := 1; line <= tc.lines; line++ {
+				got, ok := m.locate(line)
+				if changed[line] {
+					if ok {
+						t.Fatalf("changed line %d is mapped to %d", line, got)
+					}
+					continue
+				}
+				if !ok || got != line {
+					t.Fatalf("unchanged line %d: locate = %d, %v", line, got, ok)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkLineMap30kAboveBounds is a 30,000-line file whose changed region
+// is above the bounds of the exact diff.
+func BenchmarkLineMap30kAboveBounds(b *testing.B) {
+	var disk, text []string
+	for i := 0; i < 30000; i++ {
+		line := fmt.Sprintf("  def f%d(x), do: x + %d", i, i)
+		disk = append(disk, line)
+		if i == 0 || i == 29999 || i%13 == 0 {
+			line = "  # changed"
+		}
+		text = append(text, line)
+	}
+	d, t := strings.Join(disk, "\n"), strings.Join(text, "\n")
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		newLineMap(d, t)
+	}
+}
+
+// Regression: on a file system that ignores case, a path in another case than
+// the disk's was refused as outside the project root, because the check kept
+// the typed case.
+func TestFileOutline_AcceptsAnotherCaseOfAPathInsideRoot(t *testing.T) {
+	e := setupProject(t)
+	if _, err := os.Stat(filepath.Join(e.root, "LIB", "MY_APP", "WORKER.EX")); err != nil {
+		t.Skip("the volume is case-sensitive")
+	}
+	for _, p := range []string{
+		"LIB/My_App/Worker.ex",
+		filepath.Join(strings.ToUpper(e.root), "lib/my_app/worker.ex"),
+	} {
+		out := e.callTool("dexter_file_outline", map[string]any{"file": p})
+		wantContains(t, out, "lib/my_app/worker.ex", "defmodule MyApp.Worker")
+	}
+	// Another case of a path outside the root is still refused.
+	outside := filepath.Join(filepath.Dir(e.root), "Outside.ex")
+	if err := os.WriteFile(outside, []byte("defmodule Outside do\nend\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(outside) })
+	wantContains(t, e.callToolExpectError("dexter_file_outline", map[string]any{"file": strings.ToUpper(outside)}), "outside the project root")
 }

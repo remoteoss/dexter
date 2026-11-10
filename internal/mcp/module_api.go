@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/remoteoss/dexter/internal/lsp"
 	"github.com/remoteoss/dexter/internal/store"
 )
 
@@ -40,7 +41,10 @@ func (h *Handler) moduleAPI(ctx context.Context, args ModuleAPIParams) (string, 
 		}
 	}
 	if moduleDef == nil {
-		return fmt.Sprintf("Module %s is not in the index. Use dexter_search to find the right name, or dexter_reindex if the module was just created.", module), nil
+		if h.settled(ctx) {
+			return h.moduleAPI(ctx, args)
+		}
+		return fmt.Sprintf("Module %s is not in the index. Use dexter_search to find the right name.%s", module, h.notWatchingNote()), nil
 	}
 
 	var b strings.Builder
@@ -104,6 +108,35 @@ func (h *Handler) moduleAPI(ctx context.Context, args ModuleAPIParams) (string, 
 	writeSection("Private functions", sections["private"])
 	writeSection("Callbacks (this module is a behaviour)", callbacks)
 
+	members := h.lsp.ModuleMembers(module)
+	if len(members) > 0 {
+		fmt.Fprintf(&b, "\nInjected or generated (not in this module's source; dexter_definition finds them too):\n")
+		for i, m := range members {
+			if i == maxMembersShown {
+				fmt.Fprintf(&b, "  ... and %d more\n", len(members)-i)
+				break
+			}
+			line := "  " + memberSignature(m)
+			if m.Kind == "defmacro" {
+				line += " (macro)"
+			}
+			if loc := h.memberLocation(module, m); loc != "" {
+				line += " [" + loc + "]"
+			}
+			line += " - " + h.memberOrigin(module, m)
+			doc := m.Doc
+			if doc == "" && m.Source == lsp.MemberInjected && m.FilePath != "" {
+				doc = docs.docFor(m.FilePath, m.Line)
+			} else {
+				doc = firstDocLine(doc)
+			}
+			if doc != "" {
+				line += "\n    " + doc
+			}
+			b.WriteString(line + "\n")
+		}
+	}
+
 	if subs, err := h.store.ListSubmodules(module); err == nil && len(subs) > 0 {
 		fmt.Fprintf(&b, "\nSubmodules (%d):\n", len(subs))
 		const maxSubs = 20
@@ -116,7 +149,7 @@ func (h *Handler) moduleAPI(ctx context.Context, args ModuleAPIParams) (string, 
 		}
 	}
 
-	if len(funcs) == 0 && len(callbacks) == 0 {
+	if len(funcs) == 0 && len(callbacks) == 0 && len(members) == 0 {
 		fmt.Fprintf(&b, "\nNo functions indexed for this module.\n")
 	}
 	return b.String(), nil

@@ -104,6 +104,38 @@ func TestExpressionAtCursor(t *testing.T) {
 			wantFunc: "baz",
 		},
 		{
+			name:     "cursor right after function name, before paren",
+			code:     "    Foo.Bar.baz(123)",
+			line:     0,
+			col:      15,
+			wantMod:  "Foo.Bar",
+			wantFunc: "baz",
+		},
+		{
+			name:     "cursor right after function name, before comma",
+			code:     "    f(Foo.bar, 1)",
+			line:     0,
+			col:      13,
+			wantMod:  "Foo",
+			wantFunc: "bar",
+		},
+		{
+			name:     "cursor at end of line after function name",
+			code:     "    Foo.bar\nx",
+			line:     0,
+			col:      11,
+			wantMod:  "Foo",
+			wantFunc: "bar",
+		},
+		{
+			name:     "cursor after closing paren is not an expression",
+			code:     "    foo(x) + 1",
+			line:     0,
+			col:      10,
+			wantMod:  "",
+			wantFunc: "",
+		},
+		{
 			name:     "cursor on first module segment",
 			code:     "    Foo.bar()",
 			line:     0,
@@ -176,12 +208,12 @@ func TestExpressionAtCursor(t *testing.T) {
 			wantFunc: "",
 		},
 		{
-			name:     "cursor on paren",
+			name:     "cursor on paren touches the function name",
 			code:     "    Foo.bar()",
 			line:     0,
 			col:      11, // the open paren
-			wantMod:  "",
-			wantFunc: "",
+			wantMod:  "Foo",
+			wantFunc: "bar",
 		},
 		// --- Token-aware improvements over char-based version ---
 		{
@@ -3002,13 +3034,13 @@ func TestFindBareFunctionCalls(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := FindBareFunctionCalls(tt.text, tt.funcName)
+			got := findBareFunctionCalls(tt.text, tt.funcName)
 			if len(got) != len(tt.want) {
-				t.Fatalf("FindBareFunctionCalls(%q) = %v, want %v", tt.funcName, got, tt.want)
+				t.Fatalf("findBareFunctionCalls(%q) = %v, want %v", tt.funcName, got, tt.want)
 			}
 			for i := range got {
 				if got[i] != tt.want[i] {
-					t.Errorf("FindBareFunctionCalls(%q)[%d] = %d, want %d", tt.funcName, i, got[i], tt.want[i])
+					t.Errorf("findBareFunctionCalls(%q)[%d] = %d, want %d", tt.funcName, i, got[i], tt.want[i])
 				}
 			}
 		})
@@ -3799,4 +3831,16 @@ end`
 	if aliases["U"] != "SharedLib.Accounts.Users" {
 		t.Errorf("expected U -> SharedLib.Accounts.Users, got %q", aliases["U"])
 	}
+}
+
+// findBareFunctionCalls scans text for unqualified calls to functionName,
+// including direct calls like functionName(...) and pipe calls like |> functionName.
+// Returns 1-based line numbers. Definition lines are excluded.
+func findBareFunctionCalls(text string, functionName string) []int {
+	if !strings.Contains(text, functionName) {
+		return nil
+	}
+	source := []byte(text)
+	full := parser.TokenizeFull(source)
+	return findBareCallLines(source, full.Tokens, full.Interp, functionName)
 }

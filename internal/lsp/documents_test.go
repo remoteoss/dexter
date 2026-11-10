@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	"go.lsp.dev/uri"
 )
@@ -44,7 +45,7 @@ func TestDocumentStore_GetOrLoad_DiskFallback(t *testing.T) {
 
 	// And the entry should be marked transient.
 	ds.mu.RLock()
-	doc := ds.docs[docURI]
+	doc := ds.docs[docKey(docURI)]
 	ds.mu.RUnlock()
 	if doc == nil || !doc.transient {
 		t.Fatalf("expected disk-loaded entry to be transient, got %+v", doc)
@@ -134,6 +135,39 @@ func TestDocumentStore_GetOrLoad_LRUEviction(t *testing.T) {
 	}
 }
 
+func TestDocumentStore_GetOrLoad_ReadsAChangeOnDisk(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "changed.ex")
+	if err := os.WriteFile(path, []byte("defmodule Changed do\nend\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	ds := NewDocumentStore()
+	defer ds.CloseAll()
+	docURI := string(uri.File(path))
+
+	if _, ok := ds.GetOrLoad(docURI); !ok {
+		t.Fatalf("GetOrLoad failed")
+	}
+
+	// Same size, later mtime: only the stat can tell that the file changed.
+	if err := os.WriteFile(path, []byte("defmodule Chang3d do\nend\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	later := time.Now().Add(time.Hour)
+	if err := os.Chtimes(path, later, later); err != nil {
+		t.Fatal(err)
+	}
+
+	text, ok := ds.GetOrLoad(docURI)
+	if !ok || text != "defmodule Chang3d do\nend\n" {
+		t.Fatalf("GetOrLoad = %q, %v; want the text on disk", text, ok)
+	}
+	if transientCount(ds) != 1 {
+		t.Fatalf("expected 1 transient entry, got %d", transientCount(ds))
+	}
+}
+
 func TestDocumentStore_Set_PromotesTransientToEditorOwned(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "promote.ex")
@@ -164,7 +198,7 @@ func TestDocumentStore_Set_PromotesTransientToEditorOwned(t *testing.T) {
 
 	// And the entry should no longer be flagged transient.
 	ds.mu.RLock()
-	doc := ds.docs[docURI]
+	doc := ds.docs[docKey(docURI)]
 	ds.mu.RUnlock()
 	if doc == nil {
 		t.Fatalf("entry missing after Set")

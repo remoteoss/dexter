@@ -44,13 +44,38 @@ Runtime files live in the user-private `/tmp/dexter-<uid>` directory, keyed by
 the workspace. The location is environment-independent so a GUI editor and a
 shell cannot derive different ownership locks for the same index. Dexter refuses
 the directory if it is not a real directory owned by this user, is a symlink, or
-would leave the socket path past `sockaddr_un`'s limit. The key is
-the first 16 bytes of the SHA-256 of the workspace identity, rendered as hex, and
-each workspace gets `<key>.sock`, `<key>.lock`, and `<key>.log`. Nothing is placed
-under the repository: `sockaddr_un` paths are capped near 104 bytes, repository
-paths can be read-only, and this is machine-local state. The socket is removed on
-exit. The lock file is deliberately never unlinked — unlinking a lock file that
-another process holds would let a second daemon take ownership of the same index.
+would leave the socket path past `sockaddr_un`'s limit. On a multi-user host
+another user can create `/tmp/dexter-<uid>` first; Dexter then uses a second
+candidate under the home directory that the user database records for the uid
+(not `$HOME`): `~/Library/Caches/dexter/run` on macOS, `~/.cache/dexter/run`
+elsewhere. The first candidate that can be used wins, and that state is the same
+for every process of the user, so the GUI editor and the shell still agree. A
+daemon checks on each endpoint check (below) that new frontends still resolve
+its directory, and exits when they do not; while a daemon holds the workspace in
+one candidate, no process takes ownership in another. `DEXTER_RUNTIME_DIR`
+replaces every candidate; it exists for tests and sandboxes, and every frontend
+of a project must see the same value. Dexter does not change the directory that
+it names: it uses its own subdirectory `dexter-<uid>` there, and only that one is
+made private and cleaned.
+
+The key is the first 16 bytes of the SHA-256 of the workspace identity, rendered
+as hex, and each workspace gets `<key>.sock`, `<key>.lock`, and `<key>.log`. When
+a candidate directory is so long that the socket path would pass the limit, the
+key is the first 8 bytes instead. Nothing is placed under the repository:
+`sockaddr_un` paths are capped near 104 bytes, repository paths can be
+read-only, and this is machine-local state. The socket is removed on exit, but
+only when it is still the one that this daemon bound.
+
+A lock file is unlinked only by a process that holds its lock, and every lock
+acquisition checks after `flock` that the path still names the file it locked;
+otherwise it retries. That makes it safe for a starting daemon to clean up the
+runtime files of workspaces that no daemon serves: sockets and lock files whose
+lock it can take, and logs older than 14 days. Only names that Dexter makes are
+touched, and a socket on which a process still answers is kept (a daemon whose
+lock file was removed is alive). Such a cleanup, and `dexter stop`, hold the lock
+of another workspace for a moment; a daemon that starts in that moment tries
+again for 100 ms, and a frontend whose daemon exited because it found the
+workspace owned while nobody serves it starts one again.
 
 Every connection starts with a small versioned handshake carrying the workspace
 *identity*, the connection kind, and the frontend's `ContractVersion`. Identity
@@ -70,9 +95,9 @@ in the project names it with `dexter --root <path>` (or `-C`), which changes
 directory before the workspace is resolved, so relative paths follow the named
 root and the spelling an editor or agent chose is the one that gets indexed.
 
-An LSP connection becomes a raw, bidirectional LSP byte stream after the
+An LSP connection becomes a bidirectional LSP byte stream after the
 handshake; the stdio frontend never decodes or re-encodes JSON, so the hop costs
-a copy. Control connections use a line-delimited JSON protocol: requests and
+a copy and a short scan (see [Performance requirements](#performance-requirements)). Control connections use a line-delimited JSON protocol: requests and
 responses carry an id, and the daemon may push notifications (a method, no id)
 between them. One connection therefore multiplexes concurrent calls and
 subscriptions, and a slow reindex cannot block a lookup.
@@ -167,6 +192,46 @@ Startup is ordered as follows:
 Only the lock owner may perform destructive index recovery. A transient error in
 a client can therefore never delete a database another process is using.
 
+The lock is not proof on its own. An age-based temp cleaner such as
+systemd-tmpfiles, or `rm /tmp/dexter-*`, can remove the lock file of a running
+daemon, and the next process would lock a new file at the same path. So a
+process that gets the lock also refuses ownership while a daemon answers on the
+workspace socket, and while the same workspace holds a lock in another runtime
+directory candidate. `dexter init --force` therefore refuses, instead of deleting
+the index under a daemon whose lock file is gone.
+
+The running daemon checks its endpoint every 10 seconds, with a few `stat`
+calls:
+
+- The socket must be the one it bound. When it is gone, or another daemon bound
+  a new one at the path, the daemon exits; its editors reconnect (see
+  [Lifecycle](#lifecycle)) to whatever serves the path.
+- The lock file must be the one it locked. When it was removed, or replaced by a
+  file that nobody holds, the daemon locks the file at the path again. When
+  another process holds that file, that process owns the workspace and the
+  daemon exits.
+- The socket and the lock file get new times once an hour, so age-based cleaners
+  leave them alone.
+- The index file must be the one the store opened. An older Dexter build that
+  runs `dexter lsp` in-process (0.7.x) rebuilds an index of its own version at
+  the same path, and `git clean -fdx` or `rm -rf .dexter` removes it; a daemon
+  that kept its open file would write to a file that nobody reads again. The
+  daemon restarts its runtime on the file that is there now, or on a new one,
+  and every editor gets a warning that says why. A second replacement within 10
+  minutes does not restart it again (that would be a rebuild loop against a
+  process that keeps replacing the file); the editors get an error that says
+  which process to stop. Builds without the daemon (0.7.x and earlier) and later
+  builds must not serve one project at the same time.
+- The project root must be there. When its volume is ejected (FSEvents reports
+  the unmount at once; the check catches the other cases), the index work stops
+  and the daemon exits without closing the store: SQLite maps the `-shm` file of
+  that volume, and any access to it can end the process with SIGBUS. A daemon
+  never starts for a root that is not there, because opening the index would
+  create the directory again.
+
+`dexter stop --force` stops every daemon process whose command line names the
+root, not only the first one that `ps` lists.
+
 ## Workspace and session state
 
 Workspace state is shared:
@@ -174,8 +239,22 @@ Workspace state is shared:
 - SQLite store and index write coordination (`lsp.IndexCoordinator`)
 - filesystem and Git watchers
 - initial readiness and full/incremental reindex state
-- stdlib and dependency discovery
-- use-chain, generated-function, and compiled-module caches where safe
+- stdlib and dependency discovery: the coordinator keeps the detected
+  standard library (also when none was found) for 5 minutes or until
+  `.tool-versions`, `mise.toml`, `.mise.toml`, `.elixir-version`, or
+  `DEXTER_ELIXIR_LIB_ROOT` changes, so an editor after the first does not run
+  version managers and login shells again. When the shared root is empty and
+  a later detection finds a library, the workspace uses it. A `mix` that the
+  search found is kept the same way; a search that found nothing is reused only
+  by editors that started before it ended (editors that open together), so an
+  editor restarted after the user installed mix searches again. The first
+  explicit `stdlibPath` sets the standard library for the life of the
+  workspace; two spellings of one directory (a trailing slash, a symlink) are
+  one path, and an editor that asks for another directory is warned
+- use-chain, generated-function, compiled-module, and dependency caches: they
+  read only the disk and the shared index, so they live on the coordinator and
+  every session uses the same ones
+- remembered BEAM startup failures, for each build root and mix binary
 
 LSP session state is not shared:
 
@@ -189,6 +268,15 @@ response returns. Another frontend may attach to that id explicitly and answer
 from that editor's overlay; an unknown id is refused at handshake, and a frontend
 must never pick a session it was not handed, or it would answer from someone
 else's unsaved buffers.
+
+One fact about the overlays is shared: which documents each session has open.
+The `IndexCoordinator` keeps that registry (document keys only, never text), so
+that a rename never writes a file on disk under a buffer that another editor
+has open: an editor's rename puts the change of such a file into its own edit,
+and a headless rename reads the other session's buffer only to compare it with
+the disk. Each session updates the registry when it opens or closes a
+document, and the end of a session removes all of its entries. See "What a
+rename writes on disk" in `docs/architecture.md`.
 
 The disk-backed index remains globally authoritative. LSP requests prefer that
 session's overlay where existing handlers already do so. Standalone CLI and MCP
@@ -216,6 +304,8 @@ parsing remain concurrent; only the operations whose ordering affects index
 correctness are serialized. Cold parsing stays parallel and database write
 transactions stay as short as the current indexer permits.
 
+`Runtime.FlushEvents` waits until the index has every file change that happened before the call: the native watcher's event latency (FSEvents coalesces for 25 ms), then a barrier event in the queue. A rename uses it when a file it plans from has moved and the watcher has not indexed the new path yet.
+
 Subscribers — `Runtime.Subscribe` in process, `workspace/watch` over the socket —
 receive each coalesced batch. Delivery never blocks indexing: a consumer that
 falls behind loses detail and its next delivery reports a full change, so it
@@ -228,7 +318,21 @@ schedule dependency reconciliation instead, and an attached editor session still
 registers `didChangeWatchedFiles`, whose glob covers `deps/` and path
 dependencies. Events from both sources coalesce by path in the one queue, so the
 overlap costs a map insert rather than a second reindex. A watcher event overflow
-or an FSEvents dropped-event flag causes a full reconcile. If FSEvents cannot
+or an FSEvents dropped-event flag causes a full reconcile. A directory that is
+created, renamed, or removed costs only its subtree: a directory that is there
+is walked with the skip rules of the index walks, so it reports what a full
+walk would index (`deps/` included; a nested worktree in it becomes a top), and
+a directory that is gone is sent as one path, which removes what
+was indexed below it with one range read. A directory that was renamed or
+removed and is there again is sent as well, and the indexed files below it that
+are gone are removed. FSEvents reports paths in the case that the file system
+stores, so the stream compares them with that spelling of the root
+(`F_GETPATH`) and maps them back to the spelling the runtime indexes; a root
+typed in another case is watched. After a rename that changes only the case
+(`mv lib/Area lib/area`), a stat of the old spelling still succeeds; the old
+spelling is found with `F_GETPATH`, only for paths that are already suspect (a
+path in an event, or a stored path that a full walk did not see), and it is
+removed from the index. If FSEvents cannot
 start, Dexter falls back to fsnotify. A directory the kernel refuses to watch is
 logged and tracked instead of aborting the fsnotify tree. The runtime reconciles
 once when coverage is lost, retries only failed registrations, and reconciles
@@ -240,11 +344,22 @@ that cannot be watched) is a condition in the workspace reporter: every attached
 editor sees it, an editor that attaches later receives it, and the user is told
 when coverage comes back. See "Telling the user" in `docs/architecture.md`.
 
+A batch that holds a `mix.exs` or `mix.lock` of the workspace becomes one full
+reconcile, however many manifests it holds; the full pass also covers the other
+paths of the batch. A manifest in a nested worktree does not count.
+
+A pass that cannot write some files (a full disk, an I/O error) reports them as
+failed, and the runtime runs a full reconcile again after 30 s. Each later
+failure doubles the delay, up to 10 minutes, and a complete full pass stops the
+retries. The failed files keep their old stored mtime, so the retry writes them.
+
 ## Lifecycle
 
 An open connection is a lease: an LSP or long-lived MCP connection keeps the
 daemon alive. After the last connection closes, the daemon exits once the idle
-timeout has passed with no connections and no active work. The default is 15
+timeout has passed with no connections. Work that is still running then, such as
+a cold build that no client waits for, stops, and the next daemon finishes it.
+The default is 15
 minutes; `DEXTER_DAEMON_IDLE_TIMEOUT` sets it for every daemon a machine spawns
 (including one an editor starts), `dexter daemon --idle-timeout` sets it for one
 run, and `0` means never exit. Idle cost is a 2 s `.git/HEAD` stat, so the reason
@@ -262,13 +377,107 @@ carry a pid. A daemon that ignores SIGTERM is killed outright after a short
 grace; the index is a derived cache, so an uncatchable kill only costs the next
 daemon one recovery pass.
 
+When the project root is moved, deleted, or unmounted, or its path names a
+different directory without the daemon's open index file in it (a copy of the
+index is another file), the daemon tells every attached editor, logs it, and
+exits without changes to the index. A root that cannot be read for now
+(a permission error, or EIO or ESTALE on a network mount) does not count: the
+daemon changes nothing until the error clears, and then goes on. Neither does a
+remount that gives the root a new inode while the index file is still there.
+
+The index file is compared by inode only, because a remount can change the
+device number. A remount that also gives the index file a new inode counts as a
+root that is gone, and the daemon stops. A FUSE mount without stable inodes does
+that, for example sshfs without `-o use_ino`. Mount with stable inodes (sshfs
+`-o use_ino`), or restart the editor after the remount: the next frontend starts
+a new daemon, which uses the index as it is.
+The index file is in the root, so it moves with the root, and a walk of a root
+that is gone finds no files: before, the prune then deleted every stored file and
+the daemon served empty answers. The next frontend then fails clearly, or starts
+a new daemon on the directory that the path now names.
+
 An editor's `exit` ends that session, not the daemon: the session closes its own
 stream, which releases its registration and its lease. Other editors, and any
 CLI call, keep the daemon alive.
 
-Clients reconnect or start a replacement daemon after an unexpected exit. The
-replacement always performs an incremental reconciliation before reporting the
-workspace ready.
+When the daemon stops during a session — a crash, `kill -9`, a replacement by a
+newer build, `dexter stop --force`, an endpoint check that made it exit, or a
+restart of its runtime — the `dexter lsp` proxy carries the editor's session to
+a new daemon. It keeps what the session state is made of, as the raw messages:
+the `initialize` request, the `initialized` notification, the last
+`workspace/didChangeConfiguration`, and one copy of each open document: the
+`didOpen`, and after the first change the last `didChange`. Dexter asks for full
+document sync, so that message carries the whole text and is kept as it is,
+without a parse; a change that has a range anyway is applied to the proxy's copy,
+with characters counted in UTF-16 code units and lines ended by `\n`, `\r\n`,
+or `\r`, as LSP defines them. The proxy also keeps the
+work-done progress that the daemon began and did not end. On the end of the
+daemon stream it:
+
+1. ends the open progress in the editor (each daemon makes its own tokens, so a
+   new daemon never continues an old one), answers each request that the
+   daemon left open with ContentModified
+   (-32801), which editors take as "ask again" rather than as a failure, and
+   drops server requests that the old daemon sent (an editor's late answer to
+   one is not passed to the new daemon);
+2. reaches a daemon again through the normal start path, which starts one when
+   necessary — five attempts with backoff, within 90 seconds. A daemon process
+   that exits while it starts ends that attempt at once, and the cause, with the
+   end of the daemon log, is what the editor is told, not the end of the wait;
+3. replays the session: `initialize` with an id of its own (the answer is
+   dropped; the editor has one), `initialized`, the configuration, and the open
+   documents, each as one `didOpen` with its current text and version, and,
+   for a buffer with unsaved changes (a `didChange` after its open or its last
+   `didSave`), one full `didChange` with the same text, so that the new daemon
+   gives MCP tools and the CLI the editor's text. An
+   `initialize` that the old daemon never
+   answered is sent with the editor's id, and its answer goes to the editor. A
+   second `client/registerCapability` from the replayed session is answered by
+   the proxy, because the editor holds that registration already.
+
+Messages the editor sends meanwhile wait and follow the replay, so none is lost
+and none overtakes it; a request that could not be sent to a daemon that went
+away during the replay waits for the next one. `shutdown` and `exit` stop the
+reconnection at once: the proxy answers `shutdown` itself and exits on `exit`. A
+`$/cancelRequest` for a request that waits in the queue removes it and is
+answered with RequestCancelled (-32800); a cancel for a request that the proxy
+answered when the old daemon stopped is not passed to the new daemon.
+
+In the daemon, LSP messages run one after the other, as before. A request that
+can run long (references, workspace symbols, rename, formatting,
+implementations, call hierarchy) runs off the reader's goroutine, with the
+messages that follow it until the queue is empty, so the session keeps reading:
+`$/cancelRequest` cancels the context of the request that it names, and that
+request is answered with RequestCancelled. Hover, completion, and the other
+short requests still run on the reader's goroutine and pay no hand-off. At
+most 1,024 messages wait behind a slow request; then the reader waits, as it did
+when every message ran on it. Every handler's context ends with its
+connection: when the connection closes, the queued messages are dropped, the
+running request gets up to 5 seconds to see its canceled context, and only then
+is the session released. A released session starts nothing new: no BEAM, no
+Erlang warm-up, no document warm-up. References (and the
+`workspace/references` control method), workspace symbols, the planning of a
+rename, and formatting stop when their context ends; a module rename stops
+only before it starts to move and write files. When the daemon cannot be reached — a newer build took
+over and this proxy is older, the root is spelled another way, the project
+directory is gone, or every attempt failed — the proxy sends
+`window/showMessage` (Error) with the reason and the fix, answers the requests
+it still holds, and exits with a non-zero status. A session that the editor ends
+(`shutdown` and `exit`, or the end of its input) is not carried over.
+
+The replacement daemon always performs an incremental reconciliation before
+reporting the workspace ready.
+
+A panic does not stop the daemon. jsonrpc2 runs LSP handlers on its own
+goroutine, so the session's handler chain recovers a panic itself: the request
+gets an InternalError answer, the panic and its stack go to the log, and every
+editor sees an `internal.<kind>` error condition once per kind of work. The
+goroutines that the daemon owns (the mutation loop, the watchers, index passes,
+report delivery, the client log, the parser) recover the same way. Work whose
+state can be wrong after a panic — an index pass that left a write transaction
+open — makes the daemon restart its runtime, at most once per 10 minutes; a
+watcher event that was lost becomes a full reconcile, and a file that the parser
+cannot handle is a file that could not be indexed.
 
 ## Extension seams
 
@@ -335,14 +544,31 @@ runs no LSP lifecycle of its own.
   unsaved changes can be older than the disk (an editor that has not reloaded
   the file after an agent wrote it), so the disk is used. When the file on
   disk changed after the buffer's last change, the disk is used too, and the
-  answer warns that the editor's unsaved changes may conflict. The answer
+  answer warns that the editor's unsaved changes may conflict. A dirty buffer
+  whose text is the disk's (CR characters and one final newline ignored), as
+  after an editor reloads the file, counts as clean. With one-second file
+  times, a disk change in the same second as the buffer's last change has no
+  known order: the buffer is used, and the answer warns about it. The answer
   names the files that came from unsaved buffers. The index positions refer
   to the saved file, so a line is mapped into the buffer with a line diff
-  (Myers, line endings ignored; bounded, with a fallback to the lines that
-  both texts share at the start and at the end); a position on a changed line
-  shows the saved line, marked as such. Paths that the
-  agent gives must be inside the project root after symlinks are resolved, and
-  must name a regular file of at most 10 MB.
+  (Myers, line endings ignored; above its bounds, a patience diff on the
+  lines that occur once in each text); a position on a changed line
+  shows the saved line, marked as such. Paths that the agent gives must be
+  inside the project root after symlinks are resolved, compared in the
+  spelling that the file system stores (so another case of a path inside the
+  root is accepted where the file system ignores case), and must name a
+  regular file of at most 10 MB.
+- **Injected and generated functions.** `dexter_module_api` lists the public
+  functions of a module that its source does not define, from
+  `lsp.ModuleMembers`: defs in the quote of a `use`d module's `__using__`
+  (followed through the use chain, as definition does), and functions that
+  only the compiled module exports (the generated-function reader that
+  completion uses). Each shows where it comes from and the location that
+  `dexter_definition` gives; a compiled module older than the source is
+  marked. `dexter_search` adds them for a `Module.function` query (the module
+  part may be the end of the name); a query with no module part does not
+  search them, because that would read the compiled module of every module.
+  The editor's workspace symbols use the same search (`lsp.SearchNames`).
 - **Limits and cancellation.** One frontend runs at most 32 tool calls at once
   on a workspace connection, below the daemon's 64, and a call past the limit
   waits for a slot. A call that the MCP client cancels sends `$/cancel`, so the
@@ -378,9 +604,15 @@ method name and payload shapes are part of the adapter contract.
 
 ## Performance requirements
 
-The stdio LSP frontend is a raw stream proxy after the handshake. Control clients
-multiplex concurrent calls over one reused connection. Reads are never queued
-behind the mutation coordinator.
+The stdio LSP frontend copies each message after the handshake; it does not
+decode or re-encode it. To carry a session to a new daemon it reads the method
+and the id of each message with a scan that stops as soon as it has them (the
+daemon's encoder puts the id of an answer last, so that one is read from the
+end), and the document URI of `didOpen`, `didChange`, and `didClose`. A string is
+skipped with a byte search, so the scan of a 200 KB `didChange` that puts the
+text before the URI costs about 70 µs, and the scan of an answer of any size
+costs about 30 ns. Control clients multiplex concurrent calls over one reused
+connection. Reads are never queued behind the mutation coordinator.
 
 Benchmarks should cover warm definition/hover/completion latency, daemon startup,
 CLI lookup, large reference responses, event-to-index latency, concurrent reads

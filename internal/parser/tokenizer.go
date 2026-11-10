@@ -827,6 +827,10 @@ func scanSigilContent(source []byte, i, line int, sigilLetter byte, lineStarts *
 					*lineStarts = append(*lineStarts, i+2)
 				}
 				i += 2
+			} else if !escapes && ch == '\\' && i+1 < len(source) && (source[i+1] == closeCh || source[i+1] == '\\') {
+				// An uppercase sigil still takes \ before its closing
+				// delimiter as an escape (deprecated), and \\ as a pair.
+				i += 2
 			} else if escapes && ch == '#' && i+1 < len(source) && source[i+1] == '{' {
 				// A lowercase sigil interpolates: ~s(#{Mod.fun()}). Consuming
 				// the whole #{} here also keeps its braces and its delimiter
@@ -855,6 +859,8 @@ func scanSigilContent(source []byte, i, line int, sigilLetter byte, lineStarts *
 					line++
 					*lineStarts = append(*lineStarts, i+2)
 				}
+				i += 2
+			} else if !escapes && ch == '\\' && i+1 < len(source) && (source[i+1] == closeCh || source[i+1] == '\\') {
 				i += 2
 			} else if escapes && ch == '#' && i+1 < len(source) && source[i+1] == '{' {
 				// ~r/#{Mod.fun()}/ — the interpolation is code, and a closing

@@ -1096,6 +1096,34 @@ end
 	}
 }
 
+func TestRename_AsAlias_LeavesStringsAndAtoms(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule MyApp.Web do
+  alias MyApp.Deep.Thing, as: Baz
+
+  def show do
+    {Baz.run(), %Baz{}, "Baz is here #{Baz.name()}", :Baz, Other.Baz}
+    # Baz in a comment
+  end
+end
+`
+	path := filepath.Join(server.projectRoot, "lib", "web.ex")
+	indexFile(t, server.store, server.projectRoot, "lib/web.ex", content)
+	indexFile(t, server.store, server.projectRoot, "lib/thing.ex",
+		"defmodule MyApp.Deep.Thing do\n  defstruct []\n  def run, do: nil\n  def name, do: nil\nend\n")
+	docURI := "file://" + path
+	server.docs.Set(docURI, content)
+
+	got := bufferAfterEdits(t, renameAt(t, server, docURI, 4, 5, "Qux"), path, content)
+	want := strings.Replace(content, "as: Baz", "as: Qux", 1)
+	want = strings.Replace(want, `{Baz.run(), %Baz{}, "Baz is here #{Baz.name()}"`, `{Qux.run(), %Qux{}, "Baz is here #{Qux.name()}"`, 1)
+	if got != want {
+		t.Errorf("after the rename:\n%s\nwant:\n%s", got, want)
+	}
+}
+
 func TestRename_AsAlias_NestedModuleWithParentName(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
@@ -2773,6 +2801,42 @@ end
 	}
 }
 
+func TestRename_Variable_InvalidNameRefused(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	content := `defmodule MyApp do
+  def process(items) do
+    result = transform(items)
+    result
+  end
+end
+`
+	path := filepath.Join(server.projectRoot, "lib", "my_app.ex")
+	docURI := "file://" + path
+	server.docs.Set(docURI, content)
+
+	for _, name := range []string{"Foo", "my var", "do", "nil", "valid?", "1x", ""} {
+		err := renameExpectError(t, server, docURI, 2, 4, name)
+		if !strings.Contains(err.Error(), "invalid variable name") {
+			t.Errorf("rename to %q: expected 'invalid variable name', got: %v", name, err)
+		}
+	}
+}
+
+func TestIsValidVariableName(t *testing.T) {
+	for _, n := range []string{"x", "_", "_unused", "user_id", "café", "x2"} {
+		if !isValidVariableName(n) {
+			t.Errorf("isValidVariableName(%q) should be true", n)
+		}
+	}
+	for _, n := range []string{"", "Foo", "my var", "do", "end", "true", "ok?", "go!", "1x", "a.b"} {
+		if isValidVariableName(n) {
+			t.Errorf("isValidVariableName(%q) should be false", n)
+		}
+	}
+}
+
 func TestRename_Variable_ZeroArityFunctionAllowed(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
@@ -3652,5 +3716,27 @@ end
 	}
 	if strings.Contains(string(got), "SharedLib") {
 		t.Errorf("SharedLib should be gone, got:\n%s", got)
+	}
+}
+
+func TestConventionalNewPath_MapsTheNamespaceDirectories(t *testing.T) {
+	for _, tc := range []struct {
+		path, old, new, want, root string
+		ok                         bool
+	}{
+		{"/p/lib/ren/probe/mcp1.ex", "Ren.Probe.Mcp1", "Ren.Probe.Renamed.Mcp", "/p/lib/ren/probe/renamed/mcp.ex", "/p/lib", true},
+		{"/p/lib/ren/probe/mcp1.ex", "Ren.Probe.Mcp1", "Ren.Elsewhere.Mcp1", "/p/lib/ren/elsewhere/mcp1.ex", "/p/lib", true},
+		{"/p/lib/ren/probe/mcp1.ex", "Ren.Probe.Mcp1", "Ren.Top", "/p/lib/ren/top.ex", "/p/lib", true},
+		{"/p/lib/ren/probe/mcp1/child.ex", "Ren.Probe.Mcp1.Child", "Ren.Top.Child", "/p/lib/ren/top/child.ex", "/p/lib", true},
+		// A leading segment with no directory must stay the same.
+		{"/p/lib/probe/mcp1.ex", "Ren.Probe.Mcp1", "Ren.Other.Mcp1", "/p/lib/other/mcp1.ex", "/p/lib", true},
+		{"/p/lib/probe/mcp1.ex", "Ren.Probe.Mcp1", "Big.Probe.Mcp2", "/p/lib/probe/mcp2.ex", "/p/lib/probe", true},
+		{"/p/test/ren/probe_test.exs", "Ren.ProbeTest", "Ren.Deep.ProbeTest", "/p/test/ren/deep/probe_test.exs", "/p/test", true},
+		{"/p/lib/ren/other.ex", "Ren.Probe.Mcp1", "Ren.Top", "", "", false},
+	} {
+		got, root, ok := conventionalNewPath(filepath.FromSlash(tc.path), tc.old, tc.new)
+		if ok != tc.ok || got != filepath.FromSlash(tc.want) || root != filepath.FromSlash(tc.root) {
+			t.Errorf("conventionalNewPath(%s, %s, %s) = %s, %s, %v; want %s, %s, %v", tc.path, tc.old, tc.new, got, root, ok, tc.want, tc.root, tc.ok)
+		}
 	}
 }

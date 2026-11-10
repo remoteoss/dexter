@@ -2089,3 +2089,100 @@ func TestListFilePathsUnder(t *testing.T) {
 		t.Errorf("ListFilePathsUnder(file) = %v, want none", got)
 	}
 }
+
+// SameDatabaseFile compares the inode of the file at the index path with the
+// one Open opened. A copy at the path, or no file, is not the same file.
+func TestSameDatabaseFile(t *testing.T) {
+	root := t.TempDir()
+	s, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	if same, err := s.SameDatabaseFile(); err != nil || !same {
+		t.Fatalf("SameDatabaseFile() = %v, %v; want true", same, err)
+	}
+	path := DBPath(root)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(path, path+".moved"); err != nil {
+		t.Fatal(err)
+	}
+	if same, err := s.SameDatabaseFile(); err != nil || same {
+		t.Fatalf("with no file at the path: SameDatabaseFile() = %v, %v; want false", same, err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if same, err := s.SameDatabaseFile(); err != nil || same {
+		t.Fatalf("with a copy at the path: SameDatabaseFile() = %v, %v; want false", same, err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(path+".moved", path); err != nil {
+		t.Fatal(err)
+	}
+	if same, err := s.SameDatabaseFile(); err != nil || !same {
+		t.Fatalf("with the file moved back: SameDatabaseFile() = %v, %v; want true", same, err)
+	}
+}
+
+// TestWriteGenerationMovesOnEveryWrite: caches keyed by WriteGeneration
+// (use chains, injected delegates) must see each write, also one of an
+// editor buffer, which a rename of open files makes.
+func TestWriteGenerationMovesOnEveryWrite(t *testing.T) {
+	s, dir := setupTestStore(t)
+	path := filepath.Join(dir, "a.ex")
+	if err := os.WriteFile(path, []byte("defmodule A do\nend\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	defs := []parser.Definition{{Module: "A", Line: 1, FilePath: path, Kind: "module"}}
+	for name, write := range map[string]func() error{
+		"file":   func() error { return s.IndexFileWithRefs(path, defs, nil) },
+		"buffer": func() error { return s.IndexBufferWithRefs(path, defs, nil) },
+		"remove": func() error { return s.RemoveFile(path) },
+	} {
+		before := s.WriteGeneration()
+		if err := write(); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if s.WriteGeneration() == before {
+			t.Errorf("%s: WriteGeneration did not move", name)
+		}
+	}
+}
+
+// TestListSubmodulesMatchesTheExactPrefix: `_` and case are not wildcards. A
+// rename of MyApp.Api_V1 must not take MyApp.ApiXV1.Sub or MyApp.api_v1.Sub
+// along.
+func TestListSubmodulesMatchesTheExactPrefix(t *testing.T) {
+	s, dir := setupTestStore(t)
+	defer func() { _ = s.Close() }()
+
+	path := writeElixirFile(t, dir, "lib/api.ex", `defmodule MyApp.Api_V1 do
+end
+defmodule MyApp.Api_V1.Sub do
+end
+defmodule MyApp.ApiXV1.Sub do
+end
+defmodule MyApp.api_v1.Sub do
+end
+`)
+	defs, _, err := parser.ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.IndexFile(path, defs); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.ListSubmodules("MyApp.Api_V1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != "MyApp.Api_V1.Sub" {
+		t.Fatalf("ListSubmodules = %v, want [MyApp.Api_V1.Sub]", got)
+	}
+}

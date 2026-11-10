@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -18,6 +19,14 @@ import (
 // fakeDaemon answers handshakes at root with one canned rejection. It returns
 // the listener so a test can close it to model a daemon that exits.
 func fakeDaemon(t *testing.T, root string, res helloResponse) net.Listener {
+	t.Helper()
+	return fakeDaemonAnswering(t, root, res, false)
+}
+
+// fakeDaemonAnswering is fakeDaemon that can stop listening after its first
+// answer, as a daemon that understands the restart contract does: it closes
+// its socket before it releases the lock.
+func fakeDaemonAnswering(t *testing.T, root string, res helloResponse, closeAfterFirst bool) net.Listener {
 	t.Helper()
 	endpoint, err := ResolveEndpoint(root)
 	if err != nil {
@@ -44,6 +53,9 @@ func fakeDaemon(t *testing.T, root string, res helloResponse) net.Listener {
 					return
 				}
 				_ = writeJSONLine(conn, res)
+				if closeAfterFirst {
+					_ = listener.Close()
+				}
 			}(conn)
 		}
 	}()
@@ -148,7 +160,7 @@ func TestDialBoundsHandshakeByContext(t *testing.T) {
 	select {
 	case conn := <-accepted:
 		_ = conn.Close()
-	case <-time.After(time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("listener did not accept the handshake connection")
 	}
 }
@@ -165,7 +177,7 @@ func TestEnsureLeavesANewerDaemonAlone(t *testing.T) {
 
 	origSpawn := spawnDaemon
 	spawned := make(chan struct{}, 1)
-	spawnDaemon = func(string) error { spawned <- struct{}{}; return errors.New("should not spawn") }
+	spawnDaemon = func(string) (<-chan error, error) { spawned <- struct{}{}; return nil, errors.New("should not spawn") }
 	t.Cleanup(func() { spawnDaemon = origSpawn })
 
 	client, err := Ensure(context.Background(), root)
@@ -189,14 +201,14 @@ func TestEnsureLeavesANewerDaemonAlone(t *testing.T) {
 func TestEnsureReplacesAnOlderDaemon(t *testing.T) {
 	requireSocketSupport(t)
 	root := t.TempDir()
-	fakeDaemon(t, root, helloResponse{
+	fakeDaemonAnswering(t, root, helloResponse{
 		Error: "older", Contract: ContractVersion - 1,
 		PID: 4242, Incompatible: true, Exiting: true,
-	})
+	}, true)
 
 	origSpawn := spawnDaemon
 	spawned := make(chan struct{}, 1)
-	spawnDaemon = func(string) error { spawned <- struct{}{}; return errors.New("spawn reached") }
+	spawnDaemon = func(string) (<-chan error, error) { spawned <- struct{}{}; return nil, errors.New("spawn reached") }
 	t.Cleanup(func() { spawnDaemon = origSpawn })
 
 	_, err := Ensure(context.Background(), root)
@@ -257,11 +269,53 @@ func TestParseDaemonPid(t *testing.T) {
 		line(uid, 555, "dexter daemon "+root+" extra") +
 		line(other, 666, "dexter daemon "+root)
 
-	if pid, ok := parseDaemonPid(ps, root); !ok || pid != 222 {
-		t.Fatalf("parseDaemonPid = %d, %v; want 222", pid, ok)
+	if pids := parseDaemonPids(ps, root); !slices.Equal(pids, []int{222}) {
+		t.Fatalf("parseDaemonPids = %v; want [222]", pids)
 	}
-	if _, ok := parseDaemonPid(ps, "/Users/someone/code/nothing"); ok {
-		t.Fatal("parseDaemonPid matched an unrelated workspace")
+	if pids := parseDaemonPids(ps, "/Users/someone/code/nothing"); len(pids) != 0 {
+		t.Fatalf("parseDaemonPids matched an unrelated workspace: %v", pids)
+	}
+	// Two daemons for one root, as after its lock file was removed: both match.
+	ps += line(uid, 777, "dexter daemon "+root)
+	if pids := parseDaemonPids(ps, root); !slices.Equal(pids, []int{222, 777}) {
+		t.Fatalf("parseDaemonPids = %v; want [222 777]", pids)
+	}
+}
+
+// TestStopForcedStopsEveryDaemonOfTheRoot: when two daemons serve one root,
+// for example after its lock file was removed, `dexter stop --force` must stop
+// both, not the first that ps lists.
+func TestStopForcedStopsEveryDaemonOfTheRoot(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no shell helper on windows")
+	}
+	root := t.TempDir()
+	script := filepath.Join(t.TempDir(), "daemon-helper.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nsleep 60\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var exited []chan struct{}
+	for i := 0; i < 2; i++ {
+		child := exec.Command(script, "daemon", root)
+		if err := child.Start(); err != nil {
+			t.Skipf("cannot start helper: %v", err)
+		}
+		done := make(chan struct{})
+		go func() { _, _ = child.Process.Wait(); close(done) }()
+		t.Cleanup(func() { _ = child.Process.Kill() })
+		exited = append(exited, done)
+	}
+
+	handled, err := StopForced(context.Background(), root)
+	if !handled || err != nil {
+		t.Fatalf("StopForced = %v, %v", handled, err)
+	}
+	for i, done := range exited {
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("daemon %d of the root was not stopped", i)
+		}
 	}
 }
 
@@ -335,5 +389,99 @@ func TestStopForcedEscalatesToKill(t *testing.T) {
 	case <-exited:
 	case <-time.After(5 * time.Second):
 		t.Fatal("the daemon that ignored SIGTERM was not killed")
+	}
+}
+
+// TestEnsureStartsADaemonWhenTheStoppingOneReleasesItsLock: a daemon that
+// stops closes its socket first and holds its lock while it drains. A daemon
+// that a frontend starts then finds the workspace owned and exits; Ensure must
+// start one again when the lock is free, not wait out its timeout.
+func TestEnsureStartsADaemonWhenTheStoppingOneReleasesItsLock(t *testing.T) {
+	socketTestEnv(t)
+	root := t.TempDir()
+	writeModule(t, root, "lib/one.ex", "SharedLib.One")
+	ownership, endpoint, err := AcquireOwnership(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A socket file that refuses connections: the old listener is closed.
+	listener, err := net.Listen("unix", endpoint.Socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener.(*net.UnixListener).SetUnlinkOnClose(false)
+	_ = listener.Close()
+	go func() {
+		time.Sleep(1 * time.Second)
+		_ = ownership.Release()
+	}()
+
+	previous := spawnDaemon
+	spawns := 0
+	spawnDaemon = func(root string) (<-chan error, error) {
+		spawns++
+		// A real daemon tries for ownershipPatience and exits 0 when owned.
+		time.Sleep(ownershipPatience)
+		if o, _, err := AcquireOwnership(root); errors.Is(err, ErrWorkspaceOwned) {
+			exited := make(chan error, 1)
+			exited <- nil
+			return exited, nil
+		} else if err == nil {
+			_ = o.Release()
+		}
+		runDaemonInProcess(t, root)
+		return nil, nil
+	}
+	t.Cleanup(func() { spawnDaemon = previous })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	start := time.Now()
+	client, err := Ensure(ctx, root)
+	if err != nil {
+		t.Fatalf("Ensure = %v after %s (%d spawns)", err, time.Since(start), spawns)
+	}
+	_ = client.Close()
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("Ensure took %s, want about the time until the lock is free", elapsed)
+	}
+}
+
+// TestEnsureWaitsForADaemonThatLostItsSocketFile: the socket file of a live
+// daemon was removed. The daemon stops at its next socket check; Ensure waits
+// for its lock and starts a new daemon instead of failing at once.
+func TestEnsureWaitsForADaemonThatLostItsSocketFile(t *testing.T) {
+	socketTestEnv(t)
+	root := t.TempDir()
+	writeModule(t, root, "lib/one.ex", "SharedLib.One")
+	ownership, _, err := AcquireOwnership(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		time.Sleep(1 * time.Second)
+		_ = ownership.Release()
+	}()
+
+	previousFind := daemonProcessFor
+	daemonProcessFor = func(string) (int, bool) { return 4242, true }
+	previousSpawn := spawnDaemon
+	spawns := 0
+	spawnDaemon = func(root string) (<-chan error, error) {
+		spawns++
+		runDaemonInProcess(t, root)
+		return nil, nil
+	}
+	t.Cleanup(func() { daemonProcessFor, spawnDaemon = previousFind, previousSpawn })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	client, err := Ensure(ctx, root)
+	if err != nil {
+		t.Fatalf("Ensure = %v (%d spawns)", err, spawns)
+	}
+	_ = client.Close()
+	if spawns != 1 {
+		t.Fatalf("spawns = %d, want 1 after the lock was free", spawns)
 	}
 }

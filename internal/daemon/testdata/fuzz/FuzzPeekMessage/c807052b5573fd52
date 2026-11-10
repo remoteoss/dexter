@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"pArAms\":{\"teXtDoCument\":{\"uri\":\"000000000000\"}},\"method\":\"textDocument/didOpen\"}")

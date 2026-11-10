@@ -26,6 +26,7 @@ const otpMismatchStderr = "** (UndefinedFunctionError) function :erlang.foo/0 is
 // its input unless a "mixfails" file exists next to it. It returns the server, its editor, and the path of the start log.
 func otpMismatchProject(t *testing.T) (*Server, *notifytest.Client, string) {
 	t.Helper()
+	checkStampEachTime(t)
 	server, cleanup := setupTestServer(t)
 	t.Cleanup(cleanup)
 	bin := t.TempDir()
@@ -395,4 +396,11 @@ func TestConcurrentFormatsKeepTheOTPWarning(t *testing.T) {
 	if n := countMessages(client, "still works"); n != 1 {
 		t.Errorf("the Warning was sent %d times, want 1:\n%s", n, client.Dump())
 	}
+}
+
+// rememberOTPMismatch records that the BEAM of buildRoot failed with an OTP
+// mismatch. It reports nothing: what the mismatch means for the user depends
+// on the mix format fallback, and reportBeamOTP decides that.
+func (s *Server) rememberOTPMismatch(buildRoot string) {
+	s.rememberBeamFailure(buildRoot, nil, true, "")
 }

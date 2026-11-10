@@ -11,7 +11,8 @@ Which tool for which question:
 - Locate a symbol by name fragment: `dexter_search`
 - Where or what is Module.function: `dexter_definition`
 - Understand a module before reading its source: `dexter_module_api`
-- Who calls or uses something: `dexter_references` or `dexter_call_hierarchy`
+- Who calls or uses something, and from which function or test: `dexter_references`
+  (add `callees: true` to also see what a function calls)
 - Implementations of a behaviour or protocol: `dexter_implementations`
 - What a specific file defines: `dexter_file_outline`
 - Project layout and index freshness: `dexter_workspace`
@@ -19,8 +20,9 @@ Which tool for which question:
   changes; review with `git diff`)
 
 The index updates automatically: the dexter daemon, which the editor shares,
-watches file changes and git branch switches. If a lookup ever seems stale,
-`dexter_reindex` forces an immediate incremental update. An answer that ends
+watches file changes and git branch switches, and a lookup that finds nothing
+first waits for the changes the watcher has seen. `dexter_reindex` is needed
+only when `dexter_workspace` says that file watching is not active. An answer that ends
 with a note about the index (still building, being rebuilt, files that could
 not be indexed) can be incomplete; retry after the note goes away.
 
