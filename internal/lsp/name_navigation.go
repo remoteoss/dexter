@@ -61,6 +61,14 @@ type NameReferenceOptions struct {
 	ExcludeStdlib      bool
 	InjectorModules    []string
 	GeneratedProvider  string
+	// Arity, when HasArity is set, names one function of the name: only its
+	// references and declarations are listed. A function with default
+	// arguments has several arities (see aritySet). A reference whose arity
+	// Dexter cannot read stays.
+	Arity    int
+	HasArity bool
+	// arities is the arity set of the function, once ReferenceNames read it.
+	arities map[int]bool
 }
 
 // LookupName resolves a canonical module/function name through the same
@@ -226,7 +234,17 @@ func (s *Server) ReferenceNames(module, function string, opts NameReferenceOptio
 		}()
 	}
 
-	refResults, err := s.store.LookupReferences(module, function)
+	if opts.HasArity && function != "" {
+		// When every definition of the name is the requested function,
+		// there is nothing to filter, and the request is the name's.
+		var whole bool
+		if opts.arities, whole = s.aritySet(module, function, opts.Arity); whole {
+			opts.HasArity, opts.arities = false, nil
+		}
+	}
+	// The arity of each reference is read only for a filter.
+	lookupRefs := s.referenceLookup(opts)
+	refResults, err := lookupRefs(module, function)
 	if err != nil {
 		return nil, err
 	}
@@ -259,7 +277,7 @@ func (s *Server) ReferenceNames(module, function string, opts NameReferenceOptio
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
-			transitive, lookupErr := s.store.LookupReferences(injector, function)
+			transitive, lookupErr := lookupRefs(injector, function)
 			if lookupErr != nil {
 				continue
 			}
@@ -272,10 +290,10 @@ func (s *Server) ReferenceNames(module, function string, opts NameReferenceOptio
 			return nil, err
 		}
 		if function != "" {
-			refResults = append(refResults, s.findBareCallRefs(module, function)...)
+			refResults = append(refResults, s.findBareCallRefs(module, function, opts.HasArity)...)
 		}
 		if function != "" && opts.FollowDelegates {
-			delegated, err := s.delegateReferences(ctx, module, function, moduleRefs)
+			delegated, err := s.delegateReferences(ctx, module, function, moduleRefs, opts)
 			if err != nil {
 				return nil, err
 			}
@@ -292,7 +310,9 @@ func (s *Server) ReferenceNames(module, function string, opts NameReferenceOptio
 // quote of module (see siteCollector.collect): the facade is in every module
 // that uses module (moduleRefs has the use lines), and the index records its
 // bare calls there as calls of module.
-func (s *Server) delegateReferences(ctx context.Context, module, function string, moduleRefs []store.ReferenceResult) ([]store.ReferenceResult, error) {
+func (s *Server) delegateReferences(ctx context.Context, module, function string, moduleRefs []store.ReferenceResult, opts NameReferenceOptions) ([]store.ReferenceResult, error) {
+	lookupRefs := s.referenceLookup(opts)
+	withArity := opts.HasArity
 	delegates, _ := s.store.LookupDelegatesTo(module, function)
 	injected := s.injectedDelegatesTo(module, function)
 	if len(delegates) == 0 && len(injected) == 0 {
@@ -306,8 +326,8 @@ func (s *Server) delegateReferences(ctx context.Context, module, function string
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		out = append(out, store.ReferenceResult{FilePath: d.FilePath, Line: d.Line, Kind: siteDelegate})
-		if refs, err := s.store.LookupReferences(d.Module, d.Function); err == nil {
+		out = append(out, store.ReferenceResult{FilePath: d.FilePath, Line: d.Line, Kind: siteDelegate, Arity: -1})
+		if refs, err := lookupRefs(d.Module, d.Function); err == nil {
 			out = append(out, refs...)
 		}
 		users, _ := s.store.LookupReferences(d.Module, "")
@@ -324,14 +344,14 @@ func (s *Server) delegateReferences(ctx context.Context, module, function string
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		out = append(out, store.ReferenceResult{FilePath: d.FilePath, Line: d.Line, Kind: siteDelegate})
+		out = append(out, store.ReferenceResult{FilePath: d.FilePath, Line: d.Line, Kind: siteDelegate, Arity: -1})
 		if d.Module != module {
 			facades[d.Function] = append(facades[d.Function], d.Module)
-			out = append(out, s.findBareCallRefs(d.Module, d.Function)...)
+			out = append(out, s.findBareCallRefs(d.Module, d.Function, withArity)...)
 			continue
 		}
 		if d.Function != function {
-			if refs, err := s.store.LookupReferences(module, d.Function); err == nil {
+			if refs, err := lookupRefs(module, d.Function); err == nil {
 				out = append(out, refs...)
 			}
 		}
@@ -352,14 +372,40 @@ func (s *Server) delegateReferences(ctx context.Context, module, function string
 	return out, nil
 }
 
+// referenceLookup returns the query of a function's references for opts:
+// with the arity of each, and only those of opts' arities, when the request
+// filters by arity.
+func (s *Server) referenceLookup(opts NameReferenceOptions) func(module, function string) ([]store.ReferenceResult, error) {
+	if !opts.HasArity || opts.arities == nil {
+		return s.store.LookupReferences
+	}
+	arities := make([]int, 0, len(opts.arities))
+	for a := range opts.arities {
+		arities = append(arities, a)
+	}
+	return func(module, function string) ([]store.ReferenceResult, error) {
+		return s.store.LookupReferencesWithArity(module, function, arities)
+	}
+}
+
 // nameLocations filters references by kind, adds the declarations when
 // asked, and lists each line once.
 func (s *Server) nameLocations(module, function string, refResults []store.ReferenceResult, opts NameReferenceOptions) ([]NameLocation, error) {
 	refResults = filterReferenceKind(refResults, opts.Kind)
+	arities := opts.arities
+	if opts.HasArity && function != "" && arities == nil {
+		arities, _ = s.aritySet(module, function, opts.Arity)
+	}
+	if !opts.HasArity {
+		arities = nil
+	}
 	locations := make([]NameLocation, 0, len(refResults)+1)
 	seen := make(map[nameLocationKey]struct{}, len(refResults)+1)
 	for _, result := range refResults {
 		if opts.ExcludeStdlib && s.isStdlibPath(result.FilePath) {
+			continue
+		}
+		if arities != nil && result.Arity >= 0 && !arities[result.Arity] {
 			continue
 		}
 		appendNameLocation(&locations, seen, NameLocation{FilePath: result.FilePath, Line: result.Line, Kind: result.Kind})
@@ -371,11 +417,58 @@ func (s *Server) nameLocations(module, function string, refResults []store.Refer
 			return nil, lookupErr
 		}
 		for _, declaration := range declarations {
+			if arities != nil && isFunctionKind(declaration.Kind) && !arities[declaration.Arity] {
+				continue
+			}
 			declaration.IsDeclaration = true
 			appendNameLocation(&locations, seen, declaration)
 		}
 	}
 	return locations, nil
+}
+
+// aritySet returns the arities of the function module.function/arity: those
+// of each definition line that has the arity, so that a def with default
+// arguments (`def f(a, b \\ 1)`, f/1 and f/2) is one function. A name with
+// no definition of the arity in the index (a generated or injected one) is
+// that arity alone.
+// whole is true when every definition of the name is in the set: the name
+// is one function, so no reference can be of another arity.
+func (s *Server) aritySet(module, function string, arity int) (set map[int]bool, whole bool) {
+	set = map[int]bool{arity: true}
+	defs, err := s.store.LookupFunction(module, function)
+	if err != nil || len(defs) == 0 {
+		defs = s.lookupThroughUseOfWithFollow(module, function, false)
+	}
+	type key struct {
+		path string
+		line int
+	}
+	lines := map[key]bool{}
+	for _, d := range defs {
+		if d.Arity == arity {
+			lines[key{d.FilePath, d.Line}] = true
+		}
+	}
+	whole = len(lines) > 0
+	for _, d := range defs {
+		if lines[key{d.FilePath, d.Line}] {
+			set[d.Arity] = true
+		} else if isFunctionKind(d.Kind) {
+			whole = false
+		}
+	}
+	return set, whole
+}
+
+// isFunctionKind reports whether a definition kind is a function or macro
+// (with an arity), not a module or a type.
+func isFunctionKind(kind string) bool {
+	switch kind {
+	case "def", "defp", "defmacro", "defmacrop", "defguard", "defguardp", "defdelegate":
+		return true
+	}
+	return false
 }
 
 type nameLocationKey struct {

@@ -1,11 +1,14 @@
 package parser
 
-import "strings"
+import (
+	"strconv"
+	"strings"
+)
 
 // parseTextFromTokens is the token-stream replacement for the line-based ParseText.
 // It walks a []Token stream from the tokenizer and produces identical Definition
 // and Reference output.
-func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]Definition, []Reference, error) {
+func parseTextFromTokens(path string, source []byte, tokens, interp []Token, interpSpans []Span) ([]Definition, []Reference, error) {
 	var defs []Definition
 	var refs []Reference
 
@@ -279,7 +282,7 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 				arity = callArity(source, tokens, n, pos)
 			}
 			injected = append(injected, injectedRef{len(refs), cm, arity})
-			refs = append(refs, Reference{Module: mod, Function: name, Line: tokens[pos].Line, FilePath: path, Kind: callKind(pos)})
+			refs = append(refs, Reference{Module: mod, Function: name, Arity: arity, Line: tokens[pos].Line, FilePath: path, Kind: callKind(pos)})
 		}
 	}
 
@@ -358,7 +361,7 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 	// extractModuleRefs emits call/struct refs for module references in a token range.
 	// Only processes TokModule tokens that start with ASCII uppercase (matching old regex behavior).
 	extractModuleRefs := func(lineStart, lineEnd int) {
-		refs = collectModuleRefs(source, path, tokens, lineStart, lineEnd, aliases, currentModule(), selfModuleAt(tokens[lineStart].Line), callKind, refs)
+		refs = collectModuleRefs(source, path, tokens, lineStart, lineEnd, aliases, currentModule(), selfModuleAt(tokens[lineStart].Line), callKind, nil, refs)
 	}
 
 	// flushInterpRefs emits the refs written inside a #{} interpolation. The
@@ -373,7 +376,7 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 			interpPos++
 		}
 		if interpPos > start {
-			refs = collectModuleRefs(source, path, interp, start, interpPos, aliases, currentModule(), selfModuleAt(interp[start].Line), callRefKind, refs)
+			refs = collectModuleRefs(source, path, interp, start, interpPos, aliases, currentModule(), selfModuleAt(interp[start].Line), callRefKind, interpSpans, refs)
 		}
 	}
 
@@ -631,7 +634,7 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 						for _, key := range only {
 							name := tokenText(tokens[key])
 							f.only[name] = true
-							refs = append(refs, Reference{Module: resolved, Function: name, Line: tokens[key].Line, FilePath: path, Kind: "import_only"})
+							refs = append(refs, Reference{Module: resolved, Function: name, Arity: keywordArity(source, tokens, n, key), Line: tokens[key].Line, FilePath: path, Kind: "import_only"})
 						}
 						importFilters[resolved] = f
 					case len(except) > 0:
@@ -811,7 +814,7 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 					for _, p := range DeriveProtocols(source, tokens, n, i+1) {
 						resolved := ResolveModuleRef(p, aliases, cm)
 						if resolved != "" && !strings.Contains(resolved, "__MODULE__") {
-							refs = append(refs, Reference{Module: resolved, Function: cm, Line: tok.Line, FilePath: path, Kind: "derive"})
+							refs = append(refs, Reference{Module: resolved, Function: cm, Arity: -1, Line: tok.Line, FilePath: path, Kind: "derive"})
 						}
 					}
 				}
@@ -877,7 +880,7 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token) ([]
 				if !elixirKeyword[funcName] {
 					resolved := ResolveModuleRef(modName, aliases, cm)
 					if resolved != "" {
-						refs = append(refs, Reference{Module: resolved, Function: funcName, Line: tok.Line, FilePath: path, Kind: callKind(i)})
+						refs = append(refs, Reference{Module: resolved, Function: funcName, Arity: callArity(source, tokens, n, k+1), Line: tok.Line, FilePath: path, Kind: callKind(i)})
 					}
 				}
 				i = k + 2
@@ -1111,8 +1114,16 @@ func callRefKind(int) string { return "call" }
 // the interpolation tokens the tokenizer keeps beside them — so the two cannot
 // drift apart. kindAt gives the reference kind for a token index, which is how
 // a typespec reference is told apart from a call.
-func collectModuleRefs(source []byte, path string, toks []Token, from, to int, aliases map[string]string, cm, selfModule string, kindAt func(int) string, refs []Reference) []Reference {
+// interpSpans is set for the #{} stream, which holds no brackets: a call's
+// arity there is read from its interpolation (see InterpCallArity).
+func collectModuleRefs(source []byte, path string, toks []Token, from, to int, aliases map[string]string, cm, selfModule string, kindAt func(int) string, interpSpans []Span, refs []Reference) []Reference {
 	tn := len(toks)
+	arityAt := func(pos int) int {
+		if interpSpans != nil {
+			return InterpCallArity(source, interpSpans, toks[pos])
+		}
+		return callArity(source, toks, tn, pos)
+	}
 	for j := from; j < to; j++ {
 		tok := toks[j]
 
@@ -1131,6 +1142,12 @@ func collectModuleRefs(source []byte, path string, toks []Token, from, to int, a
 		if tok.Kind == TokModule && TokenText(source, tok) == "__MODULE__" {
 			if ref, k, ok := selfModuleCall(source, toks, tn, j, selfModule); ok && k <= to {
 				ref.FilePath, ref.Kind = path, kindAt(j)
+				if interpSpans != nil {
+					ref.Arity = -1
+					if k-1 < tn {
+						ref.Arity = InterpCallArity(source, interpSpans, toks[k-1])
+					}
+				}
 				refs = append(refs, ref)
 				j = k - 1
 			} else {
@@ -1158,7 +1175,7 @@ func collectModuleRefs(source []byte, path string, toks []Token, from, to int, a
 			funcName := TokenText(source, toks[k+1])
 			if !elixirKeyword[funcName] {
 				if resolved := ResolveModuleRef(modName, aliases, cm); resolved != "" {
-					refs = append(refs, Reference{Module: resolved, Function: funcName, Line: tok.Line, FilePath: path, Kind: kindAt(j)})
+					refs = append(refs, Reference{Module: resolved, Function: funcName, Arity: arityAt(k + 1), Line: tok.Line, FilePath: path, Kind: kindAt(j)})
 				}
 			}
 			j = k + 1
@@ -1518,23 +1535,48 @@ func copyImportFilters(m map[string]importFilter) map[string]importFilter {
 // one more for a do block. It returns -1 when the tokens do not show the
 // arity (a name alone can be a variable or a call with no arguments).
 func callArity(source []byte, tokens []Token, n, pos int) int {
-	if a := captureArity(source, tokens, n, pos); a >= 0 {
-		return a
+	// A qualified call (`Mod.Sub.f`, `conn.f`, `:mod.f`) has its capture `&`
+	// or its pipe before the qualifier.
+	start := qualifierStart(source, tokens, pos)
+	if start == pos {
+		if a := captureArity(source, tokens, n, pos); a >= 0 {
+			return a
+		}
+	} else if start > 0 && tokens[start-1].Kind == TokOther && TokenText(source, tokens[start-1]) == "&" &&
+		pos+2 < n && tokens[pos+1].Kind == TokOther && TokenText(source, tokens[pos+1]) == "/" && tokens[pos+2].Kind == TokNumber {
+		if a, err := strconv.Atoi(TokenText(source, tokens[pos+2])); err == nil {
+			return a
+		}
 	}
 	piped := false
-	if prev := prevSigToken(tokens, pos-1); prev >= 0 && tokens[prev].Kind == TokPipe {
-		piped = true
+	if prev := prevSigToken(tokens, start-1); prev >= 0 && tokens[prev].Kind == TokPipe {
+		piped = !isReceiver(tokens, n, pos)
+	} else if prev >= 0 && tokens[prev].Kind == TokOpenParen {
+		// `x |> (f() |> g())`: the first call in the brackets gets x.
+		if before := prevSigToken(tokens, prev-1); before >= 0 && tokens[before].Kind == TokPipe {
+			piped = !isReceiver(tokens, n, pos)
+		}
 	}
 	open := pos + 1
-	if open >= n || tokens[open].Kind != TokOpenParen {
+	// `f (x)`, with a space, is a call without parentheses of `(x)`.
+	if open >= n || tokens[open].Kind != TokOpenParen || tokens[open].Start != tokens[pos].End {
 		args := NoParenArgCount(source, tokens, pos)
+		if args < 0 && open < n && tokens[open].Kind == TokDo && ownsDoBlock(source, tokens, pos) {
+			// `setup do ... end`: the do block is the only argument.
+			args = 1
+		}
+		if args < 0 && pos > 0 && tokens[pos-1].Kind == TokDot {
+			// `Mod.fun`, `map.key`, and `f(x).key` are calls with no
+			// argument.
+			args = 0
+		}
 		if piped {
 			// `value |> name`, `value |> name arg`
 			return 1 + max(args, 0)
 		}
 		return args
 	}
-	args := CallArgCount(tokens, open)
+	args := CallArgCount(source, tokens, open)
 	if args < 0 {
 		return -1
 	}
@@ -1544,17 +1586,39 @@ func callArity(source []byte, tokens []Token, n, pos int) int {
 	return args
 }
 
+// isReceiver reports whether the call or name at tokens[pos] is the receiver
+// of another call (`shell` in `x |> Mix.shell().info()`, `attr` in
+// `x |> Mod.attr.f()`): a pipe before it gives its argument to the last call
+// of the chain.
+func isReceiver(tokens []Token, n, pos int) bool {
+	end := pos
+	if pos+1 < n && tokens[pos+1].Kind == TokOpenParen && tokens[pos+1].Start == tokens[pos].End {
+		if end = matchingClose(tokens, pos+1); end < 0 {
+			return false
+		}
+	}
+	return end+1 < n && tokens[end+1].Kind == TokDot
+}
+
+// CallArity is the arity of the call whose name is tokens[pos]: its
+// arguments (a do block is one, trailing keywords are one), one more after a
+// pipe, or the N of a capture `&name/N`. -1 when it cannot be read.
+func CallArity(source []byte, tokens []Token, pos int) int {
+	return callArity(source, tokens, len(tokens), pos)
+}
+
 // CallArgCount counts the arguments of the call whose open parenthesis is
 // tokens[open]: trailing keyword pairs (`f(a, b: 1, c: 2)`) are one, and a
 // do block after the parentheses is one more, unless the call is an
 // argument of another call (in `case f(x) do`, the do is case's). It returns
 // -1 when the parentheses do not close.
-func CallArgCount(tokens []Token, open int) int {
+func CallArgCount(source []byte, tokens []Token, open int) int {
 	n := len(tokens)
 	depth := 0
 	args := 0
 	inKeywords := false
 	argStart := true
+	swallowed := false
 	closeIdx := -1
 	angles := 0 // open bitstrings, whose commas separate segments
 scan:
@@ -1566,17 +1630,22 @@ scan:
 		case TokEOF:
 			return -1
 		case TokOpenAngle, TokCloseAngle:
-			angles = bitstringDepth(tokens, i, angles)
+			angles = bitstringDepth(source, tokens, i, angles)
 		}
 		if argStart && depth == 0 && angles == 0 && t.Kind != TokCloseParen {
 			argStart = false
-			isKey := t.Kind == TokIdent && i+1 < n && tokens[i+1].Kind == TokColon
+			isKey := isKeywordPairKey(tokens, i)
 			if !isKey || !inKeywords {
 				args++
 			}
 			if isKey {
 				inKeywords = true
 			}
+		}
+		if depth == 0 && angles == 0 && !swallowed && takesTheRest(source, tokens, i) {
+			// `f(g a, b)` is f(g(a, b)): the call without parentheses takes
+			// the rest of the arguments.
+			swallowed = true
 		}
 		switch t.Kind {
 		case TokOpenParen, TokOpenBracket, TokOpenBrace, TokDo, TokFn:
@@ -1590,8 +1659,13 @@ scan:
 				break scan
 			}
 			depth--
+			if t.Kind == TokEnd && depth == 0 {
+				// The do block ends the call without parentheses that
+				// took the rest: `f(for x <- l do ... end, g)`.
+				swallowed = false
+			}
 		case TokComma:
-			if depth == 0 && angles == 0 {
+			if depth == 0 && angles == 0 && !swallowed {
 				argStart = true
 			}
 		}
@@ -1599,7 +1673,7 @@ scan:
 	if closeIdx < 0 {
 		return -1
 	}
-	if next := closeIdx + 1; next < n && tokens[next].Kind == TokDo && ownsDoBlock(tokens, open-1) {
+	if next := closeIdx + 1; next < n && tokens[next].Kind == TokDo && ownsDoBlock(source, tokens, open-1) {
 		args++
 	}
 	return args
@@ -1613,48 +1687,22 @@ scan:
 // call (`name`, `name.field`, `name[0]`, `name + 1`, `name in list`).
 func NoParenArgCount(source []byte, tokens []Token, pos int) int {
 	n := len(tokens)
+	if !startsNoParenArg(source, tokens, pos) {
+		return -1
+	}
 	j := pos + 1
-	if j >= n || tokens[j].Start == tokens[pos].End {
-		return -1
-	}
-	switch tokens[j].Kind {
-	case TokIdent:
-		switch TokenText(source, tokens[j]) {
-		case "in", "and", "or", "not", "when":
-			return -1
-		}
-	case TokModule, TokString, TokHeredoc, TokSigil, TokCharLiteral, TokNumber, TokAtom,
-		TokOpenBracket, TokOpenBrace, TokPercent, TokAttr, TokFn:
-	case TokOpenAngle:
-		// `name <<1, 2>>`, but not `name <<< 1`.
-		if bitstringDepth(tokens, j, 0) == 0 {
-			return -1
-		}
-	case TokOther:
-		// A capture, `name &other/1` or `name &(&1 + 1)`. A unary minus
-		// (`name -1`) is left out: after a variable it is a subtraction.
-		if TokenText(source, tokens[j]) != "&" || j+1 >= n || tokens[j+1].Start != tokens[j].End {
-			return -1
-		}
-		switch tokens[j+1].Kind {
-		case TokIdent, TokModule, TokOpenParen, TokNumber:
-		default:
-			return -1
-		}
-	default:
-		return -1
-	}
 	depth := 0
 	args := 0
 	inKeywords := false
 	argStart := true
 	angles := 0
+	swallowed := false
 scan:
 	for i := j; i < n; i++ {
 		t := tokens[i]
 		switch t.Kind {
 		case TokOpenAngle, TokCloseAngle:
-			angles = bitstringDepth(tokens, i, angles)
+			angles = bitstringDepth(source, tokens, i, angles)
 		}
 		switch t.Kind {
 		case TokComment:
@@ -1665,8 +1713,14 @@ scan:
 			if depth > 0 || angles > 0 {
 				continue
 			}
-			// A line that ends with a comma continues the arguments.
-			if prev := prevSigToken(tokens, i-1); prev >= 0 && tokens[prev].Kind == TokComma {
+			// A line that ends with a comma, an operator, or a keyword key
+			// continues the arguments, and so does one before a line that
+			// starts with an operator (a guard: `assert_receive x` then
+			// `when y`).
+			if prev := prevSigToken(tokens, i-1); prev >= 0 && (tokens[prev].Kind == TokComma || tokens[prev].Kind == TokColon || continuesExpression(source, tokens[prev])) {
+				continue
+			}
+			if next := NextSigToken(tokens, n, i+1); next < n && continuesExpression(source, tokens[next]) {
 				continue
 			}
 			break scan
@@ -1674,17 +1728,17 @@ scan:
 		if depth == 0 && angles == 0 {
 			switch t.Kind {
 			case TokDo:
-				if ownsDoBlock(tokens, pos) {
+				if ownsDoBlock(source, tokens, pos) {
 					args++
 				}
 				break scan
-			case TokEnd, TokCloseParen, TokCloseBracket, TokCloseBrace, TokRightArrow, TokWhen:
+			case TokEnd, TokCloseParen, TokCloseBracket, TokCloseBrace, TokRightArrow:
 				break scan
 			}
 		}
 		if argStart && depth == 0 && angles == 0 {
 			argStart = false
-			isKey := t.Kind == TokIdent && i+1 < n && tokens[i+1].Kind == TokColon
+			isKey := isKeywordPairKey(tokens, i)
 			if !isKey || !inKeywords {
 				args++
 			}
@@ -1692,13 +1746,21 @@ scan:
 				inKeywords = true
 			}
 		}
+		if depth == 0 && angles == 0 && !swallowed && takesTheRest(source, tokens, i) {
+			// `name inner a, b`: the inner call without parentheses takes
+			// the rest, so name has one argument more, not two.
+			swallowed = true
+		}
 		switch t.Kind {
 		case TokOpenParen, TokOpenBracket, TokOpenBrace, TokDo, TokFn:
 			depth++
 		case TokCloseParen, TokCloseBracket, TokCloseBrace, TokEnd:
 			depth--
+			if t.Kind == TokEnd && depth == 0 {
+				swallowed = false
+			}
 		case TokComma:
-			if depth == 0 && angles == 0 {
+			if depth == 0 && angles == 0 && !swallowed {
 				argStart = true
 			}
 		}
@@ -1706,13 +1768,83 @@ scan:
 	return args
 }
 
+// startsNoParenArg reports whether the name at tokens[pos] is a call
+// without parentheses: an argument starts after a space on the same line
+// (`name a`, not `name`, `name.field`, `name[0]`, `name + 1`, `name in list`).
+func startsNoParenArg(source []byte, tokens []Token, pos int) bool {
+	n := len(tokens)
+	switch TokenText(source, tokens[pos]) {
+	case "in", "and", "or", "not", "when":
+		return false // operators, not calls
+	}
+	j := pos + 1
+	if j >= n || tokens[j].Start == tokens[pos].End {
+		return false
+	}
+	switch tokens[j].Kind {
+	case TokIdent:
+		switch TokenText(source, tokens[j]) {
+		case "in", "and", "or", "when":
+			return false
+		case "not":
+			// `name not x` passes `not x`; `name not in list` is an operator.
+			if k := j + 1; k < n && tokens[k].Kind == TokIdent && TokenText(source, tokens[k]) == "in" {
+				return false
+			}
+		}
+	case TokModule, TokString, TokHeredoc, TokSigil, TokCharLiteral, TokNumber, TokAtom,
+		TokOpenBracket, TokOpenBrace, TokPercent, TokAttr, TokFn,
+		TokAttrDoc, TokAttrSpec, TokAttrType, TokAttrCallback, TokAttrBehaviour,
+		TokOpenParen: // `if (a or b) and c`: after a space, a bracketed argument
+	case TokOpenAngle:
+		// `name <<1, 2>>`, but not `name <<< 1`.
+		if bitstringDepth(source, tokens, j, 0) == 0 {
+			return false
+		}
+	case TokAlias, TokImport, TokRequire, TokUse:
+		// A variable with a directive's name: `if alias = find(x) do`.
+	case TokOther:
+		// A capture (`name &other/1`, `name &(&1 + 1)`), a negation
+		// (`name !x`), or a pin (`name ^ref`). A unary minus (`name -1`) is
+		// left out: after a variable it is a subtraction.
+		switch TokenText(source, tokens[j]) {
+		case "&", "!", "^":
+		default:
+			return false
+		}
+		if j+1 >= n || tokens[j+1].Start != tokens[j].End {
+			return false
+		}
+		// An operand follows, not a second operator character: `x != y`
+		// and `x && y` are operators after a variable. `!!x` negates twice.
+		switch tokens[j+1].Kind {
+		case TokIdent, TokModule, TokOpenParen, TokNumber, TokAtom, TokAttr:
+		case TokOther:
+			if TokenText(source, tokens[j]) != "!" || TokenText(source, tokens[j+1]) != "!" {
+				return false
+			}
+		default:
+			return false
+		}
+	default:
+		return false
+	}
+	return true
+}
+
 // bitstringDepth returns the count of open bitstrings after tokens[i], a
 // `<<` or `>>`, when angles were open before it. `<<<` and `>>>` (Bitwise)
 // tokenize as `<<` or `>>` with an operator byte right after; they open and
 // close nothing, nor does a `>>` with no `<<` open.
-func bitstringDepth(tokens []Token, i, angles int) int {
+func bitstringDepth(source []byte, tokens []Token, i, angles int) int {
 	if i+1 < len(tokens) && tokens[i+1].Kind == TokOther && tokens[i+1].Start == tokens[i].End {
-		return angles
+		// `<<<`, `<<~`, and `>>>` are operators; `<<&1` and `<<^a` open a
+		// bitstring.
+		switch c := source[tokens[i+1].Start]; {
+		case tokens[i].Kind == TokOpenAngle && (c == '<' || c == '~'),
+			tokens[i].Kind == TokCloseAngle && c == '>':
+			return angles
+		}
 	}
 	if tokens[i].Kind == TokOpenAngle {
 		return angles + 1
@@ -1724,23 +1856,158 @@ func bitstringDepth(tokens []Token, i, angles int) int {
 }
 
 // ownsDoBlock reports whether a do block after the call whose name is
-// tokens[name] (with its qualifier, `Mod.name`) is the call's: the call
-// starts its statement or follows an operator (`x = f(a) do`). After a name
-// (`case f(a) do`), a comma, or an open bracket, the call is an argument of
-// another call, which owns the block.
-func ownsDoBlock(tokens []Token, name int) bool {
-	k := name
-	for k-1 >= 0 && tokens[k-1].Kind == TokDot && k-2 >= 0 && (tokens[k-2].Kind == TokModule || tokens[k-2].Kind == TokIdent) {
-		k -= 2
+// tokens[name] is the call's. Elixir gives a do block to the outermost call
+// without parentheses of its expression: in `if x = f(a) do` and in
+// `case f(a) || g(b) do` it is the if's or the case's. So the call owns the
+// block when no such call comes before it in its statement (`x = f(a) do`
+// does own it).
+func ownsDoBlock(source []byte, tokens []Token, name int) bool {
+	k := qualifierStart(source, tokens, name)
+	depth := 0
+	for j := k - 1; j >= 0; j-- {
+		t := tokens[j]
+		switch t.Kind {
+		case TokCloseParen, TokCloseBracket, TokCloseBrace:
+			depth++
+			continue
+		case TokOpenParen, TokOpenBracket, TokOpenBrace:
+			if depth == 0 {
+				return true // the start of a bracket is the start of the expression
+			}
+			depth--
+			continue
+		}
+		if depth > 0 {
+			continue
+		}
+		switch t.Kind {
+		case TokComment:
+			continue
+		case TokEOL:
+			// A line that ends with an operator or a comma goes on, and so
+			// does one before a line that starts with an operator (`when`,
+			// `|>`, `<-` in a with).
+			if prev := prevSigToken(tokens, j-1); prev >= 0 && (tokens[prev].Kind == TokComma || tokens[prev].Kind == TokColon || continuesExpression(source, tokens[prev])) {
+				continue
+			}
+			if next := NextSigToken(tokens, len(tokens), j+1); next < len(tokens) && continuesExpression(source, tokens[next]) {
+				continue
+			}
+			return true
+		case TokDo, TokEnd, TokRightArrow, TokFn:
+			return true
+		case TokDef, TokDefp, TokDefmacro, TokDefmacrop, TokDefguard, TokDefguardp,
+			TokDefmodule, TokDefprotocol, TokDefimpl:
+			// `def name(a) do`: the do is the def's.
+			return false
+		case TokIdent:
+			if startsNoParenArg(source, tokens, j) {
+				return false
+			}
+		}
 	}
-	if k == 0 {
-		return true
+	return true
+}
+
+// isKeywordPairKey reports whether tokens[i] is the key of a keyword pair: a
+// name, a capitalized word, a quoted string, or an operator, right before
+// its colon (`a: 1`, `CONFIG: c`, `"a b": 1`, `+: 2`).
+func isKeywordPairKey(tokens []Token, i int) bool {
+	if i+1 >= len(tokens) || tokens[i+1].Kind != TokColon || tokens[i+1].Start != tokens[i].End {
+		return false
 	}
-	switch tokens[k-1].Kind {
-	case TokEOL, TokComment, TokOther, TokPipe:
+	switch tokens[i].Kind {
+	case TokIdent, TokModule, TokString, TokOther:
 		return true
 	}
 	return false
+}
+
+// takesTheRest reports whether tokens[i] starts a call without parentheses,
+// which takes the rest of the arguments it is in: a name with an argument
+// after a space, or a definition or directive (`defimpl P, for: X do`).
+func takesTheRest(source []byte, tokens []Token, i int) bool {
+	switch tokens[i].Kind {
+	case TokIdent:
+		return startsNoParenArg(source, tokens, i)
+	case TokDef, TokDefp, TokDefmacro, TokDefmacrop, TokDefguard, TokDefguardp, TokDefdelegate,
+		TokDefmodule, TokDefprotocol, TokDefimpl, TokAlias, TokImport, TokRequire, TokUse:
+		return i+1 < len(tokens) && tokens[i+1].Start > tokens[i].End && tokens[i+1].Kind != TokEOL
+	}
+	return false
+}
+
+// continuesExpression reports whether a binary operator token joins the
+// expression on its line to the one on the next or the last line.
+func continuesExpression(source []byte, t Token) bool {
+	switch t.Kind {
+	case TokOther, TokPipe, TokLeftArrow, TokDoubleColon, TokAssoc, TokBackslash, TokWhen:
+		return true
+	case TokIdent:
+		switch TokenText(source, t) {
+		case "when", "and", "or", "in":
+			return true
+		}
+	}
+	return false
+}
+
+// qualifierStart returns the index of the first token of the qualified name
+// at tokens[pos]: the module, variable, or Erlang atom of `Mod.Sub.f`,
+// `conn.f`, or `:mod.f`, or pos itself when the name is not qualified.
+func qualifierStart(source []byte, tokens []Token, pos int) int {
+	start := pos
+	for start >= 2 && tokens[start-1].Kind == TokDot {
+		switch tokens[start-2].Kind {
+		case TokModule, TokIdent, TokAtom, TokAttr:
+			start -= 2
+			continue
+		case TokCloseParen:
+			// A call's result: `Mix.shell().info()`.
+			if open := matchingOpen(tokens, start-2); open > 0 && tokens[open-1].Kind == TokIdent && tokens[open-1].End == tokens[open].Start {
+				start = open - 1
+				continue
+			}
+		}
+		break
+	}
+	return start
+}
+
+// matchingOpen returns the index of the bracket that tokens[close] closes,
+// or -1.
+func matchingOpen(tokens []Token, close int) int {
+	depth := 0
+	for j := close; j >= 0; j-- {
+		switch tokens[j].Kind {
+		case TokCloseParen, TokCloseBracket, TokCloseBrace:
+			depth++
+		case TokOpenParen, TokOpenBracket, TokOpenBrace:
+			depth--
+			if depth == 0 {
+				return j
+			}
+		}
+	}
+	return -1
+}
+
+// matchingClose returns the index of the bracket that closes tokens[open],
+// or -1.
+func matchingClose(tokens []Token, open int) int {
+	depth := 0
+	for j := open; j < len(tokens); j++ {
+		switch tokens[j].Kind {
+		case TokOpenParen, TokOpenBracket, TokOpenBrace:
+			depth++
+		case TokCloseParen, TokCloseBracket, TokCloseBrace:
+			depth--
+			if depth == 0 {
+				return j
+			}
+		}
+	}
+	return -1
 }
 
 // prevSigToken returns the index of the last token at or before i that is
@@ -1771,6 +2038,45 @@ func captureArity(source []byte, tokens []Token, n, pos int) int {
 	return a
 }
 
+// InterpCallArity is the arity of the call whose name is the token name of
+// the #{} stream, or -1. That stream holds no brackets, so the innermost
+// interpolation around the name is tokenized on its own, and the call is
+// read there as it is anywhere else.
+func InterpCallArity(source []byte, spans []Span, name Token) int {
+	best := -1
+	for i, sp := range spans {
+		if sp.Start <= name.Start && name.End <= sp.End && (best < 0 || sp.End-sp.Start < spans[best].End-spans[best].Start) {
+			best = i
+		}
+	}
+	if best < 0 {
+		return -1
+	}
+	sp := spans[best]
+	frag := source[sp.Start:sp.End]
+	toks := Tokenize(frag)
+	at := name.Start - sp.Start
+	idx := TokenAtOffset(toks, at)
+	if idx < 0 || toks[idx].Start != at || toks[idx].Kind != TokIdent {
+		return -1
+	}
+	return callArity(frag, toks, len(toks), idx)
+}
+
+// keywordArity is the N of a keyword key `name: N` at toks[key], as in an
+// only: list, or -1.
+func keywordArity(source []byte, toks []Token, n, key int) int {
+	if key+1 >= n || toks[key+1].Kind != TokColon {
+		return -1
+	}
+	if j := NextSigToken(toks, n, key+2); j < n && toks[j].Kind == TokNumber {
+		if a, err := strconv.Atoi(TokenText(source, toks[j])); err == nil {
+			return a
+		}
+	}
+	return -1
+}
+
 // selfModuleCall reads `__MODULE__.fun` or `__MODULE__.Sub.fun` at toks[i],
 // a call of a function of cm (or of a module nested in it). k is the token
 // after the function name. ok is false outside a module and for a
@@ -1787,7 +2093,7 @@ func selfModuleCall(source []byte, toks []Token, n, i int, cm string) (ref Refer
 	if elixirKeyword[funcName] {
 		return Reference{}, i, false
 	}
-	return Reference{Module: cm + strings.TrimPrefix(modName, "__MODULE__"), Function: funcName, Line: toks[i].Line}, k + 2, true
+	return Reference{Module: cm + strings.TrimPrefix(modName, "__MODULE__"), Function: funcName, Arity: callArity(source, toks, n, k+1), Line: toks[i].Line}, k + 2, true
 }
 
 // StructFunctions are the functions that defstruct and defexception define:

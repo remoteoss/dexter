@@ -4433,3 +4433,49 @@ end
 		}
 	}
 }
+
+// TestParseText_ReferenceArity: each call ref carries its arity, also when a
+// pipe or a capture is before a qualifier, and inside #{}; -1 when it
+// cannot be read.
+func TestParseText_ReferenceArity(t *testing.T) {
+	src := `defmodule A do
+  import Q, only: [from: 2, where: 3]
+
+  def a(s, list) do
+    s |> Base.decode64!()
+    Enum.map(list, &Atom.to_string/1)
+    "#{Scopes.w()} #{Scopes.w(1, 2)}"
+    "#{s |> Mod.Sub.f(1)}"
+    "#{"#{Deep.g(1)}"}"
+    s |> Mod.Sub.f(1)
+    __MODULE__.g(1, 2)
+    "#{__MODULE__.h()}"
+    {MapSet.new(), MapSet.new([1])}
+    Q.go do
+      :ok
+    end
+  end
+end
+`
+	_, refs, err := ParseText("/x.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, r := range refs {
+		if r.Function != "" {
+			got[fmt.Sprintf("%s.%s/%d:%d", r.Module, r.Function, r.Arity, r.Line)] = true
+		}
+	}
+	for _, want := range []string{
+		"Q.from/2:2", "Q.where/3:2",
+		"Base.decode64!/1:5", "Atom.to_string/1:6", "Enum.map/2:6",
+		"Scopes.w/0:7", "Scopes.w/2:7", "Mod.Sub.f/2:8", "Deep.g/1:9",
+		"Mod.Sub.f/2:10", "A.g/2:11", "A.h/0:12",
+		"MapSet.new/0:13", "MapSet.new/1:13", "Q.go/1:14",
+	} {
+		if !got[want] {
+			t.Errorf("missing %s; got %v", want, got)
+		}
+	}
+}

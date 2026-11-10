@@ -98,6 +98,19 @@ type TokenResult struct {
 	// reference or a call, and never a do/end/fn that a depth tracker could
 	// miscount. Nil when no interpolation carries code.
 	Interp []Token
+	// InterpSpans are the byte ranges of the code inside each #{}, an inner
+	// one before the one around it. A call's arity needs the brackets and
+	// commas that Interp leaves out: InterpCallArity tokenizes the span.
+	InterpSpans []Span
+}
+
+// Span is a byte range [Start, End) of the source.
+type Span struct{ Start, End int }
+
+// interpSink collects what the scan of interpolations finds.
+type interpSink struct {
+	toks  []Token
+	spans []Span
 }
 
 // keywordKinds maps keyword strings to their token kind.
@@ -140,7 +153,7 @@ func Tokenize(source []byte) []Token {
 
 func TokenizeFull(source []byte) TokenResult {
 	tokens := make([]Token, 0, len(source)/8)
-	var interp []Token // code tokens inside #{}; stays nil for sources without one
+	var interp interpSink // code inside #{}; stays empty for sources without one
 	lineStarts := make([]int, 1, 64)
 	lineStarts[0] = 0 // line 1 starts at byte 0
 	line := 1
@@ -560,13 +573,13 @@ func TokenizeFull(source []byte) TokenResult {
 	}
 
 	tokens = append(tokens, Token{Kind: TokEOF, Start: len(source), End: len(source), Line: line})
-	return TokenResult{Tokens: tokens, LineStarts: lineStarts, Interp: interp}
+	return TokenResult{Tokens: tokens, LineStarts: lineStarts, Interp: interp.toks, InterpSpans: interp.spans}
 }
 
 // scanStringContent scans from after the opening delimiter to (and including) the matching closing delimiter.
 // Returns the new position (after closing delimiter) and updated line count.
 // Handles escape sequences and #{} interpolation with proper brace depth tracking.
-func scanStringContent(source []byte, i, line int, delim byte, lineStarts *[]int, interp *[]Token) (int, int) {
+func scanStringContent(source []byte, i, line int, delim byte, lineStarts *[]int, interp *interpSink) (int, int) {
 	for i < len(source) {
 		ch := source[i]
 		if ch == '\n' {
@@ -602,8 +615,16 @@ func scanStringContent(source []byte, i, line int, delim byte, lineStarts *[]int
 // they carry no reference and would only give a depth tracker something to
 // miscount. Nested strings and nested interpolations recurse, which is legal
 // Elixir: "outer #{"inner #{x}"}".
-func scanInterpolation(source []byte, i, line int, lineStarts *[]int, interp *[]Token) (int, int) {
+func scanInterpolation(source []byte, i, line int, lineStarts *[]int, interp *interpSink) (int, int) {
+	start := i
 	depth := 1
+	defer func() {
+		end := i
+		if depth == 0 {
+			end = i - 1 // before the closing }
+		}
+		interp.spans = append(interp.spans, Span{start, end})
+	}()
 	afterDot := false
 	for i < len(source) && depth > 0 {
 		c := source[i]
@@ -612,7 +633,7 @@ func scanInterpolation(source []byte, i, line int, lineStarts *[]int, interp *[]
 		case c == '.':
 			// A dot joins the segments of Mod.Sub.fun. Two dots in a row are a
 			// range operator; harmless, nothing reads a lone dot.
-			*interp = append(*interp, Token{Kind: TokDot, Start: i, End: i + 1, Line: line})
+			interp.toks = append(interp.toks, Token{Kind: TokDot, Start: i, End: i + 1, Line: line})
 			i++
 		case c == '@':
 			// @attr — record the attribute, and keep its name out of the stream
@@ -621,7 +642,7 @@ func scanInterpolation(source []byte, i, line int, lineStarts *[]int, interp *[]
 			j := i + 1
 			if j < len(source) && (isLetter(source[j]) || source[j] == '_') {
 				j = scanIdentContinue(source, j+1)
-				*interp = append(*interp, Token{Kind: TokAttr, Start: start, End: j, Line: line})
+				interp.toks = append(interp.toks, Token{Kind: TokAttr, Start: start, End: j, Line: line})
 				i = j
 			} else {
 				i++
@@ -632,24 +653,24 @@ func scanInterpolation(source []byte, i, line int, lineStarts *[]int, interp *[]
 		case isUpper(c):
 			start := i
 			i = scanIdentContinueMod(source, i+1)
-			*interp = append(*interp, Token{Kind: TokModule, Start: start, End: i, Line: line})
+			interp.toks = append(interp.toks, Token{Kind: TokModule, Start: start, End: i, Line: line})
 		case isLower(c) || c == '_':
 			start := i
 			if c == '_' && i+9 < len(source) && string(source[i:i+10]) == "__MODULE__" && !isIdentContinueAt(source, i+10) {
 				i += 10
-				*interp = append(*interp, Token{Kind: TokModule, Start: start, End: i, Line: line})
+				interp.toks = append(interp.toks, Token{Kind: TokModule, Start: start, End: i, Line: line})
 				break
 			}
 			i = scanIdentContinue(source, i+1)
 			if afterDot {
 				// Mod.end is a call to a function named end, not a keyword.
-				*interp = append(*interp, Token{Kind: TokIdent, Start: start, End: i, Line: line})
+				interp.toks = append(interp.toks, Token{Kind: TokIdent, Start: start, End: i, Line: line})
 				break
 			}
 			if _, isKeyword := keywordKinds[string(source[start:i])]; isKeyword && !isKeywordKey(source, i) {
 				break
 			}
-			*interp = append(*interp, Token{Kind: TokIdent, Start: start, End: i, Line: line})
+			interp.toks = append(interp.toks, Token{Kind: TokIdent, Start: start, End: i, Line: line})
 		case c == '\n':
 			line++
 			i++
@@ -721,7 +742,7 @@ func heredocCloser(source []byte, i int, delim byte) (int, bool) {
 
 // scanHeredocContent scans from after the opening """ (or ”') to (and including) the closing """ on its own line.
 // The closing delimiter must appear at the start of a line (possibly with leading whitespace).
-func scanHeredocContent(source []byte, i, line int, delim byte, lineStarts *[]int, interp *[]Token) (int, int) {
+func scanHeredocContent(source []byte, i, line int, delim byte, lineStarts *[]int, interp *interpSink) (int, int) {
 	for i < len(source) {
 		ch := source[i]
 		if ch == '\n' {
@@ -762,7 +783,7 @@ func scanHeredocContent(source []byte, i, line int, delim byte, lineStarts *[]in
 // including any trailing modifier letters. Returns new position and updated line count.
 // sigilLetter is the letter after ~ (e.g. 's' in ~s, 'S' in ~S). Uppercase sigil letters
 // mean the content is "raw" — backslash is NOT an escape character.
-func scanSigilContent(source []byte, i, line int, sigilLetter byte, lineStarts *[]int, interp *[]Token) (int, int) {
+func scanSigilContent(source []byte, i, line int, sigilLetter byte, lineStarts *[]int, interp *interpSink) (int, int) {
 	if i >= len(source) {
 		return i, line
 	}
@@ -837,10 +858,9 @@ func scanSigilContent(source []byte, i, line int, sigilLetter byte, lineStarts *
 				// characters from being read as the sigil's own.
 				i += 2
 				i, line = scanInterpolation(source, i, line, lineStarts, interp)
-			} else if ch == openCh {
-				depth++
-				i++
 			} else if ch == closeCh {
+				// Elixir does not nest a sigil's delimiters: ~s(a (b) c)
+				// ends after b.
 				depth--
 				i++
 			} else {

@@ -2049,6 +2049,17 @@ func filterOutPrivate(results []store.LookupResult) []store.LookupResult {
 
 // byKindForContext picks the definitions that match how the name is written:
 // types inside a typespec, everything else outside one.
+// byArityAt keeps the results of the arity of the call of name at the
+// cursor, or all of them when it cannot be read or none has it: the hover on
+// `|> Oban.insert!()` is the one of the insert!/1 head, not of insert!/2.
+func byArityAt(tf *TokenizedFile, lineNum, col int, name string, results []store.LookupResult) []store.LookupResult {
+	arity, ok := tf.callArityAt(lineNum, col, name)
+	if !ok {
+		return results
+	}
+	return filterArity(results, NameLookupOptions{CallArity: arity, HasArity: true})
+}
+
 func byKindForContext(tf *TokenizedFile, lineNum int, results []store.LookupResult) []store.LookupResult {
 	if tf.InTypespec(lineNum) {
 		return filterToTypes(results)
@@ -4308,7 +4319,7 @@ func (s *Server) injectedAliasReferences(fullModule, functionName string, module
 		if functionName == "" && r.Kind != "alias" && r.Kind != "import" && r.Kind != "use" && r.Kind != "quoted_use" && r.Kind != "require" {
 			continue
 		}
-		out = append(out, store.ReferenceResult{FilePath: r.FilePath, Line: r.Line, Kind: r.Kind})
+		out = append(out, store.ReferenceResult{FilePath: r.FilePath, Line: r.Line, Kind: r.Kind, Arity: -1})
 	}
 	return out
 }
@@ -5879,7 +5890,7 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 				results, err = s.store.LookupFunction(fullModule, functionName)
 			}
 			if err == nil && len(results) > 0 {
-				hits := byKindForContext(tf, lineNum, results)
+				hits := byArityAt(tf, lineNum, col, functionName, byKindForContext(tf, lineNum, results))
 				return s.hoverFromFile(functionName, hits[0])
 			}
 		}
@@ -5938,7 +5949,7 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 			results = filterOutTypes(s.lookupThroughUseOfWithFollow(fullModule, functionName, s.followDelegates))
 		}
 		if err == nil && len(results) > 0 {
-			hit := byKindForContext(tf, lineNum, results)[0]
+			hit := byArityAt(tf, lineNum, col, functionName, byKindForContext(tf, lineNum, results))[0]
 			doc, spec, signature, ok := s.hoverParts(functionName, hit)
 			if !ok {
 				return nil, nil
@@ -6392,6 +6403,12 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 	} else if tf.InTypespec(lineNum) {
 		kind = NameKindType
 	}
+	// The function at the cursor is one arity of the name (or the range of
+	// a head with default arguments; aritySet adds the rest).
+	arity, _, hasArity := tf.arityRangeAt(lineNum, col, functionName)
+	if kind != NameKindCallable {
+		hasArity = false
+	}
 	semantic, err := s.ReferenceNames(fullModule, functionName, NameReferenceOptions{
 		Context:            ctx,
 		Kind:               kind,
@@ -6400,6 +6417,8 @@ func (s *Server) References(ctx context.Context, params *protocol.ReferenceParam
 		ExcludeStdlib:      true,
 		InjectorModules:    injectors,
 		GeneratedProvider:  generatedProvider,
+		Arity:              arity,
+		HasArity:           hasArity,
 	})
 	if err != nil {
 		s.debugf("References: semantic lookup error: %v", err)
@@ -9149,7 +9168,8 @@ func (s *Server) getFileLine(filePath string, lineNum int) (string, bool) {
 
 // findBareCallRefs scans definition files for bare intra-module calls to
 // functionName (not indexed in the store) and returns them as ReferenceResults.
-func (s *Server) findBareCallRefs(module, functionName string) []store.ReferenceResult {
+// withArity reads the arity of each call, for a request that filters by it.
+func (s *Server) findBareCallRefs(module, functionName string, withArity bool) []store.ReferenceResult {
 	defResults, err := s.store.LookupFunction(module, functionName)
 	if err != nil {
 		return nil
@@ -9185,7 +9205,11 @@ func (s *Server) findBareCallRefs(module, functionName string) []store.Reference
 		}
 		src := []byte(fileText)
 		res := parser.TokenizeFull(src)
-		p := &parsedSource{text: fileText, src: src, tokens: res.Tokens, interp: res.Interp, lineStarts: res.LineStarts}
+		p := &parsedSource{text: fileText, src: src, tokens: res.Tokens, interp: res.Interp, interpSpans: res.InterpSpans, lineStarts: res.LineStarts}
+		var arities map[int][]int
+		if withArity {
+			arities = p.bareCallArities(functionName)
+		}
 		// A bare name inside a typespec names the type, not the function, so
 		// it is recorded under its own kind — the same split the indexed refs
 		// use. A nested or a sibling module in the file does not see the
@@ -9196,7 +9220,17 @@ func (s *Server) findBareCallRefs(module, functionName string) []store.Reference
 			if enclosing := p.moduleAt(lineNum); enclosing != "" && enclosing != module {
 				continue
 			}
-			refs = append(refs, store.ReferenceResult{FilePath: filePath, Line: lineNum, Kind: kindAt(p, lineNum)})
+			kind := kindAt(p, lineNum)
+			lineArities, scanned := arities[lineNum]
+			if scanned && len(lineArities) == 0 {
+				continue // only a definition head
+			}
+			if len(lineArities) == 0 {
+				lineArities = []int{-1}
+			}
+			for _, a := range lineArities {
+				refs = append(refs, store.ReferenceResult{FilePath: filePath, Line: lineNum, Kind: kind, Arity: a})
+			}
 		}
 	}
 	return refs
@@ -9536,10 +9570,19 @@ func (s *Server) PrepareCallHierarchy(ctx context.Context, params *protocol.Call
 		}
 	}
 
+	// The function at the cursor is one arity of the name.
+	arity, _, hasArity := tf.arityRangeAt(lineNum, col, functionName)
+	if hasArity {
+		defResults = filterArity(defResults, NameLookupOptions{CallArity: arity, HasArity: true})
+	}
 	r := defResults[0]
 	if len(generatedFunctions) > 0 {
 		r.Arity = generatedFunctions[0].Arity
 		r.Kind = generatedFunctions[0].Kind
+	}
+	data := map[string]string{"module": fullModule, "function": functionName}
+	if hasArity {
+		data["arity"] = strconv.Itoa(arity)
 	}
 	nameCol := 0
 	defLine, _ := s.getFileLine(r.FilePath, r.Line)
@@ -9557,7 +9600,7 @@ func (s *Server) PrepareCallHierarchy(ctx context.Context, params *protocol.Call
 			Start: s.outPosLine(defLine, r.Line-1, nameCol),
 			End:   s.outPosLine(defLine, r.Line-1, nameCol+len(functionName)),
 		},
-		Data: map[string]string{"module": fullModule, "function": functionName},
+		Data: data,
 	}
 	return []protocol.CallHierarchyItem{item}, nil
 }
@@ -9566,18 +9609,31 @@ func (s *Server) PrepareCallHierarchy(ctx context.Context, params *protocol.Call
 // Data field. Handles both map[string]string (direct Go calls) and
 // map[string]interface{} (after JSON round-trip).
 func extractCallHierarchyData(data interface{}) (module, function string) {
+	module, function, _, _ = extractCallHierarchyArity(data)
+	return
+}
+
+// extractCallHierarchyArity is extractCallHierarchyData with the arity of
+// the item's function, when PrepareCallHierarchy knew it.
+func extractCallHierarchyArity(data interface{}) (module, function string, arity int, hasArity bool) {
+	var arityText string
 	if m, ok := data.(map[string]interface{}); ok {
 		module, _ = m["module"].(string)
 		function, _ = m["function"].(string)
+		arityText, _ = m["arity"].(string)
 	} else if m, ok := data.(map[string]string); ok {
 		module = m["module"]
 		function = m["function"]
+		arityText = m["arity"]
+	}
+	if a, err := strconv.Atoi(arityText); err == nil && arityText != "" {
+		arity, hasArity = a, true
 	}
 	return
 }
 
 func (s *Server) IncomingCalls(ctx context.Context, params *protocol.CallHierarchyIncomingCallsParams) ([]protocol.CallHierarchyIncomingCall, error) {
-	module, functionName := extractCallHierarchyData(params.Item.Data)
+	module, functionName, arity, hasArity := extractCallHierarchyArity(params.Item.Data)
 	if module == "" || functionName == "" {
 		return nil, nil
 	}
@@ -9587,6 +9643,8 @@ func (s *Server) IncomingCalls(ctx context.Context, params *protocol.CallHierarc
 		Kind:            NameKindCallable,
 		FollowDelegates: s.followDelegates,
 		ExcludeStdlib:   true,
+		Arity:           arity,
+		HasArity:        hasArity,
 	})
 	if err != nil {
 		return nil, nil

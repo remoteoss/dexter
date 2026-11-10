@@ -491,45 +491,16 @@ func tokenArity(src []byte, toks []parser.Token, i int) (lo, hi int, known bool)
 		}
 		return 0, 0, false
 	}
-	// A pipe before the call (or before its qualifier) gives the first
-	// argument.
-	piped := func() bool {
-		k := i - 1
-		for k >= 0 && (toks[k].Kind == parser.TokDot || toks[k].Kind == parser.TokModule ||
-			(toks[k].Kind == parser.TokIdent && k+1 < len(toks) && toks[k+1].Kind == parser.TokDot)) {
-			k--
-		}
-		for k >= 0 && (toks[k].Kind == parser.TokEOL || toks[k].Kind == parser.TokComment) {
-			k--
-		}
-		return k >= 0 && toks[k].Kind == parser.TokPipe
-	}
-	if j >= len(toks) || toks[j].Kind != parser.TokOpenParen {
-		if head {
-			return 0, 0, true
-		}
-		// Counted as the parser counts it for the index.
-		n := parser.NoParenArgCount(src, toks, i)
-		if piped() {
-			n = 1 + max(n, 0) // `value |> f`, `value |> f arg`
-			return n, n, true
-		}
-		if n >= 0 {
+	if !head {
+		// Counted as the parser counts it for the index (parser.CallArity),
+		// so references and the index agree on which calls are which.
+		if n := parser.CallArity(src, toks, i); n >= 0 {
 			return n, n, true
 		}
 		return 0, 0, false
 	}
-	if !head {
-		// Counted as the parser counts it for the index (parser.CallArgCount),
-		// so a rename and references agree on which calls are which.
-		n := parser.CallArgCount(toks, j)
-		if n < 0 {
-			return 0, 0, false
-		}
-		if piped() {
-			n++
-		}
-		return n, n, true
+	if j >= len(toks) || toks[j].Kind != parser.TokOpenParen {
+		return 0, 0, true
 	}
 	n := callArgs(toks, j)
 	if head {
@@ -697,14 +668,71 @@ func (s *Server) qualifierIs(sf *siteFile, line int, q string) bool {
 
 // parsedSource is a file's text and tokens, read once for a rename plan.
 type parsedSource struct {
-	text       string
-	src        []byte
-	tokens     []parser.Token
-	interp     []parser.Token
-	lineStarts []int
+	text        string
+	src         []byte
+	tokens      []parser.Token
+	interp      []parser.Token
+	interpSpans []parser.Span
+	lineStarts  []int
 
 	modules  []string // the module at each line; see moduleAt
 	typespec []bool   // the lines in a typespec; see inTypespec
+}
+
+// bareCallArities returns, for each line, the arities of the unqualified
+// occurrences of name: a call, a capture, a pipe target, or a keyword key,
+// not a definition's own name. An occurrence whose arity cannot be read
+// gives -1. A call inside #{} is read from its interpolation.
+func (p *parsedSource) bareCallArities(name string) map[int][]int {
+	out := make(map[int][]int)
+	add := func(line, a int) {
+		for _, have := range out[line] {
+			if have == a {
+				return
+			}
+		}
+		out[line] = append(out[line], a)
+	}
+	for i, t := range p.tokens {
+		if t.Kind != parser.TokIdent || parser.TokenText(p.src, t) != name || (i > 0 && p.tokens[i-1].Kind == parser.TokDot) {
+			continue
+		}
+		if i > 0 && isHeadKeyword(p.tokens[i-1].Kind) {
+			// A definition's own name is not a call of it. A line with only
+			// a head gets an empty list: it has no call.
+			if _, seen := out[t.Line]; !seen {
+				out[t.Line] = []int{}
+			}
+			continue
+		}
+		lo, hi, known := tokenArity(p.src, p.tokens, i)
+		if !known {
+			add(t.Line, -1)
+			continue
+		}
+		for a := lo; a <= hi; a++ {
+			add(t.Line, a)
+		}
+	}
+	for i, t := range p.interp {
+		if t.Kind != parser.TokIdent || parser.TokenText(p.src, t) != name || (i > 0 && p.interp[i-1].Kind == parser.TokDot) {
+			continue
+		}
+		add(t.Line, parser.InterpCallArity(p.src, p.interpSpans, t))
+	}
+	return out
+}
+
+// isHeadKeyword reports whether a token kind starts a definition head, whose
+// next name is the defined function.
+func isHeadKeyword(k parser.TokenKind) bool {
+	switch k {
+	case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
+		parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate,
+		parser.TokAttrSpec, parser.TokAttrCallback:
+		return true
+	}
+	return false
 }
 
 // moduleAt is extractEnclosingModuleFromTokens for the 1-based line, from one

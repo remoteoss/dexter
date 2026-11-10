@@ -20,6 +20,9 @@ type TokenizedFile struct {
 	// main stream by the tokenizer. Cursor lookups fall back to it, so a call
 	// written inside a string still resolves.
 	interp []parser.Token
+	// interpSpans are the byte ranges of the interpolations, for the arity of
+	// a call inside one (parser.InterpCallArity). Nil when not known.
+	interpSpans []parser.Span
 }
 
 // NewTokenizedFile tokenizes the text once for reuse across multiple queries.
@@ -27,11 +30,12 @@ func NewTokenizedFile(text string) *TokenizedFile {
 	source := []byte(text)
 	result := parser.TokenizeFull(source)
 	return &TokenizedFile{
-		source:     source,
-		tokens:     result.Tokens,
-		n:          len(result.Tokens),
-		lineStarts: result.LineStarts,
-		interp:     result.Interp,
+		source:      source,
+		tokens:      result.Tokens,
+		n:           len(result.Tokens),
+		lineStarts:  result.LineStarts,
+		interp:      result.Interp,
+		interpSpans: result.InterpSpans,
 	}
 }
 
@@ -441,22 +445,41 @@ func FullExpressionAtCursor(tokens []parser.Token, source []byte, lineStarts []i
 // ok is false when the cursor is not on such a call or its arity cannot be
 // read, and for a definition head.
 func (tf *TokenizedFile) callArityAt(line, col int, name string) (arity int, ok bool) {
-	offset := parser.LineColToOffset(tf.lineStarts, line, col)
-	if offset < 0 {
-		return 0, false
-	}
-	idx := parser.TokenAtOffset(tf.tokens, offset)
-	if (idx < 0 || tf.tokens[idx].Kind != parser.TokIdent) && offset > 0 {
-		idx = parser.TokenAtOffset(tf.tokens, offset-1)
-	}
-	if idx < 0 || tf.tokens[idx].Kind != parser.TokIdent || parser.TokenText(tf.source, tf.tokens[idx]) != name {
-		return 0, false
-	}
-	lo, hi, known := tokenArity(tf.source, tf.tokens, idx)
-	if !known || lo != hi {
+	lo, hi, ok := tf.arityRangeAt(line, col, name)
+	if !ok || lo != hi {
 		return 0, false
 	}
 	return lo, true
+}
+
+// arityRangeAt returns the arities of the occurrence of name at the cursor:
+// one for a call, a capture, or a keyword key, and a range for a head with
+// default arguments. A call inside #{} is read from its interpolation. ok is
+// false when the cursor is not on name or its arity cannot be read.
+func (tf *TokenizedFile) arityRangeAt(line, col int, name string) (lo, hi int, ok bool) {
+	offset := parser.LineColToOffset(tf.lineStarts, line, col)
+	if offset < 0 {
+		return 0, 0, false
+	}
+	at := func(toks []parser.Token) int {
+		idx := parser.TokenAtOffset(toks, offset)
+		if (idx < 0 || toks[idx].Kind != parser.TokIdent) && offset > 0 {
+			idx = parser.TokenAtOffset(toks, offset-1)
+		}
+		if idx < 0 || toks[idx].Kind != parser.TokIdent || parser.TokenText(tf.source, toks[idx]) != name {
+			return -1
+		}
+		return idx
+	}
+	if idx := at(tf.tokens); idx >= 0 {
+		return tokenArity(tf.source, tf.tokens, idx)
+	}
+	if idx := at(tf.interp); idx >= 0 && tf.interpSpans != nil {
+		if a := parser.InterpCallArity(tf.source, tf.interpSpans, tf.interp[idx]); a >= 0 {
+			return a, a, true
+		}
+	}
+	return 0, 0, false
 }
 
 func expressionAtCursorImpl(tokens []parser.Token, source []byte, lineStarts []int, line, col int, full bool) CursorContext {
@@ -2783,28 +2806,7 @@ func findBareCallLines(source []byte, tokens, interp []parser.Token, functionNam
 	n := len(tokens)
 
 	seenLines := make(map[int]bool)
-	defLines := make(map[int]bool)
 
-	// First pass: identify definition lines to exclude
-	for i := 0; i < n; i++ {
-		tok := tokens[i]
-		switch tok.Kind {
-		case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
-			parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate:
-			name, _, ok := parser.StaticDeclarationName(source, tokens, n, i)
-			if ok && name == functionName {
-				defLines[tok.Line] = true
-			}
-		case parser.TokAttrSpec, parser.TokAttrCallback:
-			// Skip @spec and @callback lines that define this function
-			name, _, ok := parser.StaticDeclarationName(source, tokens, n, i)
-			if ok && name == functionName {
-				defLines[tok.Line] = true
-			}
-		}
-	}
-
-	// Second pass: find bare calls
 	for i := 0; i < n; i++ {
 		tok := tokens[i]
 
@@ -2814,7 +2816,9 @@ func findBareCallLines(source []byte, tokens, interp []parser.Token, functionNam
 		if parser.TokenText(source, tok) != functionName {
 			continue
 		}
-		if defLines[tok.Line] {
+		// The name of a def, @spec, or @callback head is not a call. A call
+		// on the same line is: `def f(x), do: f(x, [])` calls f/2.
+		if i > 0 && isHeadKeyword(tokens[i-1].Kind) {
 			continue
 		}
 
