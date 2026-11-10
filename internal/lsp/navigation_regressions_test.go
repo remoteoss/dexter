@@ -589,3 +589,44 @@ end
 		t.Errorf("no RevenueGoals completion")
 	}
 }
+
+// A struct key in `%__MODULE__{...}`, in a module whose nested module comes
+// before its defstruct, and through an alias that a `use` injects.
+func TestRegression_StructKeyDefinitionShapes(t *testing.T) {
+	self := bbFile{"lib/bb_self.ex", `defmodule BB.Self do
+  defmodule Helper do
+    defstruct [:other]
+  end
+
+  defstruct [:domain, :name]
+
+  def new(d), do: %__MODULE__{domain: d}
+end
+`}
+	aliaser := bbFile{"lib/bb_aliaser.ex", `defmodule BB.Aliaser do
+  defmacro __using__(_opts) do
+    quote do
+      alias BB.Self
+    end
+  end
+end
+`}
+	caller := bbFile{"lib/bb_self_user.ex", `defmodule BB.SelfUser do
+  use BB.Aliaser
+
+  def go(d), do: %Self{domain: d}
+end
+`}
+	server, cleanup := bbServer(t, self, aliaser, caller)
+	defer cleanup()
+	uri := bbOpen(t, server, self)
+	l, c := bbPos(t, self.src, "%__MODULE__{domain:", "domain")
+	if got := bbLines(definitionAt(t, server, uri, l, c), server.projectRoot); len(got) != 1 || got[0] != "lib/bb_self.ex:6" {
+		t.Errorf("%%__MODULE__ key = %v, want lib/bb_self.ex:6 (past the nested module's defstruct)", got)
+	}
+	uri = bbOpen(t, server, caller)
+	l, c = bbPos(t, caller.src, "%Self{domain:", "domain")
+	if got := bbLines(definitionAt(t, server, uri, l, c), server.projectRoot); len(got) != 1 || got[0] != "lib/bb_self.ex:6" {
+		t.Errorf("key through a use-injected alias = %v, want lib/bb_self.ex:6", got)
+	}
+}

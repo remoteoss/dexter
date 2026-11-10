@@ -1,6 +1,8 @@
 package lsp
 
 import (
+	"strings"
+
 	"github.com/remoteoss/dexter/internal/parser"
 	"github.com/remoteoss/dexter/internal/store"
 )
@@ -38,9 +40,10 @@ func (tf *TokenizedFile) structKeyAt(line, col int) (moduleRef, key string, ok b
 				depth--
 				continue
 			}
-			// %Mod{ : the module tokens and dots, then %.
+			// %Mod{ : the module tokens and dots (or __MODULE__), then %.
 			k := j - 1
-			for k >= 0 && (toks[k].Kind == parser.TokModule || toks[k].Kind == parser.TokDot) {
+			for k >= 0 && (toks[k].Kind == parser.TokModule || toks[k].Kind == parser.TokDot ||
+				(toks[k].Kind == parser.TokIdent && parser.TokenText(tf.source, toks[k]) == "__MODULE__")) {
 				k--
 			}
 			if k < 0 || k == j-1 || toks[k].Kind != parser.TokPercent {
@@ -78,14 +81,37 @@ func (s *Server) structKeyDefinition(module, key string) (path string, line int,
 	toks, src := tf.tokens, tf.source
 	atom := ":" + key
 	structLine := 0
+	// depth counts do/fn blocks from the module's line; the module's body
+	// is at moduleDepth. A nested module's body (from its defmodule until
+	// depth is back at nestedAt) holds its own struct, not this one's.
+	depth, moduleDepth, nestedAt := 0, -1, -1
+scan:
 	for i := 0; i < len(toks); i++ {
 		t := toks[i]
 		if t.Line < def.Line {
 			continue
 		}
-		if t.Kind == parser.TokDefmodule && t.Line > def.Line {
-			// A nested module's struct is not this module's.
-			break
+		switch t.Kind {
+		case parser.TokDo, parser.TokFn:
+			depth++
+			if moduleDepth < 0 {
+				moduleDepth = depth
+			}
+		case parser.TokEnd:
+			depth--
+			if nestedAt >= 0 && depth == nestedAt {
+				nestedAt = -1
+			}
+			if moduleDepth >= 0 && depth < moduleDepth {
+				break scan
+			}
+		case parser.TokDefmodule:
+			if moduleDepth >= 0 && nestedAt < 0 {
+				nestedAt = depth
+			}
+		}
+		if nestedAt >= 0 {
+			continue
 		}
 		switch t.Kind {
 		case parser.TokDefstruct:
@@ -135,10 +161,12 @@ func (s *Server) structKeyLocation(tf *TokenizedFile, filePath string, line, col
 		return store.LookupResult{}, false
 	}
 	var module string
-	if moduleRef == "__MODULE__" {
-		module = extractEnclosingModuleFromTokens(tf.source, tf.tokens, line)
+	if rest, ok := strings.CutPrefix(moduleRef, "__MODULE__"); ok {
+		module = extractEnclosingModuleFromTokens(tf.source, tf.tokens, line) + rest
 	} else {
-		module = s.resolveModuleWithNesting(moduleRef, tf.ExtractAliasesInScope(line), filePath, line)
+		aliases := tf.ExtractAliasesInScope(line)
+		s.mergeAliasesFromUseTokenized(tf, aliases)
+		module = s.resolveModuleWithNesting(moduleRef, aliases, filePath, line)
 	}
 	path, defLine, found := s.structKeyDefinition(module, key)
 	if !found {
