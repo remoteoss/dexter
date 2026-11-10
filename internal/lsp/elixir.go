@@ -2,6 +2,7 @@ package lsp
 
 import (
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode"
@@ -1468,6 +1469,7 @@ func parseHelperQuoteBlockDetailed(lines []string, helperName string, fileAliase
 				if nk < n && tokens[nk].Kind == parser.TokComma {
 					call.Opts = tokCollectKeywordModuleOpts(source, tokens, n, nk+1, fileAliases)
 					call.Which, call.WhichKey = tokCollectDispatchAtom(source, tokens, n, nk+1)
+					call.forwardOpts = isUnquoteArg(source, tokens, n, nk+1)
 				}
 				transUseCalls = append(transUseCalls, call)
 			}
@@ -1664,6 +1666,10 @@ type UseCall struct {
 	// atom-dispatch __using__ resolution and are empty otherwise.
 	Which    string
 	WhichKey string
+
+	// forwardOpts is set for a use in a __using__ quote that passes the
+	// body's options on: `use Mod, unquote(opts)`.
+	forwardOpts bool
 }
 
 // dispatchAtom is the name an atom-dispatch __using__ dispatches on, preferring
@@ -1913,9 +1919,12 @@ func tokCollectKeywordModuleOpts(source []byte, tokens []parser.Token, n, pos in
 			if i+1 < n && tokens[i+1].Kind == parser.TokColon {
 				key := parser.TokenText(source, tok)
 				k := tokNextSig(tokens, n, i+2)
+				// A module, or a value that Dexter cannot read as one (a
+				// call, a variable, `Mod.pick()`), which no default replaces.
+				result[key] = unknownOpt
 				if k < n && tokens[k].Kind == parser.TokModule {
-					modName, _ := tokCollectModuleName(source, tokens, n, k)
-					if modName != "" {
+					modName, end := tokCollectModuleName(source, tokens, n, k)
+					if modName != "" && (end >= n || (tokens[end].Kind != parser.TokDot && tokens[end].Kind != parser.TokOpenParen)) {
 						result[key] = parser.ResolveModuleRef(modName, aliases, "")
 					}
 				}
@@ -1924,6 +1933,59 @@ func tokCollectKeywordModuleOpts(source []byte, tokens []parser.Token, n, pos in
 		i++
 	}
 	return result
+}
+
+// isUnquoteArg reports whether the argument at tokens[pos] is
+// `unquote(name)`, the options of a __using__ passed on.
+func isUnquoteArg(source []byte, tokens []parser.Token, n, pos int) bool {
+	i := tokNextSig(tokens, n, pos)
+	return i+3 < n && tokens[i].Kind == parser.TokIdent && parser.TokenText(source, tokens[i]) == "unquote" &&
+		tokens[i+1].Kind == parser.TokOpenParen && tokens[i+2].Kind == parser.TokIdent && tokens[i+3].Kind == parser.TokCloseParen
+}
+
+// keywordMergeEdits reads `Keyword.merge(opts, key: Mod)` (the keys win) and
+// `Keyword.merge([key: Mod], opts)` (the options win) at tokens[at], the
+// Keyword token.
+func keywordMergeEdits(source []byte, tokens []parser.Token, n, at int, aliases map[string]string) []optEdit {
+	open := tokNextSig(tokens, n, at+3)
+	if open >= n || tokens[open].Kind != parser.TokOpenParen {
+		return nil
+	}
+	first := tokNextSig(tokens, n, open+1)
+	op, from := "put", -1
+	if first < n && tokens[first].Kind == parser.TokOpenBracket {
+		op, from = "put_new", first+1
+	} else {
+		// The literal is the second argument.
+		depth := 0
+		for j := first; j < n; j++ {
+			switch tokens[j].Kind {
+			case parser.TokOpenParen, parser.TokOpenBracket, parser.TokOpenBrace:
+				depth++
+			case parser.TokCloseParen, parser.TokCloseBracket, parser.TokCloseBrace:
+				depth--
+			case parser.TokComma:
+				if depth == 0 {
+					from = j + 1
+				}
+			}
+			if from >= 0 || depth < 0 {
+				break
+			}
+		}
+		if from < 0 {
+			return nil
+		}
+		if f := tokNextSig(tokens, n, from); f < n && tokens[f].Kind == parser.TokOpenBracket {
+			from = f + 1
+		}
+	}
+	var edits []optEdit
+	for key, mod := range tokCollectKeywordModuleOpts(source, tokens, n, from, aliases) {
+		edits = append(edits, optEdit{op: op, key: key, mod: mod})
+	}
+	sort.Slice(edits, func(i, j int) bool { return edits[i].key < edits[j].key })
+	return edits
 }
 
 // usingBody is everything a single `quote do` block injects into a consumer
@@ -1935,14 +1997,25 @@ type usingBody struct {
 	transUses   []string               // modules used inside the body (double-use chains)
 	transCalls  []UseCall              // transitive uses with dispatch atom and opts preserved
 	optBindings []optBinding           // dynamic imports/uses resolved from opts
-	aliases     map[string]string      // alias short name → full module
-	derives     []string               // protocols an @derive in the body derives for the caller
-	branchUses  []string               // transUses inside a branch of the body
+	optEdits    []optEdit              // changes to opts before they are passed on
+	// optUses are the transUses that only a `Keyword.put`/`put_new` names:
+	// a module the options can pass on. The use-chain graph keeps them as
+	// edges; a lookup for one caller follows the options instead.
+	optUses    []string
+	aliases    map[string]string // alias short name → full module
+	derives    []string          // protocols an @derive in the body derives for the caller
+	branchUses []string          // transUses inside a branch of the body
 }
 
 func (b *usingBody) isEmpty() bool {
 	return b == nil || (len(b.imports) == 0 && len(b.inlineDefs) == 0 &&
 		len(b.transUses) == 0 && len(b.transCalls) == 0 && len(b.optBindings) == 0 && len(b.aliases) == 0)
+}
+
+// isOptUse reports whether moduleName is a transUse only because the
+// options can pass it on (see optUses).
+func (b *usingBody) isOptUse(moduleName string) bool {
+	return slices.Contains(b.optUses, moduleName)
 }
 
 func (b *usingBody) hasTransCall(moduleName string) bool {
@@ -2172,14 +2245,14 @@ func addStructInlineDefs(inlineDefs map[string][]inlineDef, tok parser.Token, so
 // Uses the tokenizer so that heredocs, multi-line expressions, and comments are
 // handled correctly without line-joining heuristics.
 func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inlineDef, transUses []string, optBindings []optBinding, aliases map[string]string) {
-	imported, inlineDefs, transUses, _, optBindings, aliases, _, _ = parseUsingBodyDetailed(text)
+	imported, inlineDefs, transUses, _, optBindings, aliases, _, _, _, _ = parseUsingBodyDetailed(text)
 	return
 }
 
 // parseUsingBodyDetailed also returns the protocols that an `@derive` in the
 // body derives for each module that uses it, and the transitive uses that are
 // inside a branch (if, case, ...) of the body.
-func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[string][]inlineDef, transUses []string, transCalls []UseCall, optBindings []optBinding, aliases map[string]string, derives []string, branchUses []string) {
+func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[string][]inlineDef, transUses []string, transCalls []UseCall, optBindings []optBinding, aliases map[string]string, derives []string, branchUses []string, optEdits []optEdit, optUses []string) {
 	source := []byte(text)
 	tokens := parser.Tokenize(source)
 	n := len(tokens)
@@ -2421,7 +2494,13 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 				if j+2 < n && tokens[j+1].Kind == parser.TokOpenParen && tokens[j+2].Kind == parser.TokIdent {
 					varName := source[tokens[j+2].Start:tokens[j+2].End]
 					if b, ok := varToOpt[string(varName)]; ok {
-						optBindings = append(optBindings, optBinding{optKey: b.optKey, defaultMod: b.defaultMod, kind: "use"})
+						forward := false
+						if end := j + 3; end < n && tokens[end].Kind == parser.TokCloseParen {
+							if c := nextSig(end + 1); c < n && tokens[c].Kind == parser.TokComma {
+								forward = isUnquoteArg(source, tokens, n, c+1)
+							}
+						}
+						optBindings = append(optBindings, optBinding{optKey: b.optKey, defaultMod: b.defaultMod, kind: "use", forwardOpts: forward})
 					}
 				}
 				i = skipToEndOfStatement(tokens, n, j)
@@ -2446,6 +2525,7 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 				if nk < n && tokens[nk].Kind == parser.TokComma {
 					call.Opts = tokCollectKeywordModuleOpts(source, tokens, n, nk+1, fileAliases)
 					call.Which, call.WhichKey = tokCollectDispatchAtom(source, tokens, n, nk+1)
+					call.forwardOpts = isUnquoteArg(source, tokens, n, nk+1)
 				}
 				transCalls = append(transCalls, call)
 			}
@@ -2644,8 +2724,27 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 							varToOpt[identName] = varBinding{optKey: atomKey}
 						}
 					case "put", "put_new":
-						if atomKey != "" && defaultMod != "" {
-							transUses = append(transUses, resolveAlias(defaultMod))
+						// opts = Keyword.put_new(opts, :key, Mod): the options
+						// that this body passes on have the key.
+						if atomKey != "" {
+							mod := unknownOpt
+							if defaultMod != "" {
+								mod = resolveAlias(defaultMod)
+								transUses = append(transUses, mod)
+								optUses = append(optUses, mod)
+							}
+							optEdits = append(optEdits, optEdit{op: funcName, key: atomKey, mod: mod})
+						}
+					case "delete":
+						if atomKey != "" {
+							optEdits = append(optEdits, optEdit{op: "delete", key: atomKey})
+						}
+					case "merge":
+						optEdits = append(optEdits, keywordMergeEdits(source, tokens, n, k, fileAliases)...)
+					}
+					if funcName == "pop" || funcName == "pop!" || funcName == "pop_lazy" {
+						if atomKey != "" {
+							optEdits = append(optEdits, optEdit{op: "delete", key: atomKey})
 						}
 					}
 					i = endJ
@@ -2702,6 +2801,11 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 							varToOpt[string(varName)] = varBinding{optKey: atomKey, defaultMod: resolveAlias(defaultMod)}
 						} else if (funcName == "fetch" || funcName == "fetch!" || funcName == "pop_lazy") && atomKey != "" {
 							varToOpt[string(varName)] = varBinding{optKey: atomKey}
+						}
+						if (funcName == "pop" || funcName == "pop!" || funcName == "pop_lazy") && atomKey != "" {
+							// {mod, opts} = Keyword.pop(opts, :key): the options
+							// passed on no longer have the key.
+							optEdits = append(optEdits, optEdit{op: "delete", key: atomKey})
 						}
 						i = endJ
 						continue

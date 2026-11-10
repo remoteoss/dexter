@@ -117,6 +117,13 @@ func (s *Server) LookupName(module, function string, opts NameLookupOptions) ([]
 			}
 		}
 	}
+	if len(results) == 0 && opts.Kind != NameKindType {
+		// A use chain that reads an option Dexter cannot know: its `use`
+		// line, not a default that can be wrong.
+		if use, ok := s.unknownUseLine(module, function); ok {
+			results = []store.LookupResult{use}
+		}
+	}
 	if len(results) == 0 && opts.FallbackToModule {
 		results, err = s.store.LookupModule(module)
 		if err != nil {

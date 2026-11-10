@@ -661,3 +661,149 @@ end
 		t.Errorf("key after a one-line nested module = %v, want the field line lib/bb_site2.ex:5", got)
 	}
 }
+
+// A `use unquote(mod)` chain where an outer __using__ changes the options
+// before it passes them on: PL.Outer does Keyword.put_new(opts, :base,
+// PL.Second) and `use PL.Wrapper, unquote(opts)`; PL.Wrapper does
+// Keyword.pop(opts, :base, PL.Base) and `use unquote(mod), unquote(opts)`.
+// PL.Second does not use PL.Base.
+func TestRegression_UseUnquoteOptionFromAnOuterUsing(t *testing.T) {
+	lib := []bbFile{
+		{"lib/pl_base.ex", `defmodule PL.Base do
+  defmacro __using__(_opts) do
+    quote do
+      def new(args, opts \\ []), do: {:base, args, opts}
+    end
+  end
+end
+`},
+		{"lib/pl_second.ex", `defmodule PL.Second do
+  defmacro __using__(_opts) do
+    quote do
+      def new(args, opts \\ []), do: {:second, args, opts}
+    end
+  end
+end
+`},
+		{"lib/pl_wrapper.ex", `defmodule PL.Wrapper do
+  defmacro __using__(opts) do
+    {mod, opts} = Keyword.pop(opts, :base, PL.Base)
+
+    quote do
+      use unquote(mod), unquote(opts)
+    end
+  end
+end
+`},
+		{"lib/pl_outer.ex", `defmodule PL.Outer do
+  defmacro __using__(opts) do
+    opts = Keyword.put_new(opts, :base, PL.Second)
+
+    quote do
+      use PL.Wrapper, unquote(opts)
+    end
+  end
+end
+`},
+		{"lib/pl_forcer.ex", `defmodule PL.Forcer do
+  defmacro __using__(opts) do
+    opts = Keyword.put(opts, :base, PL.Second)
+
+    quote do
+      use PL.Wrapper, unquote(opts)
+    end
+  end
+end
+`},
+		{"lib/pl_merger.ex", `defmodule PL.Merger do
+  defmacro __using__(opts) do
+    opts = Keyword.merge([base: PL.Second], opts)
+
+    quote do
+      use PL.Wrapper, unquote(opts)
+    end
+  end
+end
+`},
+		{"lib/pl_picker.ex", `defmodule PL.Picker do
+  defmacro __using__(opts) do
+    opts = Keyword.put_new(opts, :base, pick())
+
+    quote do
+      use PL.Wrapper, unquote(opts)
+    end
+  end
+
+  def pick, do: PL.Second
+end
+`},
+	}
+	workers := []bbFile{
+		{"lib/pl_worker.ex", `defmodule PL.Worker do
+  use PL.Outer, queue: :default
+end
+`},
+		{"lib/pl_own_worker.ex", `defmodule PL.OwnWorker do
+  use PL.Outer, base: PL.Base
+end
+`},
+		{"lib/pl_plain_worker.ex", `defmodule PL.PlainWorker do
+  use PL.Wrapper
+end
+`},
+		{"lib/pl_forced_worker.ex", `defmodule PL.ForcedWorker do
+  use PL.Forcer, base: PL.Base
+end
+`},
+		{"lib/pl_merged_worker.ex", `defmodule PL.MergedWorker do
+  use PL.Merger
+end
+`},
+		{"lib/pl_picked_worker.ex", `defmodule PL.PickedWorker do
+  use PL.Picker
+end
+`},
+	}
+	caller := bbFile{"lib/pl_caller.ex", `defmodule PL.Caller do
+  def a(args), do: args |> PL.Worker.new()
+  def b(args), do: args |> PL.OwnWorker.new()
+  def c(args), do: args |> PL.PlainWorker.new()
+  def d(args), do: args |> PL.PickedWorker.new()
+  def e(args), do: args |> PL.ForcedWorker.new()
+  def f(args), do: args |> PL.MergedWorker.new()
+end
+`}
+	server, cleanup := bbServer(t, append(append(lib, workers...), caller)...)
+	defer cleanup()
+	uri := bbOpen(t, server, caller)
+	for _, tt := range []struct {
+		name, marker string
+		want         []string // any of these
+		notWant      []string
+	}{
+		{"the outer put_new", "PL.Worker.new", []string{"lib/pl_second.ex:4"}, []string{"lib/pl_base.ex:4"}},
+		{"the caller's option wins over put_new", "PL.OwnWorker.new", []string{"lib/pl_base.ex:4"}, []string{"lib/pl_second.ex:4"}},
+		{"no step sets the key: the default", "PL.PlainWorker.new", []string{"lib/pl_base.ex:4"}, []string{"lib/pl_second.ex:4"}},
+		{"put wins over the caller's option", "PL.ForcedWorker.new", []string{"lib/pl_second.ex:4"}, []string{"lib/pl_base.ex:4"}},
+		{"merge with the options last: put_new", "PL.MergedWorker.new", []string{"lib/pl_second.ex:4"}, []string{"lib/pl_base.ex:4"}},
+		{"a value that cannot be known: the use line", "PL.PickedWorker.new", []string{"lib/pl_picked_worker.ex:2"}, []string{"lib/pl_base.ex:4", "lib/pl_second.ex:4"}},
+	} {
+		l, c := bbPos(t, caller.src, tt.marker, "new")
+		got := bbLines(definitionAt(t, server, uri, l, c), server.projectRoot)
+		t.Logf("%s: %v", tt.name, got)
+		for _, bad := range tt.notWant {
+			if bbHas(got, bad) {
+				t.Errorf("%s: definition = %v, must not give %s", tt.name, got, bad)
+			}
+		}
+		if len(tt.want) > 0 {
+			ok := false
+			for _, w := range tt.want {
+				ok = ok || bbHas(got, w)
+			}
+			if !ok {
+				t.Errorf("%s: definition = %v, want %v", tt.name, got, tt.want)
+			}
+		}
+	}
+}
