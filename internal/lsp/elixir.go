@@ -1431,6 +1431,9 @@ func parseHelperQuoteBlockDetailed(lines []string, helperName string, fileAliase
 	n := len(tokens)
 
 	resolveAlias := func(modName string) string {
+		if modName == unknownOpt {
+			return modName
+		}
 		if resolved := parser.ResolveModuleRef(modName, aliases, ""); resolved != modName {
 			return resolved
 		}
@@ -1538,7 +1541,7 @@ func parseHelperQuoteBlockDetailed(lines []string, helperName string, fileAliase
 				if nk < n && tokens[nk].Kind == parser.TokComma {
 					call.Opts = tokCollectKeywordModuleOpts(source, tokens, n, nk+1, fileAliases)
 					call.Which, call.WhichKey = tokCollectDispatchAtom(source, tokens, n, nk+1)
-					call.forwardEdits, call.forwardOpts = forwardedOpts(source, tokens, n, nk+1, vars, fileAliases)
+					call.forwardEdits, call.forwardOpts, call.callerWins = forwardedOpts(source, tokens, n, nk+1, vars, fileAliases)
 				}
 				transUseCalls = append(transUseCalls, call)
 			}
@@ -1742,6 +1745,10 @@ type UseCall struct {
 	// those options had there.
 	forwardOpts  bool
 	forwardEdits []optEdit
+	// callerWins is set when the options passed on win over the literal
+	// ones of the use: `unquote(opts) ++ [k: X]` (the first value of a key
+	// wins) and `Keyword.merge([k: X], unquote(opts))` (the second does).
+	callerWins bool
 }
 
 // dispatchAtom is the name an atom-dispatch __using__ dispatches on, preferring
@@ -2057,16 +2064,66 @@ func (v optVars) derive(src string, edits []optEdit) []optEdit {
 	return append(slices.Clone(v[src]), edits...)
 }
 
-// forwardedOpts reads the options argument of a use at tokens[pos]:
-// `unquote(opts)` or `unquote(Keyword.put_new(opts, :key, Mod))`. It
-// returns the edits that the passed options have, and ok false when the
-// argument does not pass the options on.
-func forwardedOpts(source []byte, tokens []parser.Token, n, pos int, vars optVars, aliases map[string]string) ([]optEdit, bool) {
-	i := tokNextSig(tokens, n, pos)
-	if i+2 >= n || tokens[i].Kind != parser.TokIdent || parser.TokenText(source, tokens[i]) != "unquote" || tokens[i+1].Kind != parser.TokOpenParen {
-		return nil, false
+// forwardedOpts reads the options argument of a use at tokens[pos]: when
+// it passes the body's options on, the edits they have there and true. The
+// options can be all of it (`unquote(opts)`, `unquote(Keyword.put_new(opts,
+// :k, X))`) or mixed with literal ones (`[k: X] ++ unquote(opts)`, `[{:k, X}
+// | unquote(opts)]`, `[k: X, unquote_splicing(opts)]`, `Keyword.merge(...)`);
+// callerWins is then whether they win over the literal ones.
+func forwardedOpts(source []byte, tokens []parser.Token, n, pos int, vars optVars, aliases map[string]string) (edits []optEdit, ok, callerWins bool) {
+	start := tokNextSig(tokens, n, pos)
+	if start >= n {
+		return nil, false, false
 	}
-	inner := tokNextSig(tokens, n, i+2)
+	merge := start+3 < n && tokens[start].Kind == parser.TokModule && parser.TokenText(source, tokens[start]) == "Keyword" &&
+		tokens[start+1].Kind == parser.TokDot && parser.TokenText(source, tokens[start+2]) == "merge" && tokens[start+3].Kind == parser.TokOpenParen
+	end := skipToEndOfStatement(tokens, n, start)
+	// The unquote at the top level of the argument, of its list, or of the
+	// merge call.
+	depth, arg := 0, 0
+	for i := start; i < end && i < n; i++ {
+		switch tokens[i].Kind {
+		case parser.TokOpenParen, parser.TokOpenBracket, parser.TokOpenBrace:
+			depth++
+			continue
+		case parser.TokCloseParen, parser.TokCloseBracket, parser.TokCloseBrace:
+			depth--
+			continue
+		case parser.TokComma:
+			if merge && depth == 1 {
+				arg++
+			}
+			continue
+		}
+		if depth > 1 || tokens[i].Kind != parser.TokIdent || i+1 >= n || tokens[i+1].Kind != parser.TokOpenParen {
+			continue
+		}
+		switch name := parser.TokenText(source, tokens[i]); {
+		case name == "unquote" || name == "unquote_splicing":
+			e, found := unquotedOpts(source, tokens, n, i+2, vars, aliases)
+			if !found {
+				return nil, false, false
+			}
+			if merge {
+				return e, true, arg == 1
+			}
+			// The first value of a key wins: the options win when they come
+			// first and something follows.
+			closing := matchingBracket(tokens, n, i+1)
+			if i != start || closing < 0 {
+				return e, true, false
+			}
+			next := tokNextSig(tokens, n, closing+1)
+			return e, true, next < end && next < n && tokens[next].Kind != parser.TokEOL && tokens[next].Kind != parser.TokEOF
+		}
+	}
+	return nil, false, false
+}
+
+// unquotedOpts reads the inside of an unquote at tokens[inner]: a variable
+// or an edit of one.
+func unquotedOpts(source []byte, tokens []parser.Token, n, inner int, vars optVars, aliases map[string]string) ([]optEdit, bool) {
+	inner = tokNextSig(tokens, n, inner)
 	if inner+1 < n && tokens[inner].Kind == parser.TokIdent && tokens[inner+1].Kind == parser.TokCloseParen {
 		return slices.Clone(vars[parser.TokenText(source, tokens[inner])]), true
 	}
@@ -2649,6 +2706,9 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 	inlineDefs = make(map[string][]inlineDef)
 
 	resolveAlias := func(modName string) string {
+		if modName == unknownOpt {
+			return modName
+		}
 		if resolved := parser.ResolveModuleRef(modName, aliases, ""); resolved != modName {
 			return resolved
 		}
@@ -2747,6 +2807,7 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 	// scanKeywordCall checks if tokens starting at i match:
 	//   Keyword.{get|pop|put|put_new|fetch|fetch!|pop!|pop_lazy}(ident, :key [, Default])
 	// Returns (funcName, argIdent, atomKey, defaultModule, endPos) or empty strings if no match.
+	// defaultModule is unknownOpt for a default that is a call.
 	scanKeywordCall := func(i int) (string, string, string, int) {
 		// Expect: TokModule("Keyword") TokDot TokIdent(funcName) TokOpenParen
 		if i+3 >= n {
@@ -2813,10 +2874,11 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 		if tokens[j].Kind == parser.TokComma {
 			j = nextSig(j + 1)
 			defaultMod, endJ := collectModuleName(j)
-			if defaultMod != "" && endJ < n && (tokens[endJ].Kind == parser.TokDot || tokens[endJ].Kind == parser.TokOpenParen) {
-				// `Mod.pick()` or `Mod()`: a call, whose value Dexter cannot
-				// read, not the module Mod.
-				defaultMod = ""
+			if (defaultMod != "" && endJ < n && (tokens[endJ].Kind == parser.TokDot || tokens[endJ].Kind == parser.TokOpenParen)) ||
+				(j+1 < n && tokens[j].Kind == parser.TokIdent && tokens[j+1].Kind == parser.TokOpenParen) {
+				// `Mod.pick()`, `Mod()`, or `build()`: a call, whose value
+				// Dexter cannot read, not the module Mod.
+				return funcName, atomKey, unknownOpt, skipToEndOfStatement(tokens, n, j)
 			}
 			if defaultMod != "" {
 				// Advance to close paren
@@ -2894,7 +2956,7 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 						binding := optBinding{optKey: b.optKey, defaultMod: b.defaultMod, kind: "use", readEdits: b.readEdits}
 						if end := j + 3; end < n && tokens[end].Kind == parser.TokCloseParen {
 							if c := nextSig(end + 1); c < n && tokens[c].Kind == parser.TokComma {
-								binding.forwardEdits, binding.forwardOpts = forwardedOpts(source, tokens, n, c+1, vars, fileAliases)
+								binding.forwardEdits, binding.forwardOpts, _ = forwardedOpts(source, tokens, n, c+1, vars, fileAliases)
 							}
 						}
 						optBindings = append(optBindings, binding)
@@ -2922,7 +2984,7 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 				if nk < n && tokens[nk].Kind == parser.TokComma {
 					call.Opts = tokCollectKeywordModuleOpts(source, tokens, n, nk+1, fileAliases)
 					call.Which, call.WhichKey = tokCollectDispatchAtom(source, tokens, n, nk+1)
-					call.forwardEdits, call.forwardOpts = forwardedOpts(source, tokens, n, nk+1, vars, fileAliases)
+					call.forwardEdits, call.forwardOpts, call.callerWins = forwardedOpts(source, tokens, n, nk+1, vars, fileAliases)
 				}
 				transCalls = append(transCalls, call)
 			}
@@ -3059,7 +3121,7 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 				funcName := string(source[tokens[i+2].Start:tokens[i+2].End])
 				if funcName == "put" || funcName == "put_new" {
 					_, atomKey, defaultMod, endJ := scanKeywordCall(i)
-					if atomKey != "" && defaultMod != "" {
+					if atomKey != "" && defaultMod != "" && defaultMod != unknownOpt {
 						optUses = append(optUses, resolveAlias(defaultMod))
 					}
 					i = endJ

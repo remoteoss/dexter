@@ -145,12 +145,14 @@ func callOpts(call UseCall, consumer map[string]string) map[string]string {
 		return call.Opts
 	}
 	out := make(map[string]string)
-	for k, v := range effectiveOpts(consumer, call.forwardEdits, true) {
-		out[k] = v
+	forwarded := effectiveOpts(consumer, call.forwardEdits, true)
+	if call.callerWins {
+		maps.Copy(out, call.Opts)
+		maps.Copy(out, forwarded)
+		return out
 	}
-	for k, v := range call.Opts {
-		out[k] = v
-	}
+	maps.Copy(out, forwarded)
+	maps.Copy(out, call.Opts)
 	return out
 }
 
