@@ -5875,6 +5875,8 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 				find := tf.FindFunctionDefinition
 				if tf.InTypespec(lineNum) {
 					find = tf.FindTypeDefinition
+				} else if arity, ok := tf.callArityAt(lineNum, col, functionName); ok {
+					find = func(name string) (int, bool) { return tf.FindFunctionDefinitionArity(name, arity) }
 				}
 				if line, found := find(functionName); found {
 					return s.hoverFromBuffer(tf, text, line-1)

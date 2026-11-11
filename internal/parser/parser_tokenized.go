@@ -1316,6 +1316,8 @@ func CollectParams(source []byte, tokens []Token, n, i int) (int, int, []string,
 	var paramNames []string
 	currentParamName := ""
 	seenDefault := false
+	first := NextSigToken(tokens, n, i)
+	inKeywords := first < n && isKeywordPairKey(tokens, first)
 
 	for i < n && bracketDepth > 0 {
 		tok := tokens[i]
@@ -1346,6 +1348,12 @@ func CollectParams(source []byte, tokens []Token, n, i int) (int, int, []string,
 			i++
 		case TokComma:
 			if bracketDepth == 1 {
+				// Trailing keyword pairs are one parameter, a keyword list:
+				// `def f(a, b: 1, c: 2)` is f/2.
+				if next := NextSigToken(tokens, n, i+1); inKeywords && next < n && isKeywordPairKey(tokens, next) {
+					i++
+					continue
+				}
 				commas++
 				if seenDefault {
 					defaults++
@@ -1353,6 +1361,9 @@ func CollectParams(source []byte, tokens []Token, n, i int) (int, int, []string,
 				paramNames = append(paramNames, currentParamName)
 				currentParamName = ""
 				seenDefault = false
+				if next := NextSigToken(tokens, n, i+1); next < n && isKeywordPairKey(tokens, next) {
+					inKeywords = true
+				}
 			}
 			i++
 		case TokBackslash:

@@ -289,3 +289,49 @@ func TestCallHierarchy_IncomingCallsOfTheArity(t *testing.T) {
 		t.Errorf("incoming calls of display_name/2 miss AG.User.b/1: %v", callers)
 	}
 }
+
+// Hover on a local call takes the head of the call's arity from the buffer.
+func TestHover_LocalCallOfTheArity(t *testing.T) {
+	lib := bbFile{"lib/arity_local_hover.ex", `defmodule AL.Jobs do
+  @doc "Runs one job."
+  def run(job), do: run(job, [])
+
+  @doc "Runs a job with options."
+  def run(job, opts), do: {job, opts}
+
+  def go(job), do: run(job, [])
+end
+`}
+	server, cleanup := bbServer(t, lib)
+	defer cleanup()
+	uri := bbOpen(t, server, lib)
+	l, c := bbPos(t, lib.src, "def go(job), do: run(job, [])", "run")
+	h := hoverAt(t, server, uri, l, c)
+	if h == nil || !strings.Contains(h.Contents.Value, "Runs a job with options.") {
+		t.Errorf("hover on a local run/2 = %v, want the doc of run/2", h)
+	}
+}
+
+// A head with trailing keyword pairs takes one keyword list: def f(a, b: 1,
+// c: 2) is f/2, and the call f(x, b: 2) is one of its references.
+func TestReferences_KeywordHead(t *testing.T) {
+	lib := bbFile{"lib/arity_kw.ex", `defmodule AK.Mod do
+  def f(a), do: a
+  def f(a, b: 1, c: 2), do: a
+end
+`}
+	user := bbFile{"lib/arity_kw_user.ex", `defmodule AK.User do
+  def a(x), do: AK.Mod.f(x, b: 2)
+  def b(x), do: AK.Mod.f(x)
+end
+`}
+	server, cleanup := bbServer(t, lib, user)
+	defer cleanup()
+	locs, err := server.ReferenceNames("AK.Mod", "f", NameReferenceOptions{Kind: NameKindCallable, Arity: 2, HasArity: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := nameLines(locs, server.projectRoot); strings.Join(got, " ") != "lib/arity_kw_user.ex:2" {
+		t.Errorf("references of f/2 = %v, want lib/arity_kw_user.ex:2", got)
+	}
+}

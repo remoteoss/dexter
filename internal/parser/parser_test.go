@@ -4479,3 +4479,25 @@ end
 		}
 	}
 }
+
+// Trailing keyword pairs in a head are one parameter, as in a call.
+func TestParseText_KeywordHeadArity(t *testing.T) {
+	defs, _, err := ParseText("/x.ex", "defmodule K do\n  def f(a, b: 1, c: 2), do: a\n  def g(b: 1), do: 1\n  def h(a, opts \\\\ [b: 1]), do: {a, opts}\nend\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, d := range defs {
+		if d.Function != "" {
+			got[fmt.Sprintf("%s/%d", d.Function, d.Arity)] = true
+		}
+	}
+	for _, want := range []string{"f/2", "g/1", "h/1", "h/2"} {
+		if !got[want] {
+			t.Errorf("missing %s; got %v", want, got)
+		}
+	}
+	if got["f/3"] {
+		t.Errorf("f(a, b: 1, c: 2) indexed as f/3; got %v", got)
+	}
+}

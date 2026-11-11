@@ -502,28 +502,10 @@ func tokenArity(src []byte, toks []parser.Token, i int) (lo, hi int, known bool)
 	if j >= len(toks) || toks[j].Kind != parser.TokOpenParen {
 		return 0, 0, true
 	}
-	n := callArgs(toks, j)
-	if head {
-		defaults := 0
-		depth := 0
-		for k := j; k < len(toks); k++ {
-			switch toks[k].Kind {
-			case parser.TokOpenParen, parser.TokOpenBracket, parser.TokOpenBrace, parser.TokOpenAngle:
-				depth++
-			case parser.TokCloseParen, parser.TokCloseBracket, parser.TokCloseBrace, parser.TokCloseAngle:
-				depth--
-			case parser.TokBackslash:
-				if depth == 1 {
-					defaults++
-				}
-			}
-			if depth == 0 {
-				break
-			}
-		}
-		return n - defaults, n, true
-	}
-	return n, n, true
+	// A head: its parameters, with default arguments a range, counted as
+	// the index counts them.
+	n, defaults, _, _ := parser.CollectParams(src, toks, len(toks), j)
+	return n - defaults, n, true
 }
 
 // siteColumnsAnyArity is siteColumns without the arity check.

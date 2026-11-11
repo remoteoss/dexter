@@ -113,6 +113,26 @@ func (tf *TokenizedFile) FindFunctionDefinition(functionName string) (int, bool)
 	return tf.findDefinition(functionName, false)
 }
 
+// FindFunctionDefinitionArity is FindFunctionDefinition for the function of
+// one arity: the first head whose arities (a range with default arguments)
+// have it, else the first head of the name.
+func (tf *TokenizedFile) FindFunctionDefinitionArity(functionName string, arity int) (int, bool) {
+	for i := 0; i < tf.n; i++ {
+		switch tf.tokens[i].Kind {
+		case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
+			parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate:
+			name, nameIdx, ok := parser.StaticDeclarationName(tf.source, tf.tokens, tf.n, i)
+			if !ok || name != functionName {
+				continue
+			}
+			if lo, hi, known := tokenArity(tf.source, tf.tokens, nameIdx); known && arity >= lo && arity <= hi {
+				return tf.tokens[i].Line, true
+			}
+		}
+	}
+	return tf.FindFunctionDefinition(functionName)
+}
+
 // FindTypeDefinition is FindFunctionDefinition with the opposite preference:
 // use it when the cursor sits in a typespec, where a bare name refers to the
 // type rather than to a function of the same name.
