@@ -1350,7 +1350,9 @@ func CollectParams(source []byte, tokens []Token, n, i int) (int, int, []string,
 			if bracketDepth == 1 {
 				// Trailing keyword pairs are one parameter, a keyword list:
 				// `def f(a, b: 1, c: 2)` is f/2.
-				if next := NextSigToken(tokens, n, i+1); inKeywords && next < n && isKeywordPairKey(tokens, next) {
+				next := NextSigToken(tokens, n, i+1)
+				if (inKeywords && next < n && isKeywordPairKey(tokens, next)) || (next < n && tokens[next].Kind == TokCloseParen) {
+					// The next keyword pair, or a trailing comma.
 					i++
 					continue
 				}
@@ -1361,7 +1363,7 @@ func CollectParams(source []byte, tokens []Token, n, i int) (int, int, []string,
 				paramNames = append(paramNames, currentParamName)
 				currentParamName = ""
 				seenDefault = false
-				if next := NextSigToken(tokens, n, i+1); next < n && isKeywordPairKey(tokens, next) {
+				if next < n && isKeywordPairKey(tokens, next) {
 					inKeywords = true
 				}
 			}

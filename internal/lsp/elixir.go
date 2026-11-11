@@ -116,7 +116,9 @@ func (tf *TokenizedFile) FindFunctionDefinition(functionName string) (int, bool)
 // FindFunctionDefinitionArity is FindFunctionDefinition for the function of
 // one arity: the first head whose arities (a range with default arguments)
 // have it, else the first head of the name.
-func (tf *TokenizedFile) FindFunctionDefinitionArity(functionName string, arity int) (int, bool) {
+// Only heads in module, the module of the call, count: a nested module's
+// function of that name and arity is another function.
+func (tf *TokenizedFile) FindFunctionDefinitionArity(functionName, module string, arity int) (int, bool) {
 	for i := 0; i < tf.n; i++ {
 		switch tf.tokens[i].Kind {
 		case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
@@ -125,7 +127,11 @@ func (tf *TokenizedFile) FindFunctionDefinitionArity(functionName string, arity 
 			if !ok || name != functionName {
 				continue
 			}
-			if lo, hi, known := tokenArity(tf.source, tf.tokens, nameIdx); known && arity >= lo && arity <= hi {
+			lo, hi, known := tokenArity(tf.source, tf.tokens, nameIdx)
+			if !known || arity < lo || arity > hi {
+				continue
+			}
+			if extractEnclosingModuleFromTokens(tf.source, tf.tokens, tf.tokens[i].Line-1) == module {
 				return tf.tokens[i].Line, true
 			}
 		}

@@ -4482,7 +4482,7 @@ end
 
 // Trailing keyword pairs in a head are one parameter, as in a call.
 func TestParseText_KeywordHeadArity(t *testing.T) {
-	defs, _, err := ParseText("/x.ex", "defmodule K do\n  def f(a, b: 1, c: 2), do: a\n  def g(b: 1), do: 1\n  def h(a, opts \\\\ [b: 1]), do: {a, opts}\nend\n")
+	defs, _, err := ParseText("/x.ex", "defmodule K do\n  def f(a, b: 1, c: 2), do: a\n  def g(b: 1), do: 1\n  def h(a, opts \\\\ [b: 1]), do: {a, opts}\n  def k(\n        a,\n        b: 1,\n      ), do: a\nend\n")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4492,7 +4492,7 @@ func TestParseText_KeywordHeadArity(t *testing.T) {
 			got[fmt.Sprintf("%s/%d", d.Function, d.Arity)] = true
 		}
 	}
-	for _, want := range []string{"f/2", "g/1", "h/1", "h/2"} {
+	for _, want := range []string{"f/2", "g/1", "h/1", "h/2", "k/2"} {
 		if !got[want] {
 			t.Errorf("missing %s; got %v", want, got)
 		}

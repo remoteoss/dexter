@@ -296,10 +296,20 @@ func TestHover_LocalCallOfTheArity(t *testing.T) {
   @doc "Runs one job."
   def run(job), do: run(job, [])
 
+  defmodule Early do
+    @doc "The early run/2."
+    def run(job, opts), do: {job, opts}
+  end
+
   @doc "Runs a job with options."
   def run(job, opts), do: {job, opts}
 
   def go(job), do: run(job, [])
+
+  defmodule Inner do
+    @doc "The inner run/2."
+    def run(job, opts), do: {job, opts}
+  end
 end
 `}
 	server, cleanup := bbServer(t, lib)
@@ -309,6 +319,10 @@ end
 	h := hoverAt(t, server, uri, l, c)
 	if h == nil || !strings.Contains(h.Contents.Value, "Runs a job with options.") {
 		t.Errorf("hover on a local run/2 = %v, want the doc of run/2", h)
+	}
+	// Definition too: the module's own run/2, not run/1 or a nested module's.
+	if got := bbLines(definitionAt(t, server, uri, l, c), server.projectRoot); len(got) != 1 || got[0] != "lib/arity_local_hover.ex:11" {
+		t.Errorf("definition of a local run/2 = %v, want lib/arity_local_hover.ex:11", got)
 	}
 }
 

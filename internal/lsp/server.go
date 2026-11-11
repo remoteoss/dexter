@@ -1889,6 +1889,9 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 			find := tf.FindFunctionDefinition
 			if tf.InTypespec(lineNum) {
 				find = tf.FindTypeDefinition
+			} else if arity, ok := tf.callArityAt(lineNum, col, functionName); ok {
+				callModule := extractEnclosingModuleFromTokens(tf.source, tf.tokens, lineNum)
+				find = func(name string) (int, bool) { return tf.FindFunctionDefinitionArity(name, callModule, arity) }
 			}
 			if line, found := find(functionName); found {
 				return []protocol.Location{{
@@ -4433,20 +4436,38 @@ func (s *Server) resolveBareFunctionModule(filePath, text string, tf *TokenizedF
 	return module
 }
 
+// hasCallable reports whether results hold a function or macro, not only a
+// type of the name.
+func hasCallable(results []store.LookupResult) bool {
+	for _, r := range results {
+		if isFunctionKind(r.Kind) {
+			return true
+		}
+	}
+	return false
+}
+
 // resolveBareFunctionModuleWithOrigin also reports whether the winner is an
 // explicit definition in the cursor file. References uses that provenance to
 // distinguish a consumer override from a function supplied by its use chain:
 // both resolve to the consumer module, but only the latter should expand across
 // other consumers of the injector.
 func (s *Server) resolveBareFunctionModuleWithOrigin(filePath, text string, tf *TokenizedFile, lineNum int, functionName string, aliases map[string]string) (module string, definedInFile bool) {
+	if tf == nil {
+		tf = NewTokenizedFile(text)
+	}
+	// The module around the cursor, read from the tokens: the index has no
+	// module end lines, so after a nested module's end it would name the
+	// nested module. A bare call there is a call of the outer module's.
+	if enclosing := extractEnclosingModuleFromTokens(tf.source, tf.tokens, lineNum); enclosing != "" {
+		if defs, err := s.store.LookupFunction(enclosing, functionName); err == nil && hasCallable(defs) {
+			return enclosing, true
+		}
+	}
 	// Check all modules in the current file with a single query, preferring
 	// the one closest to the cursor line (handles sibling nested modules).
 	if mod, ok := s.store.LookupFunctionInFile(filePath, functionName, lineNum+1); ok {
 		return mod, true
-	}
-
-	if tf == nil {
-		tf = NewTokenizedFile(text)
 	}
 
 	// Explicit imports (direct definitions only — fast store lookup)
@@ -5876,7 +5897,8 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 				if tf.InTypespec(lineNum) {
 					find = tf.FindTypeDefinition
 				} else if arity, ok := tf.callArityAt(lineNum, col, functionName); ok {
-					find = func(name string) (int, bool) { return tf.FindFunctionDefinitionArity(name, arity) }
+					callModule := extractEnclosingModuleFromTokens(tf.source, tf.tokens, lineNum)
+					find = func(name string) (int, bool) { return tf.FindFunctionDefinitionArity(name, callModule, arity) }
 				}
 				if line, found := find(functionName); found {
 					return s.hoverFromBuffer(tf, text, line-1)
