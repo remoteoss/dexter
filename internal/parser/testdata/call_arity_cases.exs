@@ -28,6 +28,9 @@ defmodule ArityCases do
     Enum.map(list, &conn.handle/1)
     Enum.map(list, &f(&1, []))
     Enum.map(list, &Mod.h(&1, 1, 2))
+    Enum.map(list, &(Mod.h/2))
+    Enum.map(list, &(f/1))
+    Enum.map(list, &(conn.handle/1))
   end
 
   def no_parens(a, b) do
@@ -138,6 +141,16 @@ defmodule ArityCases do
     f(&<<&1, 2>>, a)
     f(a in [1, 2], a not in [3])
     f(-a, a - 1)
+  end
+
+  defmacro splicing(args) do
+    quote do
+      f(unquote_splicing(args))
+      f(1, unquote_splicing(args))
+      Mod.h(unquote_splicing(args), 2)
+      f unquote_splicing(args)
+      f(unquote(args))
+    end
   end
 
   def multiline(a, b) do

@@ -42,7 +42,6 @@
 
 - **A sigil ends at its first closing delimiter** — Dexter nested a sigil's brackets, so `~s(a (b\) c)` (an escaped closer after an open bracket) hid the rest of the file from the index
 - **References list the calls on a definition's own line** — the call of `f/2` in `def f(x), do: f(x, [])` was missing
-- **Calls are read with Elixir's rules** — a `do` block belongs to the outermost call without parentheses (`if x = f(a) do`, `case f(a) || g(b) do`), a call without parentheses takes the rest of the arguments (`f(g a, b)`), a pipe into `Mix.shell().info()` goes to `info`, and `assert not x`, `if !x`, and keys such as `"a b":` and `CONFIG:` are read as Elixir reads them. A module's own function was taken for an imported one of the same name, and some calls of imported functions were missed
 - **Go-to-definition keeps the call's arity** — `Engine.insert_job(a, b, c, d)` and a piped call of arity 4 go to `insert_job/4` only, not also to `insert_job/3`; a function with default arguments matches each arity it accepts. When no definition has the arity, all are given
 - **Go-to-definition on a struct key** — `domain` in `%Site{domain: d}` (also `%Site{site | domain: d}`) goes to the key in `defstruct`, or to the schema's `field :domain` (and `embeds_*`, `belongs_to`, `has_*`), or else to the `defstruct` or `schema` line. Before, it gave nothing
 - **Hover on a `defdelegate` shows the delegate's own `@doc`** — it showed only the target's signature. A delegate without a doc still shows the target

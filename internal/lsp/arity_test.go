@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/remoteoss/dexter/internal/parser"
 	"go.lsp.dev/protocol"
 )
 
@@ -370,5 +371,157 @@ end
 	l, c := bbPos(t, lib.src, "def go(job), do: run(job, [])", "run")
 	if got := bbLines(definitionAt(t, server, uri, l, c), server.projectRoot); len(got) != 1 || got[0] != "lib/arity_outer.ex:3" {
 		t.Errorf("definition of the outer run/2 from Inner = %v, want lib/arity_outer.ex:3", got)
+	}
+}
+
+// A defdelegate with default arguments forwards each of its arities with the
+// full one: AD.Facade.f/1 and f/2 both call AD.Target.f/2.
+func TestReferences_DelegateWithDefaults(t *testing.T) {
+	target := bbFile{"lib/arity_delegate_target.ex", `defmodule AD.Target do
+  def f(a), do: a
+  def f(a, b), do: {a, b}
+end
+`}
+	facade := bbFile{"lib/arity_delegate_facade.ex", `defmodule AD.Facade do
+  defdelegate f(a, b \\ 1), to: AD.Target
+
+  def local(x), do: f(x)
+end
+`}
+	user := bbFile{"lib/arity_delegate_user.ex", `defmodule AD.User do
+  def a(x), do: AD.Facade.f(x)
+  def b(x), do: AD.Facade.f(x, x)
+  def c(x), do: AD.Target.f(x)
+end
+`}
+	server, cleanup := bbServer(t, target, facade, user)
+	defer cleanup()
+	for _, tt := range []struct {
+		arity int
+		want  []string
+	}{
+		{1, []string{"lib/arity_delegate_user.ex:4"}},
+		{2, []string{"lib/arity_delegate_facade.ex:2", "lib/arity_delegate_facade.ex:4", "lib/arity_delegate_user.ex:2", "lib/arity_delegate_user.ex:3"}},
+	} {
+		locs, err := server.ReferenceNames("AD.Target", "f", NameReferenceOptions{Kind: NameKindCallable, Arity: tt.arity, HasArity: true, FollowDelegates: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := nameLines(locs, server.projectRoot); strings.Join(got, " ") != strings.Join(tt.want, " ") {
+			t.Errorf("references of AD.Target.f/%d = %v, want %v", tt.arity, got, tt.want)
+		}
+	}
+}
+
+// Rename reads the arity of each occurrence as the index does, captures in
+// parentheses too.
+func TestTokenArity_Captures(t *testing.T) {
+	for src, want := range map[string]int{
+		"Enum.map(l, &f/2)":             2,
+		"Enum.map(l, &Mod.f/2)":         2,
+		"Enum.map(l, &(Mod.f/2))":       2,
+		"Enum.map(l, &(f/1))":           1,
+		"Enum.map(l, &Mod.f(&1, 1))":    2,
+		"Enum.map(l, &f(&1))":           1,
+		"x |> Mod.f(1)":                 2,
+		"Mod.f(unquote_splicing(a))":    -1,
+		"Mod.f(a, unquote_splicing(b))": -1,
+	} {
+		toks := parser.Tokenize([]byte(src))
+		i := -1
+		for k, tok := range toks {
+			if tok.Kind == parser.TokIdent && parser.TokenText([]byte(src), tok) == "f" {
+				i = k
+			}
+		}
+		lo, hi, known := tokenArity([]byte(src), toks, i)
+		got := -1
+		if known {
+			got = lo
+		}
+		if got != want || (known && lo != hi) {
+			t.Errorf("%s: arity = %d..%d (known %t), want %d", src, lo, hi, known, want)
+		}
+	}
+}
+
+// A local call whose only argument is a do block is a call of name/1.
+func TestReferences_LocalDoBlockCall(t *testing.T) {
+	lib := bbFile{"lib/arity_do_block.ex", `defmodule ADB.Mod do
+  defmacro wrap(do: block), do: block
+  defmacro wrap(opts, do: block), do: {opts, block}
+
+  def run(x) do
+    wrap do
+      x
+    end
+
+    wrap x do
+      x
+    end
+
+    if x do
+      wrap
+    end
+  end
+end
+`}
+	server, cleanup := bbServer(t, lib)
+	defer cleanup()
+	for _, tt := range []struct {
+		arity int
+		want  []string
+	}{
+		{1, []string{"lib/arity_do_block.ex:6"}},
+		{2, []string{"lib/arity_do_block.ex:10"}},
+	} {
+		locs, err := server.ReferenceNames("ADB.Mod", "wrap", NameReferenceOptions{Kind: NameKindCallable, Arity: tt.arity, HasArity: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := nameLines(locs, server.projectRoot); strings.Join(got, " ") != strings.Join(tt.want, " ") {
+			t.Errorf("references of wrap/%d = %v, want %v", tt.arity, got, tt.want)
+		}
+	}
+}
+
+// The hover on a function that a use chain injects is the one of the call's
+// arity, for a bare call and a qualified one.
+func TestHover_InjectedFunctionOfTheCallsArity(t *testing.T) {
+	lib := bbFile{"lib/arity_inject.ex", `defmodule AI.Lib do
+  defmacro __using__(_opts) do
+    quote do
+      @doc "Builds from one."
+      def build(a), do: a
+
+      @doc "Builds from two."
+      def build(a, b), do: {a, b}
+    end
+  end
+end
+`}
+	user := bbFile{"lib/arity_inject_user.ex", `defmodule AI.User do
+  use AI.Lib
+
+  def one(x), do: build(x)
+  def two(x), do: build(x, x)
+end
+`}
+	caller := bbFile{"lib/arity_inject_caller.ex", `defmodule AI.Caller do
+  def one(x), do: AI.User.build(x)
+  def two(x), do: AI.User.build(x, x)
+end
+`}
+	server, cleanup := bbServer(t, lib, user, caller)
+	defer cleanup()
+	for _, f := range []bbFile{user, caller} {
+		uri := bbOpen(t, server, f)
+		for marker, want := range map[string]string{"build(x)": "Builds from one.", "build(x, x)": "Builds from two."} {
+			l, c := bbPos(t, f.src, marker, "build")
+			h := hoverAt(t, server, uri, l, c)
+			if h == nil || !strings.Contains(h.Contents.Value, want) {
+				t.Errorf("%s: hover on %s = %v, want %q", f.rel, marker, h, want)
+			}
+		}
 	}
 }

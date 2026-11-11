@@ -6,7 +6,8 @@
 # A pipe gives its target one more argument, a do block is one keyword
 # argument, and a capture `&name/2` has the arity after the slash. Calls in
 # #{} interpolations are included; the Kernel.to_string/1 that interpolation
-# adds is not. A file that does not parse is skipped.
+# adds is not. A call with an unquote_splicing argument has arity -1. A file
+# that does not parse is skipped.
 
 defmodule CallArityOracle do
   @name ~r/\A[a-z_][a-zA-Z0-9_]*[?!]?\z/
@@ -57,14 +58,14 @@ defmodule CallArityOracle do
 
   # A remote call: Mod.name(args) or :mod.name(args).
   defp call({{:., _, [recv, name]}, meta, args}, extra, acc) when is_atom(name) and is_list(args) do
-    acc = if meta[:from_interpolation], do: acc, else: record(acc, meta, name, length(args) + extra)
+    acc = if meta[:from_interpolation], do: acc, else: record(acc, meta, name, arity(args, extra))
     acc = walk(recv, acc)
     Enum.reduce(args, acc, &walk/2)
   end
 
   # A local call, or in a pipe a name without parentheses (`x |> name`).
   defp call({name, meta, args}, extra, acc) when is_atom(name) and is_list(meta) and (is_list(args) or (is_atom(args) and extra > 0)) do
-    acc = record(acc, meta, name, if(is_list(args), do: length(args), else: 0) + extra)
+    acc = record(acc, meta, name, if(is_list(args), do: arity(args, extra), else: extra))
     if is_list(args), do: Enum.reduce(args, acc, &walk/2), else: acc
   end
 
@@ -75,6 +76,12 @@ defmodule CallArityOracle do
   defp call({left, right}, _extra, acc), do: walk(right, walk(left, acc))
   defp call(list, _extra, acc) when is_list(list), do: Enum.reduce(list, acc, &walk/2)
   defp call(_other, _extra, acc), do: acc
+
+  # An unquote_splicing argument gives the call a number of arguments that
+  # only the macro knows: -1, as Dexter reads it.
+  defp arity(args, extra) do
+    if Enum.any?(args, &match?({:unquote_splicing, _, [_]}, &1)), do: -1, else: length(args) + extra
+  end
 
   defp record(acc, meta, name, arity) do
     text = Atom.to_string(name)

@@ -455,31 +455,11 @@ func tokenArity(src []byte, toks []parser.Token, i int) (lo, hi int, known bool)
 			parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate,
 			parser.TokAttrSpec, parser.TokAttrCallback:
 			head = true
-		case parser.TokOther:
-			if parser.TokenText(src, toks[prev]) == "&" {
-				// &f/2, or &f(&1, &2)
-				j := i + 1
-				if j+1 < len(toks) && toks[j].Kind == parser.TokOther && parser.TokenText(src, toks[j]) == "/" && toks[j+1].Kind == parser.TokNumber {
-					if n, err := strconv.Atoi(parser.TokenText(src, toks[j+1])); err == nil {
-						return n, n, true
-					}
-				}
-			}
 		}
 	}
+	// A capture (`&f/2`, `&Mod.f/2`, `&(Mod.f/2)`) is read with the calls,
+	// by parser.CallArity.
 	j := i + 1
-	// A qualified capture: &Mod.f/2. The & is before the qualifier.
-	if j+1 < len(toks) && toks[j].Kind == parser.TokOther && parser.TokenText(src, toks[j]) == "/" && toks[j+1].Kind == parser.TokNumber {
-		k := i - 1
-		for k >= 0 && (toks[k].Kind == parser.TokDot || toks[k].Kind == parser.TokModule || toks[k].Kind == parser.TokIdent) {
-			k--
-		}
-		if k >= 0 && toks[k].Kind == parser.TokOther && parser.TokenText(src, toks[k]) == "&" {
-			if n, err := strconv.Atoi(parser.TokenText(src, toks[j+1])); err == nil {
-				return n, n, true
-			}
-		}
-	}
 	if j < len(toks) && toks[j].Kind == parser.TokColon {
 		// A keyword key: `f: 2` in only:, except:, @optional_callbacks,
 		// defoverridable.
@@ -696,11 +676,12 @@ func (p *parsedSource) bareCallArities(name string) map[int][]int {
 			add(t.Line, a)
 		}
 	}
+	interpArities := parser.InterpArities{Source: p.src, Spans: p.interpSpans}
 	for i, t := range p.interp {
 		if t.Kind != parser.TokIdent || parser.TokenText(p.src, t) != name || (i > 0 && p.interp[i-1].Kind == parser.TokDot) {
 			continue
 		}
-		add(t.Line, parser.InterpCallArity(p.src, p.interpSpans, t))
+		add(t.Line, interpArities.Arity(t))
 	}
 	return out
 }

@@ -3,7 +3,9 @@ package lsp
 import (
 	"cmp"
 	"context"
+	"maps"
 	"runtime/debug"
+	"slices"
 	"sync"
 
 	"github.com/remoteoss/dexter/internal/beam"
@@ -311,65 +313,161 @@ func (s *Server) ReferenceNames(module, function string, opts NameReferenceOptio
 // that uses module (moduleRefs has the use lines), and the index records its
 // bare calls there as calls of module.
 func (s *Server) delegateReferences(ctx context.Context, module, function string, moduleRefs []store.ReferenceResult, opts NameReferenceOptions) ([]store.ReferenceResult, error) {
-	lookupRefs := s.referenceLookup(opts)
-	withArity := opts.HasArity
+	injected := delegateHeads(s.injectedDelegatesTo(module, function))
 	delegates, _ := s.store.LookupDelegatesTo(module, function)
-	injected := s.injectedDelegatesTo(module, function)
-	if len(delegates) == 0 && len(injected) == 0 {
+	heads := delegateHeads(delegates)
+	if len(heads) == 0 && len(injected) == 0 {
 		return nil, nil
 	}
+	filtered := opts.HasArity && opts.arities != nil
+	// A facade forwards each of its arities with the full arity of its head
+	// (`defdelegate f(a, b \\ 1)` calls the target's f/2 from f/1 too), so a
+	// head is a reference when its full arity is requested, and then the
+	// calls of all its arities are.
+	forwards := func(h delegateHead) bool { return !filtered || opts.arities[h.Arity] }
+	setOf := func(h delegateHead) map[int]bool {
+		if !filtered {
+			return nil
+		}
+		return h.arities
+	}
 	var out []store.ReferenceResult
-	facades := make(map[string][]string) // facade function → facade modules
+	facades := make(map[string][]string)           // facade function → facade modules
+	facadeArities := make(map[string]map[int]bool) // facade function → arities (nil: all)
+	addFacade := func(fn string, set map[int]bool, mods ...string) {
+		if len(mods) == 0 {
+			return
+		}
+		cur, ok := facadeArities[fn]
+		switch {
+		case !ok && set != nil:
+			facadeArities[fn] = maps.Clone(set)
+		case set == nil || cur == nil:
+			facadeArities[fn] = nil
+		default:
+			maps.Copy(cur, set)
+		}
+		facades[fn] = append(facades[fn], mods...)
+	}
 	// A facade in a __using__ quote is in each module that uses the quote's
 	// module; the index records its bare calls there as calls of that module.
 	for _, d := range injected {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		out = append(out, store.ReferenceResult{FilePath: d.FilePath, Line: d.Line, Kind: siteDelegate, Arity: -1})
-		if refs, err := lookupRefs(d.Module, d.Function); err == nil {
-			out = append(out, refs...)
+		if !forwards(d) {
+			continue
 		}
-		users, _ := s.store.LookupReferences(d.Module, "")
-		for _, u := range users {
+		out = append(out, store.ReferenceResult{FilePath: d.FilePath, Line: d.Line, Kind: siteDelegate, Arity: -1})
+		out = append(out, s.facadeReferences(d.Module, d.Function, setOf(d))...)
+		var users []string
+		refs, _ := s.store.LookupReferences(d.Module, "")
+		for _, u := range refs {
 			if u.Kind != "use" {
 				continue
 			}
 			if user := s.store.LookupEnclosingModule(u.FilePath, u.Line); user != "" && user != d.Module {
-				facades[d.Function] = append(facades[d.Function], user)
+				users = append(users, user)
 			}
 		}
+		addFacade(d.Function, setOf(d), users...)
 	}
-	for _, d := range delegates {
+	for _, d := range heads {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+		if !forwards(d) {
+			continue
+		}
 		out = append(out, store.ReferenceResult{FilePath: d.FilePath, Line: d.Line, Kind: siteDelegate, Arity: -1})
 		if d.Module != module {
-			facades[d.Function] = append(facades[d.Function], d.Module)
-			out = append(out, s.findBareCallRefs(d.Module, d.Function, withArity)...)
+			addFacade(d.Function, setOf(d), d.Module)
+			out = append(out, withAritiesIn(s.findBareCallRefs(d.Module, d.Function, filtered), setOf(d))...)
 			continue
 		}
 		if d.Function != function {
-			if refs, err := lookupRefs(module, d.Function); err == nil {
-				out = append(out, refs...)
-			}
+			out = append(out, s.facadeReferences(module, d.Function, setOf(d))...)
 		}
+		var users []string
 		for _, u := range moduleRefs {
 			if u.Kind != "use" {
 				continue
 			}
 			if user := s.store.LookupEnclosingModule(u.FilePath, u.Line); user != "" && user != module {
-				facades[d.Function] = append(facades[d.Function], user)
+				users = append(users, user)
 			}
 		}
+		addFacade(d.Function, setOf(d), users...)
 	}
 	for fn, mods := range facades {
 		if refs, err := s.store.LookupReferencesInModules(mods, fn); err == nil {
-			out = append(out, refs...)
+			out = append(out, withAritiesIn(refs, facadeArities[fn])...)
 		}
 	}
 	return out, nil
+}
+
+// delegateHead is one defdelegate line, with the arities that its head
+// defines; Arity is the full one.
+type delegateHead struct {
+	store.DelegateEntry
+	arities map[int]bool
+}
+
+// delegateHeads groups the entries of a defdelegate with default arguments,
+// one for each arity, into one head.
+func delegateHeads(entries []store.DelegateEntry) []delegateHead {
+	type key struct {
+		path string
+		line int
+	}
+	index := make(map[key]int, len(entries))
+	var heads []delegateHead
+	for _, e := range entries {
+		k := key{e.FilePath, e.Line}
+		i, ok := index[k]
+		if !ok {
+			index[k] = len(heads)
+			heads = append(heads, delegateHead{DelegateEntry: e, arities: map[int]bool{e.Arity: true}})
+			continue
+		}
+		heads[i].arities[e.Arity] = true
+		if e.Arity > heads[i].Arity {
+			heads[i].Arity = e.Arity
+		}
+	}
+	return heads
+}
+
+// facadeReferences are the calls of a facade function with an arity of set
+// (all calls when set is nil).
+func (s *Server) facadeReferences(module, function string, set map[int]bool) []store.ReferenceResult {
+	var refs []store.ReferenceResult
+	var err error
+	if set == nil {
+		refs, err = s.store.LookupReferences(module, function)
+	} else {
+		refs, err = s.store.LookupReferencesWithArity(module, function, slices.Collect(maps.Keys(set)))
+	}
+	if err != nil {
+		return nil
+	}
+	return withAritiesIn(refs, set)
+}
+
+// withAritiesIn keeps the references with an arity of set or an unknown one
+// (all of them when set is nil), and marks each as unknown: a facade call is
+// a call of the target with the head's full arity, whatever its own.
+func withAritiesIn(refs []store.ReferenceResult, set map[int]bool) []store.ReferenceResult {
+	out := refs[:0]
+	for _, r := range refs {
+		if set != nil && r.Arity >= 0 && !set[r.Arity] {
+			continue
+		}
+		r.Arity = -1
+		out = append(out, r)
+	}
+	return out
 }
 
 // referenceLookup returns the query of a function's references for opts:
@@ -567,8 +665,8 @@ func (s *Server) injectedDelegatesTo(module, function string) []store.DelegateEn
 
 	byTarget := make(map[string][]store.DelegateEntry)
 	type siteKey struct {
-		path string
-		line int
+		path        string
+		line, arity int
 	}
 	seen := make(map[siteKey]bool)
 	for _, e := range s.loadUsingEntries() {
@@ -578,13 +676,13 @@ func (s *Server) injectedDelegatesTo(module, function string) []store.DelegateEn
 					if d.kind != "defdelegate" || d.delegateTo == "" {
 						continue
 					}
-					k := siteKey{e.entry.filePath, d.line}
+					k := siteKey{e.entry.filePath, d.line, d.arity}
 					if seen[k] {
 						continue
 					}
 					seen[k] = true
 					target := d.delegateTo + "\x00" + cmp.Or(d.delegateAs, name)
-					byTarget[target] = append(byTarget[target], store.DelegateEntry{Module: e.module, Function: name, DelegateAs: d.delegateAs, FilePath: e.entry.filePath, Line: d.line})
+					byTarget[target] = append(byTarget[target], store.DelegateEntry{Module: e.module, Function: name, DelegateAs: d.delegateAs, FilePath: e.entry.filePath, Line: d.line, Arity: d.arity})
 				}
 			}
 		}

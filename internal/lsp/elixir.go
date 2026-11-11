@@ -2867,6 +2867,11 @@ func findBareCallLines(source []byte, tokens, interp []parser.Token, functionNam
 		if !isCall && parser.NoParenArgCount(source, tokens, i) >= 0 {
 			isCall = true
 		}
+		// A call whose only argument is a do block: `functionName do ... end`
+		// (not `if name do`, where the do is if's).
+		if !isCall && j < n && tokens[j].Kind == parser.TokDo && parser.CallArity(source, tokens, i) >= 1 {
+			isCall = true
+		}
 		// Check for pipe call: |> functionName
 		if !isCall && i > 0 {
 			// Look back for |> (may have EOL/comments between)

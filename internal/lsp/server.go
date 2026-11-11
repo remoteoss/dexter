@@ -5921,7 +5921,7 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 
 		// Fallback for use-chain inline defs (not stored as module definitions)
 		if results := s.lookupThroughUse(text, functionName, aliases); len(results) > 0 {
-			return s.hoverFromFile(functionName, results[0])
+			return s.hoverFromFile(functionName, byArityAt(tf, lineNum, col, functionName, results)[0])
 		}
 
 		// Generated functions have no source definition to hover: a macro emitted
@@ -6715,7 +6715,18 @@ func (s *Server) planFunctionRename(module, functionName, newName string, reques
 			delegates = append(delegates, s.injectedDelegatesTo(m, functionName)...)
 		}
 		var facadeStale indexStaleness
+		// A head with default arguments has an entry for each arity: change
+		// its line once.
+		type delegateLine struct {
+			path string
+			line int
+		}
+		changedDelegates := make(map[delegateLine]bool, len(delegates))
 		for _, del := range delegates {
+			if changedDelegates[delegateLine{del.FilePath, del.Line}] {
+				continue
+			}
+			changedDelegates[delegateLine{del.FilePath, del.Line}] = true
 			if s.isStdlibPath(del.FilePath) {
 				continue
 			}

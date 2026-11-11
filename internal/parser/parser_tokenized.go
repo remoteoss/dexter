@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -271,7 +272,9 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token, int
 
 	// emitInjected records an unqualified call of name as a ref to each
 	// injector that can bring the name in.
-	emitInjected := func(name string, pos int) {
+	// noParenArgs is NoParenArgCount at pos when the caller has it, or
+	// argsUnread.
+	emitInjectedArgs := func(name string, pos, noParenArgs int) {
 		cm := currentModule()
 		arity := -2 // not read yet
 		for mod := range injectors {
@@ -279,12 +282,14 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token, int
 				continue
 			}
 			if arity == -2 {
-				arity = callArity(source, tokens, n, pos)
+				arity = callArityArgs(source, tokens, n, pos, noParenArgs)
 			}
 			injected = append(injected, injectedRef{len(refs), cm, arity})
 			refs = append(refs, Reference{Module: mod, Function: name, Arity: arity, Line: tokens[pos].Line, FilePath: path, Kind: callKind(pos)})
 		}
 	}
+
+	emitInjected := func(name string, pos int) { emitInjectedArgs(name, pos, argsUnread) }
 
 	emitModuleRef := func(modName string, line int, kind string) {
 		resolved := resolveModule(modName, currentModule())
@@ -937,14 +942,16 @@ func parseTextFromTokens(path string, source []byte, tokens, interp []Token, int
 					i++
 					continue
 				}
-				if !isStatementStart && !isParenthesizedCall && tokens[i-1].Kind != TokDot && NoParenArgCount(source, tokens, i) >= 0 {
-					// A call without parentheses inside an expression:
-					// `value = name arg`, `do: name arg`.
-					if name := tokenText(tok); !elixirKeyword[name] {
-						emitInjected(name, i)
+				if !isStatementStart && !isParenthesizedCall && tokens[i-1].Kind != TokDot {
+					if args := NoParenArgCount(source, tokens, i); args >= 0 {
+						// A call without parentheses inside an expression:
+						// `value = name arg`, `do: name arg`.
+						if name := tokenText(tok); !elixirKeyword[name] {
+							emitInjectedArgs(name, i, args)
+						}
+						i++
+						continue
 					}
-					i++
-					continue
 				}
 				if isStatementStart || isParenthesizedCall {
 					name := tokenText(tok)
@@ -1118,9 +1125,10 @@ func callRefKind(int) string { return "call" }
 // arity there is read from its interpolation (see InterpCallArity).
 func collectModuleRefs(source []byte, path string, toks []Token, from, to int, aliases map[string]string, cm, selfModule string, kindAt func(int) string, interpSpans []Span, refs []Reference) []Reference {
 	tn := len(toks)
+	interpArities := InterpArities{Source: source, Spans: interpSpans}
 	arityAt := func(pos int) int {
 		if interpSpans != nil {
-			return InterpCallArity(source, interpSpans, toks[pos])
+			return interpArities.Arity(toks[pos])
 		}
 		return callArity(source, toks, tn, pos)
 	}
@@ -1145,7 +1153,7 @@ func collectModuleRefs(source []byte, path string, toks []Token, from, to int, a
 				if interpSpans != nil {
 					ref.Arity = -1
 					if k-1 < tn {
-						ref.Arity = InterpCallArity(source, interpSpans, toks[k-1])
+						ref.Arity = interpArities.Arity(toks[k-1])
 					}
 				}
 				refs = append(refs, ref)
@@ -1326,11 +1334,13 @@ func CollectParams(source []byte, tokens []Token, n, i int) (int, int, []string,
 			bracketDepth++
 			hasContent = true
 			i++
-		case TokOpenAngle:
+		case TokOpenAngle, TokFn, TokDo:
+			// `<<a, b>>`, and a default `fn a, b -> a end` or
+			// `if x do ... end`, whose commas are not between parameters.
 			bracketDepth++
 			hasContent = true
 			i++
-		case TokCloseAngle:
+		case TokCloseAngle, TokEnd:
 			bracketDepth--
 			i++
 		case TokCloseParen, TokCloseBracket, TokCloseBrace:
@@ -1548,18 +1558,21 @@ func copyImportFilters(m map[string]importFilter) map[string]importFilter {
 // one more for a do block. It returns -1 when the tokens do not show the
 // arity (a name alone can be a variable or a call with no arguments).
 func callArity(source []byte, tokens []Token, n, pos int) int {
+	return callArityArgs(source, tokens, n, pos, argsUnread)
+}
+
+// argsUnread is the noParenArgs of callArityArgs when the caller has not
+// counted them.
+const argsUnread = -2
+
+// callArityArgs is callArity, with NoParenArgCount at pos given when the
+// caller has it (or argsUnread).
+func callArityArgs(source []byte, tokens []Token, n, pos, noParenArgs int) int {
 	// A qualified call (`Mod.Sub.f`, `conn.f`, `:mod.f`) has its capture `&`
 	// or its pipe before the qualifier.
 	start := qualifierStart(source, tokens, pos)
-	if start == pos {
-		if a := captureArity(source, tokens, n, pos); a >= 0 {
-			return a
-		}
-	} else if start > 0 && tokens[start-1].Kind == TokOther && TokenText(source, tokens[start-1]) == "&" &&
-		pos+2 < n && tokens[pos+1].Kind == TokOther && TokenText(source, tokens[pos+1]) == "/" && tokens[pos+2].Kind == TokNumber {
-		if a, err := strconv.Atoi(TokenText(source, tokens[pos+2])); err == nil {
-			return a
-		}
+	if a := captureSlashArity(source, tokens, n, start, pos); a >= 0 {
+		return a
 	}
 	piped := false
 	if prev := prevSigToken(tokens, start-1); prev >= 0 && tokens[prev].Kind == TokPipe {
@@ -1573,7 +1586,10 @@ func callArity(source []byte, tokens []Token, n, pos int) int {
 	open := pos + 1
 	// `f (x)`, with a space, is a call without parentheses of `(x)`.
 	if open >= n || tokens[open].Kind != TokOpenParen || tokens[open].Start != tokens[pos].End {
-		args := NoParenArgCount(source, tokens, pos)
+		args := noParenArgs
+		if args == argsUnread {
+			args = NoParenArgCount(source, tokens, pos)
+		}
 		if args < 0 && open < n && tokens[open].Kind == TokDo && ownsDoBlock(source, tokens, pos) {
 			// `setup do ... end`: the do block is the only argument.
 			args = 1
@@ -1646,6 +1662,9 @@ scan:
 			angles = bitstringDepth(source, tokens, i, angles)
 		}
 		if argStart && depth == 0 && angles == 0 && t.Kind != TokCloseParen {
+			if splices(source, t) {
+				return -1
+			}
 			argStart = false
 			isKey := isKeywordPairKey(tokens, i)
 			if !isKey || !inKeywords {
@@ -1690,6 +1709,12 @@ scan:
 		args++
 	}
 	return args
+}
+
+// splices reports whether an argument starts with unquote_splicing, which
+// gives the call a number of arguments that only the macro knows.
+func splices(source []byte, t Token) bool {
+	return t.Kind == TokIdent && TokenText(source, t) == "unquote_splicing"
 }
 
 // NoParenArgCount counts the arguments of a call written without
@@ -1750,6 +1775,9 @@ scan:
 			}
 		}
 		if argStart && depth == 0 && angles == 0 {
+			if splices(source, t) {
+				return -1
+			}
 			argStart = false
 			isKey := isKeywordPairKey(tokens, i)
 			if !isKey || !inKeywords {
@@ -2035,10 +2063,28 @@ func prevSigToken(tokens []Token, i int) int {
 // captureArity returns the arity of a capture `&name/2` whose name is at
 // pos, or -1 when the name is not captured that way.
 func captureArity(source []byte, tokens []Token, n, pos int) int {
-	if pos == 0 || tokens[pos-1].Kind != TokOther || TokenText(source, tokens[pos-1]) != "&" {
+	return captureSlashArity(source, tokens, n, pos, pos)
+}
+
+// captureSlashArity is the N of a capture `&name/N`, `&Mod.name/N`, or one in
+// parentheses (`&(Mod.name/N)`), where the name is tokens[pos] and its
+// qualifier starts at tokens[start]; -1 for anything else.
+func captureSlashArity(source []byte, tokens []Token, n, start, pos int) int {
+	isAmp := func(i int) bool {
+		return i >= 0 && tokens[i].Kind == TokOther && TokenText(source, tokens[i]) == "&"
+	}
+	parens := false
+	switch {
+	case isAmp(start - 1):
+	case start >= 2 && tokens[start-1].Kind == TokOpenParen && isAmp(start-2):
+		parens = true
+	default:
 		return -1
 	}
 	if pos+2 >= n || tokens[pos+1].Kind != TokOther || TokenText(source, tokens[pos+1]) != "/" || tokens[pos+2].Kind != TokNumber {
+		return -1
+	}
+	if parens && (pos+3 >= n || tokens[pos+3].Kind != TokCloseParen) {
 		return -1
 	}
 	a := 0
@@ -2054,20 +2100,44 @@ func captureArity(source []byte, tokens []Token, n, pos int) int {
 // InterpCallArity is the arity of the call whose name is the token name of
 // the #{} stream, or -1. That stream holds no brackets, so the innermost
 // interpolation around the name is tokenized on its own, and the call is
-// read there as it is anywhere else.
+// read there as it is anywhere else. For many names, use an InterpArities.
 func InterpCallArity(source []byte, spans []Span, name Token) int {
+	r := InterpArities{Source: source, Spans: spans}
+	return r.Arity(name)
+}
+
+// InterpArities reads the arities of the calls of one file's #{} stream
+// (see InterpCallArity), and tokenizes each interpolation once.
+type InterpArities struct {
+	Source []byte
+	Spans  []Span // InterpSpans: ordered by End, an inner one first
+
+	cached int // the span that toks holds, +1 (0: none)
+	toks   []Token
+}
+
+// Arity is InterpCallArity of name.
+func (r *InterpArities) Arity(name Token) int {
+	spans := r.Spans
+	// Spans nest or do not meet, and are ordered by End, so the innermost
+	// one around the name is the first that ends at or after it and starts
+	// before it.
 	best := -1
-	for i, sp := range spans {
-		if sp.Start <= name.Start && name.End <= sp.End && (best < 0 || sp.End-sp.Start < spans[best].End-spans[best].Start) {
+	for i := sort.Search(len(spans), func(i int) bool { return spans[i].End >= name.End }); i < len(spans); i++ {
+		if spans[i].Start <= name.Start {
 			best = i
+			break
 		}
 	}
 	if best < 0 {
 		return -1
 	}
 	sp := spans[best]
-	frag := source[sp.Start:sp.End]
-	toks := Tokenize(frag)
+	frag := r.Source[sp.Start:sp.End]
+	if r.cached != best+1 {
+		r.cached, r.toks = best+1, Tokenize(frag)
+	}
+	toks := r.toks
 	at := name.Start - sp.Start
 	idx := TokenAtOffset(toks, at)
 	if idx < 0 || toks[idx].Start != at || toks[idx].Kind != TokIdent {

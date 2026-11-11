@@ -2106,6 +2106,7 @@ type DelegateEntry struct {
 	DelegateAs string // the target function name (empty if same as Function)
 	FilePath   string
 	Line       int
+	Arity      int // the facade arity; a head with defaults has a row for each
 }
 
 // LookupDelegatesTo returns all defdelegate definitions that forward the given
@@ -2113,10 +2114,10 @@ type DelegateEntry struct {
 // equals target) and the as: case (delegate_as equals target function name).
 func (s *Store) LookupDelegatesTo(targetModule, targetFunction string) ([]DelegateEntry, error) {
 	rows, err := s.db.Query(
-		`SELECT d.module, d.function, d.delegate_as, f.path, d.line FROM definitions d JOIN files f ON f.id = d.file_id
+		`SELECT d.module, d.function, d.delegate_as, f.path, d.line, d.arity FROM definitions d JOIN files f ON f.id = d.file_id
 		 WHERE d.kind = 'defdelegate' AND d.delegate_to = ? AND d.delegate_as = '' AND d.function = ?
 		 UNION ALL
-		 SELECT d.module, d.function, d.delegate_as, f.path, d.line FROM definitions d JOIN files f ON f.id = d.file_id
+		 SELECT d.module, d.function, d.delegate_as, f.path, d.line, d.arity FROM definitions d JOIN files f ON f.id = d.file_id
 		 WHERE d.kind = 'defdelegate' AND d.delegate_to = ? AND d.delegate_as = ?`,
 		targetModule, targetFunction, targetModule, targetFunction,
 	)
@@ -2128,7 +2129,7 @@ func (s *Store) LookupDelegatesTo(targetModule, targetFunction string) ([]Delega
 	var results []DelegateEntry
 	for rows.Next() {
 		var r DelegateEntry
-		if err := rows.Scan(&r.Module, &r.Function, &r.DelegateAs, &r.FilePath, &r.Line); err != nil {
+		if err := rows.Scan(&r.Module, &r.Function, &r.DelegateAs, &r.FilePath, &r.Line, &r.Arity); err != nil {
 			return nil, err
 		}
 		results = append(results, r)

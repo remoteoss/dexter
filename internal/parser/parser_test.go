@@ -4501,3 +4501,27 @@ func TestParseText_KeywordHeadArity(t *testing.T) {
 		t.Errorf("f(a, b: 1, c: 2) indexed as f/3; got %v", got)
 	}
 }
+
+// The commas of a default `fn ... end` or `do ... end` are not between
+// parameters.
+func TestParseText_DefaultWithBlockArity(t *testing.T) {
+	defs, _, err := ParseText("/x.ex", "defmodule K do\n  def f(a, sorter \\\\ fn x, y -> x <= y end), do: {a, sorter}\n  def g(a, b \\\\ if(true, do: 1, else: 2), c \\\\ if true do 1 else 2 end), do: {a, b, c}\n  def h(list, fun \\\\ fn\n        x, y -> {x, y}\n      end), do: {list, fun}\nend\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, d := range defs {
+		if d.Function != "" {
+			got[fmt.Sprintf("%s/%d", d.Function, d.Arity)] = true
+		}
+	}
+	want := []string{"f/1", "f/2", "g/1", "g/2", "g/3", "h/1", "h/2"}
+	for _, w := range want {
+		if !got[w] {
+			t.Errorf("missing %s; got %v", w, got)
+		}
+	}
+	if len(got) != len(want) {
+		t.Errorf("got %v, want only %v", got, want)
+	}
+}
