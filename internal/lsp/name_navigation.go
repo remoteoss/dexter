@@ -3,6 +3,7 @@ package lsp
 import (
 	"cmp"
 	"context"
+	"fmt"
 	"maps"
 	"runtime/debug"
 	"slices"
@@ -332,22 +333,22 @@ func (s *Server) delegateReferences(ctx context.Context, module, function string
 		return h.arities
 	}
 	var out []store.ReferenceResult
-	facades := make(map[string][]string)           // facade function → facade modules
-	facadeArities := make(map[string]map[int]bool) // facade function → arities (nil: all)
+	// The facade modules of each facade function and arity set: one query for
+	// each group, so that a module's calls are filtered by its own head's
+	// arities, not by those of another facade of the same name.
+	type facadeKey struct{ fn, arities string }
+	facades := make(map[facadeKey][]string)
+	facadeArities := make(map[facadeKey]map[int]bool) // nil: all
 	addFacade := func(fn string, set map[int]bool, mods ...string) {
 		if len(mods) == 0 {
 			return
 		}
-		cur, ok := facadeArities[fn]
-		switch {
-		case !ok && set != nil:
-			facadeArities[fn] = maps.Clone(set)
-		case set == nil || cur == nil:
-			facadeArities[fn] = nil
-		default:
-			maps.Copy(cur, set)
+		k := facadeKey{fn, "*"}
+		if set != nil {
+			k.arities = fmt.Sprint(slices.Sorted(maps.Keys(set)))
 		}
-		facades[fn] = append(facades[fn], mods...)
+		facades[k] = append(facades[k], mods...)
+		facadeArities[k] = set
 	}
 	// A facade in a __using__ quote is in each module that uses the quote's
 	// module; the index records its bare calls there as calls of that module.
@@ -399,9 +400,9 @@ func (s *Server) delegateReferences(ctx context.Context, module, function string
 		}
 		addFacade(d.Function, setOf(d), users...)
 	}
-	for fn, mods := range facades {
-		if refs, err := s.store.LookupReferencesInModules(mods, fn); err == nil {
-			out = append(out, withAritiesIn(refs, facadeArities[fn])...)
+	for k, mods := range facades {
+		if refs, err := s.store.LookupReferencesInModules(mods, k.fn); err == nil {
+			out = append(out, withAritiesIn(refs, facadeArities[k])...)
 		}
 	}
 	return out, nil

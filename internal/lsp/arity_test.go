@@ -388,20 +388,29 @@ end
   def local(x), do: f(x)
 end
 `}
+	// A second facade of the same name forwards only f/2; its f/1 is its own.
+	facade2 := bbFile{"lib/arity_delegate_facade2.ex", `defmodule AD.Facade2 do
+  defdelegate f(a, b), to: AD.Target
+
+  def f(a), do: a
+end
+`}
 	user := bbFile{"lib/arity_delegate_user.ex", `defmodule AD.User do
   def a(x), do: AD.Facade.f(x)
   def b(x), do: AD.Facade.f(x, x)
   def c(x), do: AD.Target.f(x)
+  def d(x), do: AD.Facade2.f(x)
+  def e(x), do: AD.Facade2.f(x, x)
 end
 `}
-	server, cleanup := bbServer(t, target, facade, user)
+	server, cleanup := bbServer(t, target, facade, facade2, user)
 	defer cleanup()
 	for _, tt := range []struct {
 		arity int
 		want  []string
 	}{
 		{1, []string{"lib/arity_delegate_user.ex:4"}},
-		{2, []string{"lib/arity_delegate_facade.ex:2", "lib/arity_delegate_facade.ex:4", "lib/arity_delegate_user.ex:2", "lib/arity_delegate_user.ex:3"}},
+		{2, []string{"lib/arity_delegate_facade.ex:2", "lib/arity_delegate_facade.ex:4", "lib/arity_delegate_facade2.ex:2", "lib/arity_delegate_user.ex:2", "lib/arity_delegate_user.ex:3", "lib/arity_delegate_user.ex:6"}},
 	} {
 		locs, err := server.ReferenceNames("AD.Target", "f", NameReferenceOptions{Kind: NameKindCallable, Arity: tt.arity, HasArity: true, FollowDelegates: true})
 		if err != nil {
