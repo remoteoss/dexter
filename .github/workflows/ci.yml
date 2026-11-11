@@ -81,6 +81,10 @@ jobs:
       - name: Run integration tests
         run: go test ./internal/lsp/ -run 'TestFormatter|TestDidSave_Formatter|TestCompletion_GeneratedFunctionsFromConsumerBEAM|TestDefinition_GeneratedFunctionsFromCompiler|TestRename_CompilesAfterEachRename|TestRenameModule_AliasCases' -v -timeout 600s
 
+      # The arity of each call, compared with the one Elixir's own parser reads.
+      - name: Compare call arities with Elixir
+        run: go test ./internal/parser/ -run 'TestCallArity_MatchesElixir' -v -timeout 600s
+
   lint:
     runs-on: ubuntu-latest
     steps:

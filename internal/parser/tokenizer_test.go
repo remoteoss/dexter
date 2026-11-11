@@ -273,9 +273,12 @@ func TestTokenize_Sigil(t *testing.T) {
 	assertKinds(t, "~s(alias Fake.Module)", []TokenKind{TokSigil})
 }
 
-// TestTokenize_SigilBracketNested verifies nested brackets inside sigil are handled.
-func TestTokenize_SigilBracketNested(t *testing.T) {
-	assertKinds(t, "~s(foo (bar) baz)", []TokenKind{TokSigil})
+// TestTokenize_SigilBracketNotNested: Elixir does not nest a sigil's
+// delimiters, so ~s(foo (bar) baz) ends after bar (and the rest is a
+// syntax error). An escaped closer does not end it.
+func TestTokenize_SigilBracketNotNested(t *testing.T) {
+	assertText(t, "~s(foo (bar) baz)", 0, "~s(foo (bar)")
+	assertKinds(t, `~s(foo (bar\) baz) x`, []TokenKind{TokSigil, TokIdent})
 }
 
 // TestTokenize_UppercaseSigilEscapedDelimiter: an uppercase sigil takes \ before

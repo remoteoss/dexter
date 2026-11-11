@@ -455,31 +455,11 @@ func tokenArity(src []byte, toks []parser.Token, i int) (lo, hi int, known bool)
 			parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate,
 			parser.TokAttrSpec, parser.TokAttrCallback:
 			head = true
-		case parser.TokOther:
-			if parser.TokenText(src, toks[prev]) == "&" {
-				// &f/2, or &f(&1, &2)
-				j := i + 1
-				if j+1 < len(toks) && toks[j].Kind == parser.TokOther && parser.TokenText(src, toks[j]) == "/" && toks[j+1].Kind == parser.TokNumber {
-					if n, err := strconv.Atoi(parser.TokenText(src, toks[j+1])); err == nil {
-						return n, n, true
-					}
-				}
-			}
 		}
 	}
+	// A capture (`&f/2`, `&Mod.f/2`, `&(Mod.f/2)`) is read with the calls,
+	// by parser.CallArity.
 	j := i + 1
-	// A qualified capture: &Mod.f/2. The & is before the qualifier.
-	if j+1 < len(toks) && toks[j].Kind == parser.TokOther && parser.TokenText(src, toks[j]) == "/" && toks[j+1].Kind == parser.TokNumber {
-		k := i - 1
-		for k >= 0 && (toks[k].Kind == parser.TokDot || toks[k].Kind == parser.TokModule || toks[k].Kind == parser.TokIdent) {
-			k--
-		}
-		if k >= 0 && toks[k].Kind == parser.TokOther && parser.TokenText(src, toks[k]) == "&" {
-			if n, err := strconv.Atoi(parser.TokenText(src, toks[j+1])); err == nil {
-				return n, n, true
-			}
-		}
-	}
 	if j < len(toks) && toks[j].Kind == parser.TokColon {
 		// A keyword key: `f: 2` in only:, except:, @optional_callbacks,
 		// defoverridable.
@@ -491,68 +471,21 @@ func tokenArity(src []byte, toks []parser.Token, i int) (lo, hi int, known bool)
 		}
 		return 0, 0, false
 	}
-	// A pipe before the call (or before its qualifier) gives the first
-	// argument.
-	piped := func() bool {
-		k := i - 1
-		for k >= 0 && (toks[k].Kind == parser.TokDot || toks[k].Kind == parser.TokModule ||
-			(toks[k].Kind == parser.TokIdent && k+1 < len(toks) && toks[k+1].Kind == parser.TokDot)) {
-			k--
-		}
-		for k >= 0 && (toks[k].Kind == parser.TokEOL || toks[k].Kind == parser.TokComment) {
-			k--
-		}
-		return k >= 0 && toks[k].Kind == parser.TokPipe
-	}
-	if j >= len(toks) || toks[j].Kind != parser.TokOpenParen {
-		if head {
-			return 0, 0, true
-		}
-		// Counted as the parser counts it for the index.
-		n := parser.NoParenArgCount(src, toks, i)
-		if piped() {
-			n = 1 + max(n, 0) // `value |> f`, `value |> f arg`
-			return n, n, true
-		}
-		if n >= 0 {
+	if !head {
+		// Counted as the parser counts it for the index (parser.CallArity),
+		// so references and the index agree on which calls are which.
+		if n := parser.CallArity(src, toks, i); n >= 0 {
 			return n, n, true
 		}
 		return 0, 0, false
 	}
-	if !head {
-		// Counted as the parser counts it for the index (parser.CallArgCount),
-		// so a rename and references agree on which calls are which.
-		n := parser.CallArgCount(toks, j)
-		if n < 0 {
-			return 0, 0, false
-		}
-		if piped() {
-			n++
-		}
-		return n, n, true
+	if j >= len(toks) || toks[j].Kind != parser.TokOpenParen {
+		return 0, 0, true
 	}
-	n := callArgs(toks, j)
-	if head {
-		defaults := 0
-		depth := 0
-		for k := j; k < len(toks); k++ {
-			switch toks[k].Kind {
-			case parser.TokOpenParen, parser.TokOpenBracket, parser.TokOpenBrace, parser.TokOpenAngle:
-				depth++
-			case parser.TokCloseParen, parser.TokCloseBracket, parser.TokCloseBrace, parser.TokCloseAngle:
-				depth--
-			case parser.TokBackslash:
-				if depth == 1 {
-					defaults++
-				}
-			}
-			if depth == 0 {
-				break
-			}
-		}
-		return n - defaults, n, true
-	}
-	return n, n, true
+	// A head: its parameters, with default arguments a range, counted as
+	// the index counts them.
+	n, defaults, _, _ := parser.CollectParams(src, toks, len(toks), j)
+	return n - defaults, n, true
 }
 
 // siteColumnsAnyArity is siteColumns without the arity check.
@@ -697,14 +630,72 @@ func (s *Server) qualifierIs(sf *siteFile, line int, q string) bool {
 
 // parsedSource is a file's text and tokens, read once for a rename plan.
 type parsedSource struct {
-	text       string
-	src        []byte
-	tokens     []parser.Token
-	interp     []parser.Token
-	lineStarts []int
+	text        string
+	src         []byte
+	tokens      []parser.Token
+	interp      []parser.Token
+	interpSpans []parser.Span
+	lineStarts  []int
 
 	modules  []string // the module at each line; see moduleAt
 	typespec []bool   // the lines in a typespec; see inTypespec
+}
+
+// bareCallArities returns, for each line, the arities of the unqualified
+// occurrences of name: a call, a capture, a pipe target, or a keyword key,
+// not a definition's own name. An occurrence whose arity cannot be read
+// gives -1. A call inside #{} is read from its interpolation.
+func (p *parsedSource) bareCallArities(name string) map[int][]int {
+	out := make(map[int][]int)
+	add := func(line, a int) {
+		for _, have := range out[line] {
+			if have == a {
+				return
+			}
+		}
+		out[line] = append(out[line], a)
+	}
+	for i, t := range p.tokens {
+		if t.Kind != parser.TokIdent || parser.TokenText(p.src, t) != name || (i > 0 && p.tokens[i-1].Kind == parser.TokDot) {
+			continue
+		}
+		if i > 0 && isHeadKeyword(p.tokens[i-1].Kind) {
+			// A definition's own name is not a call of it. A line with only
+			// a head gets an empty list: it has no call.
+			if _, seen := out[t.Line]; !seen {
+				out[t.Line] = []int{}
+			}
+			continue
+		}
+		lo, hi, known := tokenArity(p.src, p.tokens, i)
+		if !known {
+			add(t.Line, -1)
+			continue
+		}
+		for a := lo; a <= hi; a++ {
+			add(t.Line, a)
+		}
+	}
+	interpArities := parser.InterpArities{Source: p.src, Spans: p.interpSpans}
+	for i, t := range p.interp {
+		if t.Kind != parser.TokIdent || parser.TokenText(p.src, t) != name || (i > 0 && p.interp[i-1].Kind == parser.TokDot) {
+			continue
+		}
+		add(t.Line, interpArities.Arity(t))
+	}
+	return out
+}
+
+// isHeadKeyword reports whether a token kind starts a definition head, whose
+// next name is the defined function.
+func isHeadKeyword(k parser.TokenKind) bool {
+	switch k {
+	case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
+		parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate,
+		parser.TokAttrSpec, parser.TokAttrCallback:
+		return true
+	}
+	return false
 }
 
 // moduleAt is extractEnclosingModuleFromTokens for the 1-based line, from one

@@ -258,7 +258,7 @@ func dropPreFileIDSchema(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-	if !sqlText.Valid || strings.Contains(sqlText.String, "file_id") {
+	if !sqlText.Valid || (strings.Contains(sqlText.String, "file_id") && strings.Contains(sqlText.String, "arity")) {
 		return nil // already migrated
 	}
 	_, err = db.Exec(`
@@ -327,7 +327,9 @@ func createRefsTable(name string) string {
 			function TEXT NOT NULL DEFAULT '',
 			line INTEGER NOT NULL,
 			file_id INTEGER NOT NULL,
-			kind TEXT NOT NULL DEFAULT 'call'
+			kind TEXT NOT NULL DEFAULT 'call',
+			-- The arity of a call, or -1: not read, or not a function ref.
+			arity INTEGER NOT NULL DEFAULT -1
 			-- No FOREIGN KEY here on purpose. With _foreign_keys=ON every insert
 			-- costs a parent-key lookup, and refs is the table the cold index
 			-- spends most of its writer time on (3.9M rows on a large monorepo).
@@ -354,7 +356,7 @@ func createIndexes(db dbExecer) error {
 const createIndexesSQL = `
 		CREATE INDEX IF NOT EXISTS idx_definitions_module_function ON definitions(module, function);
 		CREATE INDEX IF NOT EXISTS idx_definitions_file_id_line ON definitions(file_id, line);
-		CREATE INDEX IF NOT EXISTS idx_refs_module_function ON refs(module, function, file_id, line, kind);
+		CREATE INDEX IF NOT EXISTS idx_refs_module_function ON refs(module, function, file_id, line, kind, arity);
 		CREATE INDEX IF NOT EXISTS idx_refs_file_id ON refs(file_id);
 		CREATE INDEX IF NOT EXISTS idx_definitions_delegate_to ON definitions(delegate_to);
 		-- LookupUsingModules runs on the References slow path. Without this it
@@ -566,14 +568,14 @@ func (s *Store) indexFileWithMtime(path string, mtimeNano int64, defs []parser.D
 	}
 
 	if len(refs) > 0 {
-		refStmt, err := tx.Prepare("INSERT INTO refs (module, function, line, file_id, kind) VALUES (?, ?, ?, ?, ?)")
+		refStmt, err := tx.Prepare("INSERT INTO refs (" + refInsertColumns + ") VALUES (?, ?, ?, ?, ?, ?)")
 		if err != nil {
 			return err
 		}
 		defer func() { _ = refStmt.Close() }()
 
 		for _, r := range refs {
-			if _, err := refStmt.Exec(r.Module, r.Function, r.Line, fileID, r.Kind); err != nil {
+			if _, err := refStmt.Exec(r.Module, r.Function, r.Line, fileID, r.Kind, refArity(r)); err != nil {
 				return err
 			}
 		}
@@ -606,10 +608,10 @@ func upsertFileID(tx txExecQuerier, path string, mtimeNano int64) (int64, error)
 // the driver's SQLite was compiled.
 const (
 	defColumns   = 9
-	refColumns   = 5
+	refColumns   = 6
 	maxBindVars  = 900
 	defChunkRows = maxBindVars / defColumns // 100
-	refChunkRows = maxBindVars / refColumns // 180
+	refChunkRows = maxBindVars / refColumns // 150
 )
 
 // batchMode selects how a Batch writes.
@@ -721,7 +723,7 @@ func (s *Store) BeginRebuild(ctx context.Context) (*Batch, error) {
 
 const (
 	defInsertColumns = "module, function, arity, kind, line, file_id, delegate_to, delegate_as, params"
-	refInsertColumns = "module, function, line, file_id, kind"
+	refInsertColumns = "module, function, line, file_id, kind, arity"
 )
 
 func (s *Store) beginBatch(ctx context.Context, mode batchMode) (_ *Batch, err error) {
@@ -769,7 +771,7 @@ func (s *Store) beginBatch(ctx context.Context, mode batchMode) (_ *Batch, err e
 	if b.defStmt, err = tx.Prepare("INSERT INTO " + defTable + " (" + defInsertColumns + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"); err != nil {
 		return nil, err
 	}
-	if b.refStmt, err = tx.Prepare("INSERT INTO " + refTable + " (" + refInsertColumns + ") VALUES (?, ?, ?, ?, ?)"); err != nil {
+	if b.refStmt, err = tx.Prepare("INSERT INTO " + refTable + " (" + refInsertColumns + ") VALUES (?, ?, ?, ?, ?, ?)"); err != nil {
 		return nil, err
 	}
 	fileSQL := "INSERT INTO files (path, mtime) VALUES (?, ?) ON CONFLICT(path) DO UPDATE SET mtime = excluded.mtime RETURNING id"
@@ -869,7 +871,7 @@ func (b *Batch) indexFile(path string, mtimeNano int64, defs []parser.Definition
 		}
 	}
 	for _, r := range refs {
-		b.refArgs = append(b.refArgs, r.Module, r.Function, r.Line, fileID, r.Kind)
+		b.refArgs = append(b.refArgs, r.Module, r.Function, r.Line, fileID, r.Kind, refArity(r))
 		if len(b.refArgs) == refColumns*refChunkRows {
 			_, err := b.refChunkStmt.Exec(b.refArgs...)
 			b.refArgs = b.refArgs[:0]
@@ -1843,6 +1845,18 @@ type ReferenceResult struct {
 	Line     int
 	Kind     string
 	Function string // set by LookupReferencesInModules only
+	// Arity is the call's arity, or -1 when it is not known (set by
+	// LookupReferences and LookupReferencesInModules).
+	Arity int
+}
+
+// refArity is the arity the store keeps for r: -1 for a ref without a
+// function, such as an alias or a use.
+func refArity(r parser.Reference) int {
+	if r.Function == "" {
+		return -1
+	}
+	return r.Arity
 }
 
 // LookupReferencesInModules returns the references to function in any of
@@ -1861,7 +1875,7 @@ func (s *Store) LookupReferencesInModules(modules []string, function string) ([]
 			args = append(args, m)
 		}
 		rows, err := s.db.Query(
-			"SELECT f.path, r.line, r.kind, r.function FROM refs r JOIN files f ON f.id = r.file_id WHERE r.function = ? AND r.module IN (?"+strings.Repeat(",?", end-start-1)+")",
+			"SELECT f.path, r.line, r.kind, r.function, r.arity FROM refs r JOIN files f ON f.id = r.file_id WHERE r.function = ? AND r.module IN (?"+strings.Repeat(",?", end-start-1)+")",
 			args...)
 		if err != nil {
 			return nil, err
@@ -1921,9 +1935,10 @@ func scanSortedReferences(rows *sql.Rows, withFunction bool) ([]ReferenceResult,
 		var r ReferenceResult
 		var err error
 		if withFunction {
-			err = rows.Scan(&r.FilePath, &r.Line, &r.Kind, &r.Function)
+			err = rows.Scan(&r.FilePath, &r.Line, &r.Kind, &r.Function, &r.Arity)
 		} else {
 			err = rows.Scan(&r.FilePath, &r.Line, &r.Kind)
+			r.Arity = -1
 		}
 		if err != nil {
 			return nil, err
@@ -1963,7 +1978,48 @@ func (s *Store) LookupReferences(module, function string) ([]ReferenceResult, er
 	var results []ReferenceResult
 	for rows.Next() {
 		var r ReferenceResult
+		r.Arity = -1
 		if err := rows.Scan(&r.FilePath, &r.Line, &r.Kind); err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].FilePath != results[j].FilePath {
+			return results[i].FilePath < results[j].FilePath
+		}
+		return results[i].Line < results[j].Line
+	})
+	return results, nil
+}
+
+// LookupReferencesWithArity is LookupReferences for the calls of the arities
+// given, and the references whose arity is not known. The arity is checked
+// in the covering index, so the rows of another arity cost no join.
+func (s *Store) LookupReferencesWithArity(module, function string, arities []int) ([]ReferenceResult, error) {
+	if len(arities) == 0 {
+		return s.LookupReferences(module, function)
+	}
+	args := make([]any, 0, len(arities)+2)
+	args = append(args, module, function)
+	for _, a := range arities {
+		args = append(args, a)
+	}
+	rows, err := s.db.Query(
+		"SELECT f.path, r.line, r.kind, r.arity FROM refs r JOIN files f ON f.id = r.file_id WHERE r.module = ? AND r.function = ? AND (r.arity = -1 OR r.arity IN (?"+strings.Repeat(",?", len(arities)-1)+"))",
+		args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var results []ReferenceResult
+	for rows.Next() {
+		var r ReferenceResult
+		if err := rows.Scan(&r.FilePath, &r.Line, &r.Kind, &r.Arity); err != nil {
 			return nil, err
 		}
 		results = append(results, r)
@@ -2050,6 +2106,7 @@ type DelegateEntry struct {
 	DelegateAs string // the target function name (empty if same as Function)
 	FilePath   string
 	Line       int
+	Arity      int // the facade arity; a head with defaults has a row for each
 }
 
 // LookupDelegatesTo returns all defdelegate definitions that forward the given
@@ -2057,10 +2114,10 @@ type DelegateEntry struct {
 // equals target) and the as: case (delegate_as equals target function name).
 func (s *Store) LookupDelegatesTo(targetModule, targetFunction string) ([]DelegateEntry, error) {
 	rows, err := s.db.Query(
-		`SELECT d.module, d.function, d.delegate_as, f.path, d.line FROM definitions d JOIN files f ON f.id = d.file_id
+		`SELECT d.module, d.function, d.delegate_as, f.path, d.line, d.arity FROM definitions d JOIN files f ON f.id = d.file_id
 		 WHERE d.kind = 'defdelegate' AND d.delegate_to = ? AND d.delegate_as = '' AND d.function = ?
 		 UNION ALL
-		 SELECT d.module, d.function, d.delegate_as, f.path, d.line FROM definitions d JOIN files f ON f.id = d.file_id
+		 SELECT d.module, d.function, d.delegate_as, f.path, d.line, d.arity FROM definitions d JOIN files f ON f.id = d.file_id
 		 WHERE d.kind = 'defdelegate' AND d.delegate_to = ? AND d.delegate_as = ?`,
 		targetModule, targetFunction, targetModule, targetFunction,
 	)
@@ -2072,7 +2129,7 @@ func (s *Store) LookupDelegatesTo(targetModule, targetFunction string) ([]Delega
 	var results []DelegateEntry
 	for rows.Next() {
 		var r DelegateEntry
-		if err := rows.Scan(&r.Module, &r.Function, &r.DelegateAs, &r.FilePath, &r.Line); err != nil {
+		if err := rows.Scan(&r.Module, &r.Function, &r.DelegateAs, &r.FilePath, &r.Line, &r.Arity); err != nil {
 			return nil, err
 		}
 		results = append(results, r)
