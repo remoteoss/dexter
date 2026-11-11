@@ -92,8 +92,12 @@ func (s *Server) LookupName(module, function string, opts NameLookupOptions) ([]
 	}
 	results = filterArity(results, opts)
 	var also []store.LookupResult
+	var unknownUse store.LookupResult
+	var hasUnknown bool
 	if len(results) == 0 {
-		results = filterArity(filterLookupKind(s.lookupThroughUseOfWithFollow(module, function, opts.FollowDelegates), opts.Kind), opts)
+		var injected []store.LookupResult
+		injected, unknownUse, hasUnknown = s.lookupThroughUseOfDetailed(module, function, opts.FollowDelegates)
+		results = filterArity(filterLookupKind(injected, opts.Kind), opts)
 		if len(results) > 0 && opts.Kind != NameKindType {
 			if declared := s.declaredLineOfInjected(module, function); len(declared) > 0 {
 				results, also = declared, results
@@ -120,8 +124,8 @@ func (s *Server) LookupName(module, function string, opts NameLookupOptions) ([]
 	if len(results) == 0 && opts.Kind != NameKindType {
 		// A use chain that reads an option Dexter cannot know: its `use`
 		// line, not a default that can be wrong.
-		if use, ok := s.unknownUseLine(module, function); ok {
-			results = []store.LookupResult{use}
+		if hasUnknown {
+			results = []store.LookupResult{unknownUse}
 		}
 	}
 	if len(results) == 0 && opts.FallbackToModule {
