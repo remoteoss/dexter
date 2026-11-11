@@ -349,3 +349,26 @@ end
 		t.Errorf("references of f/2 = %v, want lib/arity_kw_user.ex:2", got)
 	}
 }
+
+// A nested module that imports the outer one calls the outer function: the
+// definition is the outer head of the call's arity.
+func TestDefinition_NestedModuleCallsTheOuterArity(t *testing.T) {
+	lib := bbFile{"lib/arity_outer.ex", `defmodule AO.Outer do
+  def run(job), do: job
+  def run(job, opts), do: {job, opts}
+
+  defmodule Inner do
+    import AO.Outer
+
+    def go(job), do: run(job, [])
+  end
+end
+`}
+	server, cleanup := bbServer(t, lib)
+	defer cleanup()
+	uri := bbOpen(t, server, lib)
+	l, c := bbPos(t, lib.src, "def go(job), do: run(job, [])", "run")
+	if got := bbLines(definitionAt(t, server, uri, l, c), server.projectRoot); len(got) != 1 || got[0] != "lib/arity_outer.ex:3" {
+		t.Errorf("definition of the outer run/2 from Inner = %v, want lib/arity_outer.ex:3", got)
+	}
+}

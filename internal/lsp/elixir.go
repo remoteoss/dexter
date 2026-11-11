@@ -116,8 +116,8 @@ func (tf *TokenizedFile) FindFunctionDefinition(functionName string) (int, bool)
 // FindFunctionDefinitionArity is FindFunctionDefinition for the function of
 // one arity: the first head whose arities (a range with default arguments)
 // have it, else the first head of the name.
-// Only heads in module, the module of the call, count: a nested module's
-// function of that name and arity is another function.
+// Only heads in module, the module the call resolved to, count: a nested
+// module's function of that name and arity is another function.
 func (tf *TokenizedFile) FindFunctionDefinitionArity(functionName, module string, arity int) (int, bool) {
 	for i := 0; i < tf.n; i++ {
 		switch tf.tokens[i].Kind {

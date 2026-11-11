@@ -1890,8 +1890,8 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 			if tf.InTypespec(lineNum) {
 				find = tf.FindTypeDefinition
 			} else if arity, ok := tf.callArityAt(lineNum, col, functionName); ok {
-				callModule := extractEnclosingModuleFromTokens(tf.source, tf.tokens, lineNum)
-				find = func(name string) (int, bool) { return tf.FindFunctionDefinitionArity(name, callModule, arity) }
+				// The heads of the module the call resolved to.
+				find = func(name string) (int, bool) { return tf.FindFunctionDefinitionArity(name, fullModule, arity) }
 			}
 			if line, found := find(functionName); found {
 				return []protocol.Location{{
@@ -5897,8 +5897,8 @@ func (s *Server) Hover(ctx context.Context, params *protocol.HoverParams) (*prot
 				if tf.InTypespec(lineNum) {
 					find = tf.FindTypeDefinition
 				} else if arity, ok := tf.callArityAt(lineNum, col, functionName); ok {
-					callModule := extractEnclosingModuleFromTokens(tf.source, tf.tokens, lineNum)
-					find = func(name string) (int, bool) { return tf.FindFunctionDefinitionArity(name, callModule, arity) }
+					// The heads of the module the call resolved to.
+					find = func(name string) (int, bool) { return tf.FindFunctionDefinitionArity(name, fullModule, arity) }
 				}
 				if line, found := find(functionName); found {
 					return s.hoverFromBuffer(tf, text, line-1)
