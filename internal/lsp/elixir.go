@@ -21,6 +21,9 @@ type TokenizedFile struct {
 	// main stream by the tokenizer. Cursor lookups fall back to it, so a call
 	// written inside a string still resolves.
 	interp []parser.Token
+	// interpSpans are the byte ranges of the interpolations, for the arity of
+	// a call inside one (parser.InterpCallArity). Nil when not known.
+	interpSpans []parser.Span
 }
 
 // NewTokenizedFile tokenizes the text once for reuse across multiple queries.
@@ -28,11 +31,12 @@ func NewTokenizedFile(text string) *TokenizedFile {
 	source := []byte(text)
 	result := parser.TokenizeFull(source)
 	return &TokenizedFile{
-		source:     source,
-		tokens:     result.Tokens,
-		n:          len(result.Tokens),
-		lineStarts: result.LineStarts,
-		interp:     result.Interp,
+		source:      source,
+		tokens:      result.Tokens,
+		n:           len(result.Tokens),
+		lineStarts:  result.LineStarts,
+		interp:      result.Interp,
+		interpSpans: result.InterpSpans,
 	}
 }
 
@@ -108,6 +112,32 @@ func (tf *TokenizedFile) ResolveModuleExpr(expr string, targetLine int) string {
 // matching the given function name. Returns the 1-based line number and true if found.
 func (tf *TokenizedFile) FindFunctionDefinition(functionName string) (int, bool) {
 	return tf.findDefinition(functionName, false)
+}
+
+// FindFunctionDefinitionArity is FindFunctionDefinition for the function of
+// one arity: the first head whose arities (a range with default arguments)
+// have it, else the first head of the name.
+// Only heads in module, the module the call resolved to, count: a nested
+// module's function of that name and arity is another function.
+func (tf *TokenizedFile) FindFunctionDefinitionArity(functionName, module string, arity int) (int, bool) {
+	for i := 0; i < tf.n; i++ {
+		switch tf.tokens[i].Kind {
+		case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
+			parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate:
+			name, nameIdx, ok := parser.StaticDeclarationName(tf.source, tf.tokens, tf.n, i)
+			if !ok || name != functionName {
+				continue
+			}
+			lo, hi, known := tokenArity(tf.source, tf.tokens, nameIdx)
+			if !known || arity < lo || arity > hi {
+				continue
+			}
+			if extractEnclosingModuleFromTokens(tf.source, tf.tokens, tf.tokens[i].Line-1) == module {
+				return tf.tokens[i].Line, true
+			}
+		}
+	}
+	return tf.FindFunctionDefinition(functionName)
 }
 
 // FindTypeDefinition is FindFunctionDefinition with the opposite preference:
@@ -442,22 +472,41 @@ func FullExpressionAtCursor(tokens []parser.Token, source []byte, lineStarts []i
 // ok is false when the cursor is not on such a call or its arity cannot be
 // read, and for a definition head.
 func (tf *TokenizedFile) callArityAt(line, col int, name string) (arity int, ok bool) {
-	offset := parser.LineColToOffset(tf.lineStarts, line, col)
-	if offset < 0 {
-		return 0, false
-	}
-	idx := parser.TokenAtOffset(tf.tokens, offset)
-	if (idx < 0 || tf.tokens[idx].Kind != parser.TokIdent) && offset > 0 {
-		idx = parser.TokenAtOffset(tf.tokens, offset-1)
-	}
-	if idx < 0 || tf.tokens[idx].Kind != parser.TokIdent || parser.TokenText(tf.source, tf.tokens[idx]) != name {
-		return 0, false
-	}
-	lo, hi, known := tokenArity(tf.source, tf.tokens, idx)
-	if !known || lo != hi {
+	lo, hi, ok := tf.arityRangeAt(line, col, name)
+	if !ok || lo != hi {
 		return 0, false
 	}
 	return lo, true
+}
+
+// arityRangeAt returns the arities of the occurrence of name at the cursor:
+// one for a call, a capture, or a keyword key, and a range for a head with
+// default arguments. A call inside #{} is read from its interpolation. ok is
+// false when the cursor is not on name or its arity cannot be read.
+func (tf *TokenizedFile) arityRangeAt(line, col int, name string) (lo, hi int, ok bool) {
+	offset := parser.LineColToOffset(tf.lineStarts, line, col)
+	if offset < 0 {
+		return 0, 0, false
+	}
+	at := func(toks []parser.Token) int {
+		idx := parser.TokenAtOffset(toks, offset)
+		if (idx < 0 || toks[idx].Kind != parser.TokIdent) && offset > 0 {
+			idx = parser.TokenAtOffset(toks, offset-1)
+		}
+		if idx < 0 || toks[idx].Kind != parser.TokIdent || parser.TokenText(tf.source, toks[idx]) != name {
+			return -1
+		}
+		return idx
+	}
+	if idx := at(tf.tokens); idx >= 0 {
+		return tokenArity(tf.source, tf.tokens, idx)
+	}
+	if idx := at(tf.interp); idx >= 0 && tf.interpSpans != nil {
+		if a := parser.InterpCallArity(tf.source, tf.interpSpans, tf.interp[idx]); a >= 0 {
+			return a, a, true
+		}
+	}
+	return 0, 0, false
 }
 
 func expressionAtCursorImpl(tokens []parser.Token, source []byte, lineStarts []int, line, col int, full bool) CursorContext {
@@ -3242,28 +3291,7 @@ func findBareCallLines(source []byte, tokens, interp []parser.Token, functionNam
 	n := len(tokens)
 
 	seenLines := make(map[int]bool)
-	defLines := make(map[int]bool)
 
-	// First pass: identify definition lines to exclude
-	for i := 0; i < n; i++ {
-		tok := tokens[i]
-		switch tok.Kind {
-		case parser.TokDef, parser.TokDefp, parser.TokDefmacro, parser.TokDefmacrop,
-			parser.TokDefguard, parser.TokDefguardp, parser.TokDefdelegate:
-			name, _, ok := parser.StaticDeclarationName(source, tokens, n, i)
-			if ok && name == functionName {
-				defLines[tok.Line] = true
-			}
-		case parser.TokAttrSpec, parser.TokAttrCallback:
-			// Skip @spec and @callback lines that define this function
-			name, _, ok := parser.StaticDeclarationName(source, tokens, n, i)
-			if ok && name == functionName {
-				defLines[tok.Line] = true
-			}
-		}
-	}
-
-	// Second pass: find bare calls
 	for i := 0; i < n; i++ {
 		tok := tokens[i]
 
@@ -3273,7 +3301,9 @@ func findBareCallLines(source []byte, tokens, interp []parser.Token, functionNam
 		if parser.TokenText(source, tok) != functionName {
 			continue
 		}
-		if defLines[tok.Line] {
+		// The name of a def, @spec, or @callback head is not a call. A call
+		// on the same line is: `def f(x), do: f(x, [])` calls f/2.
+		if i > 0 && isHeadKeyword(tokens[i-1].Kind) {
 			continue
 		}
 
@@ -3294,6 +3324,11 @@ func findBareCallLines(source []byte, tokens, interp []parser.Token, functionNam
 		}
 		// A call without parentheses: functionName arg, ...
 		if !isCall && parser.NoParenArgCount(source, tokens, i) >= 0 {
+			isCall = true
+		}
+		// A call whose only argument is a do block: `functionName do ... end`
+		// (not `if name do`, where the do is if's).
+		if !isCall && j < n && tokens[j].Kind == parser.TokDo && parser.CallArity(source, tokens, i) >= 1 {
 			isCall = true
 		}
 		// Check for pipe call: |> functionName

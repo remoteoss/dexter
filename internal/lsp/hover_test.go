@@ -1275,13 +1275,14 @@ end
 	uri := "file://" + path
 	server.docs.Set(uri, src)
 
-	// line 5 is the bare call `schema(source, true, block)`
+	// line 5 is the bare call `schema(source, true, block)`: a call of
+	// schema/3, the private function (the macro is schema/2).
 	call := hoverAt(t, server, uri, 5, 4)
 	if call == nil {
 		t.Fatal("expected hover on the bare call")
 	}
-	if !strings.Contains(call.Contents.Value, "defmacro schema") {
-		t.Errorf("expected the macro signature on a call, got:\n%s", call.Contents.Value)
+	if !strings.Contains(call.Contents.Value, "defp schema(source, meta?, block)") || strings.Contains(call.Contents.Value, "@type") {
+		t.Errorf("expected the signature of schema/3 on a call, got:\n%s", call.Contents.Value)
 	}
 
 	// line 8 is `@spec build(schema()) :: schema()` — col 14 is on the type

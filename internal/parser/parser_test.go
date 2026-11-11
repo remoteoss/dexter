@@ -4433,3 +4433,95 @@ end
 		}
 	}
 }
+
+// TestParseText_ReferenceArity: each call ref carries its arity, also when a
+// pipe or a capture is before a qualifier, and inside #{}; -1 when it
+// cannot be read.
+func TestParseText_ReferenceArity(t *testing.T) {
+	src := `defmodule A do
+  import Q, only: [from: 2, where: 3]
+
+  def a(s, list) do
+    s |> Base.decode64!()
+    Enum.map(list, &Atom.to_string/1)
+    "#{Scopes.w()} #{Scopes.w(1, 2)}"
+    "#{s |> Mod.Sub.f(1)}"
+    "#{"#{Deep.g(1)}"}"
+    s |> Mod.Sub.f(1)
+    __MODULE__.g(1, 2)
+    "#{__MODULE__.h()}"
+    {MapSet.new(), MapSet.new([1])}
+    Q.go do
+      :ok
+    end
+  end
+end
+`
+	_, refs, err := ParseText("/x.ex", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, r := range refs {
+		if r.Function != "" {
+			got[fmt.Sprintf("%s.%s/%d:%d", r.Module, r.Function, r.Arity, r.Line)] = true
+		}
+	}
+	for _, want := range []string{
+		"Q.from/2:2", "Q.where/3:2",
+		"Base.decode64!/1:5", "Atom.to_string/1:6", "Enum.map/2:6",
+		"Scopes.w/0:7", "Scopes.w/2:7", "Mod.Sub.f/2:8", "Deep.g/1:9",
+		"Mod.Sub.f/2:10", "A.g/2:11", "A.h/0:12",
+		"MapSet.new/0:13", "MapSet.new/1:13", "Q.go/1:14",
+	} {
+		if !got[want] {
+			t.Errorf("missing %s; got %v", want, got)
+		}
+	}
+}
+
+// Trailing keyword pairs in a head are one parameter, as in a call.
+func TestParseText_KeywordHeadArity(t *testing.T) {
+	defs, _, err := ParseText("/x.ex", "defmodule K do\n  def f(a, b: 1, c: 2), do: a\n  def g(b: 1), do: 1\n  def h(a, opts \\\\ [b: 1]), do: {a, opts}\n  def k(\n        a,\n        b: 1,\n      ), do: a\nend\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, d := range defs {
+		if d.Function != "" {
+			got[fmt.Sprintf("%s/%d", d.Function, d.Arity)] = true
+		}
+	}
+	for _, want := range []string{"f/2", "g/1", "h/1", "h/2", "k/2"} {
+		if !got[want] {
+			t.Errorf("missing %s; got %v", want, got)
+		}
+	}
+	if got["f/3"] {
+		t.Errorf("f(a, b: 1, c: 2) indexed as f/3; got %v", got)
+	}
+}
+
+// The commas of a default `fn ... end` or `do ... end` are not between
+// parameters.
+func TestParseText_DefaultWithBlockArity(t *testing.T) {
+	defs, _, err := ParseText("/x.ex", "defmodule K do\n  def f(a, sorter \\\\ fn x, y -> x <= y end), do: {a, sorter}\n  def g(a, b \\\\ if(true, do: 1, else: 2), c \\\\ if true do 1 else 2 end), do: {a, b, c}\n  def h(list, fun \\\\ fn\n        x, y -> {x, y}\n      end), do: {list, fun}\nend\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, d := range defs {
+		if d.Function != "" {
+			got[fmt.Sprintf("%s/%d", d.Function, d.Arity)] = true
+		}
+	}
+	want := []string{"f/1", "f/2", "g/1", "g/2", "g/3", "h/1", "h/2"}
+	for _, w := range want {
+		if !got[w] {
+			t.Errorf("missing %s; got %v", w, got)
+		}
+	}
+	if len(got) != len(want) {
+		t.Errorf("got %v, want only %v", got, want)
+	}
+}

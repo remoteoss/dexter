@@ -51,6 +51,10 @@ type Definition struct {
 type Reference struct {
 	Module   string // fully-resolved module name
 	Function string // function name (empty for module-only refs like alias/import/use)
+	// Arity is the arity of a call (a pipe gives one more argument, a
+	// capture its /N, an only: key its N), or -1 when it cannot be read.
+	// The store keeps -1 for a ref without a function.
+	Arity    int
 	Line     int
 	FilePath string
 	Kind     string // "call", "alias", "import", "use", "quoted_use" (a use in a macro's quote)
@@ -78,7 +82,7 @@ func ParseText(path, text string) (defs []Definition, refs []Reference, err erro
 	}()
 	source := []byte(text)
 	result := TokenizeFull(source)
-	return parseTextFromTokens(path, source, result.Tokens, result.Interp)
+	return parseTextFromTokens(path, source, result.Tokens, result.Interp, result.InterpSpans)
 }
 
 // ScanFuncName reads a function/type name ([a-z_][a-z0-9_?!]*) from the start of s.
