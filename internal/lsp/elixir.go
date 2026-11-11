@@ -1366,11 +1366,11 @@ func skipToEndOfStatement(tokens []parser.Token, n, from int) int {
 // its `quote do` block, and extracts imports/uses/inline-defs/aliases from it.
 // Uses the tokenizer for correct heredoc and multi-line handling.
 func parseHelperQuoteBlock(lines []string, helperName string, fileAliases map[string]string) (imported []string, inlineDefs map[string][]inlineDef, transUses []string, optBindings []optBinding, aliases map[string]string) {
-	imported, inlineDefs, transUses, _, optBindings, aliases, _ = parseHelperQuoteBlockDetailed(lines, helperName, fileAliases, make(map[string]bool))
+	imported, inlineDefs, transUses, _, optBindings, aliases, _, _ = parseHelperQuoteBlockDetailed(lines, helperName, fileAliases, make(map[string]bool))
 	return
 }
 
-func parseHelperQuoteBlockDetailed(lines []string, helperName string, fileAliases map[string]string, visited map[string]bool) (imported []string, inlineDefs map[string][]inlineDef, transUses []string, transUseCalls []UseCall, optBindings []optBinding, aliases map[string]string, derives []string) {
+func parseHelperQuoteBlockDetailed(lines []string, helperName string, fileAliases map[string]string, visited map[string]bool) (imported []string, inlineDefs map[string][]inlineDef, transUses []string, transUseCalls []UseCall, optBindings []optBinding, aliases map[string]string, derives []string, optUses []string) {
 	if visited[helperName] {
 		return
 	}
@@ -1440,8 +1440,11 @@ func parseHelperQuoteBlockDetailed(lines []string, helperName string, fileAliase
 		if eq >= n || tokens[eq].Kind != parser.TokOther || parser.TokenText(source, tokens[eq]) != "=" {
 			continue
 		}
-		if src, edits, _, end, ok := readKeywordEdits(source, tokens, n, eq+1, fileAliases); ok {
+		if src, edits, mods, end, ok := readKeywordEdits(source, tokens, n, eq+1, fileAliases); ok {
 			vars[parser.TokenText(source, tokens[i])] = vars.derive(src, edits)
+			for _, m := range mods {
+				optUses = append(optUses, resolveAlias(m))
+			}
 			i = end - 1
 		}
 	}
@@ -1626,7 +1629,8 @@ func parseHelperQuoteBlockDetailed(lines []string, helperName string, fileAliase
 			if k >= n || tokens[k].Kind != parser.TokOpenParen {
 				continue
 			}
-			nestedImports, nestedDefs, nestedUses, nestedCalls, nestedBindings, nestedAliases, nestedDerives := parseHelperQuoteBlockDetailed(lines, nestedName, fileAliases, visited)
+			nestedImports, nestedDefs, nestedUses, nestedCalls, nestedBindings, nestedAliases, nestedDerives, nestedOptUses := parseHelperQuoteBlockDetailed(lines, nestedName, fileAliases, visited)
+			optUses = append(optUses, nestedOptUses...)
 			imported = append(imported, nestedImports...)
 			derives = append(derives, nestedDerives...)
 			for name, defs := range nestedDefs {
@@ -2261,19 +2265,33 @@ func sortedOpts(opts map[string]string) func(yield func(string, string) bool) {
 // module. A plain `__using__` has exactly one; an atom-dispatch entrypoint has
 // one per dispatch target.
 type usingBody struct {
-	imports     []string               // modules imported, source order
-	inlineDefs  map[string][]inlineDef // function name → defs in the quote do block
-	transUses   []string               // modules used inside the body (double-use chains)
-	transCalls  []UseCall              // transitive uses with dispatch atom and opts preserved
-	optBindings []optBinding           // dynamic imports/uses resolved from opts
-	aliases     map[string]string      // alias short name → full module
-	derives     []string               // protocols an @derive in the body derives for the caller
-	branchUses  []string               // transUses inside a branch of the body
+	imports    []string               // modules imported, source order
+	inlineDefs map[string][]inlineDef // function name → defs in the quote do block
+	transUses  []string               // modules used inside the body (double-use chains)
+	// optUses are the modules that option edits put (`Keyword.put_new(opts,
+	// :base, Mod)`): edges of the use-chain graph, which lists the modules
+	// that can inject a name. A lookup for one caller follows the options
+	// instead, so that a caller's own option is not passed over.
+	optUses     []string
+	transCalls  []UseCall         // transitive uses with dispatch atom and opts preserved
+	optBindings []optBinding      // dynamic imports/uses resolved from opts
+	aliases     map[string]string // alias short name → full module
+	derives     []string          // protocols an @derive in the body derives for the caller
+	branchUses  []string          // transUses inside a branch of the body
 }
 
 func (b *usingBody) isEmpty() bool {
 	return b == nil || (len(b.imports) == 0 && len(b.inlineDefs) == 0 &&
-		len(b.transUses) == 0 && len(b.transCalls) == 0 && len(b.optBindings) == 0 && len(b.aliases) == 0)
+		len(b.transUses) == 0 && len(b.optUses) == 0 && len(b.transCalls) == 0 && len(b.optBindings) == 0 && len(b.aliases) == 0)
+}
+
+// graphUses are the edges of the use-chain graph from the body: its uses
+// and the modules that its option edits put.
+func (b *usingBody) graphUses() []string {
+	if len(b.optUses) == 0 {
+		return b.transUses
+	}
+	return append(slices.Clone(b.transUses), b.optUses...)
 }
 
 func (b *usingBody) hasTransCall(moduleName string) bool {
@@ -2447,11 +2465,12 @@ func parseDispatchBodies(text string) map[string]*usingBody {
 		}
 		seen[name] = true
 
-		imported, inlineDefs, transUses, transCalls, optBindings, aliases, derives := parseHelperQuoteBlockDetailed(lines, name, fileAliases, make(map[string]bool))
+		imported, inlineDefs, transUses, transCalls, optBindings, aliases, derives, optUses := parseHelperQuoteBlockDetailed(lines, name, fileAliases, make(map[string]bool))
 		body := &usingBody{
 			imports:     imported,
 			inlineDefs:  inlineDefs,
 			transUses:   transUses,
+			optUses:     optUses,
 			transCalls:  transCalls,
 			optBindings: optBindings,
 			aliases:     aliases,
@@ -2503,14 +2522,14 @@ func addStructInlineDefs(inlineDefs map[string][]inlineDef, tok parser.Token, so
 // Uses the tokenizer so that heredocs, multi-line expressions, and comments are
 // handled correctly without line-joining heuristics.
 func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inlineDef, transUses []string, optBindings []optBinding, aliases map[string]string) {
-	imported, inlineDefs, transUses, _, optBindings, aliases, _, _ = parseUsingBodyDetailed(text)
+	imported, inlineDefs, transUses, _, optBindings, aliases, _, _, _ = parseUsingBodyDetailed(text)
 	return
 }
 
 // parseUsingBodyDetailed also returns the protocols that an `@derive` in the
 // body derives for each module that uses it, and the transitive uses that are
 // inside a branch (if, case, ...) of the body.
-func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[string][]inlineDef, transUses []string, transCalls []UseCall, optBindings []optBinding, aliases map[string]string, derives []string, branchUses []string) {
+func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[string][]inlineDef, transUses []string, transCalls []UseCall, optBindings []optBinding, aliases map[string]string, derives []string, branchUses []string, optUses []string) {
 	source := []byte(text)
 	tokens := parser.Tokenize(source)
 	n := len(tokens)
@@ -2610,7 +2629,8 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 	// argument (`build(opts)`) brings its edits to the helper's uses that
 	// pass the options on.
 	mergeHelperQuote := func(helperName string, open int) {
-		helperImported, helperDefs, helperTransUses, helperCalls, helperBindings, helperAliases, helperDerives := parseHelperQuoteBlockDetailed(lines, helperName, fileAliases, make(map[string]bool))
+		helperImported, helperDefs, helperTransUses, helperCalls, helperBindings, helperAliases, helperDerives, helperOptUses := parseHelperQuoteBlockDetailed(lines, helperName, fileAliases, make(map[string]bool))
+		optUses = append(optUses, helperOptUses...)
 		if arg := nextSig(open + 1); open < n && arg < n && tokens[arg].Kind == parser.TokIdent {
 			if edits := vars[parser.TokenText(source, tokens[arg])]; len(edits) > 0 {
 				for c := range helperCalls {
@@ -2634,6 +2654,40 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 			}
 			aliases[short] = full
 		}
+	}
+
+	// accessRead reads `opts[:key]` or `opts[:key] || Default` at tokens[k],
+	// up to the end of the line: the key, the default (aliases resolved; ""
+	// for none), and the token after.
+	accessRead := func(k int) (key, def string, end int, ok bool) {
+		if k+3 >= n || tokens[k].Kind != parser.TokIdent || tokens[k+1].Kind != parser.TokOpenBracket || tokens[k+1].Start != tokens[k].End ||
+			tokens[k+2].Kind != parser.TokAtom || tokens[k+3].Kind != parser.TokCloseBracket {
+			return "", "", 0, false
+		}
+		atom := parser.TokenText(source, tokens[k+2])
+		if len(atom) < 2 || atom[0] != ':' {
+			return "", "", 0, false
+		}
+		isBar := func(i int) bool {
+			return i < n && tokens[i].Kind == parser.TokOther && parser.TokenText(source, tokens[i]) == "|"
+		}
+		key, end = atom[1:], k+4
+		if isBar(end) && isBar(end+1) && tokens[end+1].Start == tokens[end].End {
+			// `||` is two tokens.
+			m := nextSig(end + 2)
+			if m >= n || tokens[m].Kind != parser.TokModule {
+				return "", "", 0, false
+			}
+			name, after := collectModuleName(m)
+			def, end = resolveAlias(name), after
+		}
+		for end < n && tokens[end].Kind == parser.TokComment {
+			end++
+		}
+		if end < n && tokens[end].Kind != parser.TokEOL && tokens[end].Kind != parser.TokEOF {
+			return "", "", 0, false
+		}
+		return key, def, end, true
 	}
 
 	// scanKeywordCall checks if tokens starting at i match:
@@ -2952,7 +3006,7 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 				if funcName == "put" || funcName == "put_new" {
 					_, atomKey, defaultMod, endJ := scanKeywordCall(i)
 					if atomKey != "" && defaultMod != "" {
-						transUses = append(transUses, resolveAlias(defaultMod))
+						optUses = append(optUses, resolveAlias(defaultMod))
 					}
 					i = endJ
 					continue
@@ -3005,7 +3059,7 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 				if src, edits, mods, end, ok := readKeywordEdits(source, tokens, n, k, fileAliases); ok {
 					vars[identName] = vars.derive(src, edits)
 					for _, m := range mods {
-						transUses = append(transUses, resolveAlias(m))
+						optUses = append(optUses, resolveAlias(m))
 					}
 					i = end
 					continue
@@ -3026,6 +3080,13 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 						}
 					}
 					i = endJ
+					continue
+				}
+				// var = opts[:key], or opts[:key] || Default: a read, as with
+				// Keyword.get.
+				if key, def, end, ok := accessRead(k); ok {
+					varToOpt[identName] = varBinding{optKey: key, defaultMod: def, readEdits: slices.Clone(vars[parser.TokenText(source, tokens[k])])}
+					i = end
 					continue
 				}
 				// var = ModuleName

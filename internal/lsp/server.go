@@ -3380,7 +3380,7 @@ func (s *Server) parseUsingFile(filePath, moduleName string) *usingCacheEntry {
 		}
 		text = scoped
 	}
-	imported, inlineDefs, transUses, transCalls, optBindings, aliases, derives, branchUses := parseUsingBodyDetailed(text)
+	imported, inlineDefs, transUses, transCalls, optBindings, aliases, derives, branchUses, optUses := parseUsingBodyDetailed(text)
 	return &usingCacheEntry{
 		mtime:    info.ModTime().UnixNano(),
 		filePath: filePath,
@@ -3388,6 +3388,7 @@ func (s *Server) parseUsingFile(filePath, moduleName string) *usingCacheEntry {
 			imports:     imported,
 			inlineDefs:  inlineDefs,
 			transUses:   transUses,
+			optUses:     optUses,
 			transCalls:  transCalls,
 			optBindings: optBindings,
 			aliases:     aliases,
@@ -3779,7 +3780,7 @@ func closeOverUsingChain(entries []usingEntryRef, direct []string, seen map[stri
 			}
 			for _, body := range c.entry.bodies() {
 				found := false
-				for _, tu := range body.transUses {
+				for _, tu := range body.graphUses() {
 					if tu == current {
 						seen[c.module] = true
 						all = append(all, c.module)
@@ -4137,7 +4138,7 @@ func (s *Server) closeOverInjectors(direct []string, usingByFile map[string][]st
 				}
 				passesOn := false
 				for _, body := range entry.bodies() {
-					for _, tu := range body.transUses {
+					for _, tu := range body.graphUses() {
 						if tu == current {
 							passesOn = true
 							break

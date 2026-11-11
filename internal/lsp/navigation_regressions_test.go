@@ -829,6 +829,7 @@ func TestRegression_UseChainOptionForms(t *testing.T) {
 		optModule("PL.Base", inject("base")),
 		optModule("PL.Second", inject("second")),
 		optModule("PL.Third", inject("third")),
+		optModule("PL.Empty", "  defmacro __using__(_opts) do\n    quote do\n      def other, do: :ok\n    end\n  end"),
 		optModule("PL.Wrapper", optUsing("    {mod, opts} = Keyword.pop(opts, :base, PL.Base)", "      use unquote(mod), unquote(opts)")),
 		optModule("PL.Outer", optUsing("    opts = Keyword.put_new(opts, :base, PL.Second)", "      use PL.Wrapper, unquote(opts)")),
 		optModule("PL.Piped", optUsing("    opts = opts |> Keyword.put_new(:base, PL.Second)", "      use PL.Wrapper, unquote(opts)")),
@@ -882,6 +883,7 @@ func TestRegression_UseChainOptionForms(t *testing.T) {
 		{"W.HelperOwn", "use PL.Helper, base: PL.Third", "third"},
 		{"W.HelperEdit", "use PL.HelperEdit", "second"},
 		{"W.Opaque", "use PL.OpaqueOuter", "second"},
+		{"W.OpaqueOwn", "use PL.OpaqueOuter, base: PL.Third", "third"},
 		{"W.SelfRead", "use PL.SelfRead", "second"},
 		{"W.SelfFetch", "use PL.SelfFetch", "second"},
 		{"W.SelfFetchOwn", "use PL.SelfFetch, base: PL.Third", "third"},
@@ -909,6 +911,8 @@ func TestRegression_UseChainOptionForms(t *testing.T) {
 		files = append(files, optModule(w.name, "  "+w.use+"\n\n  def run(a), do: new(a)"))
 		fmt.Fprintf(&caller, "  def f%d(a), do: %s.new(a)\n", i, w.name)
 	}
+	files = append(files, optModule("W.Empty", "  use PL.Outer, base: PL.Empty"))
+	caller.WriteString("  def empty(a), do: W.Empty.new(a)\n")
 	// Two modules in one file, each with its own use.
 	files = append(files, bbFile{"lib/two.ex", "defmodule Two.A do\n  use PL.Wrapper\nend\n\ndefmodule Two.B do\n  use PL.Outer\nend\n"})
 	caller.WriteString("  def two_a(a), do: Two.A.new(a)\n  def two_b(a), do: Two.B.new(a)\nend\n")
@@ -934,6 +938,14 @@ func TestRegression_UseChainOptionForms(t *testing.T) {
 		wuri := bbOpen(t, server, wf)
 		bl, bc := bbPos(t, wf.src, "do: new(a)", "new")
 		check(w.name+" bare new", bbLines(definitionAt(t, server, wuri, bl, bc), server.projectRoot), w.want, wf.rel)
+	}
+	// The caller's own option names a module without new: put_new's module
+	// is not a fallback.
+	l, c := bbPos(t, callerFile.src, "W.Empty.new", "new")
+	for _, got := range bbLines(definitionAt(t, server, uri, l, c), server.projectRoot) {
+		if strings.HasPrefix(got, "lib/pl_") {
+			t.Errorf("W.Empty.new: definition = %s, want none in the chain's other modules", got)
+		}
 	}
 	for marker, want := range map[string]string{"Two.A.new": "base", "Two.B.new": "second"} {
 		l, c := bbPos(t, callerFile.src, marker, "new")
