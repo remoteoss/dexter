@@ -2098,24 +2098,24 @@ func forwardedOpts(source []byte, tokens []parser.Token, n, pos int, vars optVar
 		if depth > 1 || tokens[i].Kind != parser.TokIdent || i+1 >= n || tokens[i+1].Kind != parser.TokOpenParen {
 			continue
 		}
-		switch name := parser.TokenText(source, tokens[i]); {
-		case name == "unquote" || name == "unquote_splicing":
-			e, found := unquotedOpts(source, tokens, n, i+2, vars, aliases)
-			if !found {
-				return nil, false, false
-			}
-			if merge {
-				return e, true, arg == 1
-			}
-			// The first value of a key wins: the options win when they come
-			// first and something follows.
-			closing := matchingBracket(tokens, n, i+1)
-			if i != start || closing < 0 {
-				return e, true, false
-			}
-			next := tokNextSig(tokens, n, closing+1)
-			return e, true, next < end && next < n && tokens[next].Kind != parser.TokEOL && tokens[next].Kind != parser.TokEOF
+		if name := parser.TokenText(source, tokens[i]); name != "unquote" && name != "unquote_splicing" {
+			continue
 		}
+		e, found := unquotedOpts(source, tokens, n, i+2, vars, aliases)
+		if !found {
+			return nil, false, false
+		}
+		if merge {
+			return e, true, arg == 1
+		}
+		// The first value of a key wins: the options win when they come
+		// first and something follows.
+		closing := matchingBracket(tokens, n, i+1)
+		if i != start || closing < 0 {
+			return e, true, false
+		}
+		next := tokNextSig(tokens, n, closing+1)
+		return e, true, next < end && next < n && tokens[next].Kind != parser.TokEOL && tokens[next].Kind != parser.TokEOF
 	}
 	return nil, false, false
 }
