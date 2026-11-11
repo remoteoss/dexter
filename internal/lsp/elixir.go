@@ -2101,6 +2101,10 @@ func forwardedOpts(source []byte, tokens []parser.Token, n, pos int, vars optVar
 		if name := parser.TokenText(source, tokens[i]); name != "unquote" && name != "unquote_splicing" {
 			continue
 		}
+		if !optionsPosition(source, tokens, start, i) {
+			// A value, such as `adapter: unquote(adapter)`, not the options.
+			continue
+		}
 		e, found := unquotedOpts(source, tokens, n, i+2, vars, aliases)
 		if !found {
 			return nil, false, false
@@ -2118,6 +2122,29 @@ func forwardedOpts(source []byte, tokens []parser.Token, n, pos int, vars optVar
 		return e, true, next < end && next < n && tokens[next].Kind != parser.TokEOL && tokens[next].Kind != parser.TokEOF
 	}
 	return nil, false, false
+}
+
+// optionsPosition reports whether the unquote at tokens[i] stands for a whole
+// options list in the argument that starts at tokens[start]: the argument
+// itself, an operand of `++`, the tail after `|`, a list element, or an
+// argument of Keyword.merge. A keyword value (`k: unquote(v)`) or a tuple
+// element is not one.
+func optionsPosition(source []byte, tokens []parser.Token, start, i int) bool {
+	if i == start {
+		return true
+	}
+	prev := i - 1
+	for prev > start && (tokens[prev].Kind == parser.TokEOL || tokens[prev].Kind == parser.TokComment) {
+		prev--
+	}
+	switch tokens[prev].Kind {
+	case parser.TokOpenBracket, parser.TokOpenParen, parser.TokComma:
+		return true
+	case parser.TokOther:
+		t := parser.TokenText(source, tokens[prev])
+		return t == "|" || t == "+" || t == "++"
+	}
+	return false
 }
 
 // unquotedOpts reads the inside of an unquote at tokens[inner]: a variable
