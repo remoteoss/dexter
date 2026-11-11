@@ -24,9 +24,10 @@ import (
 	"github.com/remoteoss/dexter/internal/version"
 )
 
-// ErrUnindexed reports that the SQL indexes could not be recreated after they
-// were dropped for a bulk load. The data may have committed or the load may
-// have rolled back, but either way every query is now a full table scan.
+// ErrUnindexed reports that the SQL indexes were missing after a full build
+// committed, and could not be created. Every query is then a full table scan.
+// The build makes its indexes in the same transaction as its rows, so this
+// comes only from the check after the commit, which is a safety net.
 var ErrUnindexed = errors.New("SQL indexes could not be created after bulk build")
 
 // Options configures a full build.
@@ -93,8 +94,8 @@ type Stats struct {
 	Walk          time.Duration
 	Parse         time.Duration // summed across workers, so larger than wall time
 	Write         time.Duration
-	Commit        time.Duration
-	CreateIndexes time.Duration
+	Commit        time.Duration // the commit without CreateIndexes
+	CreateIndexes time.Duration // in the commit transaction, before it commits
 	Total         time.Duration
 }
 
@@ -148,7 +149,8 @@ func statFilesParallel(paths []string) []fileEntry {
 
 // FullBuild indexes projectRoot (and opts.StdlibRoot, when set) from scratch:
 // walk and stat on all cores, parse on all cores, then one single-writer bulk
-// transaction with the indexes dropped, and finally the index version.
+// transaction with the indexes dropped, which builds the indexes again before
+// it commits, and finally the index version.
 //
 // The caller is responsible for the database being empty, and for no other
 // writer touching it while this runs. The bulk path is insert-only — it skips
@@ -244,20 +246,18 @@ func FullBuild(s *store.Store, projectRoot string, opts Options) (Stats, error) 
 	}()
 
 	// Phase 3: bulk insert (single writer, single transaction, no indexes).
+	// The transaction drops the indexes and builds them again before it
+	// commits, so readers never see the new rows without their indexes, and
+	// every path that rolls it back leaves the indexes as they were.
 	//
 	// The parse workers keep producing whatever happens here, so every error
 	// path below has to drain resultCh before returning: an early return would
 	// block them forever on a full channel, and they are the goroutines the
 	// caller's WaitGroup is waiting on.
-	if err := s.DropIndexes(); err != nil {
-		drain(resultCh)
-		return stats, restoreIndexes(s, fmt.Errorf("drop indexes: %w", err))
-	}
-
 	batch, err := s.BeginBulkInsert()
 	if err != nil {
 		drain(resultCh)
-		return stats, restoreIndexes(s, fmt.Errorf("begin bulk insert: %w", err))
+		return stats, fmt.Errorf("begin bulk insert: %w", err)
 	}
 	// A panic must not leave the bulk transaction open with the SQLite write
 	// lock; after Commit or an earlier Rollback this does nothing.
@@ -273,7 +273,7 @@ func FullBuild(s *store.Store, projectRoot string, opts Options) (Stats, error) 
 	// rebuilds.
 	for _, sr := range stdlibResults {
 		if err := batch.IndexFileWithMtimeAndRefs(sr.path, sr.mtimeNano, sr.defs, nil); err != nil {
-			return stats, abortBuild(s, batch, resultCh, fmt.Errorf("%s: %w", sr.path, err))
+			return stats, abortBuild(batch, resultCh, fmt.Errorf("%s: %w", sr.path, err))
 		}
 		stats.Files++
 		stats.Definitions += len(sr.defs)
@@ -282,13 +282,13 @@ func FullBuild(s *store.Store, projectRoot string, opts Options) (Stats, error) 
 	var writeNanos time.Duration
 	for res := range resultCh {
 		if err := ctx.Err(); err != nil {
-			return stats, abortBuild(s, batch, resultCh, err)
+			return stats, abortBuild(batch, resultCh, err)
 		}
 		writeStart := time.Now()
 		err := batch.IndexFileWithMtimeAndRefs(res.path, res.mtimeNano, res.defs, res.refs)
 		writeNanos += time.Since(writeStart)
 		if err != nil {
-			return stats, abortBuild(s, batch, resultCh, fmt.Errorf("%s: %w", res.path, err))
+			return stats, abortBuild(batch, resultCh, fmt.Errorf("%s: %w", res.path, err))
 		}
 		stats.Files++
 		stats.Definitions += len(res.defs)
@@ -298,19 +298,23 @@ func FullBuild(s *store.Store, projectRoot string, opts Options) (Stats, error) 
 	stats.Parse = time.Duration(parseNanos.Load())
 
 	if err := ctx.Err(); err != nil {
-		return stats, abortBuild(s, batch, resultCh, err)
+		return stats, abortBuild(batch, resultCh, err)
 	}
 	commitStart := time.Now()
 	if err := batch.Commit(); err != nil {
-		return stats, restoreIndexes(s, fmt.Errorf("commit: %w", err))
+		// Commit has rolled back, and with it the drop of the indexes.
+		return stats, fmt.Errorf("commit: %w", err)
 	}
-	stats.Commit = time.Since(commitStart)
+	stats.CreateIndexes = batch.IndexBuildTime()
+	stats.Commit = time.Since(commitStart) - stats.CreateIndexes
 
-	indexStart := time.Now()
+	// A safety net only: the commit included the indexes, and each statement
+	// is CREATE INDEX IF NOT EXISTS, so this changes nothing and costs
+	// almost nothing. It keeps the guarantee that a build which returns nil
+	// leaves an indexed database, also if the batch stops building them.
 	if err := createIndexesWithRetry(s); err != nil {
 		return stats, fmt.Errorf("%w: %v", ErrUnindexed, err)
 	}
-	stats.CreateIndexes = time.Since(indexStart)
 
 	// Last, so that a build interrupted before this point leaves a version the
 	// next start rejects, and rebuilds.
@@ -381,10 +385,10 @@ func parseStdlib(ctx context.Context, stdlibFiles []fileEntry) []stdlibResult {
 	return results
 }
 
-// createIndexesWithRetry recreates the indexes, retrying a few times. The
-// statements are CREATE ... IF NOT EXISTS, so a retry is free and idempotent,
-// and the likeliest failure here is SQLITE_BUSY against another pooled
-// connection, which clears on its own.
+// createIndexesWithRetry creates the indexes that are missing, retrying a few
+// times. The statements are CREATE ... IF NOT EXISTS, so a retry is free and
+// idempotent, and the likeliest failure here is SQLITE_BUSY against another
+// pooled connection, which clears on its own.
 func createIndexesWithRetry(s *store.Store) error {
 	var err error
 	for attempt := 0; attempt < createIndexAttempts; attempt++ {
@@ -433,19 +437,13 @@ func drain(ch <-chan parseResult) {
 // abortBuild ends a build that has already opened its bulk transaction. The
 // order matters: drain first, because the parse workers keep producing and the
 // caller's WaitGroup is waiting on them; then roll the transaction back, or its
-// write lock outlives the build and the pooled connection never comes back —
-// restoreIndexes runs its DDL on a different connection and would block on it.
-func abortBuild(s *store.Store, batch *store.Batch, resultCh <-chan parseResult, cause error) error {
+// write lock outlives the build and the pooled connection never comes back.
+// The rollback also undoes the drop of the indexes: the drop is in the same
+// transaction, so nothing needs to create them again.
+func abortBuild(batch *store.Batch, resultCh <-chan parseResult, cause error) error {
 	drain(resultCh)
 	if err := batch.Rollback(); err != nil {
 		cause = fmt.Errorf("%w (and rolling back failed: %v)", cause, err)
-	}
-	return restoreIndexes(s, cause)
-}
-
-func restoreIndexes(s *store.Store, cause error) error {
-	if err := createIndexesWithRetry(s); err != nil {
-		return errors.Join(cause, fmt.Errorf("%w: %v", ErrUnindexed, err))
 	}
 	return cause
 }

@@ -413,8 +413,8 @@ func cmdInit(projectRoot string, force bool, allowNonProject bool, profile bool)
 		fmt.Fprintf(os.Stderr, "  walk: %s (%s files)\n", stats.Walk.Round(time.Millisecond), formatInt(stats.Files))
 		fmt.Fprintf(os.Stderr, "  parse+write: parse %s across %d workers, write %s\n",
 			stats.Parse.Round(time.Millisecond), stats.Workers, stats.Write.Round(time.Millisecond))
+		fmt.Fprintf(os.Stderr, "  create indices: %s (in the bulk transaction)\n", stats.CreateIndexes.Round(time.Millisecond))
 		fmt.Fprintf(os.Stderr, "  commit: %s\n", stats.Commit.Round(time.Millisecond))
-		fmt.Fprintf(os.Stderr, "  create indices: %s\n", stats.CreateIndexes.Round(time.Millisecond))
 	}
 
 	fmt.Fprintf(os.Stderr, "Indexed %s files (%s definitions, %s references) in %s\n",
