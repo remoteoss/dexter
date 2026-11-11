@@ -2421,6 +2421,11 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 		if tokens[j].Kind == parser.TokComma {
 			j = nextSig(j + 1)
 			defaultMod, endJ := collectModuleName(j)
+			if defaultMod != "" && endJ < n && (tokens[endJ].Kind == parser.TokDot || tokens[endJ].Kind == parser.TokOpenParen) {
+				// `Mod.pick()` or `Mod()`: a call, whose value Dexter cannot
+				// read, not the module Mod.
+				defaultMod = ""
+			}
 			if defaultMod != "" {
 				// Advance to close paren
 				for endJ < n && tokens[endJ].Kind != parser.TokCloseParen {
@@ -2740,7 +2745,15 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 							optEdits = append(optEdits, optEdit{op: "delete", key: atomKey})
 						}
 					case "merge":
-						optEdits = append(optEdits, keywordMergeEdits(source, tokens, n, k, fileAliases)...)
+						edits := keywordMergeEdits(source, tokens, n, k, fileAliases)
+						for _, e := range edits {
+							if e.mod != unknownOpt {
+								// An edge of the use-chain graph, as for put.
+								transUses = append(transUses, e.mod)
+								optUses = append(optUses, e.mod)
+							}
+						}
+						optEdits = append(optEdits, edits...)
 					}
 					if funcName == "pop" || funcName == "pop!" || funcName == "pop_lazy" {
 						if atomKey != "" {

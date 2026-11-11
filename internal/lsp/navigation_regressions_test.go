@@ -727,7 +727,7 @@ end
 `},
 		{"lib/pl_picker.ex", `defmodule PL.Picker do
   defmacro __using__(opts) do
-    opts = Keyword.put_new(opts, :base, pick())
+    opts = Keyword.put_new(opts, :base, PL.Second.pick())
 
     quote do
       use PL.Wrapper, unquote(opts)

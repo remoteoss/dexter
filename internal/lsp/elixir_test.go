@@ -3844,3 +3844,21 @@ func findBareFunctionCalls(text string, functionName string) []int {
 	full := parser.TokenizeFull(source)
 	return findBareCallLines(source, full.Tokens, full.Interp, functionName)
 }
+
+// Keyword.merge names modules the options can pass on: the use-chain graph
+// keeps them as edges, as for put.
+func TestParseUsingBody_MergeIsAGraphEdge(t *testing.T) {
+	text := `defmodule PL.Merger do
+  defmacro __using__(opts) do
+    opts = Keyword.merge([base: PL.Second], opts)
+
+    quote do
+      use PL.Wrapper, unquote(opts)
+    end
+  end
+end`
+	_, _, transUses, _, _ := parseUsingBody(text)
+	if !slices.Contains(transUses, "PL.Second") {
+		t.Errorf("transUses = %v, want PL.Second", transUses)
+	}
+}
