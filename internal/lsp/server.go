@@ -48,7 +48,7 @@ import (
 // produces: {optKey: "mod", defaultMod: "Mox", kind: "import"}.
 type optBinding struct {
 	optKey     string // keyword key in opts (e.g. "mod")
-	defaultMod string // default module if opt not provided (e.g. "Mox"); empty if none
+	defaultMod string // default module if opt not provided (e.g. "Mox"); empty if none; unknownOpt if it cannot be read
 	kind       string // "import" or "use"
 	// readEdits are the edits that the options had where the key was read:
 	// `opts = Keyword.put_new(opts, :mod, X)` before `Keyword.get(opts, :mod)`.
@@ -120,13 +120,21 @@ func bindingModule(binding optBinding, consumer map[string]string) (mod string, 
 		}
 		return v, true
 	}
+	if binding.defaultMod == unknownOpt {
+		return "", false
+	}
 	return binding.defaultMod, binding.defaultMod != ""
 }
 
 // bindingUnknown reports whether the option an optBinding reads has a value
 // that Dexter cannot read.
 func bindingUnknown(binding optBinding, consumer map[string]string) bool {
-	return effectiveOpts(consumer, binding.readEdits, false)[binding.optKey] == unknownOpt
+	v, set := effectiveOpts(consumer, binding.readEdits, false)[binding.optKey]
+	if !set {
+		// The default applies: `opts[:key] || build()` cannot be read.
+		return binding.defaultMod == unknownOpt
+	}
+	return v == unknownOpt
 }
 
 // callOpts are the options that a use in a __using__ body passes to the
@@ -3984,11 +3992,14 @@ func (s *Server) usingInjectsAlias(module, which, targetModule, written, resolve
 			return true
 		}
 	}
-	for i := len(body.transUses) - 1; i >= 0; i-- {
-		if body.hasTransCall(body.transUses[i]) {
+	// The modules that option edits put count too: this walk lists where an
+	// alias can come from, for references, as closeOverInjectors does.
+	uses := body.graphUses()
+	for i := len(uses) - 1; i >= 0; i-- {
+		if body.hasTransCall(uses[i]) {
 			continue
 		}
-		if s.usingInjectsAlias(body.transUses[i], "", targetModule, written, resolved, visited) {
+		if s.usingInjectsAlias(uses[i], "", targetModule, written, resolved, visited) {
 			return true
 		}
 	}

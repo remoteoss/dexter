@@ -2673,13 +2673,18 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 		}
 		key, end = atom[1:], k+4
 		if isBar(end) && isBar(end+1) && tokens[end+1].Start == tokens[end].End {
-			// `||` is two tokens.
+			// `||` is two tokens. A default that is not a module alone
+			// (`build()`, `Mod.f()`) cannot be read: the key is still read.
 			m := nextSig(end + 2)
-			if m >= n || tokens[m].Kind != parser.TokModule {
-				return "", "", 0, false
+			name, after := "", m
+			if m < n && tokens[m].Kind == parser.TokModule {
+				name, after = collectModuleName(m)
 			}
-			name, after := collectModuleName(m)
-			def, end = resolveAlias(name), after
+			if name != "" && (after >= n || tokens[after].Kind == parser.TokEOL || tokens[after].Kind == parser.TokEOF || tokens[after].Kind == parser.TokComment) {
+				def, end = resolveAlias(name), after
+			} else {
+				def, end = unknownOpt, skipToEndOfStatement(tokens, n, m)
+			}
 		}
 		for end < n && tokens[end].Kind == parser.TokComment {
 			end++
