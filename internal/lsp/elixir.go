@@ -1415,19 +1415,31 @@ func skipToEndOfStatement(tokens []parser.Token, n, from int) int {
 // its `quote do` block, and extracts imports/uses/inline-defs/aliases from it.
 // Uses the tokenizer for correct heredoc and multi-line handling.
 func parseHelperQuoteBlock(lines []string, helperName string, fileAliases map[string]string) (imported []string, inlineDefs map[string][]inlineDef, transUses []string, optBindings []optBinding, aliases map[string]string) {
-	imported, inlineDefs, transUses, _, optBindings, aliases, _, _ = parseHelperQuoteBlockDetailed(lines, helperName, fileAliases, make(map[string]bool))
+	imported, inlineDefs, transUses, _, optBindings, aliases, _, _ = parseHelperQuoteBlockDetailed(newHelperSource(lines), helperName, fileAliases, make(map[string]bool))
 	return
 }
 
-func parseHelperQuoteBlockDetailed(lines []string, helperName string, fileAliases map[string]string, visited map[string]bool) (imported []string, inlineDefs map[string][]inlineDef, transUses []string, transUseCalls []UseCall, optBindings []optBinding, aliases map[string]string, derives []string, optUses []string) {
+// helperSource is a file for the helper parser, tokenized once: a __using__
+// body can call many helpers, and each one is parsed from the whole file.
+type helperSource struct {
+	lines  []string
+	source []byte
+	tokens []parser.Token
+}
+
+func newHelperSource(lines []string) *helperSource {
+	source := []byte(strings.Join(lines, "\n"))
+	return &helperSource{lines: lines, source: source, tokens: parser.Tokenize(source)}
+}
+
+func parseHelperQuoteBlockDetailed(hs *helperSource, helperName string, fileAliases map[string]string, visited map[string]bool) (imported []string, inlineDefs map[string][]inlineDef, transUses []string, transUseCalls []UseCall, optBindings []optBinding, aliases map[string]string, derives []string, optUses []string) {
 	if visited[helperName] {
 		return
 	}
 	visited[helperName] = true
 	defer delete(visited, helperName)
 
-	source := []byte(strings.Join(lines, "\n"))
-	tokens := parser.Tokenize(source)
+	source, tokens := hs.source, hs.tokens
 	n := len(tokens)
 
 	resolveAlias := func(modName string) string {
@@ -1681,7 +1693,7 @@ func parseHelperQuoteBlockDetailed(lines []string, helperName string, fileAliase
 			if k >= n || tokens[k].Kind != parser.TokOpenParen {
 				continue
 			}
-			nestedImports, nestedDefs, nestedUses, nestedCalls, nestedBindings, nestedAliases, nestedDerives, nestedOptUses := parseHelperQuoteBlockDetailed(lines, nestedName, fileAliases, visited)
+			nestedImports, nestedDefs, nestedUses, nestedCalls, nestedBindings, nestedAliases, nestedDerives, nestedOptUses := parseHelperQuoteBlockDetailed(hs, nestedName, fileAliases, visited)
 			optUses = append(optUses, nestedOptUses...)
 			imported = append(imported, nestedImports...)
 			derives = append(derives, nestedDerives...)
@@ -2589,7 +2601,7 @@ func parseDispatchBodies(text string) map[string]*usingBody {
 		return nil
 	}
 
-	lines := strings.Split(text, "\n")
+	hs := &helperSource{lines: strings.Split(text, "\n"), source: source, tokens: tokens}
 	fileAliases := extractAliasesFromTokens(source, tokens, -1)
 
 	n := len(tokens)
@@ -2608,7 +2620,7 @@ func parseDispatchBodies(text string) map[string]*usingBody {
 		}
 		seen[name] = true
 
-		imported, inlineDefs, transUses, transCalls, optBindings, aliases, derives, optUses := parseHelperQuoteBlockDetailed(lines, name, fileAliases, make(map[string]bool))
+		imported, inlineDefs, transUses, transCalls, optBindings, aliases, derives, optUses := parseHelperQuoteBlockDetailed(hs, name, fileAliases, make(map[string]bool))
 		body := &usingBody{
 			imports:     imported,
 			inlineDefs:  inlineDefs,
@@ -2738,6 +2750,7 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 
 	// Extract file-level aliases for resolution (reuse already-tokenized data)
 	lines := strings.Split(text, "\n")
+	hs := &helperSource{lines: lines, source: source, tokens: tokens}
 	fileAliases := extractAliasesFromTokens(source, tokens, -1)
 
 	inlineDefs = make(map[string][]inlineDef)
@@ -2775,7 +2788,7 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 	// argument (`build(opts)`) brings its edits to the helper's uses that
 	// pass the options on.
 	mergeHelperQuote := func(helperName string, open int) {
-		helperImported, helperDefs, helperTransUses, helperCalls, helperBindings, helperAliases, helperDerives, helperOptUses := parseHelperQuoteBlockDetailed(lines, helperName, fileAliases, make(map[string]bool))
+		helperImported, helperDefs, helperTransUses, helperCalls, helperBindings, helperAliases, helperDerives, helperOptUses := parseHelperQuoteBlockDetailed(hs, helperName, fileAliases, make(map[string]bool))
 		optUses = append(optUses, helperOptUses...)
 		if arg := nextSig(open + 1); open < n && arg < n && tokens[arg].Kind == parser.TokIdent {
 			if edits := vars[parser.TokenText(source, tokens[arg])]; len(edits) > 0 {

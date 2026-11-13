@@ -40,6 +40,38 @@ func newSharedCaches() sharedCaches {
 type usingCache struct {
 	mu      sync.RWMutex
 	entries map[string]*usingCacheEntry
+	// warming is closed when the warm-up in progress ends; nil when none
+	// runs. See warmUsingCache.
+	warming chan struct{}
+}
+
+// beginWarm starts a warm-up, or returns false when one already runs.
+func (c *usingCache) beginWarm() (end func(), ok bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.warming != nil {
+		return nil, false
+	}
+	ch := make(chan struct{})
+	c.warming = ch
+	return func() {
+		c.mu.Lock()
+		c.warming = nil
+		c.mu.Unlock()
+		close(ch)
+	}, true
+}
+
+// waitWarm waits for the warm-up in progress, if any: a request that needs
+// every entry then reads the entries it parsed, instead of parsing the same
+// files at the same time.
+func (c *usingCache) waitWarm() {
+	c.mu.RLock()
+	ch := c.warming
+	c.mu.RUnlock()
+	if ch != nil {
+		<-ch
+	}
 }
 
 func (c *usingCache) get(module string) (*usingCacheEntry, bool) {

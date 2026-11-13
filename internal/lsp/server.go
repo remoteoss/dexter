@@ -648,6 +648,17 @@ func (s *Server) OpenDocuments() int { return s.docs.Count() }
 // ProjectRoot returns the workspace root this session answers for.
 func (s *Server) ProjectRoot() string { return s.projectRoot }
 
+// startWarmUsingCache runs warmUsingCache in the background, as index work
+// that the workspace waits for when it closes.
+func (s *Server) startWarmUsingCache() {
+	s.index.backgroundWork.Add(1)
+	go func() {
+		defer s.index.backgroundWork.Done()
+		defer s.index.reporter.Recover("cache", "the warm-up of the __using__ cache")
+		s.warmUsingCache()
+	}()
+}
+
 // warmUsingCache parses every module's defmacro __using__ body ahead of the
 // first request that needs one.
 //
@@ -658,15 +669,26 @@ func (s *Server) ProjectRoot() string { return s.projectRoot }
 // a user waiting on a reference lookup. Every later request costs 1-2ms.
 //
 // The work is the same either way; this only moves it off the request path. It
-// runs at the end of the background reindex, where the index is known to exist
-// and no request is waiting, and it is bounded to NumCPU readers so that a
-// speculative warm-up cannot storm the filesystem while the editor is starting.
+// starts as soon as the index has the modules: at the start of a background
+// pass when the index already exists (an entry is checked against the file's
+// mtime when it is read, so an index that the pass then updates is safe to
+// read), and right after a cold build commits. A request that needs every
+// entry while it runs waits for it rather than parse the same files again. It
+// runs once more at the end of the pass, where it only checks mtimes. It is
+// bounded to NumCPU readers so that a speculative warm-up cannot storm the
+// filesystem while the editor is starting.
 //
 // Nothing here is required for correctness. Entries are validated against file
 // mtime when they are read, so a warmed entry that goes stale is simply
 // re-parsed, and a file that cannot be read is skipped exactly as it would be
 // on the request path.
 func (s *Server) warmUsingCache() {
+	end, ok := s.usingCache.beginWarm()
+	if !ok {
+		s.usingCache.waitWarm()
+		return
+	}
+	defer end()
 	usingModules, err := s.store.LookupUsingModules()
 	if err != nil || len(usingModules) == 0 {
 		return
@@ -1179,6 +1201,9 @@ func (s *Server) startBackgroundReindex() <-chan error {
 		start := time.Now()
 		reindexed, failed := 0, 0
 		coldStart := s.store.IsEmpty()
+		if !coldStart {
+			s.startWarmUsingCache()
+		}
 		fullBuilt := false
 		var buildTask *notify.Task
 		progress := reconcileProgress{reporter: s.index.reporter}
@@ -1221,6 +1246,7 @@ func (s *Server) startBackgroundReindex() <-chan error {
 			default:
 				fullBuilt = true
 				reindexed = stats.Files
+				s.startWarmUsingCache()
 			}
 		}
 
@@ -3753,6 +3779,7 @@ type usingEntryRef struct {
 // mtime validation (and a file read on a cache miss), so the wall-clock cost
 // is dominated by I/O rather than parsing.
 func (s *Server) loadUsingEntries() []usingEntryRef {
+	s.usingCache.waitWarm()
 	usingModules, err := s.store.LookupUsingModules()
 	if err != nil {
 		return nil
