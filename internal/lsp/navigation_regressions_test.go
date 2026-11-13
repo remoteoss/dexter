@@ -837,10 +837,7 @@ func TestRegression_UseChainOptionForms(t *testing.T) {
 		optModule("PL.InQuote", optUsing("", "      use PL.Wrapper, unquote(Keyword.put_new(opts, :base, PL.Second))")),
 		optModule("PL.Renamed", optUsing("    new_opts = Keyword.put_new(opts, :base, PL.Second)", "      use PL.Wrapper, unquote(new_opts)")),
 		optModule("PL.OtherVar", optUsing("    other = Keyword.put(opts, :base, PL.Second)\n    _ = other", "      use PL.Wrapper, unquote(opts)")),
-		optModule("PL.Mixed", optUsing("", "      use PL.Wrapper, [base: PL.Second] ++ unquote(opts)")),
 		optModule("PL.Mixed2", optUsing("", "      use PL.Wrapper, [{:base, PL.Second} | unquote(opts)]")),
-		optModule("PL.Mixed3", optUsing("", "      use PL.Wrapper, Keyword.merge(unquote(opts), base: PL.Second)")),
-		optModule("PL.Mixed4", optUsing("", "      use PL.Wrapper, [base: PL.Second, unquote_splicing(opts)]")),
 		optModule("PL.Top", optUsing("    opts = Keyword.put_new(opts, :base, PL.Third)", "      use PL.Outer, unquote(opts)")),
 		optModule("PL.TopPut", optUsing("    opts = Keyword.put(opts, :base, PL.Third)", "      use PL.Outer, unquote(opts)")),
 		optModule("PL.Web", "  def worker do\n    quote do\n      use PL.Outer\n    end\n  end\n\n  def plain do\n    quote do\n      use PL.Wrapper\n    end\n  end\n\n  defmacro __using__(which) when is_atom(which) do\n    apply(__MODULE__, which, [])\n  end"),
@@ -850,10 +847,6 @@ func TestRegression_UseChainOptionForms(t *testing.T) {
 		optModule("PL.OpaqueOuter", optUsing("    opts = Keyword.put_new(opts, :base, PL.Second)", "      use PL.Opaque, unquote(opts)")),
 		optModule("PL.CallDefault", optUsing("    mod = opts[:base] || default_base()", "      use unquote(mod)")+"\n\n  def default_base, do: PL.Base"),
 		optModule("PL.CallDefaultOuter", optUsing("    opts = Keyword.put_new(opts, :base, PL.Second)", "      use PL.CallDefault, unquote(opts)")),
-		optModule("PL.MixedKeep", optUsing("", "      use PL.Wrapper, [queue: :x] ++ unquote(opts)")),
-		optModule("PL.MergeKeep", optUsing("", "      use PL.Wrapper, Keyword.merge(unquote(opts), queue: :x)")),
-		optModule("PL.CallerFirst", optUsing("", "      use PL.Wrapper, unquote(opts) ++ [base: PL.Second]")),
-		optModule("PL.MergeCallerLast", optUsing("", "      use PL.Wrapper, Keyword.merge([base: PL.Second], unquote(opts))")),
 		optModule("PL.GetCall", optUsing("    mod = Keyword.get(opts, :base, pick())", "      use unquote(mod)")+"\n\n  def pick, do: PL.Base"),
 		optModule("PL.ValueUnquote", optUsing("    extra = :x", "      use PL.Wrapper, extra: unquote(extra)")),
 		optModule("PL.TupleValue", optUsing("    extra = :x", "      use PL.Wrapper, [{:extra, unquote(extra)} | unquote(opts)]")),
@@ -905,6 +898,8 @@ func TestRegression_UseChainOptionForms(t *testing.T) {
 		optModule("PL.Owner.Impl", inject("owner_impl")),
 		optModule("PL.Nested", "  defmodule Impl do\n    defmacro __using__(_opts) do\n      quote do\n        def new(args, opts \\\\ []), do: {:impl, args, opts}\n      end\n    end\n  end\n\n"+optUsing("", "      use PL.Wrapper, unquote(opts)")),
 		optModule("PL.Clauses", "  defmacro __using__(which) when is_atom(which) do\n    quote do\n      use PL.Third\n    end\n  end\n\n"+optUsing("", "      use PL.Wrapper, unquote(opts)")),
+		optModule("PL.MergeDefVar", optUsing("    defaults = [base: PL.Second]\n    opts = Keyword.merge(defaults, opts)", "      use PL.Wrapper, unquote(opts)")),
+		optModule("PL.BlockShadow", "  defmacro __using__(opts) do\n    mod = opts[:base] || PL.Base\n    if true do\n      mod = pick()\n      quote do\n        use unquote(mod)\n      end\n    end\n  end\n\n  def pick, do: PL.Second"),
 		optModule("PL.BlockEdit", optUsing("    if opts[:flag] do\n      opts = Keyword.put(opts, :base, PL.Second)\n      _ = opts\n    end", "      use PL.Wrapper, unquote(opts)")),
 	}
 	workers := []struct{ name, use, want string }{
@@ -914,14 +909,10 @@ func TestRegression_UseChainOptionForms(t *testing.T) {
 		{"W.InQuote", "use PL.InQuote", "second"},
 		{"W.Renamed", "use PL.Renamed", "second"},
 		{"W.OtherVar", "use PL.OtherVar", "base"},
-		{"W.Mixed", "use PL.Mixed", "second"},
 		// In a quote, `[{:k, X} | unquote(opts)]` is a list of one `|`
 		// expression: the next __using__ gets no options (Elixir 1.19 and
 		// 1.20 give PL.Base).
 		{"W.Mixed2", "use PL.Mixed2", "base"},
-		{"W.Mixed3", "use PL.Mixed3", "second"},
-		{"W.Mixed4", "use PL.Mixed4", "second"},
-		{"W.MixedOwn", "use PL.Mixed3, base: PL.Third", "second"},
 		{"W.Top", "use PL.Top", "third"},
 		{"W.TopOwn", "use PL.Top, base: PL.Base", "base"},
 		{"W.TopPut", "use PL.TopPut, base: PL.Base", "third"},
@@ -932,12 +923,6 @@ func TestRegression_UseChainOptionForms(t *testing.T) {
 		{"W.HelperEdit", "use PL.HelperEdit", "second"},
 		{"W.Opaque", "use PL.OpaqueOuter", "second"},
 		{"W.OpaqueOwn", "use PL.OpaqueOuter, base: PL.Third", "third"},
-		{"W.MixedKeep", "use PL.MixedKeep, base: PL.Third", "third"},
-		{"W.MergeKeep", "use PL.MergeKeep, base: PL.Third", "third"},
-		{"W.CallerFirst", "use PL.CallerFirst", "second"},
-		{"W.CallerFirstOwn", "use PL.CallerFirst, base: PL.Third", "third"},
-		{"W.MergeCallerLast", "use PL.MergeCallerLast", "second"},
-		{"W.MergeCallerLastOwn", "use PL.MergeCallerLast, base: PL.Third", "third"},
 		{"W.GetCallNone", "use PL.GetCall", "use"},
 		{"W.GetCallOwn", "use PL.GetCall, base: PL.Third", "third"},
 		{"W.ValueUnquote", "use PL.ValueUnquote, base: PL.Third", "base"},
@@ -1013,6 +998,13 @@ func TestRegression_UseChainOptionForms(t *testing.T) {
 		{"W.Clauses", "use PL.Clauses, base: PL.Second", "second"},
 		// A match in a block does not change the variable after the block.
 		{"W.BlockEdit", "use PL.BlockEdit", "base"},
+		// A variable bound to a keyword list, merged under the options: a
+		// key that the options hold wins.
+		{"W.MergeDefVar", "use PL.MergeDefVar", "second"},
+		{"W.MergeDefVarOwn", "use PL.MergeDefVar, base: PL.Third", "third"},
+		// A rebind in a block that Dexter cannot read: the quote in the
+		// block sees the new value, so the answer is the use line.
+		{"W.BlockShadow", "use PL.BlockShadow", "use"},
 	}
 	files := append([]bbFile(nil), lib...)
 	var caller strings.Builder

@@ -1497,14 +1497,14 @@ func parseHelperQuoteBlockDetailed(lines []string, helperName string, fileAliase
 		}
 		switch tokens[i].Kind {
 		case parser.TokIdent:
-			if end, mods, handled := ob.assignment(i, depth == 1, fileAliases); handled {
+			if end, mods, handled := ob.assignment(i, fileAliases); handled {
 				for _, m := range mods {
 					optUses = append(optUses, resolveAlias(m))
 				}
 				i = end - 1
 			}
 		case parser.TokOpenBrace:
-			if end, handled := ob.tupleAssignment(i, depth == 1); handled {
+			if end, handled := ob.tupleAssignment(i); handled {
 				i = end - 1
 			}
 		}
@@ -2523,10 +2523,15 @@ func keywordStep(source []byte, tokens []parser.Token, n, i int, piped bool, sc 
 			return r, i, false
 		}
 		first := args[0]
-		if tokens[first[0]].Kind == parser.TokIdent && first[1] == first[0]+1 {
+		single := func(a [2]int) bool { return tokens[a[0]].Kind == parser.TokIdent && a[1] == a[0]+1 }
+		// Keyword.merge(defaults, opts), where defaults is a variable bound
+		// to a keyword literal: the options are the second argument.
+		_, firstIsLiteral := sc.literal(source, tokens, first)
+		mergeIntoLiteral := op == "merge" && len(args) == 2 && single(args[1]) && (!single(first) || firstIsLiteral)
+		if single(first) && !mergeIntoLiteral {
 			r.src = parser.TokenText(source, tokens[first[0]])
 			args = args[1:]
-		} else if op == "merge" && len(args) == 2 && tokens[args[1][0]].Kind == parser.TokIdent && args[1][1] == args[1][0]+1 {
+		} else if mergeIntoLiteral {
 			// Keyword.merge([key: Mod], opts): the options win.
 			r.src = parser.TokenText(source, tokens[args[1][0]])
 			if lit, ok := sc.literal(source, tokens, first); ok {
@@ -3478,7 +3483,7 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 			// var = <an edit of the options, a read of one option, a module,
 			// or a value that Dexter cannot read>.
 			if isStmtStart {
-				if end, mods, handled := ob.assignment(i, depth == usingDepth, fileAliases); handled {
+				if end, mods, handled := ob.assignment(i, fileAliases); handled {
 					for _, m := range mods {
 						optUses = append(optUses, resolveAlias(m))
 					}
@@ -3499,7 +3504,7 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 		case parser.TokOpenBrace:
 			// {mod, opts} = Keyword.pop(opts, :key, Default), and
 			// {:ok, mod} = Keyword.fetch(opts, :key)
-			if end, handled := ob.tupleAssignment(i, depth == usingDepth); handled {
+			if end, handled := ob.tupleAssignment(i); handled {
 				i = end
 				continue
 			}

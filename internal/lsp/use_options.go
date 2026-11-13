@@ -369,13 +369,14 @@ func (b *optBinder) unquotedBinding(open int) (varBinding, bool) {
 	return unknownBinding, true
 }
 
-// assignment reads `name = value` at tokens[i] (the name). top is false for
-// a statement in a block (an if, a fn): a match there does not change the
-// variable after the block, so a value that Dexter cannot read changes
-// nothing. It returns the token to go on from, the modules that the edits put
+// assignment reads `name = value` at tokens[i] (the name). A match in a block
+// (an if, a fn) changes the variable only up to the block's end, where block
+// puts the old bindings back. A value that Dexter cannot read makes the
+// variable unknown, also in a block: the code after the match in the block
+// sees the new value, not the old one. It returns the token to go on from, the modules that the edits put
 // (edges of the use-chain graph), and handled false when the walk must go on
 // into the value, which can hold a quote.
-func (b *optBinder) assignment(i int, top bool, fileAliases map[string]string) (end int, mods []string, handled bool) {
+func (b *optBinder) assignment(i int, fileAliases map[string]string) (end int, mods []string, handled bool) {
 	tokens, n := b.tokens, b.n
 	name := b.text(i)
 	j := b.nextSig(i + 1)
@@ -453,19 +454,17 @@ func (b *optBinder) assignment(i int, top bool, fileAliases map[string]string) (
 	}
 	// Any other value (`if ...`, `case ...`, a call): Dexter cannot read it,
 	// as options or as a module.
-	if top {
-		b.varToOpt[name] = unknownBinding
-		b.vars[name] = []optEdit{{op: "unknown"}}
-	}
+	b.varToOpt[name] = unknownBinding
+	b.vars[name] = []optEdit{{op: "unknown"}}
 	return i, nil, false
 }
 
 // tupleAssignment reads a match of a tuple at tokens[i] (the `{`):
 // `{mod, opts} = Keyword.pop(opts, :key, Default)` and
-// `{:ok, mod} = Keyword.fetch(opts, :key)`. top is as for assignment. It
+// `{:ok, mod} = Keyword.fetch(opts, :key)`, as assignment does. It
 // returns the token to go on from, and handled false when the walk must go
 // on from i+1.
-func (b *optBinder) tupleAssignment(i int, top bool) (end int, handled bool) {
+func (b *optBinder) tupleAssignment(i int) (end int, handled bool) {
 	tokens, n := b.tokens, b.n
 	closing := matchingBracket(tokens, n, i)
 	if closing < 0 || !b.isAssign(b.nextSig(closing+1)) {
@@ -514,13 +513,11 @@ func (b *optBinder) tupleAssignment(i int, top bool) (end int, handled bool) {
 			return endJ, true
 		}
 	}
-	if top {
-		// A tuple that Dexter cannot read.
-		for _, e := range elems {
-			if v := varAt(e); v != "" {
-				b.varToOpt[v] = unknownBinding
-				b.vars[v] = []optEdit{{op: "unknown"}}
-			}
+	// A tuple that Dexter cannot read.
+	for _, e := range elems {
+		if v := varAt(e); v != "" {
+			b.varToOpt[v] = unknownBinding
+			b.vars[v] = []optEdit{{op: "unknown"}}
 		}
 	}
 	return i, false
