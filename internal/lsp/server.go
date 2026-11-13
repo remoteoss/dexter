@@ -68,10 +68,35 @@ const unknownOpt = "\x00unknown"
 // (`opts = Keyword.put_new(opts, :key, Mod)`). The edits of a variable are
 // in source order.
 type optEdit struct {
-	op   string   // "put", "put_new", "delete", or "take"
-	key  string   // for put, put_new, delete
-	mod  string   // the value; unknownOpt when it is not a module
+	op   string   // "put", "put_new", "update", "delete", "take", "unknown" (any key, any value), or "unknown_new" (any value for a key that is not set)
+	key  string   // for put, put_new, update, delete
+	mod  string   // the value (for update: the one put when the key is not set); unknownOpt when it is not a module
 	keys []string // for take: the keys that are kept
+}
+
+// optAnyKey, as a key of an options map, marks options whose keys Dexter
+// cannot know (`opts = if ..., do: ..., else: ...`): every key that the map
+// does not hold has a value that Dexter cannot read. optAbsent, as a value,
+// is a key that such options are known not to hold (deleted after it).
+const (
+	optAnyKey = "\x00any"
+	optAbsent = "\x00absent"
+)
+
+// optLookup is the value of key in an options map; set is false when the
+// options do not hold the key. A key that options of unknown keys can hold
+// has the value unknownOpt.
+func optLookup(opts map[string]string, key string) (v string, set bool) {
+	if v, ok := opts[key]; ok {
+		if v == optAbsent {
+			return "", false
+		}
+		return v, true
+	}
+	if _, anyKey := opts[optAnyKey]; anyKey {
+		return unknownOpt, true
+	}
+	return "", false
 }
 
 // effectiveOpts are the caller's options with edits applied: the caller
@@ -90,17 +115,51 @@ func effectiveOpts(consumer map[string]string, edits []optEdit) map[string]strin
 		case "put":
 			out[e.key] = e.mod
 		case "put_new":
-			if _, ok := out[e.key]; !ok {
+			if v, set := optLookup(out, e.key); !set {
+				out[e.key] = e.mod
+			} else if v == unknownOpt {
+				// The key can be set or not: either value.
+				out[e.key] = unknownOpt
+			}
+		case "update":
+			// Keyword.update(opts, :key, default, fun): fun changes a value
+			// that is set, and Dexter cannot read what it gives.
+			if _, set := optLookup(out, e.key); set {
+				out[e.key] = unknownOpt
+			} else {
 				out[e.key] = e.mod
 			}
 		case "delete":
-			delete(out, e.key)
+			if _, anyKey := out[optAnyKey]; anyKey {
+				out[e.key] = optAbsent
+			} else {
+				delete(out, e.key)
+			}
 		case "take":
+			_, anyKey := out[optAnyKey]
 			for k := range out {
 				if !slices.Contains(e.keys, k) {
 					delete(out, k)
 				}
 			}
+			if anyKey {
+				for _, k := range e.keys {
+					if _, ok := out[k]; !ok {
+						out[k] = unknownOpt
+					}
+				}
+			}
+		case "unknown":
+			clear(out)
+			out[optAnyKey] = unknownOpt
+		case "unknown_new":
+			// A key that the options do not hold can have any value.
+			for k, v := range out {
+				if v == optAbsent {
+					delete(out, k)
+				}
+			}
+			out[optAnyKey] = unknownOpt
 		}
 	}
 	return out
@@ -110,7 +169,7 @@ func effectiveOpts(consumer map[string]string, edits []optEdit) map[string]strin
 // options: the option's value, or the default when no step sets it. ok is
 // false, and mod empty, when there is none or the value cannot be known.
 func bindingModule(binding optBinding, consumer map[string]string) (mod string, ok bool) {
-	if v, set := effectiveOpts(consumer, binding.readEdits)[binding.optKey]; set {
+	if v, set := optLookup(effectiveOpts(consumer, binding.readEdits), binding.optKey); set {
 		if v == unknownOpt || v == "" {
 			return "", false
 		}
@@ -125,7 +184,7 @@ func bindingModule(binding optBinding, consumer map[string]string) (mod string, 
 // bindingUnknown reports whether the option an optBinding reads has a value
 // that Dexter cannot read.
 func bindingUnknown(binding optBinding, consumer map[string]string) bool {
-	v, set := effectiveOpts(consumer, binding.readEdits)[binding.optKey]
+	v, set := optLookup(effectiveOpts(consumer, binding.readEdits), binding.optKey)
 	if !set {
 		// The default applies: `opts[:key] || build()` cannot be read.
 		return binding.defaultMod == unknownOpt
@@ -140,15 +199,34 @@ func callOpts(call UseCall, consumer map[string]string) map[string]string {
 	if !call.forwardOpts {
 		return call.Opts
 	}
-	out := make(map[string]string)
 	forwarded := effectiveOpts(consumer, call.forwardEdits)
 	if call.callerWins {
-		maps.Copy(out, call.Opts)
-		maps.Copy(out, forwarded)
-		return out
+		return overlayOpts(call.Opts, forwarded)
 	}
-	maps.Copy(out, forwarded)
-	maps.Copy(out, call.Opts)
+	return overlayOpts(forwarded, call.Opts)
+}
+
+// overlayOpts are the options low with the keys of high over them.
+func overlayOpts(low, high map[string]string) map[string]string {
+	out := make(map[string]string, len(low)+len(high))
+	maps.Copy(out, low)
+	for k, v := range high {
+		if v == optAbsent {
+			if _, ok := low[k]; ok {
+				// high does not hold the key: the value of low stays.
+				continue
+			}
+		}
+		out[k] = v
+	}
+	if _, anyKey := high[optAnyKey]; anyKey {
+		// high can hold every other key too.
+		for k := range low {
+			if _, ok := high[k]; !ok {
+				out[k] = unknownOpt
+			}
+		}
+	}
 	return out
 }
 
@@ -3553,7 +3631,25 @@ func (s *Server) lookupThroughUseOfDetailed(fullModule, functionName string, fol
 			unknownUse, hasUnknown = store.LookupResult{FilePath: modResults[0].FilePath, Line: calls[i].line, Kind: "use"}, true
 		}
 	}
+	if hasUnknown && !s.unknownChainCanInject(functionName) {
+		// A name that no chain can inject, such as a typo, is not the
+		// use's.
+		return nil, store.LookupResult{}, false
+	}
 	return nil, unknownUse, hasUnknown
+}
+
+// unknownChainCanInject reports whether a use chain whose module Dexter cannot
+// read can inject name: a __using__ body of the workspace defines it, or a
+// module that one imports defines it as public. The names are cached for each
+// write generation of the store, so a request does not read the files again.
+func (s *Server) unknownChainCanInject(name string) bool {
+	names, imports := s.usingCache.injectable(s.store.WriteGeneration(), s.loadUsingEntries)
+	if names[name] {
+		return true
+	}
+	results, err := s.store.LookupFunctionInModules(imports, name, -1)
+	return err == nil && len(publicOnly(results)) > 0
 }
 
 // moduleUseCalls are the `use` calls of module in its file: a file can hold
