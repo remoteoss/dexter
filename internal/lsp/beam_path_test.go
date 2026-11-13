@@ -300,8 +300,8 @@ func writeBE32(buf *bytes.Buffer, value uint32) {
 	buf.Write(field[:])
 }
 
-// monorepoFixture lays out a workspace like tiger's: the workspace root is not a
-// Mix project and has no _build, apps/main compiles everything, and
+// monorepoFixture lays out a monorepo: the workspace root is not a Mix project
+// and has no _build, apps/main compiles everything, and
 // libs/remote-library is a path dependency whose application is `remote`.
 func monorepoFixture(t *testing.T) (*Server, string) {
 	t.Helper()
@@ -382,6 +382,106 @@ func TestGeneratedFunctionsPreferMostRecentBuild(t *testing.T) {
 				t.Errorf("%s from the older build was used", tc.notWant)
 			}
 		})
+	}
+}
+
+// separateBuildsFixture lays out a monorepo where each project has its own
+// build: apps/app_one compiles itself and its path dependency libs/lib_one,
+// and libs/lib_two is compiled on its own. The workspace root has no _build.
+func separateBuildsFixture(t *testing.T) (*Server, string) {
+	t.Helper()
+	server, cleanup := setupTestServer(t)
+	t.Cleanup(cleanup)
+	root := server.projectRoot
+	for relative, content := range map[string]string{
+		"apps/app_one/mix.exs": "defmodule AppOne.MixProject do\n  def project, do: [app: :app_one, deps: [{:lib_one, path: \"../../libs/lib_one\"}]]\nend\n",
+		"libs/lib_one/mix.exs": "defmodule LibOne.MixProject do\n  def project, do: [app: :lib_one]\nend\n",
+		"libs/lib_two/mix.exs": "defmodule LibTwo.MixProject do\n  def project, do: [app: :lib_two]\nend\n",
+	} {
+		path := filepath.Join(root, relative)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeBeamAt(t, filepath.Join(root, "apps/app_one/_build/dev/lib/app_one/ebin"), "AppOne.User", time.Now(), beamExport{"generated_fn", 0})
+	writeBeamAt(t, filepath.Join(root, "apps/app_one/_build/dev/lib/lib_one/ebin"), "LibOne.Thing", time.Now(), beamExport{"lib_fn", 0})
+	writeBeamAt(t, filepath.Join(root, "libs/lib_two/_build/dev/lib/lib_two/ebin"), "LibTwo.Thing", time.Now(), beamExport{"other_fn", 0})
+	indexFile(t, server.store, root, "apps/app_one/lib/app_one/user.ex", "defmodule AppOne.User do\n  def source_function, do: :ok\nend\n")
+	indexFile(t, server.store, root, "libs/lib_one/lib/lib_one/thing.ex", "defmodule LibOne.Thing do\n  def source_function, do: :ok\nend\n")
+	return server, root
+}
+
+// A module that no source defines, and that has no indexed parent, is found in
+// the build of the project that generates it, also when the workspace root has
+// no build of its own.
+func TestGeneratedModuleWithoutSourceFoundInProjectBuild(t *testing.T) {
+	server, root := separateBuildsFixture(t)
+	writeBeamAt(t, filepath.Join(root, "apps/app_one/_build/dev/lib/app_one/ebin"), "AppOne.Generated.Thing", time.Now(), beamExport{"run", 0})
+
+	if _, found := server.generatedSymbol("AppOne.Generated.Thing", "", "run"); !found {
+		t.Error("function of a generated module in a project build was not found")
+	}
+	if _, found := server.generatedSymbol("AppOne.User", "", "generated_fn"); !found {
+		t.Error("generated function of a project module was not found")
+	}
+}
+
+// A project with path dependencies holds more than one application that is
+// not in deps/. Its own application comes from its mix.exs, so the negative
+// result for a module that is not compiled yet watches that application's
+// ebin, and the compile that adds the module clears it.
+func TestGeneratedFunctionsPicksUpNewlyCompiledModuleInProjectWithPathDeps(t *testing.T) {
+	server, root := separateBuildsFixture(t)
+	const module = "AppOne.Later"
+	indexFile(t, server.store, root, "apps/app_one/lib/app_one/later.ex", "defmodule AppOne.Later do\n  def source_function, do: :ok\nend\n")
+
+	if got := server.generatedFunctionsForModule(module); got != nil {
+		t.Fatalf("expected nothing before the module is compiled, got %v", got)
+	}
+	ebin := filepath.Join(root, "apps/app_one/_build/dev/lib/app_one/ebin")
+	if entry := server.generatedCacheEntryForTest(module); entry == nil || entry.watchDir != ebin {
+		t.Fatalf("negative result must watch %s, got %#v", ebin, entry)
+	}
+
+	// Compile it. Only the ebin changes: the lib directory above it does not.
+	writeBeamAt(t, ebin, module, time.Now(), beamExport{"later_fn", 0})
+	// Directory mtimes can be coarse; make the change unambiguous the way a
+	// real compile landing a moment later would.
+	future := time.Now().Add(2 * time.Second)
+	if err := os.Chtimes(ebin, future, future); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, found := server.generatedSymbol(module, "", "later_fn"); !found {
+		t.Error("generated function of a newly compiled module was not found")
+	}
+	if _, found := server.generatedSymbol("LibOne.Thing", "", "lib_fn"); !found {
+		t.Error("generated function of a path dependency was not found")
+	}
+}
+
+// A build with no lib directory for the current profile is read once, not by
+// each lookup that asks it, until the directory appears.
+func TestLibIndexCachesMissingLibDirectory(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+	buildRoot := filepath.Join(server.projectRoot, "libs/test_only")
+	if err := os.MkdirAll(filepath.Join(buildRoot, "_build", "test", "lib"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	first := server.libIndex(buildRoot)
+	if first.loaded {
+		t.Fatal("a missing lib directory must not load")
+	}
+	if again := server.libIndex(buildRoot); again != first {
+		t.Error("a missing lib directory was read again")
+	}
+	writeBeamAt(t, filepath.Join(buildRoot, "_build", "dev", "lib", "test_only", "ebin"), "TestOnly", time.Now())
+	if fresh := server.libIndex(buildRoot); fresh == first || !fresh.loaded {
+		t.Error("the lib directory appeared but the snapshot was not rebuilt")
 	}
 }
 
