@@ -898,6 +898,7 @@ func TestRegression_UseChainOptionForms(t *testing.T) {
 		optModule("PL.Owner.Impl", inject("owner_impl")),
 		optModule("PL.Nested", "  defmodule Impl do\n    defmacro __using__(_opts) do\n      quote do\n        def new(args, opts \\\\ []), do: {:impl, args, opts}\n      end\n    end\n  end\n\n"+optUsing("", "      use PL.Wrapper, unquote(opts)")),
 		optModule("PL.Clauses", "  defmacro __using__(which) when is_atom(which) do\n    quote do\n      use PL.Third\n    end\n  end\n\n"+optUsing("", "      use PL.Wrapper, unquote(opts)")),
+		optModule("PL.UnquoteMerge", optUsing("    extra = [base: PL.Second]", "      use PL.Wrapper, unquote(Keyword.merge(opts, extra))")),
 		optModule("PL.MergeDefVar", optUsing("    defaults = [base: PL.Second]\n    opts = Keyword.merge(defaults, opts)", "      use PL.Wrapper, unquote(opts)")),
 		optModule("PL.BlockShadow", "  defmacro __using__(opts) do\n    mod = opts[:base] || PL.Base\n    if true do\n      mod = pick()\n      quote do\n        use unquote(mod)\n      end\n    end\n  end\n\n  def pick, do: PL.Second"),
 		optModule("PL.BlockEdit", optUsing("    if opts[:flag] do\n      opts = Keyword.put(opts, :base, PL.Second)\n      _ = opts\n    end", "      use PL.Wrapper, unquote(opts)")),
@@ -1001,6 +1002,9 @@ func TestRegression_UseChainOptionForms(t *testing.T) {
 		// A variable bound to a keyword list, merged under the options: a
 		// key that the options hold wins.
 		{"W.MergeDefVar", "use PL.MergeDefVar", "second"},
+		// The unquote runs in macro code, where extra is the keyword list.
+		{"W.UnquoteMerge", "use PL.UnquoteMerge", "second"},
+		{"W.UnquoteMergeOwn", "use PL.UnquoteMerge, base: PL.Third", "second"},
 		{"W.MergeDefVarOwn", "use PL.MergeDefVar, base: PL.Third", "third"},
 		// A rebind in a block that Dexter cannot read: the quote in the
 		// block sees the new value, so the answer is the use line.

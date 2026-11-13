@@ -62,8 +62,11 @@ func (b *optBinder) macroScope(aliases map[string]string) optScope {
 	return optScope{aliases: aliases, consts: b.varToOpt, lits: b.lits, self: b.self, macroCode: true}
 }
 
+// quoteScope is the scope of a quote. It keeps the keyword literal variables
+// of the macro code: literal does not read them in the quote, where a name is
+// the caller's variable, but the code in an unquote (macro) does.
 func (b *optBinder) quoteScope(aliases map[string]string) optScope {
-	return optScope{aliases: aliases, consts: b.varToOpt, self: b.self, macroCode: true, inQuote: true}
+	return optScope{aliases: aliases, consts: b.varToOpt, lits: b.lits, self: b.self, macroCode: true, inQuote: true}
 }
 
 // unknownBinding is a variable whose value Dexter cannot read.
