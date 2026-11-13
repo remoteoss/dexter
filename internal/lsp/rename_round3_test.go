@@ -372,10 +372,11 @@ func TestRename_OnlyTheTargetModulesCalls(t *testing.T) {
 	}
 }
 
-// The rename waits for the watcher only when a file it plans from is gone and
-// no earlier reply moved it; the common case does not touch the barrier, and
-// a barrier that does not finish refuses instead of dropping the file.
-func TestRename_FlushForUnrecordedMoves(t *testing.T) {
+// The rename waits once for the watcher before it plans, so a file written a
+// moment before is in the plan; a gone file that the watcher did not report
+// stops the rename once; and a barrier that does not finish refuses instead of
+// planning from an index that is behind.
+func TestRename_FlushesBeforePlanning(t *testing.T) {
 	setup := func(t *testing.T) (*Server, string, *int) {
 		dir := t.TempDir()
 		servers, st := sessionsAt(t, dir, 1)
@@ -397,8 +398,8 @@ func TestRename_FlushForUnrecordedMoves(t *testing.T) {
 		if err := rename(a, dir); err != nil {
 			t.Fatal(err)
 		}
-		if *calls != 0 {
-			t.Errorf("the barrier ran %d times for a rename with no gone file", *calls)
+		if *calls != 1 {
+			t.Errorf("the barrier ran %d times, want 1", *calls)
 		}
 	})
 	t.Run("saved file", func(t *testing.T) {
@@ -410,8 +411,8 @@ func TestRename_FlushForUnrecordedMoves(t *testing.T) {
 		if err := rename(a, dir); err != nil {
 			t.Fatal(err)
 		}
-		if *calls != 0 {
-			t.Errorf("the barrier ran %d times for a saved file", *calls)
+		if *calls != 1 {
+			t.Errorf("the barrier ran %d times for a saved file, want 1", *calls)
 		}
 	})
 	t.Run("gone file", func(t *testing.T) {
@@ -432,8 +433,29 @@ func TestRename_FlushForUnrecordedMoves(t *testing.T) {
 		if err := rename(a, dir); err != nil {
 			t.Fatalf("the second try: %v", err)
 		}
-		if *calls != 1 {
-			t.Errorf("the second try ran the barrier again")
+		if *calls != 2 {
+			t.Errorf("the barrier ran %d times after two tries, want 2", *calls)
+		}
+	})
+	t.Run("file written just before", func(t *testing.T) {
+		dir := t.TempDir()
+		servers, st := sessionsAt(t, dir, 1)
+		a := servers[0]
+		indexFile(t, st, dir, "lib/alpha.ex", safetyDefA)
+		indexFile(t, st, dir, "lib/beta.ex", safetyCallB)
+		// A file that calls the function is written; the watcher indexes it
+		// when the barrier runs, as the runtime's FlushEvents does.
+		gamma := strings.Replace(safetyCallB, "Beta", "Gamma", 1)
+		writeFile(t, filepath.Join(dir, "lib/gamma.ex"), gamma)
+		a.index.SetEventFlusher(func(context.Context) error {
+			indexFile(t, st, dir, "lib/gamma.ex", gamma)
+			return nil
+		})
+		if err := rename(a, dir); err != nil {
+			t.Fatal(err)
+		}
+		if got := readFile(t, filepath.Join(dir, "lib/gamma.ex")); got == gamma || strings.Contains(got, ".foo(") {
+			t.Errorf("gamma.ex was not renamed:\n%s", got)
 		}
 	})
 	t.Run("barrier times out", func(t *testing.T) {

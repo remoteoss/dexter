@@ -43,6 +43,10 @@ type RenameSummary struct {
 	// did not end within renameSummaryWait (it waits behind a long index pass,
 	// such as the one after a branch switch) or before the request ended.
 	IndexPending bool
+	// Warnings are the rename's messages for the user, such as calls that it
+	// could not change (through a variable, or with the function's atom).
+	// An editor gets them as messages; a caller without one shows them.
+	Warnings []string
 
 	mu      sync.Mutex
 	indexed []<-chan struct{}
