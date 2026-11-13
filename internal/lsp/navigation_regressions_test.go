@@ -992,8 +992,11 @@ func TestRegression_UseChainOptionAlias(t *testing.T) {
 	defWrapper := optModule("AL.DefWrapper", optUsing("    {mod, opts} = Keyword.pop(opts, :base, AL.Base)", "      use unquote(mod), unquote(opts)"))
 	outer := optModule("AL.Outer", optUsing("    opts = Keyword.put_new(opts, :base, AL.Base)", "      use AL.Wrapper, unquote(opts)"))
 	pass := optModule("AL.Pass", optUsing("", "      use AL.Wrapper, unquote(opts)"))
+	// The second use of the wrapper, with other options, is a new expansion:
+	// it must not hide the first one, which injects the alias.
+	twice := optModule("AL.Twice", "  defmacro __using__(_opts) do\n    quote do\n      use AL.Wrapper, base: AL.Base\n      use AL.Wrapper, base: AL.Other\n    end\n  end")
 	var files []bbFile
-	files = append(files, target, base, other, wrapper, defWrapper, outer, pass)
+	files = append(files, target, base, other, wrapper, defWrapper, outer, pass, twice)
 	users := []struct {
 		use      string
 		injected bool
@@ -1006,6 +1009,7 @@ func TestRegression_UseChainOptionAlias(t *testing.T) {
 		{"use AL.DefWrapper, base: AL.Other", false},
 		{"use AL.Pass, base: AL.Base", true},
 		{"use AL.Pass", false},
+		{"use AL.Twice", true},
 	}
 	want := map[string]bool{}
 	what := map[string]string{}

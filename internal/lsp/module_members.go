@@ -133,11 +133,9 @@ func (s *Server) injectedMembers(module string) []ModuleMember {
 }
 
 func (s *Server) collectUsingDefs(moduleName, which string, consumerOpts map[string]string, visited map[string]bool, add func(filePath, name string, d inlineDef)) {
-	visitKey := usingVisitKey(moduleName, which)
-	if visited[visitKey] {
+	if !beginUsingVisit(visited, usingVisitKey(moduleName, which, consumerOpts)) {
 		return
 	}
-	visited[visitKey] = true
 	entry := s.cachedUsing(moduleName)
 	if entry == nil {
 		return

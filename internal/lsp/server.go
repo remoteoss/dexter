@@ -3574,8 +3574,41 @@ func moduleUseCalls(fileText, module string) []UseCall {
 	return kept
 }
 
-func usingVisitKey(moduleName, which string) string {
-	return moduleName + "\x00" + which
+// usingVisitKey identifies one expansion of a __using__ body in a use-chain
+// walk. The options are part of it: Elixir expands a module again for each
+// use, and `use unquote(mod)` makes the body depend on them, so a second use
+// of the same module with other options can inject other code. Option values
+// come from the source, so the walk has a finite number of keys;
+// maxUseChainVisits bounds it on code that has very many.
+func usingVisitKey(moduleName, which string, opts map[string]string) string {
+	key := moduleName + "\x00" + which
+	if len(opts) == 0 {
+		return key
+	}
+	keys := slices.Sorted(maps.Keys(opts))
+	var b strings.Builder
+	b.WriteString(key)
+	for _, k := range keys {
+		b.WriteByte(0)
+		b.WriteString(k)
+		b.WriteByte('=')
+		b.WriteString(opts[k])
+	}
+	return b.String()
+}
+
+// maxUseChainVisits bounds the expansions of one use-chain walk. Real chains
+// have a few dozen; the bound only stops a pathological option fan-out.
+const maxUseChainVisits = 1024
+
+// beginUsingVisit marks the expansion of key as visited, and reports false
+// when it was visited already or the walk has reached maxUseChainVisits.
+func beginUsingVisit(visited map[string]bool, key string) bool {
+	if visited[key] || len(visited) >= maxUseChainVisits {
+		return false
+	}
+	visited[key] = true
+	return true
 }
 
 // lookupInUsingEntryFor is lookupInUsingEntry with the dispatch atom from the
@@ -3585,11 +3618,9 @@ func (s *Server) lookupInUsingEntryFor(moduleName, functionName, which string, c
 }
 
 func (s *Server) lookupInUsingEntryForWithFollow(moduleName, functionName, which string, consumerOpts map[string]string, visited map[string]bool, followDelegates bool) []store.LookupResult {
-	visitKey := usingVisitKey(moduleName, which)
-	if visited[visitKey] {
+	if !beginUsingVisit(visited, usingVisitKey(moduleName, which, consumerOpts)) {
 		return nil
 	}
-	visited[visitKey] = true
 
 	entry := s.cachedUsing(moduleName)
 	if entry == nil {
@@ -3683,11 +3714,9 @@ func (s *Server) resolveModuleViaUseChainWithOpts(moduleName, functionName strin
 // resolveModuleViaUseChainFor is resolveModuleViaUseChainWithOpts with the
 // dispatch atom from the `use` site (empty for an ordinary `use Module`).
 func (s *Server) resolveModuleViaUseChainFor(moduleName, functionName, which string, consumerOpts map[string]string, visited map[string]bool) string {
-	visitKey := usingVisitKey(moduleName, which)
-	if visited[visitKey] {
+	if !beginUsingVisit(visited, usingVisitKey(moduleName, which, consumerOpts)) {
 		return ""
 	}
-	visited[visitKey] = true
 
 	entry := s.cachedUsing(moduleName)
 	if entry == nil {
@@ -3989,11 +4018,9 @@ func (s *Server) findInjectedAliasesFor(targetModule string, targetRefs []store.
 // When a chain reads an option that Dexter cannot know, every module that the
 // body's option edits can put counts, as the use-chain graph has them.
 func (s *Server) usingInjectsAlias(module, which string, consumerOpts map[string]string, targetModule, written, resolved string, visited map[string]bool) bool {
-	visitKey := usingVisitKey(module, which)
-	if visited[visitKey] {
+	if !beginUsingVisit(visited, usingVisitKey(module, which, consumerOpts)) {
 		return false
 	}
-	visited[visitKey] = true
 
 	entry := s.cachedUsing(module)
 	if entry == nil {
@@ -4643,11 +4670,9 @@ func (s *Server) injectedAliasReferences(fullModule, functionName string, module
 // addCompletionsFromUsing adds completion items injected by a module's __using__
 // body — inline defs, imported functions, and transitive uses — into items.
 func (s *Server) addCompletionsFromUsingFor(moduleName, which string, consumerOpts map[string]string, funcPrefix string, seen map[string]bool, items *[]protocol.CompletionItem, visited map[string]bool, inPipe bool, useSnippets bool) {
-	visitKey := usingVisitKey(moduleName, which)
-	if visited[visitKey] {
+	if !beginUsingVisit(visited, usingVisitKey(moduleName, which, consumerOpts)) {
 		return
 	}
-	visited[visitKey] = true
 
 	entry := s.cachedUsing(moduleName)
 	if entry == nil {
@@ -4856,11 +4881,9 @@ func (s *Server) mergeAliasesFromUseCalls(useCalls []UseCall, aliases map[string
 }
 
 func (s *Server) mergeAliasesFromUsingEntryFor(moduleName, which string, consumerOpts map[string]string, aliases map[string]string, visited map[string]bool) {
-	visitKey := usingVisitKey(moduleName, which)
-	if visited[visitKey] {
+	if !beginUsingVisit(visited, usingVisitKey(moduleName, which, consumerOpts)) {
 		return
 	}
-	visited[visitKey] = true
 
 	entry := s.cachedUsing(moduleName)
 	if entry == nil {
@@ -5333,11 +5356,9 @@ func (s *Server) findCallbacksViaUseChain(text, functionName string, arity int, 
 }
 
 func (s *Server) collectCallbacksInChainFor(moduleName, which, functionName string, arity int, visited map[string]bool, results *[]store.CallbackResult) {
-	visitKey := usingVisitKey(moduleName, which)
-	if visited[visitKey] {
+	if !beginUsingVisit(visited, usingVisitKey(moduleName, which, nil)) {
 		return
 	}
-	visited[visitKey] = true
 
 	if callbacks, err := s.store.LookupCallbackDef(moduleName, functionName); err == nil {
 		for _, cb := range callbacks {
