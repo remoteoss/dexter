@@ -246,34 +246,37 @@ var (
 // second for the writer and tries again; after 30 tries in a row the reclaim
 // stops, and the next call goes on.
 func (s *Store) ReclaimFreePages(ctx context.Context) (int64, error) {
-	var mode, pageSize, pages, free int64
-	if err := s.db.QueryRowContext(ctx, "PRAGMA auto_vacuum").Scan(&mode); err != nil {
-		return 0, err
-	}
-	if mode != 2 { // 2 is INCREMENTAL
-		return 0, nil
-	}
-	if err := s.db.QueryRowContext(ctx, "PRAGMA page_size").Scan(&pageSize); err != nil {
-		return 0, err
-	}
-	if err := s.db.QueryRowContext(ctx, "PRAGMA page_count").Scan(&pages); err != nil {
-		return 0, err
-	}
-	if err := s.db.QueryRowContext(ctx, "PRAGMA freelist_count").Scan(&free); err != nil {
-		return 0, err
-	}
-	if free*reclaimMinShare < pages || free*pageSize < reclaimMinBytes {
-		return 0, nil
-	}
-	// The steps run on a connection of their own, outside the pool, with a
+	// Every query runs on a connection of its own, outside the pool, with a
 	// short busy timeout: a step that waits for a writer must not hold one
 	// of the pool's two connections from the readers, and must not wait 5 s.
+	// The check of the thresholds runs there too, so that a reclaim that has
+	// nothing to do does not use the pool either.
 	db, err := sql.Open(driverName, s.path+fmt.Sprintf("?_busy_timeout=%d", reclaimBusyMs))
 	if err != nil {
 		return 0, err
 	}
 	defer func() { _ = db.Close() }()
 	db.SetMaxOpenConns(1)
+
+	var mode, pageSize, pages, free int64
+	if err := db.QueryRowContext(ctx, "PRAGMA auto_vacuum").Scan(&mode); err != nil {
+		return 0, err
+	}
+	if mode != 2 { // 2 is INCREMENTAL
+		return 0, nil
+	}
+	if err := db.QueryRowContext(ctx, "PRAGMA page_size").Scan(&pageSize); err != nil {
+		return 0, err
+	}
+	if err := db.QueryRowContext(ctx, "PRAGMA page_count").Scan(&pages); err != nil {
+		return 0, err
+	}
+	if err := db.QueryRowContext(ctx, "PRAGMA freelist_count").Scan(&free); err != nil {
+		return 0, err
+	}
+	if free*reclaimMinShare < pages || free*pageSize < reclaimMinBytes {
+		return 0, nil
+	}
 
 	start := free
 	busy := 0
