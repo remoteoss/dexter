@@ -944,6 +944,9 @@ func (s *Server) formatContent(ctx context.Context, mixRoot, path, content strin
 		default:
 			if err := bp.Ready(ctx); err != nil {
 				if ctx.Err() != nil {
+					if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+						log.Printf("Formatting: %s did not finish within the time limit; the formatter process is still starting", path)
+					}
 					return "", err
 				}
 				s.evictBeam(bp, fmt.Sprintf("formatContent: Ready failed: %v", err))
@@ -965,7 +968,11 @@ func (s *Server) formatContent(ctx context.Context, mixRoot, path, content strin
 		if errors.As(err, &formatErr) {
 			log.Printf("Formatting: %s failed: %s", path, formatErr.Message)
 		} else if ctx.Err() != nil {
-			// Context cancelled — the BEAM is fine, the editor just moved on.
+			// Context cancelled — the BEAM is fine, the editor just moved on,
+			// or the request reached its time limit.
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				log.Printf("Formatting: %s did not finish within the time limit; the formatter is still busy (the first format of a project loads its formatter configuration)", path)
+			}
 		} else {
 			s.evictBeam(bp, fmt.Sprintf("formatContent: Format request failed: %v", err))
 			log.Printf("Formatting: BEAM process crashed: %v", err)

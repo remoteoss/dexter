@@ -146,7 +146,18 @@ defmodule Dexter.Formatter do
       mix_exs = Path.join(project_root, "mix.exs")
 
       if File.regular?(mix_exs) do
-        Code.eval_file(mix_exs)
+        # The _build paths are on the code path now, so the compiler's check
+        # of remote calls would load every module that mix.exs calls (its
+        # aliases often call project modules): seconds on a large project,
+        # and only for warnings. The check is off for this evaluation.
+        previous = Code.get_compiler_option(:no_warn_undefined)
+        Code.put_compiler_option(:no_warn_undefined, :all)
+
+        try do
+          Code.eval_file(mix_exs)
+        after
+          Code.put_compiler_option(:no_warn_undefined, previous)
+        end
       end
     end
 
