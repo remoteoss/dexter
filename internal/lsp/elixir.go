@@ -1974,15 +1974,20 @@ func tokCollectKeywordModuleOpts(source []byte, tokens []parser.Token, n, pos in
 	i := tokNextSig(tokens, n, pos)
 	for i < n {
 		tok := tokens[i]
-		// `{:key, Mod}`, the tuple form of a pair.
-		if tok.Kind == parser.TokOpenBrace && i+4 < n && tokens[i+1].Kind == parser.TokAtom && tokens[i+2].Kind == parser.TokComma {
-			if m := tokNextSig(tokens, n, i+3); m < n && tokens[m].Kind == parser.TokModule {
-				modName, end := tokCollectModuleName(source, tokens, n, m)
-				if c := tokNextSig(tokens, n, end); modName != "" && c < n && tokens[c].Kind == parser.TokCloseBrace {
-					result[parser.TokenText(source, tokens[i+1])[1:]] = parser.ResolveModuleRef(modName, aliases, "")
-					i = c + 1
-					continue
+		// A tuple: `{:key, Mod}`, the tuple form of a pair, is an option.
+		// Nothing inside a tuple is one (`{:key, [base: X]}` holds a value).
+		if tok.Kind == parser.TokOpenBrace {
+			if i+4 < n && tokens[i+1].Kind == parser.TokAtom && tokens[i+2].Kind == parser.TokComma {
+				if m := tokNextSig(tokens, n, i+3); m < n && tokens[m].Kind == parser.TokModule {
+					modName, end := tokCollectModuleName(source, tokens, n, m)
+					if c := tokNextSig(tokens, n, end); modName != "" && c < n && tokens[c].Kind == parser.TokCloseBrace {
+						result[parser.TokenText(source, tokens[i+1])[1:]] = parser.ResolveModuleRef(modName, aliases, "")
+					}
 				}
+			}
+			if c := matchingBracket(tokens, n, i); c > i {
+				i = c + 1
+				continue
 			}
 		}
 		// Stop at EOL not followed by a continuation (keyword opt)
@@ -2081,13 +2086,18 @@ func forwardedOpts(source []byte, tokens []parser.Token, n, pos int, vars optVar
 	// The unquote at the top level of the argument, of its list, or of the
 	// merge call.
 	depth, arg := 0, 0
+	var openers []parser.TokenKind
 	for i := start; i < end && i < n; i++ {
 		switch tokens[i].Kind {
 		case parser.TokOpenParen, parser.TokOpenBracket, parser.TokOpenBrace:
 			depth++
+			openers = append(openers, tokens[i].Kind)
 			continue
 		case parser.TokCloseParen, parser.TokCloseBracket, parser.TokCloseBrace:
 			depth--
+			if len(openers) > 0 {
+				openers = openers[:len(openers)-1]
+			}
 			continue
 		case parser.TokComma:
 			if merge && depth == 1 {
@@ -2101,7 +2111,7 @@ func forwardedOpts(source []byte, tokens []parser.Token, n, pos int, vars optVar
 		if name := parser.TokenText(source, tokens[i]); name != "unquote" && name != "unquote_splicing" {
 			continue
 		}
-		if !optionsPosition(source, tokens, start, i) {
+		if (len(openers) > 0 && openers[len(openers)-1] == parser.TokOpenBrace) || !optionsPosition(source, tokens, start, i) {
 			// A value, such as `adapter: unquote(adapter)`, not the options.
 			continue
 		}
@@ -2127,8 +2137,8 @@ func forwardedOpts(source []byte, tokens []parser.Token, n, pos int, vars optVar
 // optionsPosition reports whether the unquote at tokens[i] stands for a whole
 // options list in the argument that starts at tokens[start]: the argument
 // itself, an operand of `++`, the tail after `|`, a list element, or an
-// argument of Keyword.merge. A keyword value (`k: unquote(v)`) or a tuple
-// element is not one.
+// argument of Keyword.merge. A keyword value (`k: unquote(v)`) is not one,
+// and the caller checks that it is not in a tuple.
 func optionsPosition(source []byte, tokens []parser.Token, start, i int) bool {
 	if i == start {
 		return true

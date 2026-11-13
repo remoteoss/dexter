@@ -77,7 +77,7 @@ type optEdit struct {
 // effectiveOpts are the caller's options with edits applied: the caller
 // wins over put_new, put wins over the caller, and (with forward) delete and
 // take change what is passed on. The caller's map is not changed.
-func effectiveOpts(consumer map[string]string, edits []optEdit, forward bool) map[string]string {
+func effectiveOpts(consumer map[string]string, edits []optEdit) map[string]string {
 	if len(edits) == 0 {
 		return consumer
 	}
@@ -94,15 +94,11 @@ func effectiveOpts(consumer map[string]string, edits []optEdit, forward bool) ma
 				out[e.key] = e.mod
 			}
 		case "delete":
-			if forward {
-				delete(out, e.key)
-			}
+			delete(out, e.key)
 		case "take":
-			if forward {
-				for k := range out {
-					if !slices.Contains(e.keys, k) {
-						delete(out, k)
-					}
+			for k := range out {
+				if !slices.Contains(e.keys, k) {
+					delete(out, k)
 				}
 			}
 		}
@@ -114,7 +110,7 @@ func effectiveOpts(consumer map[string]string, edits []optEdit, forward bool) ma
 // options: the option's value, or the default when no step sets it. ok is
 // false, and mod empty, when there is none or the value cannot be known.
 func bindingModule(binding optBinding, consumer map[string]string) (mod string, ok bool) {
-	if v, set := effectiveOpts(consumer, binding.readEdits, false)[binding.optKey]; set {
+	if v, set := effectiveOpts(consumer, binding.readEdits)[binding.optKey]; set {
 		if v == unknownOpt || v == "" {
 			return "", false
 		}
@@ -129,7 +125,7 @@ func bindingModule(binding optBinding, consumer map[string]string) (mod string, 
 // bindingUnknown reports whether the option an optBinding reads has a value
 // that Dexter cannot read.
 func bindingUnknown(binding optBinding, consumer map[string]string) bool {
-	v, set := effectiveOpts(consumer, binding.readEdits, false)[binding.optKey]
+	v, set := effectiveOpts(consumer, binding.readEdits)[binding.optKey]
 	if !set {
 		// The default applies: `opts[:key] || build()` cannot be read.
 		return binding.defaultMod == unknownOpt
@@ -145,7 +141,7 @@ func callOpts(call UseCall, consumer map[string]string) map[string]string {
 		return call.Opts
 	}
 	out := make(map[string]string)
-	forwarded := effectiveOpts(consumer, call.forwardEdits, true)
+	forwarded := effectiveOpts(consumer, call.forwardEdits)
 	if call.callerWins {
 		maps.Copy(out, call.Opts)
 		maps.Copy(out, forwarded)
@@ -162,7 +158,7 @@ func bindingOpts(binding optBinding, consumer map[string]string) map[string]stri
 	if !binding.forwardOpts {
 		return nil
 	}
-	return effectiveOpts(consumer, binding.forwardEdits, true)
+	return effectiveOpts(consumer, binding.forwardEdits)
 }
 
 // usingCacheEntry holds the full parsed result of a module's defmacro __using__
