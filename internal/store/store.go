@@ -158,7 +158,10 @@ func Open(projectRoot string) (*Store, error) {
 
 	dbPath := DBPath(projectRoot)
 	registerDriver()
-	db, err := sql.Open(driverName, dbPath+"?_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=5000&_foreign_keys=ON")
+	// _auto_vacuum applies only to a new database (see ReclaimFreePages). An
+	// index from an older Dexter keeps its mode; a change of IndexVersion
+	// deletes it, and the new one has incremental vacuum.
+	db, err := sql.Open(driverName, dbPath+"?_auto_vacuum=incremental&_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=5000&_foreign_keys=ON")
 	if err != nil {
 		return nil, err
 	}
@@ -209,6 +212,96 @@ func (s *Store) Close() error {
 // connection) reclaims the rest.
 func (s *Store) Checkpoint() error {
 	_, err := s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	return err
+}
+
+// Reclaim thresholds: see ReclaimFreePages. Variables so that tests can use
+// a small database.
+var (
+	reclaimStepPages int64 = 4096     // 16 MiB at the 4 KiB page size: about 0.2 s of writes
+	reclaimMinShare  int64 = 4        // free pages are at least 1/reclaimMinShare of the file
+	reclaimMinBytes  int64 = 64 << 20 // and at least this many bytes
+)
+
+// ReclaimFreePages gives the free pages of the index file back to the file
+// system, and returns how many bytes it freed.
+//
+// A rebuild (BeginRebuild) copies the symbol tables into new ones and drops
+// the old ones, and a prune of many files deletes their rows. SQLite keeps the
+// freed pages in the file for later writes, so after a rebuild the file can be
+// twice the size of the data: 2.0 GB for 0.86 GB of data on a large
+// monorepo. A VACUUM would take 12 s there, all of it under the write lock,
+// longer than the 5 s that a writer waits for it. So the pages go back in steps
+// of reclaimStepPages, each in its own write transaction (at most about 0.2
+// s), and readers are never blocked (WAL). It does nothing when the free pages
+// are less than 1/reclaimMinShare of the file or less than reclaimMinBytes, or
+// when the database does not have incremental vacuum (an index that an older
+// Dexter made).
+//
+// Moving pages changes no row, so the write generation does not move and no
+// cache is dropped. A step that cannot get the write lock in time ends the
+// reclaim; a later call goes on.
+func (s *Store) ReclaimFreePages(ctx context.Context) (int64, error) {
+	var mode, pageSize, pages, free int64
+	if err := s.db.QueryRowContext(ctx, "PRAGMA auto_vacuum").Scan(&mode); err != nil {
+		return 0, err
+	}
+	if mode != 2 { // 2 is INCREMENTAL
+		return 0, nil
+	}
+	if err := s.db.QueryRowContext(ctx, "PRAGMA page_size").Scan(&pageSize); err != nil {
+		return 0, err
+	}
+	if err := s.db.QueryRowContext(ctx, "PRAGMA page_count").Scan(&pages); err != nil {
+		return 0, err
+	}
+	if err := s.db.QueryRowContext(ctx, "PRAGMA freelist_count").Scan(&free); err != nil {
+		return 0, err
+	}
+	if free*reclaimMinShare < pages || free*pageSize < reclaimMinBytes {
+		return 0, nil
+	}
+	start := free
+	for free > 0 {
+		if err := ctx.Err(); err != nil {
+			return (start - free) * pageSize, err
+		}
+		if err := s.reclaimStep(ctx); err != nil {
+			return (start - free) * pageSize, err
+		}
+		before := free
+		if err := s.db.QueryRowContext(ctx, "PRAGMA freelist_count").Scan(&free); err != nil {
+			return (start - before) * pageSize, err
+		}
+		if free >= before {
+			break // a write in between used the pages, or nothing moved
+		}
+	}
+	// In WAL mode the file is cut at the checkpoint.
+	return (start - free) * pageSize, s.Checkpoint()
+}
+
+// reclaimStep moves up to reclaimStepPages pages in one write transaction. It
+// takes its own connection for the transaction and gives it back at once, so
+// that the pool keeps a connection for readers between steps.
+func (s *Store) reclaimStep(ctx context.Context) (err error) {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if _, err = conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		}
+	}()
+	if _, err = conn.ExecContext(ctx, fmt.Sprintf("PRAGMA incremental_vacuum(%d)", reclaimStepPages)); err != nil {
+		return err
+	}
+	_, err = conn.ExecContext(ctx, "COMMIT")
 	return err
 }
 
