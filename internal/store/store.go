@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	sqlite3 "github.com/mattn/go-sqlite3"
 	"github.com/remoteoss/dexter/internal/parser"
@@ -367,8 +368,9 @@ const createIndexesSQL = `
 		CREATE INDEX IF NOT EXISTS idx_definitions_using ON definitions(module, file_id) WHERE function = '__using__';
 	`
 
-func (s *Store) DropIndexes() error {
-	_, err := s.db.Exec(`
+// dropIndexesSQL removes every index the symbol tables have had, current and
+// retired, so that a bulk load writes to tables with no index to update.
+const dropIndexesSQL = `
 		DROP INDEX IF EXISTS idx_definitions_module;
 		DROP INDEX IF EXISTS idx_definitions_module_function;
 		DROP INDEX IF EXISTS idx_definitions_file_path;
@@ -380,17 +382,16 @@ func (s *Store) DropIndexes() error {
 		DROP INDEX IF EXISTS idx_refs_function_kind;
 		DROP INDEX IF EXISTS idx_definitions_delegate_to;
 		DROP INDEX IF EXISTS idx_definitions_using;
-	`)
-	return err
-}
+	`
 
 func (s *Store) CreateIndexes() error {
 	return createIndexes(s.db)
 }
 
 // IndexNames returns the names of dexter's own indexes, as the database
-// currently has them. The bulk load drops them before writing and recreates
-// them after, so tests use this to check that they came back.
+// currently has them. The bulk load drops them in its transaction and builds
+// them again before it commits, so tests use this to check that readers always
+// see them.
 func (s *Store) IndexNames() ([]string, error) {
 	rows, err := s.db.Query("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%' ORDER BY name")
 	if err != nil {
@@ -621,7 +622,8 @@ const (
 	// batchIncremental replaces each file's rows in the live tables: an upsert
 	// of the files row, a DELETE by file id, and buffered INSERTs.
 	batchIncremental batchMode = iota
-	// batchInsertOnly fills empty tables whose indexes the caller has dropped.
+	// batchInsertOnly fills empty tables with their indexes dropped, and
+	// builds the indexes at Commit. See BeginBulkInsert.
 	batchInsertOnly
 	// batchRebuild writes into new, unindexed copies of the symbol tables and
 	// swaps them in at Commit. See BeginRebuild.
@@ -666,6 +668,10 @@ type Batch struct {
 	// counter and writes files rows with an explicit id, so a cold index never
 	// pays a round trip per file to learn what id it just wrote.
 	nextFileID int64
+
+	// indexBuild is how long Commit took to build the indexes, in
+	// insert-only mode.
+	indexBuild time.Duration
 }
 
 // multiRowInsert builds "INSERT INTO <table> (<cols>) VALUES (?,..),(?,..)" for
@@ -698,9 +704,16 @@ func (s *Store) BeginBatchContext(ctx context.Context) (*Batch, error) {
 	return s.beginBatch(ctx, batchIncremental)
 }
 
-// BeginBulkInsert starts a batch optimized for inserting into an empty table.
-// It skips DELETE statements before each insert. Callers should drop indexes
-// before calling this and recreate them after Commit.
+// BeginBulkInsert starts a batch optimized for inserting into empty tables.
+// It skips DELETE statements before each insert, and drops the indexes of the
+// symbol tables in its transaction, so that no insert updates an index.
+//
+// Commit builds the indexes again, each with one sort, before it commits. The
+// rows and their indexes become visible to readers together: until the
+// commit, a reader sees the database as it was, with its indexes. A reader
+// that saw the rows without the indexes would scan the full table on each
+// lookup, which takes seconds on a large project. A rollback restores the
+// dropped indexes.
 func (s *Store) BeginBulkInsert() (*Batch, error) {
 	return s.beginBatch(context.Background(), batchInsertOnly)
 }
@@ -740,18 +753,25 @@ func (s *Store) beginBatch(ctx context.Context, mode batchMode) (_ *Batch, err e
 	}()
 
 	defTable, refTable := "definitions", "refs"
-	if mode == batchRebuild {
-		defTable, refTable = "definitions_rebuild", "refs_rebuild"
-		// Take the write lock first. The transaction is deferred, so the
-		// DROP below would open it as a read, and the CREATE after it would
-		// have to upgrade that read to a write. SQLite does not call the busy
-		// handler for that upgrade: with another writer active, the rebuild
-		// would fail at once with "database is locked" instead of waiting
-		// for busy_timeout. A write statement as the first statement waits
-		// like every other writer.
+	if mode != batchIncremental {
+		// Take the write lock first. The transaction is deferred, so a DROP
+		// ... IF EXISTS of an object that is not there would open it as a
+		// read, and the next write would have to upgrade that read to a
+		// write. SQLite does not call the busy handler for that upgrade: with
+		// another writer active, the batch would fail at once with "database
+		// is locked" instead of waiting for busy_timeout. A write statement
+		// as the first statement waits like every other writer.
 		if _, err = tx.ExecContext(ctx, "DELETE FROM metadata WHERE key = 'rebuild_lock'"); err != nil {
 			return nil, err
 		}
+	}
+	if mode == batchInsertOnly {
+		if _, err = tx.ExecContext(ctx, dropIndexesSQL); err != nil {
+			return nil, err
+		}
+	}
+	if mode == batchRebuild {
+		defTable, refTable = "definitions_rebuild", "refs_rebuild"
 		// A rolled-back rebuild leaves nothing behind, but a copy from a
 		// process that died mid-way would make CREATE ... IF NOT EXISTS keep
 		// its rows.
@@ -946,14 +966,27 @@ func (b *Batch) Commit() error {
 	defer b.store.wrote()
 	err := b.flushPending()
 	b.closeStmts()
-	if err == nil && b.mode == batchRebuild {
-		err = b.finishRebuild()
+	if err == nil {
+		switch b.mode {
+		case batchRebuild:
+			err = b.finishRebuild()
+		case batchInsertOnly:
+			start := time.Now()
+			_, err = b.tx.ExecContext(b.ctx, createIndexesSQL)
+			b.indexBuild = time.Since(start)
+		}
 	}
 	if err != nil {
 		_ = b.tx.Rollback()
 		return err
 	}
 	return b.tx.Commit()
+}
+
+// IndexBuildTime returns how long Commit took to build the indexes of a bulk
+// insert batch. The commit time includes it.
+func (b *Batch) IndexBuildTime() time.Duration {
+	return b.indexBuild
 }
 
 // finishRebuild copies the rows of every file the rebuild did not write or

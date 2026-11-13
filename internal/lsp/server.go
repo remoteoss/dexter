@@ -905,8 +905,8 @@ func (s *Server) detachFromReporter() {
 }
 
 // fullBuild rebuilds the whole index in-process, through the same pipeline
-// `dexter init` uses: parse on every core, then one bulk transaction with the
-// indexes dropped. It is only correct on an empty index, so backgroundReindex
+// `dexter init` uses: parse on every core, then one bulk transaction that
+// drops the indexes and builds them again before it commits. It is only correct on an empty index, so backgroundReindex
 // is the only caller.
 //
 // The emptiness test is made here, under the same lock that holds for the whole
@@ -917,10 +917,12 @@ func (s *Server) detachFromReporter() {
 // error for exactly that case, which is not a failure — the incremental path
 // handles what is already there.
 //
-// The whole build is one WAL transaction, so the -wal file grows to roughly the
-// size of the index before backgroundReindex's checkpoint reclaims it;
-// wal_autocheckpoint cannot touch frames belonging to an open transaction. On a
-// very large repository that is a few hundred MiB of transient disk.
+// The whole build, its SQL indexes included, is one WAL transaction, so the
+// -wal file grows to roughly the size of the database before
+// backgroundReindex's checkpoint reclaims it; wal_autocheckpoint cannot touch
+// frames belonging to an open transaction. On a very large repository that is
+// about 1 GiB of transient disk. The indexes are in the transaction so that
+// readers never see the rows without them.
 //
 // InProcess suppresses the connection-wide pragmas. They cannot be applied
 // reliably or undone on a live pool — leaving WAL needs exclusive access, and
@@ -1078,9 +1080,10 @@ func (s *Server) startBackgroundReindex() <-chan error {
 			stats, ran, err := s.fullBuild()
 			switch {
 			case errors.Is(err, indexer.ErrUnindexed):
-				// The SQL indexes did not come back after the bulk load committed
-				// or rolled back, so every query is a full table scan. Falling back
-				// to the incremental walk would be far worse than doing nothing:
+				// The SQL indexes were missing after the bulk load committed,
+				// and could not be created, so every query is a full table
+				// scan. Falling back to the incremental walk would be far worse
+				// than doing nothing:
 				// each per-file write issues a DELETE by file_id against definitions
 				// and refs tables, once per file on disk. FullBuild leaves the
 				// index version unset, so the next editor start rebuilds from

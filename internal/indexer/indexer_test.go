@@ -1,30 +1,16 @@
 package indexer
 
 import (
-	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/remoteoss/dexter/internal/store"
 	"github.com/remoteoss/dexter/internal/version"
 )
-
-func TestRestoreIndexesFailureIsUnindexed(t *testing.T) {
-	dir := t.TempDir()
-	s, err := store.Open(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	err = restoreIndexes(s, errors.New("bulk write failed"))
-	if !errors.Is(err, ErrUnindexed) {
-		t.Fatalf("restoreIndexes error = %v, want ErrUnindexed", err)
-	}
-}
 
 func writeFile(t *testing.T, dir, relPath, content string) string {
 	t.Helper()
@@ -132,7 +118,7 @@ func TestFullBuild_RestoresIndexes(t *testing.T) {
 	// idx_definitions_using, for instance, turns LookupUsingModules — and so
 	// the server's warmUsingCache — back into a scan of every definition.
 	//
-	// DropIndexes names eleven; the other five were retired earlier and it
+	// The bulk insert drops eleven; the other five were retired earlier and it
 	// clears them out on purpose, so createIndexes does not rebuild them.
 	for _, want := range []string{
 		"idx_definitions_module_function",
@@ -200,6 +186,10 @@ func TestFullBuild_WriteFailureFailsTheBuild(t *testing.T) {
 	if err := s.IndexFileWithRefs(filepath.Join(dir, "lib", "a.ex"), nil, nil); err != nil {
 		t.Fatal(err)
 	}
+	before, err := s.IndexNames()
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	var warnings int
 	if _, err := FullBuild(s, dir, Options{
@@ -215,13 +205,14 @@ func TestFullBuild_WriteFailureFailsTheBuild(t *testing.T) {
 	}
 
 	// A failed bulk load has to leave the indexes behind, or every query on the
-	// database it left is a table scan.
+	// database it left is a table scan. The drop is in the rolled-back
+	// transaction, so all of them are still there.
 	names, err := s.IndexNames()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(names) == 0 {
-		t.Error("no indexes on the database after a failed build")
+	if !reflect.DeepEqual(names, before) {
+		t.Errorf("indexes after a failed build = %v, want %v", names, before)
 	}
 }
 
@@ -297,4 +288,101 @@ func TestFullBuild_WarnsOnUnreadableFile(t *testing.T) {
 	if results, _ := s.LookupFunction("A", "a"); len(results) == 0 {
 		t.Error("the readable file was not indexed")
 	}
+}
+
+// writeStallFixture writes files modules that call each other, so the build has
+// enough refs that creating the indexes takes a measurable time.
+func writeStallFixture(t *testing.T, dir string, files, callsPerFile int) {
+	t.Helper()
+	for i := 0; i < files; i++ {
+		var b strings.Builder
+		fmt.Fprintf(&b, "defmodule StallFix.Mod%04d do\n", i)
+		fmt.Fprintf(&b, "  def run(x) do\n")
+		for c := 0; c < callsPerFile; c++ {
+			fmt.Fprintf(&b, "    StallFix.Mod%04d.step_%d(x)\n", (i+c+1)%files, c%7)
+		}
+		fmt.Fprintf(&b, "  end\n")
+		for c := 0; c < 7; c++ {
+			fmt.Fprintf(&b, "  def step_%d(x), do: x\n", c)
+		}
+		fmt.Fprintf(&b, "end\n")
+		writeFile(t, dir, fmt.Sprintf("lib/stall_fix/mod_%04d.ex", i), b.String())
+	}
+}
+
+// A reader must never see the rows of a full build without the indexes that
+// make them searchable. When the build committed its rows first and created
+// the indexes after, every request in between scanned the whole refs table,
+// and each request that came after it on the same connection waited behind
+// it. The commit has to publish the rows and the indexes together.
+func TestFullBuild_ReadersNeverSeeRowsWithoutIndexes(t *testing.T) {
+	dir := t.TempDir()
+	writeStallFixture(t, dir, 1500, 150)
+
+	s := openStore(t, dir)
+	reader := openStore(t, dir)
+	want, err := reader.IndexNames()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(want) == 0 {
+		t.Fatal("a new store has no indexes")
+	}
+
+	stop := make(chan struct{})
+	type observation struct {
+		polls, withRows int
+		unindexed       bool
+		names           []string
+		err             error
+	}
+	result := make(chan observation, 1)
+	go func() {
+		var obs observation
+		defer func() { result <- obs }()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			obs.polls++
+			// Rows first, then indexes: the indexes can only come back after
+			// the rows, so this order cannot miss a gap between the two.
+			hasRows := !reader.IsEmpty()
+			names, err := reader.IndexNames()
+			if err != nil {
+				obs.err = err
+				return
+			}
+			if !hasRows {
+				continue
+			}
+			obs.withRows++
+			if len(names) != len(want) {
+				obs.unindexed, obs.names = true, names
+				return
+			}
+		}
+	}()
+
+	_, err = FullBuild(s, dir, Options{InProcess: true})
+	close(stop)
+	obs := <-result
+	if err != nil {
+		t.Fatal(err)
+	}
+	if obs.err != nil {
+		t.Fatalf("reader: %v", obs.err)
+	}
+	if obs.unindexed {
+		t.Fatalf("a reader saw the built rows with indexes %v, want %v", obs.names, want)
+	}
+	if obs.polls == 0 {
+		t.Fatal("the reader did not poll during the build")
+	}
+	if names, err := reader.IndexNames(); err != nil || len(names) != len(want) {
+		t.Fatalf("indexes after the build = %v (%v), want %v", names, err, want)
+	}
+	t.Logf("reader polled %d times, %d with rows", obs.polls, obs.withRows)
 }
