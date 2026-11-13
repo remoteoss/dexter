@@ -1500,15 +1500,24 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 		}
 	} else if clientRoot != "" && s.workspaceEvents != nil {
 		rel, err := filepath.Rel(s.projectRoot, clientRoot)
+		if err == nil && (rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator))) {
+			// The editor's workspace is above the project (an editor root
+			// marker found a parent directory): Dexter serves its project,
+			// and files outside it are not in its index.
+			if up, upErr := filepath.Rel(clientRoot, s.projectRoot); upErr == nil && up != ".." && !strings.HasPrefix(up, ".."+string(os.PathSeparator)) {
+				log.Printf("Initialize: the editor workspace %s is above the project %s; Dexter serves the project", clientRoot, s.projectRoot)
+				clientRoot, rel = s.projectRoot, "."
+			}
+		}
 		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
-			return nil, fmt.Errorf("editor workspace root %s does not use daemon root spelling %s", clientRoot, s.projectRoot)
+			return nil, fmt.Errorf("the editor's workspace folder %s is not inside the project %s that this Dexter daemon serves. Set the editor's root for Dexter to %s, or open the project of %s in its own editor", clientRoot, s.projectRoot, s.projectRoot, clientRoot)
 		}
 		resolvedProject, projectErr := filepath.EvalSymlinks(s.projectRoot)
 		resolvedClient, clientErr := filepath.EvalSymlinks(clientRoot)
 		if projectErr == nil && clientErr == nil {
 			resolvedRel, relErr := filepath.Rel(resolvedProject, resolvedClient)
 			if relErr != nil || filepath.Clean(resolvedRel) != filepath.Clean(rel) {
-				return nil, fmt.Errorf("editor workspace root %s uses a symlink spelling that differs from daemon root %s", clientRoot, s.projectRoot)
+				return nil, fmt.Errorf("the editor's workspace folder %s is the project %s under another name (a symlink). Open the project as %s, so that file paths match", clientRoot, s.projectRoot, s.projectRoot)
 			}
 		}
 	}

@@ -315,9 +315,15 @@ func findMarkerBefore(path, marker, stop string) string {
 // than the intent to index one: a `dexter lookup` in the home directory would
 // otherwise spend minutes of CPU building a database over every file the user
 // owns, and would do it silently. -y/--yes is the way through, and it is
-// needed only once because the database it creates is itself a marker.
+// needed only once: it records the choice (store.MarkChosenRoot), so later
+// sessions there use the directory without -y.
 func requireProjectRoot(dir string, allowNonProject bool) {
 	if allowNonProject {
+		if store.NonProjectRootError(dir) != nil {
+			if err := store.MarkChosenRoot(dir); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: could not record %s as a chosen workspace: %v\n", dir, err)
+			}
+		}
 		return
 	}
 	if err := store.NonProjectRootError(dir); err != nil {

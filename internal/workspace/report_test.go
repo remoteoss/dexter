@@ -269,7 +269,7 @@ func TestRootThatIsNotAProjectIsShown(t *testing.T) {
 	r := notify.New()
 	r.SetLogf(func(string, ...any) {})
 	reportRoot(t.TempDir(), r)
-	if c := r.Conditions(); len(c) != 1 || !strings.Contains(c[0].Message, "does not look like an Elixir project") {
+	if c := r.Conditions(); len(c) != 1 || !strings.Contains(c[0].Message, "is probably not an Elixir project") {
 		t.Fatalf("conditions = %+v", c)
 	}
 
