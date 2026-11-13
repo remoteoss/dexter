@@ -400,3 +400,72 @@ func TestRebuildWaitsForConcurrentWriter(t *testing.T) {
 		t.Errorf("%d files left after the removal, want 5", len(paths))
 	}
 }
+
+// A bulk insert drops the indexes in its own transaction and builds them again
+// before it commits. A reader sees either the database as it was, with its
+// indexes, or the new rows with their indexes; a rollback leaves the indexes
+// as they were.
+func TestBulkInsertPublishesRowsWithIndexes(t *testing.T) {
+	s, dir := setupTestStore(t)
+	t.Cleanup(func() { _ = s.Close() })
+	reader, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reader.Close() })
+	want, err := reader.IndexNames()
+	if err != nil || len(want) == 0 {
+		t.Fatalf("indexes of a new store: %v (%v)", want, err)
+	}
+	write := func(b *Batch) {
+		t.Helper()
+		for i := 0; i < 20; i++ {
+			defs, refs := synthRows(i, 0)
+			if err := b.IndexFileWithMtimeAndRefs(synthPath(dir, i), 1, defs, refs); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	readerSees := func(when string, wantEmpty bool) {
+		t.Helper()
+		if got, err := reader.IndexNames(); err != nil || !reflect.DeepEqual(got, want) {
+			t.Errorf("%s: a reader sees indexes %v (%v), want %v", when, got, err, want)
+		}
+		if got := reader.IsEmpty(); got != wantEmpty {
+			t.Errorf("%s: a reader sees IsEmpty = %v, want %v", when, got, wantEmpty)
+		}
+	}
+
+	b, err := s.BeginBulkInsert()
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(b)
+	readerSees("during a bulk insert", true)
+	if err := b.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	readerSees("after a rollback", true)
+
+	// The bulk insert waits for another writer, as the rebuild does.
+	released := holdWriteLock(t, dir, 200*time.Millisecond)
+	if b, err = s.BeginBulkInsert(); err != nil {
+		t.Fatalf("BeginBulkInsert with a concurrent writer: %v", err)
+	}
+	select {
+	case <-released:
+	default:
+		t.Error("BeginBulkInsert got the write lock while another connection held it")
+	}
+	write(b)
+	if err := b.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if b.IndexBuildTime() <= 0 {
+		t.Error("Commit did not report the time it took to build the indexes")
+	}
+	readerSees("after the commit", false)
+	if r, _ := reader.LookupFunction("MyApp.Mod3", "run_v0"); len(r) != 1 {
+		t.Error("the committed rows are not visible")
+	}
+}
