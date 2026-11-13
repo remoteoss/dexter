@@ -980,3 +980,55 @@ func TestRegression_UseChainOptionForms(t *testing.T) {
 		check(marker, bbLines(definitionAt(t, server, uri, l, c), server.projectRoot), want, "")
 	}
 }
+
+// An alias that a library's __using__ injects, reached through a wrapper
+// that selects the library with an option (`use unquote(mod)`), has its
+// references in the modules whose options select that library.
+func TestRegression_UseChainOptionAlias(t *testing.T) {
+	target := bbFile{"lib/al_target.ex", "defmodule AL.Target.Thing do\n  def run, do: :ok\nend\n"}
+	base := optModule("AL.Base", "  defmacro __using__(_opts) do\n    quote do\n      alias AL.Target.Thing\n    end\n  end")
+	other := optModule("AL.Other", "  defmacro __using__(_opts) do\n    quote do\n      :ok\n    end\n  end")
+	wrapper := optModule("AL.Wrapper", optUsing("    {mod, opts} = Keyword.pop(opts, :base, AL.Other)", "      use unquote(mod), unquote(opts)"))
+	defWrapper := optModule("AL.DefWrapper", optUsing("    {mod, opts} = Keyword.pop(opts, :base, AL.Base)", "      use unquote(mod), unquote(opts)"))
+	outer := optModule("AL.Outer", optUsing("    opts = Keyword.put_new(opts, :base, AL.Base)", "      use AL.Wrapper, unquote(opts)"))
+	pass := optModule("AL.Pass", optUsing("", "      use AL.Wrapper, unquote(opts)"))
+	var files []bbFile
+	files = append(files, target, base, other, wrapper, defWrapper, outer, pass)
+	users := []struct {
+		use      string
+		injected bool
+	}{
+		{"use AL.Outer", true},
+		{"use AL.Outer, base: AL.Other", false},
+		{"use AL.Wrapper", false},
+		{"use AL.Wrapper, base: AL.Base", true},
+		{"use AL.DefWrapper", true},
+		{"use AL.DefWrapper, base: AL.Other", false},
+		{"use AL.Pass, base: AL.Base", true},
+		{"use AL.Pass", false},
+	}
+	want := map[string]bool{}
+	what := map[string]string{}
+	for i, u := range users {
+		f := bbFile{fmt.Sprintf("lib/al_user%d.ex", i), fmt.Sprintf("defmodule AL.User%d do\n  %s\n\n  def go, do: Thing.run()\nend\n", i, u.use)}
+		files = append(files, f)
+		want[f.rel+":4"] = u.injected
+		what[f.rel+":4"] = u.use
+	}
+	server, cleanup := bbServer(t, files...)
+	defer cleanup()
+	locs, err := server.ReferenceNames("AL.Target.Thing", "run", NameReferenceOptions{Kind: NameKindCallable})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, l := range locs {
+		rel, _ := filepath.Rel(server.projectRoot, l.FilePath)
+		got[fmt.Sprintf("%s:%d", rel, l.Line)] = true
+	}
+	for site, injected := range want {
+		if got[site] != injected {
+			t.Errorf("%s: reference = %t, want %t", what[site], got[site], injected)
+		}
+	}
+}

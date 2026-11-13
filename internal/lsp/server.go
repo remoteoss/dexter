@@ -245,6 +245,9 @@ type IndexCoordinator struct {
 	// injectedDelegates keeps the defdelegate facades of __using__ quotes;
 	// see injectedDelegatesTo.
 	injectedDelegates injectedDelegateCache
+	// optionInjectors keeps the optionInjectors of the __using__ bodies,
+	// built again after each index write.
+	optionInjectors optionInjectorCache
 	// useCalls keeps the use calls of module files for completion; see
 	// fileUseCalls.
 	useCalls useCallsCache
@@ -3966,12 +3969,13 @@ func (s *Server) findInjectedAliasesFor(targetModule string, targetRefs []store.
 		return nil
 	}
 
+	graph := s.optionInjectorGraph()
 	result := make([]injectedAlias, 0, len(direct))
 	for k, injectors := range direct {
 		result = append(result, injectedAlias{
 			shortName: k.shortName,
 			module:    k.module,
-			injectors: s.closeOverInjectors(injectors, usingByFile),
+			injectors: s.closeOverInjectors(injectors, usingByFile, graph),
 		})
 	}
 	return result
@@ -3979,8 +3983,12 @@ func (s *Server) findInjectedAliasesFor(targetModule string, targetRefs []store.
 
 // usingInjectsAlias reports whether the body selected by a concrete use call
 // injects the requested alias, directly or through another use. Dispatch is
-// significant: aliases from `:controller` must not leak into `:channel`.
-func (s *Server) usingInjectsAlias(module, which, targetModule, written, resolved string, visited map[string]bool) bool {
+// significant: aliases from `:controller` must not leak into `:channel`. The
+// options follow the chain as for a definition (consumerOpts are the ones
+// this use gets): `use unquote(mod)` uses the module that the options name.
+// When a chain reads an option that Dexter cannot know, every module that the
+// body's option edits can put counts, as the use-chain graph has them.
+func (s *Server) usingInjectsAlias(module, which string, consumerOpts map[string]string, targetModule, written, resolved string, visited map[string]bool) bool {
 	visitKey := usingVisitKey(module, which)
 	if visited[visitKey] {
 		return false
@@ -4001,20 +4009,34 @@ func (s *Server) usingInjectsAlias(module, which, targetModule, written, resolve
 			return true
 		}
 	}
-	for i := len(body.transCalls) - 1; i >= 0; i-- {
-		call := body.transCalls[i]
-		if s.usingInjectsAlias(call.Module, call.dispatchAtom(), targetModule, written, resolved, visited) {
+	unknown := false
+	for _, b := range body.optBindings {
+		if b.kind != "use" {
+			continue
+		}
+		if bindingUnknown(b, consumerOpts) {
+			unknown = true
+			continue
+		}
+		if mod, ok := bindingModule(b, consumerOpts); ok && s.usingInjectsAlias(mod, "", bindingOpts(b, consumerOpts), targetModule, written, resolved, visited) {
 			return true
 		}
 	}
-	// The modules that option edits put count too: this walk lists where an
-	// alias can come from, for references, as closeOverInjectors does.
-	uses := body.graphUses()
+	for i := len(body.transCalls) - 1; i >= 0; i-- {
+		call := body.transCalls[i]
+		if s.usingInjectsAlias(call.Module, call.dispatchAtom(), callOpts(call, consumerOpts), targetModule, written, resolved, visited) {
+			return true
+		}
+	}
+	uses := body.transUses
+	if unknown {
+		uses = body.graphUses()
+	}
 	for i := len(uses) - 1; i >= 0; i-- {
 		if body.hasTransCall(uses[i]) {
 			continue
 		}
-		if s.usingInjectsAlias(uses[i], "", targetModule, written, resolved, visited) {
+		if s.usingInjectsAlias(uses[i], "", nil, targetModule, written, resolved, visited) {
 			return true
 		}
 	}
@@ -4127,7 +4149,7 @@ func (s *Server) usingModulesByFile() map[string][]string {
 // uses an injector passes the injected alias on to its own users. Candidates
 // come from the index — the `use` sites of each injector — so this costs one
 // indexed query per injector rather than a scan of every __using__ body.
-func (s *Server) closeOverInjectors(direct []string, usingByFile map[string][]string) []string {
+func (s *Server) closeOverInjectors(direct []string, usingByFile map[string][]string, graph optionInjectors) []string {
 	seen := make(map[string]bool, len(direct))
 	all := make([]string, 0, len(direct))
 	queue := make([]string, 0, len(direct))
@@ -4139,9 +4161,20 @@ func (s *Server) closeOverInjectors(direct []string, usingByFile map[string][]st
 		}
 	}
 
+	add := func(mod string) {
+		if !seen[mod] {
+			seen[mod] = true
+			all = append(all, mod)
+			queue = append(queue, mod)
+		}
+	}
 	for len(queue) > 0 {
 		current := queue[0]
 		queue = queue[1:]
+
+		for _, mod := range graph.users[current] {
+			add(mod)
+		}
 
 		refs, err := s.store.LookupReferences(current, "")
 		if err != nil {
@@ -4149,6 +4182,9 @@ func (s *Server) closeOverInjectors(direct []string, usingByFile map[string][]st
 		}
 		for _, r := range refs {
 			if r.Kind != "use" {
+				for _, mod := range graph.openUsers[r.FilePath] {
+					add(mod)
+				}
 				continue
 			}
 			for _, mod := range usingByFile[r.FilePath] {
@@ -4185,6 +4221,98 @@ func (s *Server) closeOverInjectors(direct []string, usingByFile map[string][]st
 	}
 
 	return all
+}
+
+// optionInjectors are the use-chain edges that the index has no use reference
+// for. A wrapper can name an injector in an option edit (`Keyword.put_new(opts,
+// :base, Injector)`) or as the default of `use unquote(mod)`: users maps the
+// injector to those wrappers. And a wrapper with `use unquote(mod)` (or one
+// that passes its options on to such a wrapper) is open: it uses whatever
+// module its caller's options name. It is a candidate for an injector that a
+// file with a use of it names, and the check of each use site
+// (usingInjectsAlias, with that caller's options) keeps only the right ones.
+type optionInjectors struct {
+	// openUsers maps a file to the open wrappers that it uses: in such a
+	// file, a reference to a module (`use Wrapper, base: Injector`) can
+	// select that module.
+	openUsers map[string][]string
+	users     map[string][]string
+}
+
+type optionInjectorCache struct {
+	mu    sync.Mutex
+	gen   uint64
+	valid bool
+	graph optionInjectors
+}
+
+// optionInjectorGraph reads the optionInjectors from the parsed __using__
+// bodies, once for each index generation.
+func (s *Server) optionInjectorGraph() optionInjectors {
+	c := &s.index.optionInjectors
+	gen := s.store.WriteGeneration()
+	c.mu.Lock()
+	if c.valid && c.gen == gen {
+		g := c.graph
+		c.mu.Unlock()
+		return g
+	}
+	c.mu.Unlock()
+	g := s.buildOptionInjectorGraph()
+	c.mu.Lock()
+	c.graph, c.gen, c.valid = g, gen, true
+	c.mu.Unlock()
+	return g
+}
+
+func (s *Server) buildOptionInjectorGraph() optionInjectors {
+	g := optionInjectors{users: make(map[string][]string), openUsers: make(map[string][]string)}
+	entries := s.loadUsingEntries()
+	open := make(map[string]bool)
+	for _, e := range entries {
+		for _, body := range e.entry.bodies() {
+			for _, m := range body.optUses {
+				g.users[m] = append(g.users[m], e.module)
+			}
+			for _, b := range body.optBindings {
+				if b.kind != "use" {
+					continue
+				}
+				open[e.module] = true
+				if b.defaultMod != "" && b.defaultMod != unknownOpt {
+					g.users[b.defaultMod] = append(g.users[b.defaultMod], e.module)
+				}
+			}
+		}
+	}
+	// A wrapper that passes its options on to an open one is open too.
+	for changed := true; changed; {
+		changed = false
+		for _, e := range entries {
+			if open[e.module] {
+				continue
+			}
+			for _, body := range e.entry.bodies() {
+				for _, c := range body.transCalls {
+					if c.forwardOpts && open[c.Module] {
+						open[e.module], changed = true, true
+					}
+				}
+			}
+		}
+	}
+	for mod := range open {
+		refs, err := s.store.LookupReferences(mod, "")
+		if err != nil {
+			continue
+		}
+		for _, r := range refs {
+			if r.Kind == "use" && !slices.Contains(g.openUsers[r.FilePath], mod) {
+				g.openUsers[r.FilePath] = append(g.openUsers[r.FilePath], mod)
+			}
+		}
+	}
+	return g
 }
 
 // injectedAliasRefs returns indexed references that name targetModule, or a
@@ -4395,7 +4523,7 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 							continue
 						}
 						for _, call := range useCallsAt(r.FilePath, r.Line) {
-							if resolvedUseModule(tf, call, inj) != inj || call.local || !s.usingInjectsAlias(inj, call.dispatchAtom(), targetModule, ia.shortName, ia.module, make(map[string]bool)) {
+							if resolvedUseModule(tf, call, inj) != inj || call.local || !s.usingInjectsAlias(inj, call.dispatchAtom(), call.Opts, targetModule, ia.shortName, ia.module, make(map[string]bool)) {
 								continue
 							}
 							sites = append(sites, useSite{r.FilePath, r.Line, call.token, lexicalScopeAt(tf, r.Line, call.token)})
