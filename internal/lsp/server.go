@@ -1337,8 +1337,12 @@ func (s *Server) startBackgroundReindex() <-chan error {
 		// asks for it. See warmUsingCache.
 		s.warmUsingCache()
 
-		// A rebuild or a large prune leaves free pages in the index file.
-		s.startReclaimFreePages()
+		// A rebuild or a large prune leaves free pages in the index file. Only
+		// after a pass that worked: a pass that found the root gone or could
+		// not write must leave the index alone.
+		if result == nil {
+			s.startReclaimFreePages()
+		}
 
 		elapsed := time.Since(start).Round(time.Millisecond)
 		if failed > 0 {

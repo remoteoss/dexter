@@ -158,19 +158,22 @@ func Open(projectRoot string) (*Store, error) {
 
 	dbPath := DBPath(projectRoot)
 	registerDriver()
-	// _auto_vacuum applies only to a new database (see ReclaimFreePages). An
-	// index from an older Dexter keeps its mode; a change of IndexVersion
-	// deletes it, and the new one has incremental vacuum.
-	db, err := sql.Open(driverName, dbPath+"?_auto_vacuum=incremental&_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=5000&_foreign_keys=ON")
+	db, err := sql.Open(driverName, dbPath+"?_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=5000&_foreign_keys=ON")
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(2)
-
+	// One connection while the schema is made, so that the auto_vacuum mode
+	// and the first table are on the same connection.
+	db.SetMaxOpenConns(1)
+	if err := setIncrementalVacuum(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	if err := migrate(db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
+	db.SetMaxOpenConns(2)
 
 	s := &Store{db: db, path: dbPath}
 	s.recordInode()
@@ -239,8 +242,9 @@ var (
 // Dexter made).
 //
 // Moving pages changes no row, so the write generation does not move and no
-// cache is dropped. A step that cannot get the write lock in time ends the
-// reclaim; a later call goes on.
+// cache is dropped. A step that cannot get the write lock in 0.2 s waits a
+// second for the writer and tries again; after 30 tries in a row the reclaim
+// stops, and the next call goes on.
 func (s *Store) ReclaimFreePages(ctx context.Context) (int64, error) {
 	var mode, pageSize, pages, free int64
 	if err := s.db.QueryRowContext(ctx, "PRAGMA auto_vacuum").Scan(&mode); err != nil {
@@ -261,16 +265,38 @@ func (s *Store) ReclaimFreePages(ctx context.Context) (int64, error) {
 	if free*reclaimMinShare < pages || free*pageSize < reclaimMinBytes {
 		return 0, nil
 	}
+	// The steps run on a connection of their own, outside the pool, with a
+	// short busy timeout: a step that waits for a writer must not hold one
+	// of the pool's two connections from the readers, and must not wait 5 s.
+	db, err := sql.Open(driverName, s.path+fmt.Sprintf("?_busy_timeout=%d", reclaimBusyMs))
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = db.Close() }()
+	db.SetMaxOpenConns(1)
+
 	start := free
+	busy := 0
 	for free > 0 {
 		if err := ctx.Err(); err != nil {
 			return (start - free) * pageSize, err
 		}
-		if err := s.reclaimStep(ctx); err != nil {
-			return (start - free) * pageSize, err
+		if err := reclaimStep(ctx, db); err != nil {
+			if !isBusy(err) || busy >= reclaimBusyRetries {
+				return (start - free) * pageSize, err
+			}
+			// A writer holds the lock: let it finish, then go on.
+			busy++
+			select {
+			case <-ctx.Done():
+				return (start - free) * pageSize, ctx.Err()
+			case <-time.After(reclaimBusyPause):
+			}
+			continue
 		}
+		busy = 0
 		before := free
-		if err := s.db.QueryRowContext(ctx, "PRAGMA freelist_count").Scan(&free); err != nil {
+		if err := db.QueryRowContext(ctx, "PRAGMA freelist_count").Scan(&free); err != nil {
 			return (start - before) * pageSize, err
 		}
 		if free >= before {
@@ -278,18 +304,31 @@ func (s *Store) ReclaimFreePages(ctx context.Context) (int64, error) {
 		}
 	}
 	// In WAL mode the file is cut at the checkpoint.
-	return (start - free) * pageSize, s.Checkpoint()
+	_, err = db.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)")
+	return (start - free) * pageSize, err
 }
 
-// reclaimStep moves up to reclaimStepPages pages in one write transaction. It
-// takes its own connection for the transaction and gives it back at once, so
-// that the pool keeps a connection for readers between steps.
-func (s *Store) reclaimStep(ctx context.Context) (err error) {
-	conn, err := s.db.Conn(ctx)
+// A reclaim step waits reclaimBusyMs for a writer, then pauses
+// reclaimBusyPause, at most reclaimBusyRetries times in a row.
+const (
+	reclaimBusyMs      = 200
+	reclaimBusyRetries = 30
+)
+
+var reclaimBusyPause = time.Second // a variable for tests
+
+func isBusy(err error) bool {
+	var se sqlite3.Error
+	return errors.As(err, &se) && (se.Code == sqlite3.ErrBusy || se.Code == sqlite3.ErrLocked)
+}
+
+// reclaimStep moves up to reclaimStepPages pages in one write transaction.
+func reclaimStep(ctx context.Context, db *sql.DB) (err error) {
+	conn, err := db.Conn(ctx)
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if _, err = conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
 		return err
 	}
@@ -331,6 +370,32 @@ func (s *Store) SetBulkPragmas() error {
 		}
 	}
 	return nil
+}
+
+// setIncrementalVacuum gives a new database incremental vacuum (see
+// ReclaimFreePages). The mode can only be set before the first table, so an
+// index from an older Dexter keeps its mode; a change of IndexVersion deletes
+// such an index, and the new one has incremental vacuum.
+//
+// It is not a DSN option (_auto_vacuum): that runs the PRAGMA on each new
+// connection of the pool, and on an existing database the PRAGMA waits for
+// the write lock, so a read that needed a new connection while a write ran
+// waited the whole busy timeout and then failed.
+func setIncrementalVacuum(db *sql.DB) error {
+	var tables int
+	if err := db.QueryRow("SELECT count(*) FROM sqlite_master").Scan(&tables); err != nil {
+		return err
+	}
+	if tables > 0 {
+		return nil
+	}
+	// The connection already wrote the header (journal_mode=WAL), so the new
+	// mode needs a VACUUM, which is instant on an empty database.
+	if _, err := db.Exec("PRAGMA auto_vacuum = INCREMENTAL"); err != nil {
+		return err
+	}
+	_, err := db.Exec("VACUUM")
+	return err
 }
 
 // dropPreFileIDSchema removes the pre-file_id tables so migrate can recreate

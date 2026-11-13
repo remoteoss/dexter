@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // A new index has incremental vacuum, so that ReclaimFreePages can give the
@@ -14,7 +15,7 @@ func TestNewIndexHasIncrementalVacuum(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	var mode int
 	if err := s.db.QueryRow("PRAGMA auto_vacuum").Scan(&mode); err != nil {
 		t.Fatal(err)
@@ -33,7 +34,7 @@ func TestReclaimFreePagesShrinksTheFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	fillAndDrop(t, s, 4000)
 	before := fileSize(t, s.path)
 
@@ -61,7 +62,7 @@ func TestReclaimFreePagesKeepsAFewFreePages(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	if _, err := s.db.Exec("CREATE TABLE filler (v TEXT); INSERT INTO filler VALUES ('x'); DROP TABLE filler"); err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +89,7 @@ func TestReclaimFreePagesStopsWhenCanceled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	fillAndDrop(t, s, 2000)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -121,6 +122,86 @@ func fillAndDrop(t *testing.T, s *Store, n int) {
 		t.Fatal(err)
 	}
 	if err := s.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A reclaim that meets a writer waits for it on its own connection: readers
+// of the pool are not blocked meanwhile, and the reclaim ends after the
+// writer.
+func TestReclaimFreePagesWaitsForAWriterOutsideThePool(t *testing.T) {
+	oldStep, oldMin, oldPause := reclaimStepPages, reclaimMinBytes, reclaimBusyPause
+	reclaimStepPages, reclaimMinBytes, reclaimBusyPause = 64, 0, 50*time.Millisecond
+	defer func() { reclaimStepPages, reclaimMinBytes, reclaimBusyPause = oldStep, oldMin, oldPause }()
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	fillAndDrop(t, s, 4000)
+
+	// A writer holds the write lock on one of the pool's two connections.
+	tx, err := s.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec("INSERT INTO metadata (key, value) VALUES ('writer', 'x')"); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.ReclaimFreePages(context.Background())
+		done <- err
+	}()
+	time.Sleep(300 * time.Millisecond)
+	// A reader gets the pool's other connection at once.
+	start := time.Now()
+	var n int
+	if err := s.db.QueryRow("SELECT count(*) FROM files").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(start); d > 100*time.Millisecond {
+		t.Errorf("a read waited %s while the reclaim waited for the writer", d)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("reclaim after the writer: %v", err)
+	}
+	var free int
+	if err := s.db.QueryRow("PRAGMA freelist_count").Scan(&free); err != nil {
+		t.Fatal(err)
+	}
+	if free != 0 {
+		t.Errorf("%d free pages left after the writer ended", free)
+	}
+}
+
+// A read that needs a new connection of the pool while a write runs does not
+// wait for the write lock (WAL readers never do).
+func TestNewConnectionDoesNotWaitForAWriter(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	s.db.SetMaxIdleConns(0) // the read below must open a new connection
+	defer s.db.SetMaxIdleConns(2)
+	tx, err := s.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec("INSERT INTO metadata (key, value) VALUES ('writer', 'x')"); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	var n int
+	err = s.db.QueryRow("SELECT count(*) FROM files").Scan(&n)
+	if d := time.Since(start); err != nil || d > 500*time.Millisecond {
+		t.Errorf("read on a new connection during a write: err %v after %s", err, d)
+	}
+	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
 }
