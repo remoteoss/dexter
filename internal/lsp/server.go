@@ -649,13 +649,20 @@ func (s *Server) OpenDocuments() int { return s.docs.Count() }
 func (s *Server) ProjectRoot() string { return s.projectRoot }
 
 // startWarmUsingCache runs warmUsingCache in the background, as index work
-// that the workspace waits for when it closes.
+// that the workspace waits for when it closes. The warm-up is marked as in
+// progress before the goroutine starts, so a request that arrives first waits
+// for it instead of parsing the same files at the same time.
 func (s *Server) startWarmUsingCache() {
+	end, ok := s.usingCache.beginWarm()
+	if !ok {
+		return
+	}
 	s.index.backgroundWork.Add(1)
 	go func() {
 		defer s.index.backgroundWork.Done()
+		defer end()
 		defer s.index.reporter.Recover("cache", "the warm-up of the __using__ cache")
-		s.warmUsingCache()
+		s.fillUsingCache()
 	}()
 }
 
@@ -689,6 +696,12 @@ func (s *Server) warmUsingCache() {
 		return
 	}
 	defer end()
+	s.fillUsingCache()
+}
+
+// fillUsingCache is the work of warmUsingCache. The caller holds the warm-up
+// mark of the cache (beginWarm).
+func (s *Server) fillUsingCache() {
 	usingModules, err := s.store.LookupUsingModules()
 	if err != nil || len(usingModules) == 0 {
 		return
