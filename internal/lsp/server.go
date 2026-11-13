@@ -48,8 +48,117 @@ import (
 // produces: {optKey: "mod", defaultMod: "Mox", kind: "import"}.
 type optBinding struct {
 	optKey     string // keyword key in opts (e.g. "mod")
-	defaultMod string // default module if opt not provided (e.g. "Mox"); empty if none
+	defaultMod string // default module if opt not provided (e.g. "Mox"); empty if none; unknownOpt if it cannot be read
 	kind       string // "import" or "use"
+	// readEdits are the edits that the options had where the key was read:
+	// `opts = Keyword.put_new(opts, :mod, X)` before `Keyword.get(opts, :mod)`.
+	// An edit after the read does not change what it read.
+	readEdits []optEdit
+	// forwardOpts is set for `use unquote(mod), unquote(opts)`: the used
+	// module's __using__ gets the options too, with forwardEdits.
+	forwardOpts  bool
+	forwardEdits []optEdit
+}
+
+// unknownOpt is the value of an option that Dexter cannot read, such as a
+// function call: no default replaces it, because the default can be wrong.
+const unknownOpt = "\x00unknown"
+
+// optEdit is a change that a __using__ body makes to one options variable
+// (`opts = Keyword.put_new(opts, :key, Mod)`). The edits of a variable are
+// in source order.
+type optEdit struct {
+	op   string   // "put", "put_new", "delete", or "take"
+	key  string   // for put, put_new, delete
+	mod  string   // the value; unknownOpt when it is not a module
+	keys []string // for take: the keys that are kept
+}
+
+// effectiveOpts are the caller's options with edits applied: the caller
+// wins over put_new, put wins over the caller, and (with forward) delete and
+// take change what is passed on. The caller's map is not changed.
+func effectiveOpts(consumer map[string]string, edits []optEdit) map[string]string {
+	if len(edits) == 0 {
+		return consumer
+	}
+	out := make(map[string]string, len(consumer)+len(edits))
+	for k, v := range consumer {
+		out[k] = v
+	}
+	for _, e := range edits {
+		switch e.op {
+		case "put":
+			out[e.key] = e.mod
+		case "put_new":
+			if _, ok := out[e.key]; !ok {
+				out[e.key] = e.mod
+			}
+		case "delete":
+			delete(out, e.key)
+		case "take":
+			for k := range out {
+				if !slices.Contains(e.keys, k) {
+					delete(out, k)
+				}
+			}
+		}
+	}
+	return out
+}
+
+// bindingModule is the module that an optBinding names for the caller's
+// options: the option's value, or the default when no step sets it. ok is
+// false, and mod empty, when there is none or the value cannot be known.
+func bindingModule(binding optBinding, consumer map[string]string) (mod string, ok bool) {
+	if v, set := effectiveOpts(consumer, binding.readEdits)[binding.optKey]; set {
+		if v == unknownOpt || v == "" {
+			return "", false
+		}
+		return v, true
+	}
+	if binding.defaultMod == unknownOpt {
+		return "", false
+	}
+	return binding.defaultMod, binding.defaultMod != ""
+}
+
+// bindingUnknown reports whether the option an optBinding reads has a value
+// that Dexter cannot read.
+func bindingUnknown(binding optBinding, consumer map[string]string) bool {
+	v, set := effectiveOpts(consumer, binding.readEdits)[binding.optKey]
+	if !set {
+		// The default applies: `opts[:key] || build()` cannot be read.
+		return binding.defaultMod == unknownOpt
+	}
+	return v == unknownOpt
+}
+
+// callOpts are the options that a use in a __using__ body passes to the
+// used module: its literal options, and the body's own options, with their
+// edits, when it passes them on (`use Mod, unquote(opts)`).
+func callOpts(call UseCall, consumer map[string]string) map[string]string {
+	if !call.forwardOpts {
+		return call.Opts
+	}
+	out := make(map[string]string)
+	forwarded := effectiveOpts(consumer, call.forwardEdits)
+	if call.callerWins {
+		maps.Copy(out, call.Opts)
+		maps.Copy(out, forwarded)
+		return out
+	}
+	maps.Copy(out, forwarded)
+	maps.Copy(out, call.Opts)
+	return out
+}
+
+// bindingOpts are the options that `use unquote(mod), unquote(opts)` passes
+// to mod's __using__.
+func bindingOpts(binding optBinding, consumer map[string]string) map[string]string {
+	if !binding.forwardOpts {
+		return nil
+	}
+	return effectiveOpts(consumer, binding.forwardEdits)
 }
 
 // usingCacheEntry holds the full parsed result of a module's defmacro __using__
@@ -1882,6 +1991,9 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 					return storeResultsToLocations(results), nil
 				}
 			}
+			if loc, ok := s.unknownUseLocation(tf, lineNum, functionName); ok {
+				return loc, nil
+			}
 			s.debugf("Definition: could not resolve bare function %q", functionName)
 			return nil, nil
 		}
@@ -1935,6 +2047,10 @@ func (s *Server) Definition(ctx context.Context, params *protocol.DefinitionPara
 				s.debugf("Definition: generated fallback for bare %q provider=%s precise=%t", functionName, provider.module, precise)
 				return storeResultsToLocations(results), nil
 			}
+		}
+
+		if loc, ok := s.unknownUseLocation(tf, lineNum, functionName); ok {
+			return loc, nil
 		}
 
 		s.debugf("Definition: no result found for bare function %q in module %q", functionName, fullModule)
@@ -3287,7 +3403,7 @@ func (s *Server) parseUsingFile(filePath, moduleName string) *usingCacheEntry {
 		}
 		text = scoped
 	}
-	imported, inlineDefs, transUses, transCalls, optBindings, aliases, derives, branchUses := parseUsingBodyDetailed(text)
+	imported, inlineDefs, transUses, transCalls, optBindings, aliases, derives, branchUses, optUses := parseUsingBodyDetailed(text)
 	return &usingCacheEntry{
 		mtime:    info.ModTime().UnixNano(),
 		filePath: filePath,
@@ -3295,6 +3411,7 @@ func (s *Server) parseUsingFile(filePath, moduleName string) *usingCacheEntry {
 			imports:     imported,
 			inlineDefs:  inlineDefs,
 			transUses:   transUses,
+			optUses:     optUses,
 			transCalls:  transCalls,
 			optBindings: optBindings,
 			aliases:     aliases,
@@ -3331,8 +3448,9 @@ func (s *Server) lookupThroughUseOfWithFollow(fullModule, functionName string, f
 		return nil
 	}
 	// Only the module's own uses: one in a __using__ quote injects into the
-	// caller, not into this module.
-	return s.lookupThroughUseCalls(ExtractModuleUsesWithOpts(fileText, ExtractAliases(fileText)), functionName, followDelegates)
+	// caller, not into this module, and another module of the file has its
+	// own.
+	return s.lookupThroughUseCalls(moduleUseCalls(fileText, fullModule), functionName, followDelegates)
 }
 
 // lookupThroughUse searches for functionName in definitions injected by `use`
@@ -3389,6 +3507,70 @@ func (e *usingCacheEntry) bodies() []*usingBody {
 	return out
 }
 
+// unknownUseLocation is, for a bare call that nothing else resolves, the
+// `use` line of the module around the call when one of its use chains reads
+// an option that Dexter cannot know.
+func (s *Server) unknownUseLocation(tf *TokenizedFile, lineNum int, functionName string) ([]protocol.Location, bool) {
+	enclosing := extractEnclosingModuleFromTokens(tf.source, tf.tokens, lineNum)
+	if enclosing == "" {
+		return nil, false
+	}
+	_, use, ok := s.lookupThroughUseOfDetailed(enclosing, functionName, s.followDelegates)
+	if !ok {
+		return nil, false
+	}
+	return []protocol.Location{{URI: pathToURI(use.FilePath), Range: lineRange(use.Line - 1)}}, true
+}
+
+// unknownChainKey marks, in the visited set of a use-chain lookup, that the
+// lookup met an option whose value it cannot read (see unknownOpt).
+const unknownChainKey = "\x00unknown-option"
+
+// lookupThroughUseOfDetailed is lookupThroughUseOfWithFollow that also
+// returns, when the lookup finds nothing because a use chain reads an option
+// that Dexter cannot know, the `use` line of the module that starts that
+// chain: a correct answer for the definition, where a default can be wrong.
+// Only the module's own uses count, not those of another module in its file.
+func (s *Server) lookupThroughUseOfDetailed(fullModule, functionName string, followDelegates bool) (results []store.LookupResult, unknownUse store.LookupResult, hasUnknown bool) {
+	modResults, err := s.store.LookupModule(fullModule)
+	if err != nil || len(modResults) == 0 {
+		return nil, store.LookupResult{}, false
+	}
+	fileText, _, ok := s.readFileText(modResults[0].FilePath)
+	if !ok {
+		return nil, store.LookupResult{}, false
+	}
+	calls := moduleUseCalls(fileText, fullModule)
+	visited := make(map[string]bool)
+	for i := len(calls) - 1; i >= 0; i-- {
+		if result := s.lookupInUsingEntryForWithFollow(calls[i].Module, functionName, calls[i].dispatchAtom(), calls[i].Opts, visited, followDelegates); result != nil {
+			return result, store.LookupResult{}, false
+		}
+		if visited[unknownChainKey] && !hasUnknown && calls[i].line > 0 {
+			unknownUse, hasUnknown = store.LookupResult{FilePath: modResults[0].FilePath, Line: calls[i].line, Kind: "use"}, true
+		}
+	}
+	return nil, unknownUse, hasUnknown
+}
+
+// moduleUseCalls are the `use` calls of module in its file: a file can hold
+// several modules, each with its own uses.
+func moduleUseCalls(fileText, module string) []UseCall {
+	calls := ExtractModuleUsesWithOpts(fileText, ExtractAliases(fileText))
+	if len(calls) == 0 {
+		return calls
+	}
+	source := []byte(fileText)
+	tokens := parser.Tokenize(source)
+	kept := calls[:0]
+	for _, c := range calls {
+		if c.line == 0 || extractEnclosingModuleFromTokens(source, tokens, c.line-1) == module {
+			kept = append(kept, c)
+		}
+	}
+	return kept
+}
+
 func usingVisitKey(moduleName, which string) string {
 	return moduleName + "\x00" + which
 }
@@ -3442,9 +3624,9 @@ func (s *Server) lookupInUsingEntryForWithFollow(moduleName, functionName, which
 
 	// Dynamic imports/uses driven by opts (e.g. `import unquote(mod)`)
 	for _, b := range body.optBindings {
-		mod := consumerOpts[b.optKey]
-		if mod == "" {
-			mod = b.defaultMod
+		mod, _ := bindingModule(b, consumerOpts)
+		if bindingUnknown(b, consumerOpts) {
+			visited[unknownChainKey] = true
 		}
 		if mod == "" {
 			continue
@@ -3463,7 +3645,7 @@ func (s *Server) lookupInUsingEntryForWithFollow(moduleName, functionName, which
 				return results
 			}
 		case "use":
-			if result := s.lookupInUsingEntryForWithFollow(mod, functionName, "", nil, visited, followDelegates); result != nil {
+			if result := s.lookupInUsingEntryForWithFollow(mod, functionName, "", bindingOpts(b, consumerOpts), visited, followDelegates); result != nil {
 				return result
 			}
 		}
@@ -3472,7 +3654,7 @@ func (s *Server) lookupInUsingEntryForWithFollow(moduleName, functionName, which
 	// Transitive uses: use Module inside the __using__ body (double-use chains)
 	for k := len(body.transCalls) - 1; k >= 0; k-- {
 		call := body.transCalls[k]
-		if result := s.lookupInUsingEntryForWithFollow(call.Module, functionName, call.dispatchAtom(), call.Opts, visited, followDelegates); result != nil {
+		if result := s.lookupInUsingEntryForWithFollow(call.Module, functionName, call.dispatchAtom(), callOpts(call, consumerOpts), visited, followDelegates); result != nil {
 			return result
 		}
 	}
@@ -3526,10 +3708,7 @@ func (s *Server) resolveModuleViaUseChainFor(moduleName, functionName, which str
 	}
 
 	for _, b := range body.optBindings {
-		mod := consumerOpts[b.optKey]
-		if mod == "" {
-			mod = b.defaultMod
-		}
+		mod, _ := bindingModule(b, consumerOpts)
 		if mod == "" {
 			continue
 		}
@@ -3539,7 +3718,7 @@ func (s *Server) resolveModuleViaUseChainFor(moduleName, functionName, which str
 				return mod
 			}
 		case "use":
-			if m := s.resolveModuleViaUseChainWithOpts(mod, functionName, nil, visited); m != "" {
+			if m := s.resolveModuleViaUseChainWithOpts(mod, functionName, bindingOpts(b, consumerOpts), visited); m != "" {
 				return m
 			}
 		}
@@ -3547,7 +3726,7 @@ func (s *Server) resolveModuleViaUseChainFor(moduleName, functionName, which str
 
 	for k := len(body.transCalls) - 1; k >= 0; k-- {
 		call := body.transCalls[k]
-		if mod := s.resolveModuleViaUseChainFor(call.Module, functionName, call.dispatchAtom(), call.Opts, visited); mod != "" {
+		if mod := s.resolveModuleViaUseChainFor(call.Module, functionName, call.dispatchAtom(), callOpts(call, consumerOpts), visited); mod != "" {
 			return mod
 		}
 	}
@@ -3624,7 +3803,7 @@ func closeOverUsingChain(entries []usingEntryRef, direct []string, seen map[stri
 			}
 			for _, body := range c.entry.bodies() {
 				found := false
-				for _, tu := range body.transUses {
+				for _, tu := range body.graphUses() {
 					if tu == current {
 						seen[c.module] = true
 						all = append(all, c.module)
@@ -3828,11 +4007,14 @@ func (s *Server) usingInjectsAlias(module, which, targetModule, written, resolve
 			return true
 		}
 	}
-	for i := len(body.transUses) - 1; i >= 0; i-- {
-		if body.hasTransCall(body.transUses[i]) {
+	// The modules that option edits put count too: this walk lists where an
+	// alias can come from, for references, as closeOverInjectors does.
+	uses := body.graphUses()
+	for i := len(uses) - 1; i >= 0; i-- {
+		if body.hasTransCall(uses[i]) {
 			continue
 		}
-		if s.usingInjectsAlias(body.transUses[i], "", targetModule, written, resolved, visited) {
+		if s.usingInjectsAlias(uses[i], "", targetModule, written, resolved, visited) {
 			return true
 		}
 	}
@@ -3982,7 +4164,7 @@ func (s *Server) closeOverInjectors(direct []string, usingByFile map[string][]st
 				}
 				passesOn := false
 				for _, body := range entry.bodies() {
-					for _, tu := range body.transUses {
+					for _, tu := range body.graphUses() {
 						if tu == current {
 							passesOn = true
 							break
@@ -4406,10 +4588,7 @@ func (s *Server) addCompletionsFromUsingFor(moduleName, which string, consumerOp
 	}
 
 	for _, binding := range body.optBindings {
-		mod := consumerOpts[binding.optKey]
-		if mod == "" {
-			mod = binding.defaultMod
-		}
+		mod, _ := bindingModule(binding, consumerOpts)
 		if mod == "" {
 			continue
 		}
@@ -4417,12 +4596,12 @@ func (s *Server) addCompletionsFromUsingFor(moduleName, which string, consumerOp
 		case "import":
 			addModule(mod)
 		case "use":
-			s.addCompletionsFromUsingFor(mod, "", nil, funcPrefix, seen, items, visited, inPipe, useSnippets)
+			s.addCompletionsFromUsingFor(mod, "", bindingOpts(binding, consumerOpts), funcPrefix, seen, items, visited, inPipe, useSnippets)
 		}
 	}
 
 	for _, call := range body.transCalls {
-		s.addCompletionsFromUsingFor(call.Module, call.dispatchAtom(), call.Opts, funcPrefix, seen, items, visited, inPipe, useSnippets)
+		s.addCompletionsFromUsingFor(call.Module, call.dispatchAtom(), callOpts(call, consumerOpts), funcPrefix, seen, items, visited, inPipe, useSnippets)
 	}
 	for _, transModule := range body.transUses {
 		if !body.hasTransCall(transModule) {
@@ -4573,18 +4752,15 @@ func (s *Server) mergeAliasesFromUsingEntryFor(moduleName, which string, consume
 		if binding.kind != "use" {
 			continue
 		}
-		mod := consumerOpts[binding.optKey]
-		if mod == "" {
-			mod = binding.defaultMod
-		}
+		mod, _ := bindingModule(binding, consumerOpts)
 		if mod != "" {
-			s.mergeAliasesFromUsingEntryFor(mod, "", nil, aliases, visited)
+			s.mergeAliasesFromUsingEntryFor(mod, "", bindingOpts(binding, consumerOpts), aliases, visited)
 		}
 	}
 
 	// Follow transitive uses
 	for _, call := range body.transCalls {
-		s.mergeAliasesFromUsingEntryFor(call.Module, call.dispatchAtom(), call.Opts, aliases, visited)
+		s.mergeAliasesFromUsingEntryFor(call.Module, call.dispatchAtom(), callOpts(call, consumerOpts), aliases, visited)
 	}
 	for _, transModule := range body.transUses {
 		if !body.hasTransCall(transModule) {

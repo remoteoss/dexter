@@ -151,16 +151,13 @@ func (s *Server) collectUsingDefs(moduleName, which string, consumerOpts map[str
 		if b.kind != "use" {
 			continue
 		}
-		mod := consumerOpts[b.optKey]
-		if mod == "" {
-			mod = b.defaultMod
-		}
+		mod, _ := bindingModule(b, consumerOpts)
 		if mod != "" {
-			s.collectUsingDefs(mod, "", nil, visited, add)
+			s.collectUsingDefs(mod, "", bindingOpts(b, consumerOpts), visited, add)
 		}
 	}
 	for _, call := range body.transCalls {
-		s.collectUsingDefs(call.Module, call.dispatchAtom(), call.Opts, visited, add)
+		s.collectUsingDefs(call.Module, call.dispatchAtom(), callOpts(call, consumerOpts), visited, add)
 	}
 	for _, mod := range body.transUses {
 		if !body.hasTransCall(mod) {

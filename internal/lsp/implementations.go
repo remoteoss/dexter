@@ -138,7 +138,7 @@ func (s *Server) derivesThroughUse(protocol string, derived map[string]bool) []P
 				continue
 			}
 			body := &byModule[m].usingBody
-			for _, used := range body.transUses {
+			for _, used := range body.graphUses() {
 				if sure[used] && !slices.Contains(body.branchUses, used) {
 					sure[m], changed = true, true
 					break

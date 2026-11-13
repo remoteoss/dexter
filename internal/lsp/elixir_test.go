@@ -1723,7 +1723,7 @@ end`
 }
 
 func TestParseUsingBody_KeywordModuleHints(t *testing.T) {
-	t.Run("Keyword.put_new adds module as transitive use", func(t *testing.T) {
+	t.Run("Keyword.put_new adds module as a graph edge", func(t *testing.T) {
 		text := `defmodule Remote.Oban.Pro.Worker do
   defmacro __using__(opts) do
     opts = Keyword.put_new(opts, :oban_module, Oban.Pro.Worker)
@@ -1733,15 +1733,9 @@ func TestParseUsingBody_KeywordModuleHints(t *testing.T) {
     end
   end
 end`
-		_, _, transUses, _, _ := parseUsingBody(text)
-		found := false
-		for _, u := range transUses {
-			if u == "Oban.Pro.Worker" {
-				found = true
-			}
-		}
-		if !found {
-			t.Errorf("expected Oban.Pro.Worker in transUses, got %v", transUses)
+		_, _, transUses, _, _, _, _, _, optUses := parseUsingBodyDetailed(text)
+		if !slices.Contains(optUses, "Oban.Pro.Worker") || slices.Contains(transUses, "Oban.Pro.Worker") {
+			t.Errorf("expected Oban.Pro.Worker in optUses only, got optUses %v, transUses %v", optUses, transUses)
 		}
 	})
 
@@ -3843,4 +3837,45 @@ func findBareFunctionCalls(text string, functionName string) []int {
 	source := []byte(text)
 	full := parser.TokenizeFull(source)
 	return findBareCallLines(source, full.Tokens, full.Interp, functionName)
+}
+
+// Keyword.merge names modules the options can pass on: the use-chain graph
+// keeps them as edges, as for put, but a lookup for one caller does not
+// walk them (the options decide).
+func TestParseUsingBody_MergeIsAGraphEdge(t *testing.T) {
+	text := `defmodule PL.Merger do
+  defmacro __using__(opts) do
+    opts = Keyword.merge([base: PL.Second], opts)
+
+    quote do
+      use PL.Wrapper, unquote(opts)
+    end
+  end
+end`
+	_, _, transUses, _, _, _, _, _, optUses := parseUsingBodyDetailed(text)
+	if !slices.Contains(optUses, "PL.Second") || slices.Contains(transUses, "PL.Second") {
+		t.Errorf("optUses = %v, transUses = %v, want PL.Second in optUses only", optUses, transUses)
+	}
+}
+
+// An option edit in a helper that builds the quote is a graph edge too.
+func TestParseUsingBody_HelperEditIsAGraphEdge(t *testing.T) {
+	text := `defmodule PL.HelperEdit do
+  defmacro __using__(opts) do
+    build(opts)
+  end
+
+  defp build(opts) do
+    opts = Keyword.put_new(opts, :base, PL.Second)
+
+    quote do
+      use PL.Wrapper, unquote(opts)
+    end
+  end
+end`
+	body := (&usingCacheEntry{}).usingBody
+	_, _, body.transUses, _, _, _, _, _, body.optUses = parseUsingBodyDetailed(text)
+	if !slices.Contains(body.graphUses(), "PL.Second") || !slices.Contains(body.graphUses(), "PL.Wrapper") {
+		t.Errorf("graphUses = %v, want PL.Wrapper and PL.Second", body.graphUses())
+	}
 }

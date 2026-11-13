@@ -661,3 +661,322 @@ end
 		t.Errorf("key after a one-line nested module = %v, want the field line lib/bb_site2.ex:5", got)
 	}
 }
+
+// A `use unquote(mod)` chain where an outer __using__ changes the options
+// before it passes them on: PL.Outer does Keyword.put_new(opts, :base,
+// PL.Second) and `use PL.Wrapper, unquote(opts)`; PL.Wrapper does
+// Keyword.pop(opts, :base, PL.Base) and `use unquote(mod), unquote(opts)`.
+// PL.Second does not use PL.Base.
+func TestRegression_UseUnquoteOptionFromAnOuterUsing(t *testing.T) {
+	lib := []bbFile{
+		{"lib/pl_base.ex", `defmodule PL.Base do
+  defmacro __using__(_opts) do
+    quote do
+      def new(args, opts \\ []), do: {:base, args, opts}
+    end
+  end
+end
+`},
+		{"lib/pl_second.ex", `defmodule PL.Second do
+  defmacro __using__(_opts) do
+    quote do
+      def new(args, opts \\ []), do: {:second, args, opts}
+    end
+  end
+end
+`},
+		{"lib/pl_wrapper.ex", `defmodule PL.Wrapper do
+  defmacro __using__(opts) do
+    {mod, opts} = Keyword.pop(opts, :base, PL.Base)
+
+    quote do
+      use unquote(mod), unquote(opts)
+    end
+  end
+end
+`},
+		{"lib/pl_outer.ex", `defmodule PL.Outer do
+  defmacro __using__(opts) do
+    opts = Keyword.put_new(opts, :base, PL.Second)
+
+    quote do
+      use PL.Wrapper, unquote(opts)
+    end
+  end
+end
+`},
+		{"lib/pl_forcer.ex", `defmodule PL.Forcer do
+  defmacro __using__(opts) do
+    opts = Keyword.put(opts, :base, PL.Second)
+
+    quote do
+      use PL.Wrapper, unquote(opts)
+    end
+  end
+end
+`},
+		{"lib/pl_merger.ex", `defmodule PL.Merger do
+  defmacro __using__(opts) do
+    opts = Keyword.merge([base: PL.Second], opts)
+
+    quote do
+      use PL.Wrapper, unquote(opts)
+    end
+  end
+end
+`},
+		{"lib/pl_picker.ex", `defmodule PL.Picker do
+  defmacro __using__(opts) do
+    opts = Keyword.put_new(opts, :base, PL.Second.pick())
+
+    quote do
+      use PL.Wrapper, unquote(opts)
+    end
+  end
+
+  def pick, do: PL.Second
+end
+`},
+	}
+	workers := []bbFile{
+		{"lib/pl_worker.ex", `defmodule PL.Worker do
+  use PL.Outer, queue: :default
+end
+`},
+		{"lib/pl_own_worker.ex", `defmodule PL.OwnWorker do
+  use PL.Outer, base: PL.Base
+end
+`},
+		{"lib/pl_plain_worker.ex", `defmodule PL.PlainWorker do
+  use PL.Wrapper
+end
+`},
+		{"lib/pl_forced_worker.ex", `defmodule PL.ForcedWorker do
+  use PL.Forcer, base: PL.Base
+end
+`},
+		{"lib/pl_merged_worker.ex", `defmodule PL.MergedWorker do
+  use PL.Merger
+end
+`},
+		{"lib/pl_picked_worker.ex", `defmodule PL.PickedWorker do
+  use PL.Picker
+end
+`},
+	}
+	caller := bbFile{"lib/pl_caller.ex", `defmodule PL.Caller do
+  def a(args), do: args |> PL.Worker.new()
+  def b(args), do: args |> PL.OwnWorker.new()
+  def c(args), do: args |> PL.PlainWorker.new()
+  def d(args), do: args |> PL.PickedWorker.new()
+  def e(args), do: args |> PL.ForcedWorker.new()
+  def f(args), do: args |> PL.MergedWorker.new()
+end
+`}
+	server, cleanup := bbServer(t, append(append(lib, workers...), caller)...)
+	defer cleanup()
+	uri := bbOpen(t, server, caller)
+	for _, tt := range []struct {
+		name, marker string
+		want         []string // any of these
+		notWant      []string
+	}{
+		{"the outer put_new", "PL.Worker.new", []string{"lib/pl_second.ex:4"}, []string{"lib/pl_base.ex:4"}},
+		{"the caller's option wins over put_new", "PL.OwnWorker.new", []string{"lib/pl_base.ex:4"}, []string{"lib/pl_second.ex:4"}},
+		{"no step sets the key: the default", "PL.PlainWorker.new", []string{"lib/pl_base.ex:4"}, []string{"lib/pl_second.ex:4"}},
+		{"put wins over the caller's option", "PL.ForcedWorker.new", []string{"lib/pl_second.ex:4"}, []string{"lib/pl_base.ex:4"}},
+		{"merge with the options last: put_new", "PL.MergedWorker.new", []string{"lib/pl_second.ex:4"}, []string{"lib/pl_base.ex:4"}},
+		{"a value that cannot be known: the use line", "PL.PickedWorker.new", []string{"lib/pl_picked_worker.ex:2"}, []string{"lib/pl_base.ex:4", "lib/pl_second.ex:4"}},
+	} {
+		l, c := bbPos(t, caller.src, tt.marker, "new")
+		got := bbLines(definitionAt(t, server, uri, l, c), server.projectRoot)
+		t.Logf("%s: %v", tt.name, got)
+		for _, bad := range tt.notWant {
+			if bbHas(got, bad) {
+				t.Errorf("%s: definition = %v, must not give %s", tt.name, got, bad)
+			}
+		}
+		if len(tt.want) > 0 {
+			ok := false
+			for _, w := range tt.want {
+				ok = ok || bbHas(got, w)
+			}
+			if !ok {
+				t.Errorf("%s: definition = %v, want %v", tt.name, got, tt.want)
+			}
+		}
+	}
+}
+
+// optModule is a fixture file with one module.
+func optModule(name, body string) bbFile {
+	return bbFile{"lib/" + strings.ToLower(strings.ReplaceAll(name, ".", "_")) + ".ex", "defmodule " + name + " do\n" + body + "\nend\n"}
+}
+
+// optUsing is a __using__ body: pre runs before the quote.
+func optUsing(pre, quote string) string {
+	return "  defmacro __using__(opts) do\n" + pre + "\n    quote do\n" + quote + "\n    end\n  end"
+}
+
+// The options that use chains pass on, in each form, with the module that
+// Elixir gives (each case was compiled to check it). PL.Wrapper reads the
+// option with Keyword.pop and a default of PL.Base.
+func TestRegression_UseChainOptionForms(t *testing.T) {
+	inject := func(tag string) string {
+		return "  defmacro __using__(_opts) do\n    quote do\n      def new(args, opts \\\\ []), do: {:" + tag + ", args, opts}\n    end\n  end"
+	}
+	lib := []bbFile{
+		optModule("PL.Base", inject("base")),
+		optModule("PL.Second", inject("second")),
+		optModule("PL.Third", inject("third")),
+		optModule("PL.Empty", "  defmacro __using__(_opts) do\n    quote do\n      def other, do: :ok\n    end\n  end"),
+		optModule("PL.Wrapper", optUsing("    {mod, opts} = Keyword.pop(opts, :base, PL.Base)", "      use unquote(mod), unquote(opts)")),
+		optModule("PL.Outer", optUsing("    opts = Keyword.put_new(opts, :base, PL.Second)", "      use PL.Wrapper, unquote(opts)")),
+		optModule("PL.Piped", optUsing("    opts = opts |> Keyword.put_new(:base, PL.Second)", "      use PL.Wrapper, unquote(opts)")),
+		optModule("PL.Piped2", optUsing("    opts =\n      opts\n      |> Keyword.put_new(:base, PL.Second)", "      use PL.Wrapper, unquote(opts)")),
+		optModule("PL.InQuote", optUsing("", "      use PL.Wrapper, unquote(Keyword.put_new(opts, :base, PL.Second))")),
+		optModule("PL.Renamed", optUsing("    new_opts = Keyword.put_new(opts, :base, PL.Second)", "      use PL.Wrapper, unquote(new_opts)")),
+		optModule("PL.OtherVar", optUsing("    other = Keyword.put(opts, :base, PL.Second)\n    _ = other", "      use PL.Wrapper, unquote(opts)")),
+		optModule("PL.Mixed", optUsing("", "      use PL.Wrapper, [base: PL.Second] ++ unquote(opts)")),
+		optModule("PL.Mixed2", optUsing("", "      use PL.Wrapper, [{:base, PL.Second} | unquote(opts)]")),
+		optModule("PL.Mixed3", optUsing("", "      use PL.Wrapper, Keyword.merge(unquote(opts), base: PL.Second)")),
+		optModule("PL.Mixed4", optUsing("", "      use PL.Wrapper, [base: PL.Second, unquote_splicing(opts)]")),
+		optModule("PL.Top", optUsing("    opts = Keyword.put_new(opts, :base, PL.Third)", "      use PL.Outer, unquote(opts)")),
+		optModule("PL.TopPut", optUsing("    opts = Keyword.put(opts, :base, PL.Third)", "      use PL.Outer, unquote(opts)")),
+		optModule("PL.Web", "  def worker do\n    quote do\n      use PL.Outer\n    end\n  end\n\n  def plain do\n    quote do\n      use PL.Wrapper\n    end\n  end\n\n  defmacro __using__(which) when is_atom(which) do\n    apply(__MODULE__, which, [])\n  end"),
+		optModule("PL.Helper", "  defmacro __using__(opts) do\n    opts = Keyword.put_new(opts, :base, PL.Second)\n    build(opts)\n  end\n\n  defp build(opts) do\n    quote do\n      use PL.Wrapper, unquote(opts)\n    end\n  end"),
+		optModule("PL.HelperEdit", "  defmacro __using__(opts) do\n    build(opts)\n  end\n\n  defp build(opts) do\n    opts = Keyword.put_new(opts, :base, PL.Second)\n\n    quote do\n      use PL.Wrapper, unquote(opts)\n    end\n  end"),
+		optModule("PL.Opaque", optUsing("    mod = opts[:base] || PL.Base", "      use unquote(mod)")),
+		optModule("PL.OpaqueOuter", optUsing("    opts = Keyword.put_new(opts, :base, PL.Second)", "      use PL.Opaque, unquote(opts)")),
+		optModule("PL.CallDefault", optUsing("    mod = opts[:base] || default_base()", "      use unquote(mod)")+"\n\n  def default_base, do: PL.Base"),
+		optModule("PL.CallDefaultOuter", optUsing("    opts = Keyword.put_new(opts, :base, PL.Second)", "      use PL.CallDefault, unquote(opts)")),
+		optModule("PL.MixedKeep", optUsing("", "      use PL.Wrapper, [queue: :x] ++ unquote(opts)")),
+		optModule("PL.MergeKeep", optUsing("", "      use PL.Wrapper, Keyword.merge(unquote(opts), queue: :x)")),
+		optModule("PL.CallerFirst", optUsing("", "      use PL.Wrapper, unquote(opts) ++ [base: PL.Second]")),
+		optModule("PL.MergeCallerLast", optUsing("", "      use PL.Wrapper, Keyword.merge([base: PL.Second], unquote(opts))")),
+		optModule("PL.GetCall", optUsing("    mod = Keyword.get(opts, :base, pick())", "      use unquote(mod)")+"\n\n  def pick, do: PL.Base"),
+		optModule("PL.ValueUnquote", optUsing("    extra = :x", "      use PL.Wrapper, extra: unquote(extra)")),
+		optModule("PL.TupleValue", optUsing("    extra = :x", "      use PL.Wrapper, [{:extra, unquote(extra)} | unquote(opts)]")),
+		optModule("PL.TupleNested", optUsing("", "      use PL.Wrapper, [{:base, PL.Second}, {:extra, [base: PL.Third]}]")),
+		optModule("PL.DeleteRead", optUsing("    opts = Keyword.delete(opts, :base)\n    mod = Keyword.get(opts, :base, PL.Base)", "      use unquote(mod)")),
+		optModule("PL.TakeRead", optUsing("    opts = Keyword.take(opts, [:queue])\n    mod = opts[:base] || PL.Base", "      use unquote(mod)")),
+		optModule("PL.SelfRead", optUsing("    opts = Keyword.put_new(opts, :base, PL.Second)\n    base = opts[:base]", "      use unquote(base)")),
+		optModule("PL.SelfFetch", optUsing("    opts = Keyword.put_new(opts, :base, PL.Second)\n    base = Keyword.fetch!(opts, :base)", "      use unquote(base)")),
+		optModule("PL.PopThenPut", optUsing("    {mod, opts} = Keyword.pop(opts, :base, PL.Base)\n    opts = Keyword.put(opts, :base, PL.Second)", "      use unquote(mod), unquote(opts)")),
+		optModule("PL.MergePut", optUsing("    opts = Keyword.merge(opts, base: PL.Second)", "      use PL.Wrapper, unquote(opts)")),
+		optModule("PL.MergeML", optUsing("    opts =\n      Keyword.merge(\n        [queue: :x, base: PL.Second],\n        opts\n      )", "      use PL.Wrapper, unquote(opts)")),
+		optModule("PL.Deleter", optUsing("    opts = Keyword.delete(opts, :base)", "      use PL.Wrapper, unquote(opts)")),
+		optModule("PL.Dropper", optUsing("    opts = Keyword.drop(opts, [:base])", "      use PL.Wrapper, unquote(opts)")),
+		optModule("PL.Taker", optUsing("    sub = Keyword.take(opts, [:queue])", "      use PL.Wrapper, unquote(sub)")),
+		optModule("PL.GetWrapper", optUsing("    mod = Keyword.get(opts, :base, PL.Base)", "      use unquote(mod)")),
+		optModule("PL.GetOuter", optUsing("    opts = Keyword.put_new(opts, :base, PL.Second)", "      use PL.GetWrapper, unquote(opts)")),
+		optModule("PL.Aliased", "  alias PL.Second, as: Sec\n"+optUsing("    opts = Keyword.put_new(opts, :base, Sec)", "      use PL.Wrapper, unquote(opts)")),
+		optModule("PL.Literal", optUsing("", "      use PL.Wrapper, base: PL.Second")),
+		optModule("PL.Unrelated", optUsing("    opts = Keyword.put_new(opts, :queue, :default)", "      use PL.Wrapper, unquote(opts)")),
+	}
+	workers := []struct{ name, use, want string }{
+		{"W.Outer", "use PL.Outer, queue: :default", "second"},
+		{"W.Piped", "use PL.Piped", "second"},
+		{"W.Piped2", "use PL.Piped2", "second"},
+		{"W.InQuote", "use PL.InQuote", "second"},
+		{"W.Renamed", "use PL.Renamed", "second"},
+		{"W.OtherVar", "use PL.OtherVar", "base"},
+		{"W.Mixed", "use PL.Mixed", "second"},
+		{"W.Mixed2", "use PL.Mixed2", "second"},
+		{"W.Mixed3", "use PL.Mixed3", "second"},
+		{"W.Mixed4", "use PL.Mixed4", "second"},
+		{"W.MixedOwn", "use PL.Mixed3, base: PL.Third", "second"},
+		{"W.Top", "use PL.Top", "third"},
+		{"W.TopOwn", "use PL.Top, base: PL.Base", "base"},
+		{"W.TopPut", "use PL.TopPut, base: PL.Base", "third"},
+		{"W.WebWorker", "use PL.Web, :worker", "second"},
+		{"W.WebPlain", "use PL.Web, :plain", "base"},
+		{"W.Helper", "use PL.Helper", "second"},
+		{"W.HelperOwn", "use PL.Helper, base: PL.Third", "third"},
+		{"W.HelperEdit", "use PL.HelperEdit", "second"},
+		{"W.Opaque", "use PL.OpaqueOuter", "second"},
+		{"W.OpaqueOwn", "use PL.OpaqueOuter, base: PL.Third", "third"},
+		{"W.MixedKeep", "use PL.MixedKeep, base: PL.Third", "third"},
+		{"W.MergeKeep", "use PL.MergeKeep, base: PL.Third", "third"},
+		{"W.CallerFirst", "use PL.CallerFirst", "second"},
+		{"W.CallerFirstOwn", "use PL.CallerFirst, base: PL.Third", "third"},
+		{"W.MergeCallerLast", "use PL.MergeCallerLast", "second"},
+		{"W.MergeCallerLastOwn", "use PL.MergeCallerLast, base: PL.Third", "third"},
+		{"W.GetCallNone", "use PL.GetCall", "use"},
+		{"W.GetCallOwn", "use PL.GetCall, base: PL.Third", "third"},
+		{"W.ValueUnquote", "use PL.ValueUnquote, base: PL.Third", "base"},
+		{"W.TupleValue", "use PL.TupleValue, base: PL.Third", "third"},
+		{"W.TupleNested", "use PL.TupleNested", "second"},
+		{"W.DeleteRead", "use PL.DeleteRead, base: PL.Second", "base"},
+		{"W.TakeRead", "use PL.TakeRead, base: PL.Second", "base"},
+		{"W.CallDefault", "use PL.CallDefaultOuter", "second"},
+		{"W.CallDefaultOwn", "use PL.CallDefault, base: PL.Third", "third"},
+		{"W.CallDefaultNone", "use PL.CallDefault", "use"},
+		{"W.SelfRead", "use PL.SelfRead", "second"},
+		{"W.SelfFetch", "use PL.SelfFetch", "second"},
+		{"W.SelfFetchOwn", "use PL.SelfFetch, base: PL.Third", "third"},
+		{"W.PopThenPut", "use PL.PopThenPut", "base"},
+		{"W.MergePut", "use PL.MergePut, base: PL.Base", "second"},
+		{"W.MergeML", "use PL.MergeML", "second"},
+		{"W.MergeMLOwn", "use PL.MergeML, base: PL.Third", "third"},
+		{"W.Deleter", "use PL.Deleter, base: PL.Second", "base"},
+		{"W.Dropper", "use PL.Dropper, base: PL.Second", "base"},
+		{"W.Taker", "use PL.Taker, base: PL.Second", "base"},
+		{"W.GetOuter", "use PL.GetOuter", "second"},
+		{"W.Aliased", "use PL.Aliased", "second"},
+		{"W.Literal", "use PL.Literal, base: PL.Third", "second"},
+		{"W.Unrelated", "use PL.Unrelated", "base"},
+		{"W.Plain", "use PL.Wrapper", "base"},
+		{"W.PlainAtom", "use PL.Wrapper, queue: :default, base: PL.Second", "second"},
+		{"W.Var", "use PL.Wrapper, base: @base", "use"},
+		{"W.MultiLine", "use PL.Outer,\n    queue: :default,\n    base: PL.Third", "third"},
+		{"W.Nested", "use PL.Wrapper, base: PL.Second, extra: [base: :nope]", "second"},
+	}
+	files := append([]bbFile(nil), lib...)
+	var caller strings.Builder
+	caller.WriteString("defmodule PL.Caller do\n")
+	for i, w := range workers {
+		files = append(files, optModule(w.name, "  "+w.use+"\n\n  def run(a), do: new(a)"))
+		fmt.Fprintf(&caller, "  def f%d(a), do: %s.new(a)\n", i, w.name)
+	}
+	files = append(files, optModule("W.Empty", "  use PL.Outer, base: PL.Empty"))
+	caller.WriteString("  def empty(a), do: W.Empty.new(a)\n")
+	// Two modules in one file, each with its own use.
+	files = append(files, bbFile{"lib/two.ex", "defmodule Two.A do\n  use PL.Wrapper\nend\n\ndefmodule Two.B do\n  use PL.Outer\nend\n"})
+	caller.WriteString("  def two_a(a), do: Two.A.new(a)\n  def two_b(a), do: Two.B.new(a)\nend\n")
+	callerFile := bbFile{"lib/pl_caller.ex", caller.String()}
+	files = append(files, callerFile)
+	server, cleanup := bbServer(t, files...)
+	defer cleanup()
+	uri := bbOpen(t, server, callerFile)
+	check := func(what string, got []string, want, worker string) {
+		t.Helper()
+		wantLine := "lib/pl_" + want + ".ex:4"
+		if want == "use" {
+			wantLine = worker + ":2"
+		}
+		if len(got) != 1 || got[0] != wantLine {
+			t.Errorf("%s: definition = %v, want %s", what, got, wantLine)
+		}
+	}
+	for _, w := range workers {
+		wf := optModule(w.name, "  "+w.use+"\n\n  def run(a), do: new(a)")
+		l, c := bbPos(t, callerFile.src, w.name+".new", "new")
+		check(w.name+".new", bbLines(definitionAt(t, server, uri, l, c), server.projectRoot), w.want, wf.rel)
+		wuri := bbOpen(t, server, wf)
+		bl, bc := bbPos(t, wf.src, "do: new(a)", "new")
+		check(w.name+" bare new", bbLines(definitionAt(t, server, wuri, bl, bc), server.projectRoot), w.want, wf.rel)
+	}
+	// The caller's own option names a module without new: put_new's module
+	// is not a fallback.
+	l, c := bbPos(t, callerFile.src, "W.Empty.new", "new")
+	for _, got := range bbLines(definitionAt(t, server, uri, l, c), server.projectRoot) {
+		if strings.HasPrefix(got, "lib/pl_") {
+			t.Errorf("W.Empty.new: definition = %s, want none in the chain's other modules", got)
+		}
+	}
+	for marker, want := range map[string]string{"Two.A.new": "base", "Two.B.new": "second"} {
+		l, c := bbPos(t, callerFile.src, marker, "new")
+		check(marker, bbLines(definitionAt(t, server, uri, l, c), server.projectRoot), want, "")
+	}
+}
