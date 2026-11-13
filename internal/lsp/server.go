@@ -1612,7 +1612,17 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 		s.snippetSupport = params.Capabilities.TextDocument.Completion.CompletionItem.SnippetSupport
 	}
 
-	result := &protocol.InitializeResult{
+	result := NewInitializeResult()
+	s.debugf("Initialize: capabilities: %+v", result.Capabilities)
+	return result, nil
+}
+
+// NewInitializeResult is the answer to initialize. It does not depend on the
+// client's request: every session of every daemon gets the same one. The
+// `dexter lsp` proxy gives it to an editor whose start directory only holds
+// other projects, where no daemon answers initialize (see docs/daemon.md).
+func NewInitializeResult() *protocol.InitializeResult {
+	return &protocol.InitializeResult{
 		Capabilities: protocol.ServerCapabilities{
 			TextDocumentSync: protocol.TextDocumentSyncOptions{
 				OpenClose:         true,
@@ -1650,8 +1660,6 @@ func (s *Server) Initialize(ctx context.Context, params *protocol.InitializePara
 			Version: version.Version,
 		},
 	}
-	s.debugf("Initialize: capabilities: %+v", result.Capabilities)
-	return result, nil
 }
 
 func (s *Server) Initialized(ctx context.Context, params *protocol.InitializedParams) error {

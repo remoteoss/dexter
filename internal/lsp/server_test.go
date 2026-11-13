@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -8490,5 +8491,33 @@ end
 	symbols := documentSymbols(t, server, docURI)
 	if len(symbols) != 1 || findSymbol(symbols[0].Children, "Deep.Inner") == nil {
 		t.Errorf("document symbols = %v, want Deep.Inner under Outer", collectNames(symbols[0].Children))
+	}
+}
+
+// TestInitializeAcceptsItsOwnRootFromAProxy: the `dexter lsp` proxy gives the
+// daemon of each project an initialize whose workspace folder is that
+// daemon's own root. A daemon accepts it and answers with the result that
+// the proxy gives an editor itself; a folder outside its root is still
+// refused.
+func TestInitializeAcceptsItsOwnRootFromAProxy(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+	server.workspaceEvents = &recordedEvents{}
+	own := string(uri.File(server.projectRoot))
+	result, err := server.Initialize(context.Background(), &protocol.InitializeParams{
+		RootURI:          protocol.DocumentURI(own),
+		WorkspaceFolders: []protocol.WorkspaceFolder{{URI: own, Name: filepath.Base(server.projectRoot)}},
+	})
+	if err != nil {
+		t.Fatalf("Initialize with the daemon's own root: %v", err)
+	}
+	if !reflect.DeepEqual(result, NewInitializeResult()) {
+		t.Fatalf("Initialize result differs from NewInitializeResult")
+	}
+	other := string(uri.File(t.TempDir()))
+	if _, err := server.Initialize(context.Background(), &protocol.InitializeParams{
+		WorkspaceFolders: []protocol.WorkspaceFolder{{URI: other, Name: "other"}},
+	}); err == nil {
+		t.Fatal("Initialize with a folder outside the daemon root was accepted")
 	}
 }

@@ -150,6 +150,21 @@ func docKey(u string) string {
 	return key
 }
 
+// URIPath returns the file path of a file URI, or "" for another URI. It
+// decodes the URI as the daemon does, so that a frontend that routes by path
+// sees the same path as the daemon.
+func URIPath(u string) string {
+	const scheme = "file://"
+	if !strings.HasPrefix(u, scheme) {
+		return ""
+	}
+	if rest := u[len(scheme):]; isCanonicalURIPath(rest) {
+		return filepath.FromSlash(rest)
+	}
+	_, path := docKeyPath(u)
+	return path
+}
+
 // docKeyPath returns the key of u and the clean file path it names. The path
 // is empty for a URI that is not a file URI or that cannot be parsed.
 func docKeyPath(u string) (key, path string) {

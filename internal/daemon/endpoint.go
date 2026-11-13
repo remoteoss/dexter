@@ -90,6 +90,21 @@ func candidateEndpoint(dir string, keys []string) (socket, lock, logPath string,
 	return "", "", "", false
 }
 
+// workspaceIdentity is the path that names the workspace of root for its
+// lock and socket: the absolute path without symlinks, in the letter case
+// that the file system stores. Two spellings of one directory have one
+// identity, and so one daemon.
+func workspaceIdentity(root string) string {
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return filepath.Clean(root)
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return pathcase.DiskSpelling(resolved)
+	}
+	return abs
+}
+
 // ResolveEndpoint derives the private runtime paths for root. Runtime files go
 // in an environment-independent directory owned by this user. A session-local
 // location would let a GUI editor and a shell derive different ownership locks.
@@ -103,10 +118,7 @@ func ResolveEndpoint(root string) (Endpoint, error) {
 	if err != nil {
 		return Endpoint{}, err
 	}
-	identity := abs
-	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
-		identity = pathcase.DiskSpelling(resolved)
-	}
+	identity := workspaceIdentity(abs)
 	keys := endpointKeys(sha256.Sum256([]byte(identity)))
 
 	var lastErr error

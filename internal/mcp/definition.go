@@ -11,6 +11,7 @@ import (
 type DefinitionParams struct {
 	Module   string `json:"module" jsonschema:"fully-qualified module name, e.g. MyApp.Accounts (aliases are not resolved)"`
 	Function string `json:"function,omitempty" jsonschema:"function/macro/type name without arity; omit to look up the module itself"`
+	ProjectParam
 }
 
 func (h *Handler) definition(ctx context.Context, args DefinitionParams) (string, error) {

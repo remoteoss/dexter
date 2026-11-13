@@ -479,6 +479,82 @@ open — makes the daemon restart its runtime, at most once per 10 minutes; a
 watcher event that was lost becomes a full reconcile, and a file that the parser
 cannot handle is a file that could not be indexed.
 
+### Sessions with several projects
+
+An editor or an agent can start `dexter lsp` in a directory that holds several
+projects: clones and linked worktrees of repositories. Each file then goes to
+the daemon of its own project. Below the start root, a file belongs to another
+project only when a nested clone (a `.git` directory) or a linked worktree is
+between the file and the start root; the nearest one is the project. Else the
+file belongs to the start root. A Dexter index alone does not make a project,
+so an index that was left in `apps/foo` of a monorepo does not split the
+session. A submodule (a `.git` file that is not a linked worktree) is a part of
+the project that holds it. A file in `deps/`, `_build/`, or `node_modules/`
+belongs to the project that holds that directory, so a git dependency gets no
+daemon. Two spellings of one project (a symlink, or another letter case on a
+file system that ignores case) share one upstream, as they share one daemon.
+Only the files below the start root go to a project of their own. A file outside the
+start root (a standard library file that a definition opened) goes to the
+daemon of the start root.
+
+The proxy keeps one connection to a daemon, an upstream, for each project. It
+makes an upstream when the first message for a file of that project comes. A
+session whose files are all in the start root has one upstream, and its
+messages pass as before: the proxy does not change them, and it reads only the
+method, the id, and the document URI, without a full decode.
+
+A new upstream gets the editor's `initialize` with an id of the proxy and with
+the roots (`rootUri`, `rootPath`, `workspaceFolders`) set to its own project.
+The proxy drops the answer, because the editor has one. Then the upstream gets
+`initialized`, the last configuration, the open documents of its project, and
+the messages that waited for it. Each upstream reconnects on its own when its
+daemon stops, as above; the other upstreams serve meanwhile. When the proxy
+cannot reach the daemon of a project that is not the start root, it tells the
+editor, the requests for that project get an error, and the session goes on for
+the other projects. The first message for that project after a wait starts a
+new attempt. The wait is 15 seconds, and it doubles after each failed attempt,
+up to 2 minutes. Only the first failure is shown; when an attempt works, the
+editor is told once that the project gets answers again.
+
+When the editor's input ends while an upstream is in its initialize exchange
+(a reconnect, or the first connect, which can start a daemon), the proxy
+closes that connection too, or the one that the exchange makes current. Else
+that daemon would never see the end of its input, and the proxy would not
+end.
+
+| Editor message | Goes to |
+|---|---|
+| `textDocument/*` | the upstream of `params.textDocument.uri` |
+| `callHierarchy/*`, `typeHierarchy/*` | the upstream of `params.item.uri` |
+| `completionItem/resolve` | the upstream that answered the last completion |
+| `workspace/symbol` | every connected upstream; the proxy joins the results |
+| `shutdown` | every upstream; the editor gets one answer when all answered |
+| `initialized`, `workspace/didChangeConfiguration`, `workspace/didChangeWorkspaceFolders`, `$/setTrace`, `exit` | every upstream |
+| `workspace/didChangeWatchedFiles` | each change to the upstream of its file; no new upstream |
+| `$/cancelRequest` | the upstream that holds the request; a canceled `workspace/symbol` is answered by the proxy at once |
+| `window/workDoneProgress/cancel` | the upstream that made the token |
+| an answer to a daemon request | the daemon that asked, with its own id |
+| any other message | the upstream of the start root |
+
+From the daemons to the editor, notifications pass as they are. The requests
+of each upstream other than the first daemon of the start root get ids of the
+proxy, so that two daemons' ids never meet, and the proxy gives the answers
+back with the daemon's id. A progress token that such an upstream creates gets
+a prefix of that upstream. A second `client/registerCapability` for a
+registration that the editor has already (each daemon registers the same file
+watcher) is answered by the proxy.
+
+A start root that only holds other projects (`store.IsProjectContainer`: no Mix
+project of its own, and a clone or worktree below it that has one) gets no
+daemon, because its index would be a copy of the projects in it. The proxy
+answers `initialize` itself with `lsp.NewInitializeResult`, the answer that
+every daemon gives: it does not depend on the request. The proxy cannot hold
+the editor's `initialize` until a daemon exists, because the editor opens files
+only after the answer. Until a file of a project is open, requests get an empty
+answer, and notifications are dropped. A file of the container itself, or a
+file outside it, goes to the upstream of the last file that has a project, and
+its document stays on that upstream until the editor closes it.
+
 ## Extension seams
 
 Two registries let a protocol adapter land without editing the daemon:

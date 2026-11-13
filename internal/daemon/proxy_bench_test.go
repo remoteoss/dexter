@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -353,3 +355,79 @@ func BenchmarkLSPCompletionPipe(b *testing.B) {
 func BenchmarkLSPCompletionBurstPipe(b *testing.B)   { benchmarkBurstMode(b, "pipe") }
 func BenchmarkLSPCompletionBurstDirect(b *testing.B) { benchmarkBurst(b, false) }
 func BenchmarkLSPCompletionBurstProxy(b *testing.B)  { benchmarkBurst(b, true) }
+
+// benchmarkProxyForward measures what the proxy itself adds to one editor
+// message: the scan, the routing, the session state, and the write to the
+// daemon. The daemon side only reads, so the daemon's own work is not in it.
+func benchmarkProxyForward(b *testing.B, frames func(i int) []byte, setup [][]byte) {
+	log.SetOutput(io.Discard)
+	b.Cleanup(func() { log.SetOutput(os.Stderr) })
+	root := b.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".git"), 0o755); err != nil {
+		b.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "mix.exs"), nil, 0o644); err != nil {
+		b.Fatal(err)
+	}
+	editorToProxy, proxyIn := io.Pipe()
+	proxySide, daemonSide := net.Pipe()
+	proxy := newBenchProxy(root, editorToProxy)
+	go func() { _ = proxy.run(proxySide, bufio.NewReader(proxySide)) }()
+	b.Cleanup(func() { _ = proxyIn.Close(); _ = daemonSide.Close() })
+	got := make(chan struct{}, 1)
+	go func() {
+		r := bufio.NewReaderSize(daemonSide, 1<<20)
+		for {
+			if _, _, err := readProxyFrame(r); err != nil {
+				return
+			}
+			got <- struct{}{}
+		}
+	}()
+	for _, frame := range setup {
+		if _, err := proxyIn.Write(frame); err != nil {
+			b.Fatal(err)
+		}
+		<-got
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := proxyIn.Write(frames(i)); err != nil {
+			b.Fatal(err)
+		}
+		<-got
+	}
+}
+
+func benchFrame(message map[string]any) []byte {
+	message["jsonrpc"] = "2.0"
+	body, _ := json.Marshal(message)
+	return frameMessage(body)
+}
+
+func BenchmarkProxyForwardHover(b *testing.B) {
+	uri := "file:///p/lib/a.ex"
+	frame := benchFrame(map[string]any{"id": 1, "method": "textDocument/hover", "params": map[string]any{
+		"textDocument": map[string]any{"uri": uri}, "position": map[string]any{"line": 1, "character": 2}}})
+	benchmarkProxyForward(b, func(int) []byte { return frame }, nil)
+}
+
+func BenchmarkProxyForwardDidChange100KB(b *testing.B) {
+	uri := "file:///p/lib/a.ex"
+	text := strings.Repeat("defmodule A do\n  def x, do: 1\nend\n", 100<<10/34)
+	open := benchFrame(map[string]any{"method": "textDocument/didOpen", "params": map[string]any{
+		"textDocument": map[string]any{"uri": uri, "languageId": "elixir", "version": 1, "text": text}}})
+	change := benchFrame(map[string]any{"method": "textDocument/didChange", "params": map[string]any{
+		"textDocument": map[string]any{"uri": uri, "version": 2}, "contentChanges": []any{map[string]any{"text": text}}}})
+	b.SetBytes(int64(len(change)))
+	benchmarkProxyForward(b, func(int) []byte {
+		// A new slice each time, as the editor reader gives.
+		return append([]byte(nil), change...)
+	}, [][]byte{open})
+}
+
+func newBenchProxy(root string, in io.Reader) *lspProxy {
+	return newLSPProxy(context.Background(), root, false, in, io.Discard, func(context.Context, string) (net.Conn, *bufio.Reader, error) {
+		return nil, nil, errors.New("no reconnect in this benchmark")
+	})
+}

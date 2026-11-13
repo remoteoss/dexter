@@ -12,6 +12,7 @@ import (
 type ModuleAPIParams struct {
 	Module         string `json:"module" jsonschema:"fully-qualified module name, e.g. MyApp.Accounts (aliases are not resolved)"`
 	IncludePrivate bool   `json:"include_private,omitempty" jsonschema:"also list defp/defmacrop definitions (default false)"`
+	ProjectParam
 }
 
 func (h *Handler) moduleAPI(ctx context.Context, args ModuleAPIParams) (string, error) {
