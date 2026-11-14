@@ -2434,7 +2434,8 @@ func readKeywordEdits(source []byte, tokens []parser.Token, n, at int, sc optSco
 		}
 		edits = append(edits, step.edits...)
 		for _, e := range step.edits {
-			if (e.op == "put" || e.op == "put_new") && e.mod != unknownOpt {
+			// Keyword.update puts its default when the key is not set.
+			if (e.op == "put" || e.op == "put_new" || e.op == "update") && e.mod != unknownOpt {
 				mods = append(mods, e.mod)
 			}
 		}

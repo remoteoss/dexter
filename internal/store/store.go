@@ -251,6 +251,12 @@ func (s *Store) ReclaimFreePages(ctx context.Context) (int64, error) {
 	// of the pool's two connections from the readers, and must not wait 5 s.
 	// The check of the thresholds runs there too, so that a reclaim that has
 	// nothing to do does not use the pool either.
+	//
+	// The free pages are in the database file, so a file below the minimum
+	// cannot reach it: one stat, and no connection, for most indexes.
+	if info, err := os.Stat(s.path); err != nil || info.Size() < reclaimMinBytes {
+		return 0, nil
+	}
 	db, err := sql.Open(driverName, s.path+fmt.Sprintf("?_busy_timeout=%d", reclaimBusyMs))
 	if err != nil {
 		return 0, err

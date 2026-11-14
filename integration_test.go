@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -225,11 +226,36 @@ func runDexter(t *testing.T, binary string, dir string, args ...string) string {
 	// points at the process's directory, and the spelled path is what the daemon
 	// indexes so stored paths match the URIs this test sends.
 	cmd.Env = append(os.Environ(), "DEXTER_DAEMON_IDLE_TIMEOUT=1s", "PWD="+mustAbs(t, dir))
+	stopDaemonAtCleanup(t, binary, dir)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("dexter %v failed: %v\n%s", args, err, out)
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// stoppedAtCleanup holds the test and directory pairs that stopDaemonAtCleanup
+// has registered.
+var stoppedAtCleanup sync.Map
+
+// stopDaemonAtCleanup stops the daemon that a CLI call in dir started, when
+// the test ends. A daemon that is still in its idle timeout can write to
+// .dexter while the test removes its temporary directory, which then fails
+// with "directory not empty". The cleanup runs before the removal of a
+// directory that t.TempDir made earlier, and a forced stop waits for the
+// daemon to exit.
+func stopDaemonAtCleanup(t *testing.T, binary, dir string) {
+	t.Helper()
+	key := t.Name() + "\x00" + dir
+	if _, loaded := stoppedAtCleanup.LoadOrStore(key, true); loaded {
+		return
+	}
+	t.Cleanup(func() {
+		stoppedAtCleanup.Delete(key)
+		stop := exec.Command(binary, "stop", "--force", "--root", dir)
+		stop.Dir = dir
+		_ = stop.Run()
+	})
 }
 
 func TestIntegration_InitAndLookup(t *testing.T) {

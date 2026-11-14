@@ -1115,6 +1115,40 @@ func TestRegression_UseChainOptionAlias(t *testing.T) {
 	}
 }
 
+// A wrapper that names the injector only as the default of a piped
+// Keyword.update makes the alias reach its users: the default is put when
+// the caller gives no value. The wrapper passes its options on, so the open
+// wrappers also find these users; the injector graph takes the default too,
+// as it does for the direct call.
+func TestRegression_UseChainUpdateDefaultAlias(t *testing.T) {
+	files := []bbFile{
+		{"lib/au_target.ex", "defmodule AU.Target.Thing do\n  def run, do: :ok\nend\n"},
+		optModule("AU.Base", "  defmacro __using__(_opts) do\n    quote do\n      alias AU.Target.Thing\n    end\n  end"),
+		optModule("AU.Other", "  defmacro __using__(_opts) do\n    quote do\n      :ok\n    end\n  end"),
+		optModule("AU.Wrapper", optUsing("    {mod, opts} = Keyword.pop(opts, :base, AU.Other)", "      use unquote(mod), unquote(opts)")),
+		optModule("AU.Outer", optUsing("    opts = opts |> Keyword.update(:base, AU.Base, & &1)", "      use AU.Wrapper, unquote(opts)")),
+		{"lib/au_user0.ex", "defmodule AU.User0 do\n  use AU.Outer\n\n  def go, do: Thing.run()\nend\n"},
+		{"lib/au_user1.ex", "defmodule AU.User1 do\n  use AU.Outer, base: AU.Other\n\n  def go, do: Thing.run()\nend\n"},
+	}
+	server, cleanup := bbServer(t, files...)
+	defer cleanup()
+	locs, err := server.ReferenceNames("AU.Target.Thing", "run", NameReferenceOptions{Kind: NameKindCallable})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, l := range locs {
+		rel, _ := filepath.Rel(server.projectRoot, l.FilePath)
+		got[fmt.Sprintf("%s:%d", rel, l.Line)] = true
+	}
+	if !got["lib/au_user0.ex:4"] {
+		t.Errorf("use AU.Outer: no reference through the Keyword.update default (got %v)", got)
+	}
+	if got["lib/au_user1.ex:4"] {
+		t.Errorf("use AU.Outer, base: AU.Other: a reference, but the caller's value wins")
+	}
+}
+
 // A module whose use chain has an option value that Dexter cannot read: only
 // a name that a chain can inject goes to the use line. A typo keeps the
 // answer that it has with no such option.
