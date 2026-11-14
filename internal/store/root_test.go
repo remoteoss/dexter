@@ -56,7 +56,10 @@ func TestResolveRoot(t *testing.T) {
 		{"a container that is not in git", []string{"shop/.git/", "shop/mix.exs", "shop/lib/a.ex"}, "shop/lib", "shop", OneProject},
 		{"an old index above a clone is not used", []string{".git/", ".dexter/dexter.db", "shop/.git/", "shop/mix.exs", "shop/lib/a.ex"}, "shop/lib", "shop", OneProject},
 		{"an old index in a folder without a project is not used", []string{".dexter/dexter.db", "shop/.git/", "shop/mix.exs", "shop/lib/a.ex"}, "shop/lib", "shop", OneProject},
-		{"an index in a Mix app of a monorepo is not used", []string{".git/", "apps/shop/mix.exs", "apps/shop/.dexter/dexter.db", "apps/shop/lib/a.ex"}, "apps/shop/lib", ".", OneProject},
+		{"an index that a user made in a Mix app is used", []string{".git/", "apps/shop/mix.exs", "apps/shop/.dexter/dexter.db", "apps/shop/lib/a.ex"}, "apps/shop/lib", "apps/shop", OneProject},
+		{"the nearest index in a Mix project wins", []string{".git/", "mix.exs", ".dexter/dexter.db", "apps/shop/mix.exs", "apps/shop/.dexter/dexter.db", "apps/shop/lib/a.ex"}, "apps/shop/lib", "apps/shop", OneProject},
+		{"another Mix app without an index uses the repository", []string{".git/", "apps/shop/mix.exs", "apps/shop/.dexter/dexter.db", "apps/web/mix.exs", "apps/web/lib/a.ex"}, "apps/web/lib", ".", OneProject},
+		{"an index without a mix.exs in a monorepo is not used", []string{".git/", "apps/shop/mix.exs", "apps/shop/lib/.dexter/dexter.db", "apps/shop/lib/a.ex"}, "apps/shop/lib", ".", OneProject},
 		{"a submodule is a part of its repository", []string{".git/", "mix.exs", "vendor/lib/.git", "vendor/lib/a.ex"}, "vendor/lib", ".", OneProject},
 		{"a git dependency belongs to its project", []string{".git/", "mix.exs", "deps/dep/.git/", "deps/dep/mix.exs", "deps/dep/lib/a.ex"}, "deps/dep/lib", ".", OneProject},
 		{"build output belongs to its project", []string{"shop/.git/", "shop/mix.exs", "shop/_build/dev/lib/shop/ebin/x.beam"}, "shop/_build/dev/lib/shop/ebin", "shop", OneProject},
@@ -225,5 +228,30 @@ func TestRemoveIndexDeletesOnlyDexterFiles(t *testing.T) {
 	// No index: nothing to do.
 	if err := RemoveIndex(t.TempDir()); err != nil {
 		t.Errorf("RemoveIndex of a directory without an index = %v", err)
+	}
+}
+
+// An index above the project that a session started in its own directory
+// uses (a monorepo above one of its apps, or above a clone in it) is not
+// stray. The index of a container, or of a folder that is not a project, is.
+func TestStrayIndexesAboveKeepsIndexesInUse(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	writeRootTree(t, home,
+		"code/.dexter/dexter.db",
+		"code/ws/.git/", "code/ws/.dexter/dexter.db",
+		"code/ws/mono/.git/", "code/ws/mono/.dexter/dexter.db",
+		"code/ws/mono/apps/shop/mix.exs", "code/ws/mono/apps/shop/.dexter/dexter.db",
+		"code/ws/mono/tools/clone/.git/", "code/ws/mono/tools/clone/mix.exs",
+	)
+	for _, from := range []string{"code/ws/mono/apps/shop", "code/ws/mono/tools/clone"} {
+		var dirs []string
+		for _, s := range StrayIndexesAbove(filepath.Join(home, from)) {
+			rel, _ := filepath.Rel(home, s.Dir)
+			dirs = append(dirs, rel)
+		}
+		if got, want := strings.Join(dirs, ","), "code/ws,code"; got != want {
+			t.Errorf("stray indexes above %s = %s, want %s (not the monorepo's)", from, got, want)
+		}
 	}
 }

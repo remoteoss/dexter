@@ -31,11 +31,13 @@ import (
 //  3. With no repository, the outermost mix.exs below the home directory is
 //     the project (an umbrella that is not in git).
 //
-// A Dexter index does not make a project: one that a frontend made in the
-// wrong directory (a parent of many projects) would otherwise make that
-// directory the workspace of every later session below it. An index in a
-// directory above the root that this rule picks is never used (see
-// StrayIndexesAbove).
+// Before step 1, at each level, an index next to a mix.exs is a project: a
+// user made it there on purpose (`dexter init` in apps/my_app of a
+// monorepo), and the nearest one wins. An index alone does not make a
+// project: one that a frontend made in the wrong directory (a parent of many
+// projects) would otherwise make that directory the workspace of every later
+// session below it. An index in a directory that the rule does not resolve
+// to itself is never used (see StrayIndexesAbove).
 
 // RootKind is what ResolveRoot found.
 type RootKind int
@@ -69,6 +71,12 @@ func ResolveRoot(path string) Root {
 	// (rare) looks for a mix.exs.
 	var gitFile string
 	for d := dir; !home.is(d); {
+		// An index that a user made in a Mix project (`dexter init` in
+		// apps/my_app of a monorepo) is that project's: the nearest one wins.
+		// An index without a mix.exs next to it makes no project.
+		if regularFile(DBPath(d)) && regularFile(filepath.Join(d, "mix.exs")) {
+			return Root{Dir: d, Kind: OneProject}
+		}
 		if info, err := os.Lstat(filepath.Join(d, ".git")); err == nil {
 			if info.IsDir() || (info.Mode().IsRegular() && parser.IsLinkedWorktree(d)) {
 				return classifyRepo(d)
@@ -213,9 +221,10 @@ type StrayIndex struct {
 }
 
 // StrayIndexesAbove lists the Dexter indexes in the directories above root,
-// up to and including the home directory. No session uses them: the rule
-// never picks a directory above a project. Earlier versions of Dexter made
-// such indexes in parents of several projects, where they can be very large.
+// up to and including the home directory, that no session uses: the rule
+// does not resolve their directory to itself (see servesItself). Earlier
+// versions of Dexter made such indexes in parents of several projects, where
+// they can be very large.
 // Only the .dexter layout counts: Open moved the old .dexter.db layout long
 // ago.
 func StrayIndexesAbove(root string) []StrayIndex {
@@ -230,10 +239,20 @@ func StrayIndexesAbove(root string) []StrayIndex {
 			return stray
 		}
 		d = parent
-		if s, ok := StrayIndexAt(d); ok {
+		if s, ok := StrayIndexAt(d); ok && !servesItself(d) {
 			stray = append(stray, s)
 		}
 	}
+}
+
+// servesItself reports whether a session that starts in dir uses an index
+// in dir: the rule resolves dir to itself, as one project. The index of a
+// monorepo above one of its apps, or of a monorepo above a clone in it, is
+// in use; the index of a container, or of a folder that is not a project,
+// is not.
+func servesItself(dir string) bool {
+	r := ResolveRoot(dir)
+	return r.Kind == OneProject && r.Dir == dir
 }
 
 // StrayIndexAt returns the index of dir as a StrayIndex, when it has one. A
