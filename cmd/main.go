@@ -142,6 +142,28 @@ func main() {
 	}
 	stopCmd.Flags().BoolVar(&forceStop, "force", false, "Stop even while editor or CLI clients are attached")
 
+	var pruneDelete bool
+	pruneCmd := &cobra.Command{
+		Use:   "prune [path]",
+		Short: "List, or delete, old Dexter indexes that no session uses",
+		Long: "List the Dexter indexes that no session uses: those in the directories above the project, " +
+			"and the index of a folder that only holds other projects. Earlier versions of Dexter made them, " +
+			"and they can be very large. With --delete, delete each one that no Dexter daemon uses. " +
+			"Only Dexter's own files are deleted; a .dexter directory that holds other files stays.",
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			target, err := resolvePath(args, 0)
+			if err != nil {
+				return err
+			}
+			if err := cmdPrune(target, pruneDelete, os.Stdout); err != nil {
+				fatal(err)
+			}
+			return nil
+		},
+	}
+	pruneCmd.Flags().BoolVar(&pruneDelete, "delete", false, "Delete the indexes that no daemon uses")
+
 	lspCmd := &cobra.Command{
 		Use:   "lsp [path]",
 		Short: "Start the LSP server (stdio)",
@@ -211,7 +233,7 @@ func main() {
 		},
 	}
 
-	rootCmd.AddCommand(initCmd, reindexCmd, lookupCmd, referencesCmd, stopCmd, lspCmd, mcpCmd, daemonCmd, versionCmd)
+	rootCmd.AddCommand(initCmd, reindexCmd, lookupCmd, referencesCmd, stopCmd, pruneCmd, lspCmd, mcpCmd, daemonCmd, versionCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)

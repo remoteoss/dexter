@@ -208,7 +208,7 @@ func HasIndex(dir string) bool {
 
 // StrayIndex is a Dexter index that the project root rule does not use.
 type StrayIndex struct {
-	Dir   string // the directory that holds the index
+	Dir   string // the directory that holds the .dexter directory
 	Bytes int64  // the size of the database and its journal files
 }
 
@@ -216,6 +216,8 @@ type StrayIndex struct {
 // up to and including the home directory. No session uses them: the rule
 // never picks a directory above a project. Earlier versions of Dexter made
 // such indexes in parents of several projects, where they can be very large.
+// Only the .dexter layout counts: Open moved the old .dexter.db layout long
+// ago.
 func StrayIndexesAbove(root string) []StrayIndex {
 	home := homeDir()
 	var stray []StrayIndex
@@ -228,45 +230,89 @@ func StrayIndexesAbove(root string) []StrayIndex {
 			return stray
 		}
 		d = parent
-		if HasIndex(d) {
-			stray = append(stray, StrayIndex{Dir: d, Bytes: indexBytes(d)})
+		if s, ok := StrayIndexAt(d); ok {
+			stray = append(stray, s)
 		}
 	}
 }
 
+// StrayIndexAt returns the index of dir as a StrayIndex, when it has one. A
+// container's own index is one: the rule gives a container no index.
+func StrayIndexAt(dir string) (StrayIndex, bool) {
+	if !regularFile(DBPath(dir)) {
+		return StrayIndex{}, false
+	}
+	return StrayIndex{Dir: dir, Bytes: indexBytes(dir)}, true
+}
+
+// indexFiles are the files that Dexter keeps in its .dexter directory.
+var indexFiles = []string{"dexter.db", "dexter.db-wal", "dexter.db-shm", ".gitignore", "chosen-root"}
+
 func indexBytes(dir string) int64 {
 	var n int64
-	for _, db := range []string{DBPath(dir), LegacyDBPath(dir)} {
-		for _, suffix := range []string{"", "-wal", "-shm"} {
-			if info, err := os.Stat(db + suffix); err == nil {
-				n += info.Size()
-			}
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		if info, err := os.Stat(DBPath(dir) + suffix); err == nil {
+			n += info.Size()
 		}
 	}
 	return n
 }
 
-// StrayIndexMessage explains the stray indexes above a workspace, or is ""
-// when there are none.
+// RemoveIndex deletes the Dexter index of dir: each file that Dexter keeps in
+// .dexter, one at a time, and then the directory when it is empty. It never
+// deletes a file that it does not know, so a .dexter that holds other files
+// stays, and the error names them. The caller holds the workspace lock of
+// dir, so that no daemon opens the index while it goes.
+func RemoveIndex(dir string) error {
+	dbDir := DBDir(dir)
+	for _, name := range indexFiles {
+		if err := os.Remove(filepath.Join(dbDir, name)); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	if err := os.Remove(dbDir); err != nil && !os.IsNotExist(err) {
+		entries, readErr := os.ReadDir(dbDir)
+		if readErr != nil || len(entries) == 0 {
+			return err
+		}
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		return &OtherFilesError{Dir: dbDir, Names: names}
+	}
+	return nil
+}
+
+// OtherFilesError is RemoveIndex's answer when it deleted the index, but the
+// .dexter directory also holds files that Dexter did not make.
+type OtherFilesError struct {
+	Dir   string
+	Names []string
+}
+
+func (e *OtherFilesError) Error() string {
+	return fmt.Sprintf("deleted the index, but %s also holds %s, which Dexter did not make, so the directory stays", e.Dir, strings.Join(e.Names, ", "))
+}
+
+// StrayIndexMessage explains the stray indexes above a workspace and how to
+// delete them, or is "" when there are none.
 func StrayIndexMessage(stray []StrayIndex) string {
 	if len(stray) == 0 {
 		return ""
 	}
-	var b strings.Builder
-	b.WriteString("Dexter: ")
-	for i, s := range stray {
-		if i > 0 {
-			b.WriteString("; ")
-		}
-		fmt.Fprintf(&b, "%s (%s)", DBDir(s.Dir), formatBytes(s.Bytes))
+	var where []string
+	for _, s := range stray {
+		where = append(where, fmt.Sprintf("%s (%s)", DBDir(s.Dir), formatBytes(s.Bytes)))
 	}
 	if len(stray) == 1 {
-		b.WriteString(" is an old Dexter index that no session uses: it is above this project, and Dexter makes an index only at a project root. Delete that directory to free the space.")
-	} else {
-		b.WriteString(" are old Dexter indexes that no session uses: they are above this project, and Dexter makes an index only at a project root. Delete those directories to free the space.")
+		return fmt.Sprintf("Dexter: an earlier version of Dexter made an index at %s. No session uses it now: Dexter makes an index only at a project root. To free the space, run `dexter prune --delete` in this project.", where[0])
 	}
-	return b.String()
+	return fmt.Sprintf("Dexter: an earlier version of Dexter made indexes at %s. No session uses them now: Dexter makes an index only at a project root. To free the space, run `dexter prune --delete` in this project.", strings.Join(where, ", "))
 }
+
+// FormatBytes writes a size for a person: KB, MB, or GB.
+func FormatBytes(n int64) string { return formatBytes(n) }
 
 func formatBytes(n int64) string {
 	switch {

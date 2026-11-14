@@ -315,7 +315,7 @@ func TestStrayIndexAboveTheProjectIsShown(t *testing.T) {
 	reportRoot(project, r)
 	c := r.Conditions()
 	if len(c) != 1 || c[0].Key != condStrayIndex || c[0].Severity != notify.Warning ||
-		!strings.Contains(c[0].Message, store.DBDir(ws)+" (2 MB)") || !strings.Contains(c[0].Message, "Delete that directory") {
+		!strings.Contains(c[0].Message, store.DBDir(ws)+" (2 MB)") || !strings.Contains(c[0].Message, "dexter prune --delete") {
 		t.Fatalf("conditions = %+v", c)
 	}
 }

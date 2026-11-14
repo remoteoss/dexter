@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -137,7 +138,7 @@ func TestStrayIndexesAbove(t *testing.T) {
 		t.Errorf("the size of %s leaves out its journal: %d bytes", stray[0].Dir, stray[0].Bytes)
 	}
 	msg := StrayIndexMessage(stray)
-	for _, want := range []string{filepath.Join(home, "code", "ws", ".dexter") + " (3 MB)", "no session uses", "Delete those directories"} {
+	for _, want := range []string{filepath.Join(home, "code", "ws", ".dexter") + " (3 MB)", "No session uses them", "dexter prune --delete"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("message %q does not say %q", msg, want)
 		}
@@ -190,5 +191,39 @@ func TestResolveRootKnowsTheHomeDirectoryInAnotherSpelling(t *testing.T) {
 	// The index in the home directory is listed once, in the resolved spelling.
 	if stray := StrayIndexesAbove(filepath.Join(resolved, "scratch")); len(stray) != 1 {
 		t.Errorf("stray indexes = %v, want the home index", stray)
+	}
+}
+
+func TestRemoveIndexDeletesOnlyDexterFiles(t *testing.T) {
+	dir := t.TempDir()
+	writeRootTree(t, dir, ".dexter/dexter.db", ".dexter/dexter.db-wal", ".dexter/dexter.db-shm", ".dexter/.gitignore", "lib/a.ex")
+	if err := RemoveIndex(dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(DBDir(dir)); !os.IsNotExist(err) {
+		t.Errorf(".dexter is still there: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "lib", "a.ex")); err != nil {
+		t.Errorf("a file outside .dexter is gone: %v", err)
+	}
+
+	// A file that Dexter did not make stays, and so does its directory.
+	other := t.TempDir()
+	writeRootTree(t, other, ".dexter/dexter.db", ".dexter/notes.txt")
+	err := RemoveIndex(other)
+	var otherFiles *OtherFilesError
+	if !errors.As(err, &otherFiles) || len(otherFiles.Names) != 1 || otherFiles.Names[0] != "notes.txt" {
+		t.Errorf("RemoveIndex = %v, want an OtherFilesError that names notes.txt", err)
+	}
+	if regularFile(DBPath(other)) {
+		t.Error("the database is still there")
+	}
+	if !regularFile(filepath.Join(DBDir(other), "notes.txt")) {
+		t.Error("a file that Dexter did not make was deleted")
+	}
+
+	// No index: nothing to do.
+	if err := RemoveIndex(t.TempDir()); err != nil {
+		t.Errorf("RemoveIndex of a directory without an index = %v", err)
 	}
 }

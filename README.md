@@ -717,6 +717,19 @@ to an outright kill if the process will not exit. Editors attached to a forced
 stop lose the workspace until it restarts on the next `dexter lsp`, lookup, or
 reindex.
 
+Earlier versions of Dexter could make an index in a folder above your
+projects (for example a folder that holds several clones and worktrees), where
+it can grow very large. No session uses such an index now, and Dexter warns
+about it with its path and size. `dexter prune` lists these indexes, and
+`dexter prune --delete` deletes each one that no daemon uses. It deletes only
+Dexter's own files, one at a time: a `.dexter` folder that holds other files
+stays.
+
+```sh
+dexter prune            # list old indexes above this project
+dexter prune --delete   # delete them
+```
+
 `dexter init` is the one command that needs the workspace to itself. It asks an
 idle daemon to exit and refuses while a client is attached, so close your editor
 (or wait for the idle timeout) before rebuilding an index from scratch.
