@@ -943,7 +943,13 @@ func setRetryDelays(t *testing.T, initial, maximum time.Duration) {
 func TestIncompletePassIsRetriedUntilWritesWork(t *testing.T) {
 	setRetryDelays(t, 20*time.Millisecond, 80*time.Millisecond)
 	var passes atomic.Int32
-	testHookFullPass = func(error) { passes.Add(1) }
+	var completed atomic.Bool // a pass ended with no error
+	testHookFullPass = func(err error) {
+		passes.Add(1)
+		if err == nil {
+			completed.Store(true)
+		}
+	}
 	t.Cleanup(func() { testHookFullPass = nil })
 
 	rt, root := newTestRuntime(t)
@@ -968,6 +974,7 @@ func TestIncompletePassIsRetriedUntilWritesWork(t *testing.T) {
 	t.Cleanup(restore)
 
 	passes.Store(0)
+	completed.Store(false)
 	if err := rt.Reindex(testContext(t, 10*time.Second)); !errors.Is(err, lsp.ErrIncomplete) {
 		t.Fatalf("reindex on a full disk = %v, want ErrIncomplete", err)
 	}
@@ -987,8 +994,9 @@ func TestIncompletePassIsRetriedUntilWritesWork(t *testing.T) {
 	})
 
 	// After a complete pass, nothing is scheduled. The pass that wrote the
-	// files can still be counting when they show, so wait for it first.
-	time.Sleep(100 * time.Millisecond)
+	// files can still run when they show (on a slow machine for longer than
+	// any fixed wait), so wait until it has ended.
+	eventually(t, 10*time.Second, completed.Load)
 	n := passes.Load()
 	time.Sleep(200 * time.Millisecond)
 	if passes.Load() != n {
