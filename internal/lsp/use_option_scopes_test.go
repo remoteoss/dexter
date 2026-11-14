@@ -33,6 +33,9 @@ func TestRegression_UseChainOptionScopes(t *testing.T) {
 		optModule("PL.Validate2", optUsing("    opts = Keyword.validate!(opts, [:queue, base: PL.Second])\n    mod = opts[:base]", "      use unquote(mod)")),
 		optModule("PL.InnerQuote", "  defmacro __using__(opts) do\n    mod = Keyword.get(opts, :base, PL.Second)\n    quote do\n      use unquote(mod)\n    end\n  end"),
 		optModule("PL.DoKw", "  defmacro __using__(opts) do\n    _ = if true, do: :ok\n    opts = Keyword.put(opts, :base, PL.Second)\n    quote do\n      use PL.Wrapper, unquote(opts)\n    end\n  end"),
+		optModule("PL.HelperExtraArg", "  defmacro __using__(opts) do\n    opts = Keyword.put_new(opts, :base, PL.Second)\n    build(opts, :x)\n  end\n\n  defp build(o, _env) do\n    quote do\n      use PL.Wrapper, unquote(o)\n    end\n  end"),
+		optModule("PL.InQuoteTuple", "  defmacro __using__(opts) do\n    quote do\n      {mod, opts} = Keyword.pop(unquote(opts), :base, PL.Third)\n      use PL.Wrapper, unquote(opts)\n    end\n  end"),
+		optModule("PL.NestedAtom", "  defmacro __using__(_opts) do\n    quote do\n      use PL.Wrapper, base: PL.Second\n    end\n  end\n\n  defmodule Inner do\n    defmacro __using__(which) when is_atom(which) do\n      quote do\n        use PL.Wrapper, base: PL.Third\n      end\n    end\n  end"),
 		optModule("PL.InQuoteRebind", "  defmacro __using__(opts) do\n    quote do\n      opts = [base: PL.Third]\n      use PL.Wrapper, unquote(opts)\n    end\n  end"),
 	}
 	workers := []struct{ name, use, want string }{
@@ -52,6 +55,9 @@ func TestRegression_UseChainOptionScopes(t *testing.T) {
 		{"W.Validate2Own", "use PL.Validate2, base: PL.Third", "third"},
 		{"W.DoKw", "use PL.DoKw", "second"},
 		{"W.InQuoteRebind", "use PL.InQuoteRebind, base: PL.Second", "second"},
+		{"W.HelperExtraArg", "use PL.HelperExtraArg", "second"},
+		{"W.InQuoteTuple", "use PL.InQuoteTuple, base: PL.Second", "second"},
+		{"W.NestedAtom", "use PL.NestedAtom, :x", "second"},
 	}
 	files := append([]bbFile(nil), lib...)
 	var caller strings.Builder

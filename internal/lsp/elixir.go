@@ -2948,16 +2948,33 @@ func sourceForModule(text, moduleName string) (string, bool) {
 	return "", false
 }
 
-// laterNonListUsingClause reports whether a __using__ clause from token i on
-// does not take a keyword list.
+// laterNonListUsingClause reports whether a __using__ clause of the same
+// module, from token i on, does not take a keyword list. A nested module's
+// clauses are not the module's own, and the scan ends with the module.
 func laterNonListUsingClause(source []byte, tokens []parser.Token, i int) bool {
 	n := len(tokens)
+	depth, nested := 0, -1
 	for ; i < n; i++ {
-		if tokens[i].Kind != parser.TokDefmacro {
-			continue
-		}
-		if name, j, ok := parser.StaticDeclarationName(source, tokens, n, i); ok && name == "__using__" && !usingClauseTakesList(source, tokens, n, j+1) {
-			return true
+		switch tokens[i].Kind {
+		case parser.TokDo, parser.TokFn, parser.TokEnd:
+			parser.TrackBlockDepth(tokens[i].Kind, &depth)
+			if nested >= 0 && depth < nested {
+				nested = -1
+			}
+			if depth < 0 {
+				return false // the end of the module
+			}
+		case parser.TokDefmodule:
+			if nested < 0 {
+				nested = depth + 1
+			}
+		case parser.TokDefmacro:
+			if nested >= 0 {
+				continue
+			}
+			if name, j, ok := parser.StaticDeclarationName(source, tokens, n, i); ok && name == "__using__" && !usingClauseTakesList(source, tokens, n, j+1) {
+				return true
+			}
 		}
 	}
 	return false
@@ -3240,7 +3257,9 @@ func parseUsingBodyClause(text string, atomClause bool, bothKinds *bool) (import
 		// edit of it (`build(Keyword.put_new(opts, :key, Mod))`).
 		if arg := nextSig(open + 1); open < n && arg < n {
 			var edits []optEdit
-			if src, argEdits, mods, _, ok := readKeywordEdits(source, tokens, n, arg, ob.macroScope(fileAliases)); ok && src != "" {
+			if next := nextSig(arg + 1); tokens[arg].Kind == parser.TokIdent && next < n && (tokens[next].Kind == parser.TokComma || tokens[next].Kind == parser.TokCloseParen) {
+				edits = slices.Clone(vars[parser.TokenText(source, tokens[arg])]) // `build(opts, env)`
+			} else if src, argEdits, mods, _, ok := readKeywordEdits(source, tokens, n, arg, ob.macroScope(fileAliases)); ok && src != "" {
 				edits = append(slices.Clone(vars[src]), argEdits...)
 				for _, m := range mods {
 					optUses = append(optUses, resolveAlias(m))
@@ -3603,9 +3622,11 @@ func parseUsingBodyClause(text string, atomClause bool, bothKinds *bool) (import
 		case parser.TokOpenBrace:
 			// {mod, opts} = Keyword.pop(opts, :key, Default), and
 			// {:ok, mod} = Keyword.fetch(opts, :key)
-			if end, handled := ob.tupleAssignment(i); handled {
-				i = end
-				continue
+			if len(quotes) == 0 {
+				if end, handled := ob.tupleAssignment(i); handled {
+					i = end
+					continue
+				}
 			}
 			i++
 
