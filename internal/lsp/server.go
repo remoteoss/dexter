@@ -315,8 +315,10 @@ type IndexCoordinator struct {
 	failures fileFailures
 	// firstBuildReported makes the first-build report once per workspace.
 	firstBuildReported atomic.Bool
-	otp                otpOutcomes  // see reportBeamOTP
-	beamFailures       beamFailures // see rememberBeamFailure
+	// reclaiming is set while startReclaimFreePages runs.
+	reclaiming   atomic.Bool
+	otp          otpOutcomes  // see reportBeamOTP
+	beamFailures beamFailures // see rememberBeamFailure
 
 	// caches are shared by every session; see sharedCaches.
 	caches sharedCaches
@@ -785,6 +787,34 @@ func (s *Server) startWarmUsingCache() {
 		defer end()
 		defer s.index.reporter.Recover("cache", "the warm-up of the __using__ cache")
 		s.fillUsingCache()
+	}()
+}
+
+// startReclaimFreePages gives the free pages of the index file back in the
+// background (see store.ReclaimFreePages), one reclaim at a time for the
+// workspace. It is index work that the workspace waits for, or cancels, when
+// it closes. A reclaim that stops (a writer that held the lock too long, a
+// shutdown) goes on after the next pass.
+func (s *Server) startReclaimFreePages() {
+	if !s.index.reclaiming.CompareAndSwap(false, true) {
+		return
+	}
+	if !s.index.backgroundWork.start() {
+		s.index.reclaiming.Store(false)
+		return
+	}
+	go func() {
+		defer s.index.backgroundWork.done()
+		defer s.index.reclaiming.Store(false)
+		defer s.index.reporter.Recover("index", "the reclaim of free index pages")
+		start := time.Now()
+		freed, err := s.store.ReclaimFreePages(s.index.work)
+		switch {
+		case err != nil && s.index.work.Err() == nil:
+			log.Printf("Index file: reclaimed %d MB of free pages, then stopped: %v", freed>>20, err)
+		case freed > 0:
+			log.Printf("Index file: reclaimed %d MB of free pages (%s)", freed>>20, time.Since(start).Round(time.Millisecond))
+		}
 	}()
 }
 
@@ -1475,6 +1505,13 @@ func (s *Server) startBackgroundReindex() <-chan error {
 		// The index is in place now, so fill the __using__ cache before a user
 		// asks for it. See warmUsingCache.
 		s.warmUsingCache()
+
+		// A rebuild or a large prune leaves free pages in the index file. Only
+		// after a pass that worked: a pass that found the root gone or could
+		// not write must leave the index alone.
+		if result == nil {
+			s.startReclaimFreePages()
+		}
 
 		elapsed := time.Since(start).Round(time.Millisecond)
 		if failed > 0 {
