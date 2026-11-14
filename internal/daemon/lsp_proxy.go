@@ -170,7 +170,7 @@ func newLSPProxy(ctx context.Context, root string, container bool, in io.Reader,
 	return &lspProxy{
 		ctx:             ctx,
 		root:            root,
-		rootKey:         resolveRootKey(root),
+		rootKey:         workspaceIdentity(root),
 		container:       container,
 		in:              bufio.NewReaderSize(in, 64<<10),
 		out:             out,

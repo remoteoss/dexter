@@ -84,7 +84,7 @@ func (p *lspProxy) route(docURI string, create bool) (u *upstream, fallback bool
 	if root != "" {
 		key, ok := p.rootKeys[root]
 		if !ok {
-			key = resolveRootKey(root)
+			key = workspaceIdentity(root)
 			p.rootKeys[root] = key
 		}
 		// Another spelling of the start root is the start root.
@@ -167,14 +167,6 @@ func within(path, base string) bool {
 		return false
 	}
 	return strings.HasSuffix(base, string(filepath.Separator)) || path[len(base)] == filepath.Separator
-}
-
-// resolveRootKey is the identity that the daemon of root has (see
-// workspaceIdentity): two spellings of one project, a symlink or another
-// letter case on a case-insensitive file system, share one upstream, as they
-// share one daemon.
-func resolveRootKey(root string) string {
-	return workspaceIdentity(root)
 }
 
 func (u *upstream) isFailed() bool {

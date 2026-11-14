@@ -52,8 +52,10 @@ type Config struct {
 type Frontend struct {
 	cfg Config
 
-	mu       sync.Mutex
-	closed   bool
+	mu     sync.Mutex
+	closed bool
+	// conns holds one connection for each project, keyed by connKey: two
+	// spellings of one folder (a symlink, other letter case) share one.
 	conns    map[string]*workspaceConn
 	sessions map[*mcp.ServerSession]*sessionState
 	// containers caches store.ContainerProjects for each resolved root: nil
@@ -68,12 +70,14 @@ type workspaceConn struct {
 
 type sessionState struct {
 	root  string
-	dirty bool // the client's roots changed; resolve again on the next call
+	key   string // connKey(root)
+	dirty bool   // the client's roots changed; resolve again on the next call
 	// container is true when root only holds other projects: the session
 	// has no Backend of its own (see store.IsProjectContainer).
 	container bool
-	// projects are the other roots that the session's calls named with
-	// the project argument; each holds one user of its connection.
+	// projects are the connKeys of the other roots that the session's calls
+	// named with the project argument; each holds one user of its
+	// connection.
 	projects map[string]bool
 }
 
@@ -103,7 +107,7 @@ func (f *Frontend) backendFor(ctx context.Context, ss *mcp.ServerSession) (Backe
 			f.mu.Unlock()
 			return nil, errContainerRoot
 		}
-		b := f.conns[st.root].backend
+		b := f.conns[st.key].backend
 		f.mu.Unlock()
 		return b, nil
 	}
@@ -115,6 +119,7 @@ func (f *Frontend) backendFor(ctx context.Context, ss *mcp.ServerSession) (Backe
 		return nil, err
 	}
 	container := f.isContainer(root)
+	key := connKey(root)
 
 	f.mu.Lock()
 	if f.closed {
@@ -122,13 +127,13 @@ func (f *Frontend) backendFor(ctx context.Context, ss *mcp.ServerSession) (Backe
 		return nil, errClosed
 	}
 	st, bound := f.sessions[ss]
-	if bound && st.root == root {
+	if bound && st.key == key {
 		st.dirty = false
 		if st.container {
 			f.mu.Unlock()
 			return nil, errContainerRoot
 		}
-		b := f.conns[root].backend
+		b := f.conns[key].backend
 		f.mu.Unlock()
 		return b, nil
 	}
@@ -136,14 +141,14 @@ func (f *Frontend) backendFor(ctx context.Context, ss *mcp.ServerSession) (Backe
 	var projects map[string]bool
 	if bound {
 		if !st.container {
-			orphan = f.releaseLocked(st.root)
+			orphan = f.releaseLocked(st.key)
 		}
 		projects = st.projects
 	}
 	if container {
 		// No daemon for a container: its index would copy the projects in
 		// it. Calls name their project (see callBackend).
-		f.sessions[ss] = &sessionState{root: root, container: true, projects: projects}
+		f.sessions[ss] = &sessionState{root: root, key: key, container: true, projects: projects}
 		f.mu.Unlock()
 		log.Printf("MCP session workspace: %s (%s) holds several projects; calls name the project", root, source)
 		if !bound {
@@ -157,13 +162,13 @@ func (f *Frontend) backendFor(ctx context.Context, ss *mcp.ServerSession) (Backe
 		}
 		return nil, errContainerRoot
 	}
-	c, exists := f.conns[root]
+	c, exists := f.conns[key]
 	if !exists {
 		c = &workspaceConn{backend: f.cfg.Connect(root)}
-		f.conns[root] = c
+		f.conns[key] = c
 	}
 	c.users++
-	f.sessions[ss] = &sessionState{root: root, projects: projects}
+	f.sessions[ss] = &sessionState{root: root, key: key, projects: projects}
 	f.mu.Unlock()
 
 	log.Printf("MCP session workspace: %s (%s)", root, source)
@@ -215,10 +220,10 @@ func (f *Frontend) resolve(dir string) (string, error) {
 	return defaultResolveRoot(dir)
 }
 
-// releaseLocked drops one user of root and returns its Backend when no session
-// uses it any more. The caller closes it outside the lock.
-func (f *Frontend) releaseLocked(root string) Backend {
-	c, ok := f.conns[root]
+// releaseLocked drops one user of the connection key and returns its Backend
+// when no session uses it any more. The caller closes it outside the lock.
+func (f *Frontend) releaseLocked(key string) Backend {
+	c, ok := f.conns[key]
 	if !ok {
 		return nil
 	}
@@ -226,7 +231,7 @@ func (f *Frontend) releaseLocked(root string) Backend {
 	if c.users > 0 {
 		return nil
 	}
-	delete(f.conns, root)
+	delete(f.conns, key)
 	return c.backend
 }
 
@@ -239,10 +244,10 @@ func (f *Frontend) detach(ss *mcp.ServerSession) {
 	if st, ok := f.sessions[ss]; ok {
 		delete(f.sessions, ss)
 		if !st.container {
-			orphan = f.releaseLocked(st.root)
+			orphan = f.releaseLocked(st.key)
 		}
-		for root := range st.projects {
-			if b := f.releaseLocked(root); b != nil {
+		for key := range st.projects {
+			if b := f.releaseLocked(key); b != nil {
 				orphans = append(orphans, b)
 			}
 		}

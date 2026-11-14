@@ -272,45 +272,34 @@ func resolvePath(args []string, index int) (string, error) {
 	return os.Getwd()
 }
 
-func findProjectRoot(path string) string {
-	return findProjectRootWithMissing(path, false)
+// findProjectRoot is projectRootFor for the CLI: it exits on an error.
+func findProjectRoot(path string, allowMissing bool) string {
+	root, err := projectRootFor(path, allowMissing)
+	if err != nil {
+		fatal(err)
+	}
+	return root
 }
 
-// findProjectRootWithMissing is findProjectRoot for a target that may have been
-// deleted. The search starts from the nearest ancestor that still exists: the
-// missing path itself can hold no marker, and returning it as the root would
-// name a workspace that is not there.
-func findProjectRootWithMissing(path string, allowMissing bool) string {
-	info, err := os.Stat(path)
+// projectRootFor returns the workspace of path (store.FindProjectRoot), a
+// file or a directory. With allowMissing, a target that was deleted is
+// looked up from the nearest folder above it that still exists: the missing
+// path itself can hold no marker, and returning it as the root would name a
+// workspace that is not there.
+func projectRootFor(path string, allowMissing bool) (string, error) {
+	_, err := os.Stat(path)
 	for allowMissing && os.IsNotExist(err) {
 		parent := filepath.Dir(path)
 		if parent == path {
 			break
 		}
 		path = parent
-		info, err = os.Stat(path)
+		_, err = os.Stat(path)
 	}
-	if err != nil {
-		fatal(err)
-	}
-	return projectRootIn(path, info)
-}
-
-// projectRootFor is findProjectRoot for a frontend that must not exit on an
-// error, such as the MCP server resolving a root that a client gave.
-func projectRootFor(path string) (string, error) {
-	info, err := os.Stat(path)
 	if err != nil {
 		return "", err
 	}
-	return projectRootIn(path, info), nil
-}
-
-func projectRootIn(path string, info os.FileInfo) string {
-	if !info.IsDir() {
-		path = filepath.Dir(path)
-	}
-	return store.FindProjectRoot(path)
+	return store.FindProjectRoot(path), nil
 }
 
 // requireProjectRoot refuses to treat a directory that shows no sign of being
@@ -436,7 +425,7 @@ func cmdInit(projectRoot string, force bool, allowNonProject bool, profile bool)
 }
 
 func cmdReindex(target string, allowNonProject bool) {
-	projectRoot := findProjectRootWithMissing(target, true)
+	projectRoot := findProjectRoot(target, true)
 	requireProjectRoot(projectRoot, allowNonProject)
 	client, err := daemon.Ensure(context.Background(), projectRoot)
 	if err != nil {
@@ -461,7 +450,7 @@ func cmdReindex(target string, allowNonProject bool) {
 }
 
 func cmdLookup(projectRoot string, module string, function string, strict bool, followDelegates bool, opts queryOptions, allowNonProject bool) {
-	projectRoot = findProjectRoot(projectRoot)
+	projectRoot = findProjectRoot(projectRoot, false)
 	requireProjectRoot(projectRoot, allowNonProject)
 	client, err := daemon.Ensure(context.Background(), projectRoot)
 	if err != nil {
@@ -490,7 +479,7 @@ func cmdLookup(projectRoot string, module string, function string, strict bool, 
 }
 
 func cmdReferences(projectRoot string, module string, function string, opts queryOptions, allowNonProject bool) {
-	projectRoot = findProjectRoot(projectRoot)
+	projectRoot = findProjectRoot(projectRoot, false)
 	requireProjectRoot(projectRoot, allowNonProject)
 	client, err := daemon.Ensure(context.Background(), projectRoot)
 	if err != nil {
@@ -526,7 +515,7 @@ func cmdReferences(projectRoot string, module string, function string, opts quer
 // deliberately idempotent: stopping a workspace with no daemon is success so a
 // script can call it without first checking.
 func cmdStop(projectRoot string, force bool) {
-	projectRoot = findProjectRoot(projectRoot)
+	projectRoot = findProjectRoot(projectRoot, false)
 	ctx := context.Background()
 
 	// --force is the manual escape hatch: terminate by process, with no
@@ -685,7 +674,7 @@ func cmdStopIncompatible(ctx context.Context, root string, e *daemon.Incompatibl
 // editor why, as the answer to its initialize request; fatal only repeats it on
 // stderr for the editor's log.
 func cmdLSP(projectRoot string) {
-	projectRoot = findProjectRoot(projectRoot)
+	projectRoot = findProjectRoot(projectRoot, false)
 	log.SetOutput(os.Stderr)
 	log.Printf("Dexter LSP proxy v%s starting (root: %s, daemon log: %s)", version.Version, projectRoot, daemonLogPath(projectRoot))
 	if err := daemon.ProxyLSP(context.Background(), projectRoot, os.Stdin, os.Stdout); err != nil {
@@ -787,7 +776,7 @@ func fatal(err error) {
 // the roots that clients give go through the same project-root search as the
 // CLI, so every frontend reaches the same daemon for one directory.
 func mcpConfig(launchDir string, explicitRoot bool) (dexter_mcp.Config, error) {
-	root, err := projectRootFor(launchDir)
+	root, err := projectRootFor(launchDir, false)
 	if err != nil {
 		return dexter_mcp.Config{}, err
 	}
@@ -807,7 +796,7 @@ func mcpConfig(launchDir string, explicitRoot bool) (dexter_mcp.Config, error) {
 // project, or that is the home directory, would start a daemon that indexes
 // all of it. The MCP frontend treats a refused root as unusable.
 func mcpClientRoot(dir string) (string, error) {
-	root, err := projectRootFor(dir)
+	root, err := projectRootFor(dir, false)
 	if err != nil {
 		return "", err
 	}

@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/remoteoss/dexter/internal/pathcase"
+	"github.com/remoteoss/dexter/internal/store"
 )
 
 // ContractVersion is the workspace contract: the handshake, the control
@@ -99,8 +99,8 @@ func workspaceIdentity(root string) string {
 	if err != nil {
 		return filepath.Clean(root)
 	}
-	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
-		return pathcase.DiskSpelling(resolved)
+	if canonical := store.CanonicalDir(abs); canonical != "" {
+		return canonical
 	}
 	return abs
 }

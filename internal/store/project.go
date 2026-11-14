@@ -202,10 +202,10 @@ func isDependencyDir(d string) bool {
 	return false
 }
 
-// LooksLikeProject reports whether dir shows the cheap signs of a workspace
+// looksLikeProject reports whether dir shows the cheap signs of a workspace
 // root: a mix.exs or a .git. A Dexter database alone is not a sign (see the
 // project root rule).
-func LooksLikeProject(dir string) bool {
+func looksLikeProject(dir string) bool {
 	return regularFile(filepath.Join(dir, "mix.exs")) || gitMarker(filepath.Join(dir, ".git"))
 }
 
@@ -375,15 +375,30 @@ func gitMarker(path string) bool {
 // NonProjectRootError explains why dir is not a workspace to index, or returns
 // nil when it is one. Every frontend refuses such a directory unless the user
 // insists (-y, which applies to that command only), because indexing it (the
-// home directory, a mistyped path) would read every file under it.
+// home directory, a mistyped path) would read every file under it. The error
+// is a *NotProjectError.
 func NonProjectRootError(dir string) error {
 	if IsHomeDir(dir) {
-		return fmt.Errorf("refusing to use %s as a workspace: it is your home directory, not a project", dir)
+		return &NotProjectError{Dir: dir, Home: true}
 	}
-	if LooksLikeProject(dir) {
+	if looksLikeProject(dir) {
 		return nil
 	}
-	return fmt.Errorf("refusing to use %s as a workspace: no mix.exs or .git found, so it does not look like an Elixir project", dir)
+	return &NotProjectError{Dir: dir}
+}
+
+// NotProjectError is NonProjectRootError's answer: dir is the home directory,
+// or has no mix.exs or .git.
+type NotProjectError struct {
+	Dir  string
+	Home bool
+}
+
+func (e *NotProjectError) Error() string {
+	if e.Home {
+		return fmt.Sprintf("refusing to use %s as a workspace: it is your home directory, not a project", e.Dir)
+	}
+	return fmt.Sprintf("refusing to use %s as a workspace: no mix.exs or .git found, so it does not look like an Elixir project", e.Dir)
 }
 
 // ContainerRootError explains that dir only holds other projects, or returns

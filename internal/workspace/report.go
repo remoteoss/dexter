@@ -1,6 +1,7 @@
 package workspace
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/remoteoss/dexter/internal/notify"
@@ -26,12 +27,13 @@ func reportRoot(root string, reporter *notify.Reporter) {
 	if msg := store.StrayIndexMessage(store.StrayIndexesAbove(root)); msg != "" {
 		reporter.Set(condStrayIndex, notify.Warning, msg)
 	}
-	if store.IsHomeDir(root) {
-		reporter.Set(condRoot, notify.Warning, fmt.Sprintf(
-			"Dexter: %s is your home directory, not a project, but the editor opened it as the workspace. Dexter indexes it anyway, which can take a long time. Open the project directory instead, or set --root <path> in the dexter command of the editor.", root))
+	var notProject *store.NotProjectError
+	if !errors.As(store.NonProjectRootError(root), &notProject) {
 		return
 	}
-	if store.LooksLikeProject(root) {
+	if notProject.Home {
+		reporter.Set(condRoot, notify.Warning, fmt.Sprintf(
+			"Dexter: %s is your home directory, not a project, but the editor opened it as the workspace. Dexter indexes it anyway, which can take a long time. Open the project directory instead, or set --root <path> in the dexter command of the editor.", root))
 		return
 	}
 	reporter.Set(condRoot, notify.Warning, fmt.Sprintf(

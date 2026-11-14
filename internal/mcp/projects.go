@@ -135,29 +135,17 @@ func (f *Frontend) callBackend(ctx context.Context, ss *mcp.ServerSession, proje
 	if f.isContainer(root) {
 		return nil, "", f.newContainerError(root)
 	}
-	pb, err := f.projectBackend(ss, f.knownSpelling(root))
+	pb, err := f.projectBackend(ss, root)
 	return pb, "", err
 }
 
-// knownSpelling returns the spelling of root that a connection already uses,
-// or root. A project named through a symlink, or in other letter case, then
-// shares the connection to its daemon: a second connection in another
-// spelling would fail the daemon's root check.
-func (f *Frontend) knownSpelling(root string) string {
-	f.mu.Lock()
-	if _, ok := f.conns[root]; ok {
-		f.mu.Unlock()
-		return root
-	}
-	known := make([]string, 0, len(f.conns))
-	for r := range f.conns {
-		known = append(known, r)
-	}
-	f.mu.Unlock()
-	for _, r := range known {
-		if store.SameDir(r, root) {
-			return r
-		}
+// connKey is the key of root's connection: the folder in its canonical
+// spelling, so that a symlink or other letter case shares one connection
+// (a second connection in another spelling would fail the daemon's root
+// check). A folder that does not exist keys as written.
+func connKey(root string) string {
+	if c := store.CanonicalDir(root); c != "" {
+		return c
 	}
 	return root
 }
@@ -175,6 +163,7 @@ func (f *Frontend) sessionRoot(ss *mcp.ServerSession) string {
 // projectBackend returns the Backend of root for the session, which then
 // holds one user of its connection until it ends.
 func (f *Frontend) projectBackend(ss *mcp.ServerSession, root string) (Backend, error) {
+	key := connKey(root)
 	f.mu.Lock()
 	if f.closed {
 		f.mu.Unlock()
@@ -185,21 +174,21 @@ func (f *Frontend) projectBackend(ss *mcp.ServerSession, root string) (Backend, 
 		f.mu.Unlock()
 		return nil, errClosed
 	}
-	if !st.container && st.root == root {
-		b := f.conns[root].backend
+	if !st.container && st.key == key {
+		b := f.conns[key].backend
 		f.mu.Unlock()
 		return b, nil
 	}
-	c, exists := f.conns[root]
+	c, exists := f.conns[key]
 	if !exists {
 		c = &workspaceConn{backend: f.cfg.Connect(root)}
-		f.conns[root] = c
+		f.conns[key] = c
 	}
-	if !st.projects[root] {
+	if !st.projects[key] {
 		if st.projects == nil {
 			st.projects = make(map[string]bool)
 		}
-		st.projects[root] = true
+		st.projects[key] = true
 		c.users++
 	}
 	f.mu.Unlock()

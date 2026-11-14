@@ -949,7 +949,7 @@ func TestProxyCachedRouteDropsAFailedFallback(t *testing.T) {
 	work, _, featureA, _ := containerFixture(t)
 	p := newLSPProxy(context.Background(), work, true, nil, io.Discard, nil)
 	u := p.newUpstream(featureA, 1)
-	p.upstreams[resolveRootKey(featureA)] = u
+	p.upstreams[workspaceIdentity(featureA)] = u
 	p.upstreamList = []*upstream{u}
 	p.fallbackUp = u
 	raw := []byte(`"` + fileURI(filepath.Join(work, "notes.ex")) + `"`)
