@@ -367,6 +367,10 @@ func reclaimStep(ctx context.Context, db *sql.DB, pages int64) (err error) {
 	return err
 }
 
+// SetMaxIdleConns sets how many idle connections the pool keeps. Tests use
+// it to make the next query open a new connection.
+func (s *Store) SetMaxIdleConns(n int) { s.db.SetMaxIdleConns(n) }
+
 // SetBulkPragmas configures SQLite for maximum write throughput. Safe only
 // when the database is fresh and throwaway-on-crash (e.g. a forced full
 // rebuild): synchronous=OFF skips all fsyncs, journal_mode=MEMORY keeps the

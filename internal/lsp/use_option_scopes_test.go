@@ -36,6 +36,8 @@ func TestRegression_UseChainOptionScopes(t *testing.T) {
 		optModule("PL.HelperExtraArg", "  defmacro __using__(opts) do\n    opts = Keyword.put_new(opts, :base, PL.Second)\n    build(opts, :x)\n  end\n\n  defp build(o, _env) do\n    quote do\n      use PL.Wrapper, unquote(o)\n    end\n  end"),
 		optModule("PL.InQuoteTuple", "  defmacro __using__(opts) do\n    quote do\n      {mod, opts} = Keyword.pop(unquote(opts), :base, PL.Third)\n      use PL.Wrapper, unquote(opts)\n    end\n  end"),
 		optModule("PL.NestedAtom", "  defmacro __using__(_opts) do\n    quote do\n      use PL.Wrapper, base: PL.Second\n    end\n  end\n\n  defmodule Inner do\n    defmacro __using__(which) when is_atom(which) do\n      quote do\n        use PL.Wrapper, base: PL.Third\n      end\n    end\n  end"),
+		optModule("PL.OneLineNested", "  defmacro __using__(opts) when is_list(opts) do\n    quote do\n      use PL.Wrapper, base: PL.Third\n    end\n  end\n\n  defmodule Tiny, do: def(x, do: x)\n\n  defmacro __using__(which) when is_atom(which) do\n    quote do\n      use PL.Wrapper, base: PL.Second\n    end\n  end"),
+		{"lib/pl_siblings.ex", "defmodule PL.SibA do\n  defmacro __using__(_opts) do\n    quote do\n      use PL.Wrapper, base: PL.Second\n    end\n  end\nend\n\ndefmodule PL.SibB do\n  defmacro __using__(which) when is_atom(which) do\n    quote do\n      use PL.Wrapper, base: PL.Third\n    end\n  end\nend\n"},
 		optModule("PL.InQuoteRebind", "  defmacro __using__(opts) do\n    quote do\n      opts = [base: PL.Third]\n      use PL.Wrapper, unquote(opts)\n    end\n  end"),
 	}
 	workers := []struct{ name, use, want string }{
@@ -58,6 +60,8 @@ func TestRegression_UseChainOptionScopes(t *testing.T) {
 		{"W.HelperExtraArg", "use PL.HelperExtraArg", "second"},
 		{"W.InQuoteTuple", "use PL.InQuoteTuple, base: PL.Second", "second"},
 		{"W.NestedAtom", "use PL.NestedAtom, :x", "second"},
+		{"W.OneLineNested", "use PL.OneLineNested, :x", "second"},
+		{"W.Sibling", "use PL.SibA, :x", "second"},
 	}
 	files := append([]bbFile(nil), lib...)
 	var caller strings.Builder

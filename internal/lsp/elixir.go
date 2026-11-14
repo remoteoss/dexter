@@ -2953,11 +2953,20 @@ func sourceForModule(text, moduleName string) (string, bool) {
 // clauses are not the module's own, and the scan ends with the module.
 func laterNonListUsingClause(source []byte, tokens []parser.Token, i int) bool {
 	n := len(tokens)
+	keyword := func(j int) bool { return j+1 < n && tokens[j+1].Kind == parser.TokColon } // `do:`
+	// depth counts the blocks opened from i on; the module's own end takes it
+	// below zero. nested is the depth inside a nested defmodule, or -1.
 	depth, nested := 0, -1
 	for ; i < n; i++ {
 		switch tokens[i].Kind {
-		case parser.TokDo, parser.TokFn, parser.TokEnd:
-			parser.TrackBlockDepth(tokens[i].Kind, &depth)
+		case parser.TokDo:
+			if !keyword(i) {
+				depth++
+			}
+		case parser.TokFn:
+			depth++
+		case parser.TokEnd:
+			depth--
 			if nested >= 0 && depth < nested {
 				nested = -1
 			}
@@ -2965,7 +2974,9 @@ func laterNonListUsingClause(source []byte, tokens []parser.Token, i int) bool {
 				return false // the end of the module
 			}
 		case parser.TokDefmodule:
-			if nested < 0 {
+			// Only a block form (`defmodule Inner do ... end`) has clauses
+			// to skip; `defmodule Tiny, do: ...` has no end.
+			if doIdx, _, hasDo := parser.ScanForwardToBlockDo(tokens, n, i+1); nested < 0 && hasDo && !keyword(doIdx) {
 				nested = depth + 1
 			}
 		case parser.TokDefmacro:

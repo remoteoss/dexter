@@ -951,6 +951,12 @@ func (s *Server) pruneMissingFiles(seen map[string]struct{}) error {
 
 	storedPaths, err := s.store.ListFilePaths()
 	if err != nil {
+		// A root that went away also fails the read: the pool opens a new
+		// connection by the index's path, which is gone with the root. Say
+		// that, not only that the pass is incomplete.
+		if rootErr := s.checkProjectRoot(); errors.Is(rootErr, ErrRootGone) {
+			return rootErr
+		}
 		return fmt.Errorf("%w: listing stored files: %v", ErrIncomplete, err)
 	}
 
