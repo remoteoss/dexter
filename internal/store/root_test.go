@@ -255,3 +255,28 @@ func TestStrayIndexesAboveKeepsIndexesInUse(t *testing.T) {
 		}
 	}
 }
+
+// A linked worktree inside a checkout (an agent worktree) is its own
+// project, and the checkout's index above it is in use, also for a monorepo
+// without a root mix.exs and for a project with one.
+func TestStrayIndexesAboveANestedWorktree(t *testing.T) {
+	for _, layout := range [][]string{
+		{".git/", ".dexter/dexter.db", "apps/shop/mix.exs", ".agents/wt/.git@", ".agents/wt/apps/shop/mix.exs"},
+		{".git/", ".dexter/dexter.db", "mix.exs", ".agents/wt/.git@", ".agents/wt/mix.exs"},
+	} {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		root := filepath.Join(home, "repo")
+		if err := os.MkdirAll(root, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeRootTree(t, root, layout...)
+		wt := filepath.Join(root, ".agents", "wt")
+		if got := ResolveRoot(wt); got.Dir != wt {
+			t.Fatalf("ResolveRoot(worktree) = %s, want the worktree", got.Dir)
+		}
+		if stray := StrayIndexesAbove(wt); len(stray) != 0 {
+			t.Errorf("layout %v: the checkout's index above its worktree is stray: %v", layout, stray)
+		}
+	}
+}
