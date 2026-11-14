@@ -142,6 +142,25 @@ func main() {
 	}
 	stopCmd.Flags().BoolVar(&forceStop, "force", false, "Stop even while editor or CLI clients are attached")
 
+	logCmd := &cobra.Command{
+		Use:   "log [path]",
+		Short: "Print the path of the daemon log of a project",
+		Long: "Print the path of the workspace daemon's log for the project of the path (default: the current directory), " +
+			"for example `tail -f \"$(dexter log)\"`. Every editor, CLI command, and MCP session of a project share one daemon and one log. " +
+			"For a folder of repositories, print the log of each project in it that has one.",
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			target, err := resolvePath(args, 0)
+			if err != nil {
+				return err
+			}
+			if err := cmdLog(target, os.Stdout, os.Stderr); err != nil {
+				fatal(err)
+			}
+			return nil
+		},
+	}
+
 	var pruneDelete bool
 	pruneCmd := &cobra.Command{
 		Use:   "prune [path]",
@@ -233,7 +252,7 @@ func main() {
 		},
 	}
 
-	rootCmd.AddCommand(initCmd, reindexCmd, lookupCmd, referencesCmd, stopCmd, pruneCmd, lspCmd, mcpCmd, daemonCmd, versionCmd)
+	rootCmd.AddCommand(initCmd, reindexCmd, lookupCmd, referencesCmd, stopCmd, pruneCmd, logCmd, lspCmd, mcpCmd, daemonCmd, versionCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -676,7 +695,11 @@ func cmdStopIncompatible(ctx context.Context, root string, e *daemon.Incompatibl
 func cmdLSP(projectRoot string) {
 	projectRoot = findProjectRoot(projectRoot, false)
 	log.SetOutput(os.Stderr)
-	log.Printf("Dexter LSP proxy v%s starting (root: %s, daemon log: %s)", version.Version, projectRoot, daemonLogPath(projectRoot))
+	if store.IsProjectContainer(projectRoot) {
+		log.Printf("Dexter %s for %s: a folder of repositories; each project in it has its own daemon log, which this log names when Dexter connects to it", version.Version, projectRoot)
+	} else {
+		log.Printf("Dexter %s for %s (log: %s)", version.Version, projectRoot, daemonLogPath(projectRoot))
+	}
 	if err := daemon.ProxyLSP(context.Background(), projectRoot, os.Stdin, os.Stdout); err != nil {
 		fatal(err)
 	}
@@ -833,9 +856,9 @@ func cmdMCP(projectRoot string, listen string, listenUnsafe bool, explicitRoot b
 	frontend := dexter_mcp.NewFrontend(cfg)
 	defer frontend.Close()
 	if explicitRoot {
-		log.Printf("Dexter MCP v%s starting (root: %s, daemon log: %s)", version.Version, root, daemonLogPath(root))
+		log.Printf("Dexter %s MCP for %s (log: %s)", version.Version, root, daemonLogPath(root))
 	} else {
-		log.Printf("Dexter MCP v%s starting (workspace roots negotiated per session; fallback root: %s)", version.Version, root)
+		log.Printf("Dexter %s MCP (each session's workspace comes from the client; fallback: %s)", version.Version, root)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

@@ -213,7 +213,7 @@ func (f *Frontend) projectBackend(ss *mcp.ServerSession, root string) (Backend, 
 	}
 	f.mu.Unlock()
 	if !exists {
-		log.Printf("MCP session project: %s", root)
+		log.Printf("MCP session project: %s (log: %s)", root, daemonLogOf(root))
 		if w, ok := c.backend.(warmer); ok && store.NonProjectRootError(root) == nil {
 			go w.warm(context.Background())
 		}

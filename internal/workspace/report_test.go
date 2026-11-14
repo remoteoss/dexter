@@ -260,6 +260,19 @@ func TestUpgradeOfAnOlderSchemaIsReportedAsAnUpgrade(t *testing.T) {
 	if store.UpgradedBy(root) != version.IndexVersion {
 		t.Error("the upgrade is not recorded")
 	}
+	// A new file, with the auto_vacuum mode of a new index.
+	check, err := sql.Open("sqlite3", store.DBPath(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = check.Close() }()
+	var mode int
+	if err := check.QueryRow("PRAGMA auto_vacuum").Scan(&mode); err != nil {
+		t.Fatal(err)
+	}
+	if mode != 2 {
+		t.Errorf("auto_vacuum of the upgraded index = %d, want 2 (incremental): the old file was kept", mode)
+	}
 }
 
 // seedIndex writes an index that holds one file.

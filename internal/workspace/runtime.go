@@ -1368,14 +1368,15 @@ func openStore(root string, reporter *notify.Reporter) (*store.Store, error) {
 		// in between: two Dexter versions serve this project.
 		again := stored > 0 && stored < version.IndexVersion && store.UpgradedBy(root) == version.IndexVersion
 		reporter.Set(lsp.CondIndexRebuild, notify.Warning, versionMismatchMessage(stored, version.IndexVersion, again))
-		if !s.IsEmpty() {
-			if err := s.Close(); err != nil {
-				return nil, fmt.Errorf("closing outdated index: %w", err)
-			}
-			removeIndexFiles(root)
-			if s, err = store.Open(root); err != nil {
-				return nil, openFailed(reporter, otherOpenFailureMessage(root, err), err)
-			}
+		// A new file also when the open has emptied the old one: it gets
+		// the old file's pages back and the incremental auto_vacuum of a new
+		// index, which an existing file cannot change to.
+		if err := s.Close(); err != nil {
+			return nil, fmt.Errorf("closing outdated index: %w", err)
+		}
+		removeIndexFiles(root)
+		if s, err = store.Open(root); err != nil {
+			return nil, openFailed(reporter, otherOpenFailureMessage(root, err), err)
 		}
 		if stored > 0 && stored < version.IndexVersion {
 			if err := store.MarkUpgraded(root, version.IndexVersion); err != nil {

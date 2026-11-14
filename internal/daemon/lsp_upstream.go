@@ -635,7 +635,7 @@ func (u *upstream) reconnect(first bool) (net.Conn, <-chan struct{}, error) {
 			continue
 		}
 		if first {
-			log.Printf("LSP proxy: connected to the workspace daemon of %s", u.root)
+			log.Printf("Dexter: connected to the daemon of %s (log: %s)", u.root, daemonLog(u.root))
 			u.connMu.Lock()
 			again := u.failures > 0
 			u.failures = 0
@@ -644,7 +644,7 @@ func (u *upstream) reconnect(first bool) (net.Conn, <-chan struct{}, error) {
 				p.showMessage(3, fmt.Sprintf("Dexter reaches the workspace daemon of %s again; the files of this project get answers again.", u.root))
 			}
 		} else {
-			log.Printf("LSP proxy: reconnected to the workspace daemon of %s", u.root)
+			log.Printf("Dexter: reconnected to the daemon of %s (log: %s)", u.root, daemonLog(u.root))
 		}
 		return conn, daemonDone, nil
 	}
@@ -918,4 +918,12 @@ func (u *upstream) awaitResponse(conn net.Conn, reader *bufio.Reader, id []byte,
 			}
 		}
 	}
+}
+
+// daemonLog is the path of the log of root's daemon, for the editor's log.
+func daemonLog(root string) string {
+	if ep, err := ResolveEndpoint(root); err == nil {
+		return ep.Log
+	}
+	return "unknown"
 }

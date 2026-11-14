@@ -367,9 +367,9 @@ func TestDaemonExitsWithoutTheIndexWhenTheRootIsGone(t *testing.T) {
 func setCandidates(t *testing.T, dirs ...string) {
 	t.Helper()
 	t.Setenv(RuntimeDirEnv, "")
-	previous := platformDirs
-	platformDirs = func() []string { return dirs }
-	t.Cleanup(func() { platformDirs = previous })
+	f := func() []string { return dirs }
+	previous := platformDirsOverride.Swap(&f)
+	t.Cleanup(func() { platformDirsOverride.Store(previous) })
 }
 
 // TestResolveEndpointFallsBackWhenTheFirstDirectoryIsUnusable: on a

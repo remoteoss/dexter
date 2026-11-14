@@ -309,3 +309,11 @@ func (b *daemonBackend) Close() error {
 	b.client = nil
 	return err
 }
+
+// daemonLogOf is the path of the log of root's workspace daemon.
+func daemonLogOf(root string) string {
+	if ep, err := daemon.ResolveEndpoint(root); err == nil {
+		return ep.Log
+	}
+	return "unknown"
+}
