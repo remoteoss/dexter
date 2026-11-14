@@ -649,12 +649,14 @@ Dexter keeps its index in `.dexter/dexter.db` at the root of the project. The fo
 
 ```mermaid
 flowchart TD
-    start["Start folder"] --> index{"Has .dexter/ and mix.exs?"}
+    start["Start folder"] --> home{"Is it your home folder?"}
+    home -- no --> index{"Has .dexter/ and mix.exs?"}
     index -- yes --> app["This folder is the project<br/>(an index that you made, e.g. in apps/my_app)"]
     index -- no --> git{"Is a clone (.git folder)<br/>or a linked worktree?"}
-    git -- no --> top{"At the home folder or /?"}
-    top -- no --> up["Go to the parent folder"] --> index
-    top -- yes --> mix{"Passed a mix.exs?"}
+    git -- no --> top{"Is it / (the top of the disk)?"}
+    top -- no --> up["Go to the parent folder"] --> home
+    home -- yes --> mix{"Passed a mix.exs?"}
+    top -- yes --> mix
     mix -- yes --> outer["The outermost mix.exs folder is the project"]
     mix -- no --> none["Not a project: the CLI and MCP refuse<br/>(-y allows one command); an editor gets a warning"]
     git -- yes --> own{"Has a Mix project of its own?<br/>(not in a nested repository)"}
@@ -664,7 +666,7 @@ flowchart TD
     holds -- no --> repo
 ```
 
-A submodule, and a dependency in `deps/`, belong to the project that holds them. An index anywhere else is not used. Earlier versions could make one in a folder above your projects; `dexter prune` lists them, and `dexter prune --delete` deletes them.
+Your home folder is never a project, also when it is a git repository (dotfiles). A submodule, and a dependency in `deps/`, belong to the project that holds them. An index anywhere else is not used. Earlier versions could make one in a folder above your projects; `dexter prune` lists them, and `dexter prune --delete` deletes them.
 
 If you're upgrading from a pre-`.dexter/` version of dexter, any existing `.dexter.db` file at your project root will be automatically deleted and rebuilt into the new `.dexter/` folder on the next `dexter init` or LSP startup. You can also remove any `.dexter.db*` or `.dexter/` entries from your `.gitignore`, as they are no longer needed.
 
