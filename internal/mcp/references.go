@@ -14,6 +14,7 @@ type ReferencesParams struct {
 	Module   string `json:"module" jsonschema:"fully-qualified module name, e.g. MyApp.Accounts (aliases are not resolved)"`
 	Function string `json:"function,omitempty" jsonschema:"function name; omit to list references to the module itself (aliases, imports, uses, qualified calls)"`
 	Callees  bool   `json:"callees,omitempty" jsonschema:"also list what the function calls (its callees) with the lines of the calls; needs function"`
+	ProjectParam
 }
 
 const maxCallees = 100

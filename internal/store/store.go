@@ -87,62 +87,6 @@ func LegacyDBPath(projectRoot string) string {
 	return filepath.Join(projectRoot, ".dexter.db")
 }
 
-// FindProjectRoot walks up from path looking for known dexter/project
-// markers. The default markers (in priority order) are:
-//
-//  1. .dexter/dexter.db — the current database layout
-//  2. .dexter.db         — the legacy layout (pre-.dexter/ folder)
-//  3. .git               — repository root fallback
-//
-// Additional markers can be passed via extraMarkers; they are tried after
-// the defaults, in the order given. The CLI passes "mix.exs" to fall back
-// to the nearest Mix project when no dexter/git marker is found.
-//
-// The search never climbs above a linked git worktree: one checked out inside
-// another checkout (e.g. .claude/worktrees/<name>) is its own project, and
-// finding the enclosing checkout's database first would serve the wrong files.
-//
-// Returns the original path if no marker is found.
-func FindProjectRoot(path string, extraMarkers ...string) string {
-	markers := append([]string{
-		filepath.Join(".dexter", "dexter.db"),
-		".dexter.db",
-		".git",
-	}, extraMarkers...)
-
-	for _, marker := range markers {
-		dir := path
-		for {
-			if validProjectMarker(filepath.Join(dir, marker), marker) {
-				return dir
-			}
-			if parser.IsLinkedWorktree(dir) {
-				break
-			}
-			parent := filepath.Dir(dir)
-			if parent == dir {
-				break
-			}
-			dir = parent
-		}
-	}
-	return path
-}
-
-func validProjectMarker(path, marker string) bool {
-	info, err := os.Stat(path)
-	if err != nil {
-		return false
-	}
-	switch marker {
-	case ".git":
-		// Linked worktrees and submodules use a regular .git file.
-		return info.IsDir() || info.Mode().IsRegular()
-	default:
-		return info.Mode().IsRegular()
-	}
-}
-
 func Open(projectRoot string) (*Store, error) {
 	if err := migrateLegacyLayout(projectRoot); err != nil {
 		return nil, fmt.Errorf("migrate legacy layout: %w", err)

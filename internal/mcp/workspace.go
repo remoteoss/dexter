@@ -11,7 +11,9 @@ import (
 	"github.com/remoteoss/dexter/internal/version"
 )
 
-type WorkspaceParams struct{}
+type WorkspaceParams struct {
+	ProjectParam
+}
 
 func (h *Handler) workspace(ctx context.Context, args WorkspaceParams) (string, error) {
 	var b strings.Builder

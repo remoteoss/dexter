@@ -13,6 +13,7 @@ const maxProtocolImpls = 100
 type ImplementationsParams struct {
 	Module   string `json:"module" jsonschema:"behaviour or protocol module, fully qualified"`
 	Function string `json:"function,omitempty" jsonschema:"callback or protocol function name; when set, locate its definition in each implementor"`
+	ProjectParam
 }
 
 func (h *Handler) implementations(ctx context.Context, args ImplementationsParams) (string, error) {

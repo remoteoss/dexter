@@ -6,7 +6,9 @@ import (
 	"time"
 )
 
-type ReindexParams struct{}
+type ReindexParams struct {
+	ProjectParam
+}
 
 func (h *Handler) reindex(ctx context.Context, args ReindexParams) (string, error) {
 	// The workspace daemon owns the index: this is the same barrier as
