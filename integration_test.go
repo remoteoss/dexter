@@ -769,6 +769,7 @@ func TestIntegration_StopDaemon(t *testing.T) {
 
 	// Spawn the daemon with a long idle timeout so it cannot disappear between
 	// the commands on a slow machine.
+	stopDaemonAtCleanup(t, binary, root)
 	spawn := exec.Command(binary, "lookup", "--root", root, "MyApp.Repo")
 	spawn.Dir = root
 	spawn.Env = append(os.Environ(), "DEXTER_DAEMON_IDLE_TIMEOUT=30s", "PWD="+root)
@@ -826,6 +827,7 @@ func TestIntegration_StopDaemonForce(t *testing.T) {
 func TestIntegration_RefusesNonProjectRoot(t *testing.T) {
 	binary := buildDexter(t)
 	scratch := t.TempDir()
+	stopDaemonAtCleanup(t, binary, scratch)
 
 	run := func(args ...string) (string, error) {
 		cmd := exec.Command(binary, args...)
@@ -876,6 +878,7 @@ func TestIntegration_RefusesGitBackedHome(t *testing.T) {
 	if err := os.Mkdir(child, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	stopDaemonAtCleanup(t, binary, child)
 	cmd := exec.Command(binary, "lookup", "MyApp.Repo")
 	cmd.Dir = child
 	cmd.Env = append(os.Environ(), "HOME="+home, "PWD="+child)
@@ -929,6 +932,7 @@ func TestIntegration_GitBackedHomeYesIsSticky(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(home, ".git"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	stopDaemonAtCleanup(t, binary, home)
 	run := func(args ...string) (string, error) {
 		cmd := exec.Command(binary, args...)
 		cmd.Dir = home
@@ -990,6 +994,7 @@ func TestIntegration_LegacyMigration(t *testing.T) {
 // MCP client session.
 func mcpConnect(t *testing.T, binary, root string) *sdkmcp.ClientSession {
 	t.Helper()
+	stopDaemonAtCleanup(t, binary, root)
 	cmd := exec.Command(binary, "mcp", root)
 	cmd.Dir = root
 	cmd.Stderr = os.Stderr
