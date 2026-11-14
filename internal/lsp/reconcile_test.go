@@ -1022,3 +1022,31 @@ func TestReconcile_PanicInRebuildIsRecoveredAndTheNextPassFinishes(t *testing.T)
 		}
 	}
 }
+
+// After the workspace waited for its index work, no new work starts: a rename
+// that outlives its session cannot add work to a group that is being waited
+// for, or write to a closed store.
+func TestServer_NoIndexWorkAfterWaitForIndexWork(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+	path := writeTestFile(t, server.projectRoot, "lib/late.ex", moduleSource(7, 0))
+	server.WaitForIndexWork()
+
+	select {
+	case err := <-server.startBackgroundReindex():
+		if err != nil {
+			t.Errorf("a pass after the wait: %v, want a canceled pass", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a pass after the wait did not end")
+	}
+	select {
+	case <-server.reindexAfterRename(nil, []string{path}, nil):
+	case <-time.After(5 * time.Second):
+		t.Fatal("an index update after the wait did not end")
+	}
+	if has, _ := server.store.HasPath(path); has {
+		t.Error("index work ran after the wait")
+	}
+	server.index.backgroundWork.Wait()
+}

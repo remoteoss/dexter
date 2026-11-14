@@ -306,7 +306,7 @@ type IndexCoordinator struct {
 	writes      sync.RWMutex
 	unavailable bool // guarded by writes
 
-	backgroundWork sync.WaitGroup
+	backgroundWork workGroup
 
 	// reporter tells every attached editor about failures, degraded states,
 	// and long work. It is shared like the store: one workspace, one set of
@@ -483,6 +483,10 @@ func (c *IndexCoordinator) takeClientMove(from string) (string, bool) {
 // editor. The caller holds renameSerial (see beginRename).
 func (s *Server) renameNotify(sev notify.Severity, msg string) {
 	s.index.renameNotices = append(s.index.renameNotices, renameNotice{sev, msg})
+	if r := s.index.renameReport; r != nil && sev != notify.Error {
+		// An error is the rename's returned error too.
+		r.Warnings = append(r.Warnings, strings.TrimPrefix(msg, "Dexter: "))
+	}
 }
 
 // CancelWork stops the reconciliation in flight and makes every later one
@@ -716,10 +720,44 @@ func isStreamClosed(err error) bool {
 		errors.Is(err, syscall.EPIPE)
 }
 
-// WaitForIndexWork waits for background index writes already accepted by this
-// workspace. Callers must prevent new sessions from adding work first.
+// WaitForIndexWork stops accepting background index work in this workspace,
+// and waits for the work already accepted. A session that is still running
+// (a rename that outlives its connection) cannot start more: its index update
+// is left to the next start, which finds the files changed.
 func (s *Server) WaitForIndexWork() {
-	s.index.backgroundWork.Wait()
+	s.index.backgroundWork.closeAndWait()
+}
+
+// workGroup is a WaitGroup that stops accepting work when it closes, so that
+// no work can start while, or after, the workspace waits for it to end.
+type workGroup struct {
+	mu     sync.Mutex
+	closed bool
+	wg     sync.WaitGroup
+}
+
+// start accepts one piece of work, unless the group is closed. The caller
+// calls done when it ends.
+func (g *workGroup) start() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closed {
+		return false
+	}
+	g.wg.Add(1)
+	return true
+}
+
+func (g *workGroup) done() { g.wg.Done() }
+
+// Wait waits for the work accepted so far.
+func (g *workGroup) Wait() { g.wg.Wait() }
+
+func (g *workGroup) closeAndWait() {
+	g.mu.Lock()
+	g.closed = true
+	g.mu.Unlock()
+	g.wg.Wait()
 }
 
 // OpenDocuments reports how many buffers this session holds. Daemon status
@@ -1226,14 +1264,19 @@ func (s *Server) backgroundReindex() {
 // not be written and a later pass must write them.
 func (s *Server) startBackgroundReindex() <-chan error {
 	done := make(chan error, 1)
-	s.index.backgroundWork.Add(1)
+	if !s.index.backgroundWork.start() {
+		// The workspace is closing: the pass is canceled.
+		done <- nil
+		close(done)
+		return done
+	}
 	go func() {
 		var result error
 		defer func() {
 			done <- result
 			close(done)
 		}()
-		defer s.index.backgroundWork.Done()
+		defer s.index.backgroundWork.done()
 		s.index.reindexing.Lock()
 		defer s.index.reindexing.Unlock()
 		// Deferred last so it runs first: the locks above are released after
@@ -7120,6 +7163,7 @@ func (s *Server) planFunctionRename(module, functionName, newName string, reques
 		return nil, plan.err
 	}
 	family.notifyDynamicCalls(s, source)
+	family.notifyApplyCalls(s, source)
 
 	// Update defdelegate lines that forward to this function: add or update
 	// the `as:` option so the facade keeps working after the rename. The
@@ -9177,9 +9221,14 @@ func (s *Server) reindexAfterRename(removePaths, diskPaths []string, textPaths [
 	done := make(chan struct{})
 	// The caller holds renameSerial (see beginRename).
 	s.index.lastRenameIndexed = done
-	s.index.backgroundWork.Add(1)
+	if !s.index.backgroundWork.start() {
+		// The workspace is closing: the next start finds the renamed files
+		// changed and indexes them.
+		close(done)
+		return done
+	}
 	go func() {
-		defer s.index.backgroundWork.Done()
+		defer s.index.backgroundWork.done()
 		defer close(done)
 		// Deferred after close(done), so it runs first; the locks are
 		// released in writeAfterRename before it.

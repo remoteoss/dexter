@@ -97,10 +97,14 @@ func anchorLines(a, b []string, match func(i, j int)) {
 			tails[lo] = k
 		}
 	}
+	// The longest increasing sequence ends at the last element of tails,
+	// and prev leads back through it.
 	anchors := make([]pair, len(tails))
-	for k, n := len(tails)-1, len(tails); n > 0; n-- {
-		anchors[n-1] = unique[k]
-		k = prev[k]
+	if len(tails) > 0 {
+		for k, n := tails[len(tails)-1], len(tails); n > 0; n-- {
+			anchors[n-1] = unique[k]
+			k = prev[k]
+		}
 	}
 	anchors = append(anchors, pair{len(a), len(b)}) // the end, not a match
 
