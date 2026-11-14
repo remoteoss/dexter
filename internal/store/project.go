@@ -64,20 +64,29 @@ func ResolveRoot(path string) Root {
 	}
 	dir = ownerOfDependencies(dir)
 	home := homeDir()
-	var gitFile, mixDir string
-	for d := dir; ; {
-		if home != "" && d == home {
+	// One Lstat of .git at each level. Only a walk that finds no repository
+	// (rare) looks for a mix.exs.
+	var gitFile string
+	for d := dir; !home.is(d); {
+		if info, err := os.Lstat(filepath.Join(d, ".git")); err == nil {
+			if info.IsDir() || (info.Mode().IsRegular() && parser.IsLinkedWorktree(d)) {
+				return classifyRepo(d)
+			}
+			if gitFile == "" && info.Mode().IsRegular() {
+				gitFile = d // a submodule outside a clone, or a worktree whose admin directory is gone
+			}
+		}
+		parent := filepath.Dir(d)
+		if parent == d {
 			break
 		}
-		if isNestedProject(d) {
-			if !repoHasOwnMixProject(d) && IsProjectContainer(d) {
-				return Root{Dir: d, Kind: Container}
-			}
-			return Root{Dir: d, Kind: OneProject}
-		}
-		if gitFile == "" && regularFile(filepath.Join(d, ".git")) {
-			gitFile = d // a submodule outside a clone, or a worktree whose admin directory is gone
-		}
+		d = parent
+	}
+	if gitFile != "" {
+		return Root{Dir: gitFile, Kind: OneProject}
+	}
+	var mixDir string
+	for d := dir; !home.is(d); {
 		if regularFile(filepath.Join(d, "mix.exs")) {
 			mixDir = d
 		}
@@ -87,13 +96,21 @@ func ResolveRoot(path string) Root {
 		}
 		d = parent
 	}
-	switch {
-	case gitFile != "":
-		return Root{Dir: gitFile, Kind: OneProject}
-	case mixDir != "":
+	if mixDir != "" {
 		return Root{Dir: mixDir, Kind: OneProject}
 	}
 	return Root{Dir: dir, Kind: NotAProject}
+}
+
+// classifyRepo is step 2 of the project root rule for the repository dir.
+func classifyRepo(dir string) Root {
+	if regularFile(filepath.Join(dir, "mix.exs")) {
+		return Root{Dir: dir, Kind: OneProject}
+	}
+	if scan := scanRepo(dir); scan.container {
+		return Root{Dir: dir, Kind: Container}
+	}
+	return Root{Dir: dir, Kind: OneProject} // a monorepo, or a repository without Elixir
 }
 
 // FindProjectRoot returns the directory of ResolveRoot: the project root of
@@ -103,12 +120,48 @@ func FindProjectRoot(path string) string {
 	return ResolveRoot(path).Dir
 }
 
-func homeDir() string {
+// homeDirs is the home directory as written and with its symlinks resolved.
+type homeDirs []string
+
+// homeCache holds homeDir for one value of the home directory, so that a
+// walk does not resolve its symlinks each time.
+var homeCache struct {
+	sync.Mutex
+	home string
+	dirs homeDirs
+}
+
+func homeDir() homeDirs {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
-		return ""
+		return nil
 	}
-	return filepath.Clean(home)
+	homeCache.Lock()
+	defer homeCache.Unlock()
+	if homeCache.home == home && homeCache.dirs != nil {
+		return homeCache.dirs
+	}
+	h := homeDirs{filepath.Clean(home)}
+	if resolved, err := filepath.EvalSymlinks(home); err == nil && resolved != h[0] {
+		h = append(h, resolved)
+	}
+	homeCache.home, homeCache.dirs = home, h
+	return h
+}
+
+// is reports whether d is the home directory. A string compare without case
+// finds the candidates, so a walk pays a stat only at a directory that can be
+// the home directory in another spelling.
+func (h homeDirs) is(d string) bool {
+	for _, home := range h {
+		if d == home {
+			return true
+		}
+		if strings.EqualFold(d, home) && SameDir(d, home) {
+			return true
+		}
+	}
+	return false
 }
 
 // ownerOfDependencies returns the project directory that holds dir when dir is
@@ -166,7 +219,7 @@ func StrayIndexesAbove(root string) []StrayIndex {
 	home := homeDir()
 	var stray []StrayIndex
 	for d := filepath.Clean(root); ; {
-		if home != "" && d == home {
+		if home.is(d) {
 			return stray
 		}
 		parent := filepath.Dir(d)
@@ -314,16 +367,6 @@ type scanCacheEntry struct {
 	at   time.Time
 }
 
-// repoHasOwnMixProject reports whether the repository dir holds a Mix project
-// that is its own: a mix.exs at its root (one stat), or one below it that is
-// not in a nested repository.
-func repoHasOwnMixProject(dir string) bool {
-	if regularFile(filepath.Join(dir, "mix.exs")) {
-		return true
-	}
-	return scanRepo(dir).own
-}
-
 // scanRepo reads the directories of dir breadth first, to containerScanDepth.
 // It stops at the first mix.exs that is not in a nested repository (a
 // monorepo), and does not go into a nested repository (a clone or a linked
@@ -386,12 +429,34 @@ func scanRepoUncached(dir string) repoScan {
 			continue
 		}
 		for _, e := range entries {
-			if e.IsDir() && !skipContainerDir(e.Name()) {
-				queue = append(queue, item{filepath.Join(it.dir, e.Name()), it.depth + 1})
+			if skipContainerDir(e.Name()) {
+				continue
+			}
+			path := filepath.Join(it.dir, e.Name())
+			switch {
+			case e.IsDir():
+				queue = append(queue, item{path, it.depth + 1})
+			case e.Type()&os.ModeSymlink != 0 && isNestedProject(path) && !linksInto(path, dir):
+				// A clone that is a symlink: a repository of the container.
+				// The scan does not go into other symlinks, so a link loop
+				// cannot hold it.
+				scan.nested = append(scan.nested, path)
 			}
 		}
 	}
 	return scan
+}
+
+// linksInto reports whether the symlink path points to dir or into it.
+func linksInto(path, dir string) bool {
+	target, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return true
+	}
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = resolved
+	}
+	return within(target, dir)
 }
 
 // IsProjectContainer reports whether dir only holds other projects: it has no
@@ -409,6 +474,29 @@ func IsProjectContainer(dir string) bool {
 		return false
 	}
 	return scanRepo(dir).container
+}
+
+// LinkedRepositories returns the nested repositories of the container dir
+// that are symlinks, with the directory that each one points to. A file in
+// such a repository can come with either path: the link's, below dir, or
+// the resolved one, outside it. It reads the cached scan.
+func LinkedRepositories(dir string) map[string]string {
+	var links map[string]string
+	for _, p := range scanRepo(dir).nested {
+		info, err := os.Lstat(p)
+		if err != nil || info.Mode()&os.ModeSymlink == 0 {
+			continue
+		}
+		target, err := filepath.EvalSymlinks(p)
+		if err != nil {
+			continue
+		}
+		if links == nil {
+			links = make(map[string]string)
+		}
+		links[target] = p
+	}
+	return links
 }
 
 // ContainerProjects returns the repositories below dir that hold a Mix

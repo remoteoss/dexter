@@ -156,3 +156,21 @@ func TestProjectArgument_NotAProjectStartsNoDaemon(t *testing.T) {
 		}
 	}
 }
+
+// A project named through a symlink shares the connection of the project in
+// its own spelling: a second connection would fail the daemon's root check.
+func TestProjectArgument_SymlinkSharesTheConnection(t *testing.T) {
+	e := setupNegotiation(t)
+	root, _, featureA, _ := containerDir(t)
+	link := filepath.Join(t.TempDir(), "feature-link")
+	if err := os.Symlink(featureA, link); err != nil {
+		t.Fatal(err)
+	}
+	cs, _ := e.connect(nil, fileURI(root))
+
+	wantContains(t, mustTool(t, cs, "dexter_definition", map[string]any{"module": "Shop", "project": featureA}), "root="+featureA)
+	wantContains(t, mustTool(t, cs, "dexter_definition", map[string]any{"module": "Shop", "project": link}), "root="+featureA)
+	if n := e.connCount(); n != 1 {
+		t.Errorf("%d daemon connections, want 1 (the symlink is the same project)", n)
+	}
+}

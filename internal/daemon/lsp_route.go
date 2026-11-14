@@ -116,15 +116,35 @@ func (p *lspProxy) route(docURI string, create bool) (u *upstream, fallback bool
 // project: a Dexter index left in apps/foo of a monorepo is not one. A
 // submodule (a .git file that is not a linked worktree) stays a part of the
 // project that holds it. The rule is the same for a container.
+//
+// In a container, a file of a repository that is a symlink can come with the
+// resolved path, outside the start root; it goes to that repository too.
 func (p *lspProxy) projectRoot(dir string) string {
 	base := p.root
 	if !within(dir, base) {
 		if p.rootKey == base || !within(dir, p.rootKey) {
-			return ""
+			return p.linkedProject(dir)
 		}
 		base = p.rootKey // the start root through its resolved spelling
 	}
 	return store.NestedProject(dir, base)
+}
+
+// linkedProject returns the project of dir when dir is in the target of a
+// repository of the container that is a symlink, or "".
+func (p *lspProxy) linkedProject(dir string) string {
+	if !p.container {
+		return ""
+	}
+	for target, link := range store.LinkedRepositories(p.root) {
+		if within(dir, target) {
+			if nested := store.NestedProject(dir, target); nested != "" {
+				return nested
+			}
+			return link
+		}
+	}
+	return ""
 }
 
 // within reports whether path is base or below it.

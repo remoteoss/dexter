@@ -962,3 +962,40 @@ func TestProxyCachedRouteDropsAFailedFallback(t *testing.T) {
 		t.Fatalf("cached fallback = %v after its upstream failed, want none, as route gives", got)
 	}
 }
+
+// A repository of a container that is a symlink gets the files of both of
+// its paths: through the link, and resolved (outside the container). A file
+// outside the container that is in no such repository has no project.
+func TestProxyRoutesTheResolvedPathOfALinkedRepository(t *testing.T) {
+	work := t.TempDir()
+	elsewhere := t.TempDir()
+	writeFiles(t, work, map[string]string{"README.md": "x"})
+	writeFiles(t, elsewhere, map[string]string{"shop/mix.exs": "x", "shop/lib/a.ex": "x", "other/lib/b.ex": "x"})
+	for _, d := range []string{filepath.Join(work, ".git"), filepath.Join(elsewhere, "shop", ".git")} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	link := filepath.Join(work, "shop")
+	if err := os.Symlink(filepath.Join(elsewhere, "shop"), link); err != nil {
+		t.Fatal(err)
+	}
+	if !store.IsProjectContainer(work) {
+		t.Fatal("a folder with a symlinked clone is not a container")
+	}
+	resolved, err := filepath.EvalSymlinks(filepath.Join(elsewhere, "shop"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := newLSPProxy(context.Background(), work, true, nil, io.Discard, nil)
+	if got := p.projectRoot(filepath.Join(link, "lib")); got != link {
+		t.Errorf("projectRoot(link/lib) = %q, want %q", got, link)
+	}
+	if got := p.projectRoot(filepath.Join(resolved, "lib")); got != link {
+		t.Errorf("projectRoot(resolved/lib) = %q, want %q", got, link)
+	}
+	otherResolved, _ := filepath.EvalSymlinks(filepath.Join(elsewhere, "other"))
+	if got := p.projectRoot(filepath.Join(otherResolved, "lib")); got != "" {
+		t.Errorf("projectRoot(a folder outside the container) = %q, want \"\"", got)
+	}
+}

@@ -135,8 +135,31 @@ func (f *Frontend) callBackend(ctx context.Context, ss *mcp.ServerSession, proje
 	if f.isContainer(root) {
 		return nil, "", f.newContainerError(root)
 	}
-	pb, err := f.projectBackend(ss, root)
+	pb, err := f.projectBackend(ss, f.knownSpelling(root))
 	return pb, "", err
+}
+
+// knownSpelling returns the spelling of root that a connection already uses,
+// or root. A project named through a symlink, or in other letter case, then
+// shares the connection to its daemon: a second connection in another
+// spelling would fail the daemon's root check.
+func (f *Frontend) knownSpelling(root string) string {
+	f.mu.Lock()
+	if _, ok := f.conns[root]; ok {
+		f.mu.Unlock()
+		return root
+	}
+	known := make([]string, 0, len(f.conns))
+	for r := range f.conns {
+		known = append(known, r)
+	}
+	f.mu.Unlock()
+	for _, r := range known {
+		if store.SameDir(r, root) {
+			return r
+		}
+	}
+	return root
 }
 
 // sessionRoot is the root that backendFor bound the session to.

@@ -163,3 +163,32 @@ func TestContainerRootError(t *testing.T) {
 		t.Errorf("a monorepo is refused: %v", err)
 	}
 }
+
+// The home directory under another spelling (HOME is a symlink, or the path
+// uses other letter case) is still the home directory.
+func TestResolveRootKnowsTheHomeDirectoryInAnotherSpelling(t *testing.T) {
+	real := t.TempDir()
+	writeRootTree(t, real, ".git/", "scratch/lib/a.ex", ".dexter/dexter.db")
+	link := filepath.Join(t.TempDir(), "home-link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", link)
+	resolved, err := filepath.EvalSymlinks(real)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := ResolveRoot(filepath.Join(resolved, "scratch", "lib")); got.Kind != NotAProject {
+		t.Errorf("a folder below the resolved home resolves to %s (kind %d), want no project", got.Dir, got.Kind)
+	}
+	upper := strings.ToUpper(resolved[:2]) + resolved[2:]
+	if upper != resolved && SameDir(upper, resolved) { // a file system without case
+		if got := ResolveRoot(filepath.Join(upper, "scratch", "lib")); got.Kind != NotAProject {
+			t.Errorf("a folder below the home in other letter case resolves to %s (kind %d), want no project", got.Dir, got.Kind)
+		}
+	}
+	// The index in the home directory is listed once, in the resolved spelling.
+	if stray := StrayIndexesAbove(filepath.Join(resolved, "scratch")); len(stray) != 1 {
+		t.Errorf("stray indexes = %v, want the home index", stray)
+	}
+}

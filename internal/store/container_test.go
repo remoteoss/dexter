@@ -59,3 +59,28 @@ func TestIsProjectContainer(t *testing.T) {
 		})
 	}
 }
+
+// A clone that is a symlink is a repository of the container too.
+func TestIsProjectContainerWithASymlinkedClone(t *testing.T) {
+	root := t.TempDir()
+	elsewhere := t.TempDir()
+	writeRootTree(t, root, ".git/", "README.md")
+	writeRootTree(t, elsewhere, "shop/.git/", "shop/mix.exs")
+	if err := os.Symlink(filepath.Join(elsewhere, "shop"), filepath.Join(root, "shop")); err != nil {
+		t.Fatal(err)
+	}
+	// A link loop is not followed, and a link back into the container is
+	// not a repository of it.
+	if err := os.Symlink(root, filepath.Join(root, "loop")); err != nil {
+		t.Fatal(err)
+	}
+	if scan := scanRepoUncached(root); len(scan.nested) != 1 {
+		t.Errorf("nested repositories = %v, want only shop", scan.nested)
+	}
+	if !IsProjectContainer(root) {
+		t.Error("a folder with a symlinked clone is not a container")
+	}
+	if projects, ok := ContainerProjects(root); !ok || len(projects) != 1 || projects[0] != filepath.Join(root, "shop") {
+		t.Errorf("ContainerProjects = %v, %t", projects, ok)
+	}
+}
