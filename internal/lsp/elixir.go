@@ -1,6 +1,7 @@
 package lsp
 
 import (
+	"maps"
 	"slices"
 	"sort"
 	"strconv"
@@ -1504,6 +1505,7 @@ func parseHelperQuoteBlockDetailed(hs *helperSource, helperName string, fileAlia
 	for i := helperStart; i < quoteBodyStart && depth > 0; i++ {
 		parser.TrackBlockDepth(tokens[i].Kind, &depth)
 		ob.block(tokens[i].Kind)
+		ob.boundary(i)
 		if i > 0 && tokens[i-1].Kind != parser.TokEOL && tokens[i-1].Kind != parser.TokComment {
 			continue
 		}
@@ -1799,8 +1801,17 @@ func (u UseCall) dispatchAtom() string {
 	if u.Which != "" {
 		return u.Which
 	}
-	return u.WhichKey
+	if u.WhichKey != "" {
+		return keywordDispatch + u.WhichKey
+	}
+	return ""
 }
+
+// keywordDispatch marks a dispatch atom that is the first key of a keyword
+// list (`use MyAppWeb, live_view: ...`), not a literal atom (`use Mod, :x`):
+// an atom-dispatch table takes both, but only a literal atom selects the
+// atom clause of a __using__ (usingCacheEntry.atomBody).
+const keywordDispatch = "\x01"
 
 // ExtractUsesWithOpts parses all `use Module` and `use Module, key: Val`
 // declarations, returning each as a UseCall. Aliases are resolved using the
@@ -2937,6 +2948,21 @@ func sourceForModule(text, moduleName string) (string, bool) {
 	return "", false
 }
 
+// laterNonListUsingClause reports whether a __using__ clause from token i on
+// does not take a keyword list.
+func laterNonListUsingClause(source []byte, tokens []parser.Token, i int) bool {
+	n := len(tokens)
+	for ; i < n; i++ {
+		if tokens[i].Kind != parser.TokDefmacro {
+			continue
+		}
+		if name, j, ok := parser.StaticDeclarationName(source, tokens, n, i); ok && name == "__using__" && !usingClauseTakesList(source, tokens, n, j+1) {
+			return true
+		}
+	}
+	return false
+}
+
 // usingClauseTakesList reports whether the __using__ clause whose head
 // continues at tokens[i] (after the name) can take a keyword list, the
 // argument of `use Mod` and `use Mod, key: value`: not a clause for an atom
@@ -3063,6 +3089,15 @@ func parseUsingBody(text string) (imported []string, inlineDefs map[string][]inl
 // body derives for each module that uses it, and the transitive uses that are
 // inside a branch (if, case, ...) of the body.
 func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[string][]inlineDef, transUses []string, transCalls []UseCall, optBindings []optBinding, aliases map[string]string, derives []string, branchUses []string, optUses []string) {
+	return parseUsingBodyClause(text, false, nil)
+}
+
+// parseUsingBodyClause is parseUsingBodyDetailed for one clause of
+// __using__: with atomClause, the first clause that does not take a keyword
+// list (`defmacro __using__(which) when is_atom(which)`), which a `use Mod,
+// :name` selects. bothKinds, when not nil, is set when the module has a
+// clause of each kind, so that the caller parses the other one only then.
+func parseUsingBodyClause(text string, atomClause bool, bothKinds *bool) (imported []string, inlineDefs map[string][]inlineDef, transUses []string, transCalls []UseCall, optBindings []optBinding, aliases map[string]string, derives []string, branchUses []string, optUses []string) {
 	source := []byte(text)
 	tokens := parser.Tokenize(source)
 	n := len(tokens)
@@ -3124,6 +3159,11 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 				// Scan forward to find TokDo; Elixir allows split-line heads.
 				_, nextPos, hasDo := parser.ScanForwardToBlockDo(tokens, n, j+1)
 				if !usingClauseTakesList(source, tokens, n, j+1) {
+					if atomClause && hasDo {
+						usingBodyStart = nextPos
+						usingDepth = 1
+						break
+					}
 					// A clause for an atom or a tuple: the first clause that
 					// takes the options of `use Mod, key: value` comes
 					// before it, if there is one.
@@ -3132,9 +3172,15 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 					}
 					continue
 				}
+				if atomClause {
+					continue
+				}
 				if hasDo {
 					usingBodyStart = nextPos
 					usingDepth = 1 // inside the defmacro do..end
+				}
+				if bothKinds != nil {
+					*bothKinds = firstClauseStart >= 0 || laterNonListUsingClause(source, tokens, i+1)
 				}
 				break
 			}
@@ -3153,7 +3199,7 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 			}
 		}
 	}
-	if usingBodyStart < 0 && firstClauseStart >= 0 {
+	if usingBodyStart < 0 && firstClauseStart >= 0 && !atomClause {
 		usingBodyStart, usingDepth = firstClauseStart, 1
 	}
 	if usingBodyStart < 0 {
@@ -3190,8 +3236,17 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 	mergeHelperQuote := func(helperName string, open int) {
 		helperImported, helperDefs, helperTransUses, helperCalls, helperBindings, helperAliases, helperDerives, helperOptUses := parseHelperQuoteBlockDetailed(hs, helperName, fileAliases, make(map[string]bool))
 		optUses = append(optUses, helperOptUses...)
-		if arg := nextSig(open + 1); open < n && arg < n && tokens[arg].Kind == parser.TokIdent {
-			if edits := vars[parser.TokenText(source, tokens[arg])]; len(edits) > 0 {
+		// The argument: the body's options variable (`build(opts)`), or an
+		// edit of it (`build(Keyword.put_new(opts, :key, Mod))`).
+		if arg := nextSig(open + 1); open < n && arg < n {
+			var edits []optEdit
+			if src, argEdits, mods, _, ok := readKeywordEdits(source, tokens, n, arg, ob.macroScope(fileAliases)); ok && src != "" {
+				edits = append(slices.Clone(vars[src]), argEdits...)
+				for _, m := range mods {
+					optUses = append(optUses, resolveAlias(m))
+				}
+			}
+			if len(edits) > 0 {
 				for c := range helperCalls {
 					if helperCalls[c].forwardOpts {
 						helperCalls[c].forwardEdits = append(slices.Clone(edits), helperCalls[c].forwardEdits...)
@@ -3231,8 +3286,23 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 	// block: what is inside one is injected only when the branch is taken,
 	// which depends on the caller's options.
 	var branches []int
+	// quotes holds the depth inside each open `quote do` block: a match there
+	// is code of the caller, not of the macro, so it does not bind the
+	// macro's variables (`opts = unquote(opts)` in a quote).
+	var quotes []int
+	// clauses counts the clause boundaries (else, ->, rescue, ...) of each
+	// open branch statement, parallel to branches; branchIDs names it.
+	var clauses, branchIDs []int
+	nextBranchID := 0
+	// callClause is the branch statement and clause of each use call made
+	// in a branch, by its index in transCalls.
+	callClause := make(map[int][2]int)
 	for i < n && depth > 0 {
 		tok := tokens[i]
+		ob.boundary(i)
+		if len(branches) > 0 && depth == branches[len(branches)-1] && isClauseBoundary(source, tokens, i) {
+			clauses[len(clauses)-1]++
+		}
 
 		switch tok.Kind {
 		case parser.TokDo, parser.TokFn, parser.TokEnd:
@@ -3240,6 +3310,11 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 			ob.block(tok.Kind)
 			for len(branches) > 0 && branches[len(branches)-1] > depth {
 				branches = branches[:len(branches)-1]
+				clauses = clauses[:len(clauses)-1]
+				branchIDs = branchIDs[:len(branchIDs)-1]
+			}
+			for len(quotes) > 0 && quotes[len(quotes)-1] > depth {
+				quotes = quotes[:len(quotes)-1]
 			}
 			i++
 		case parser.TokEOL, parser.TokComment, parser.TokString, parser.TokHeredoc,
@@ -3312,6 +3387,9 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 					call.Opts = useCallOpts(source, tokens, n, nk+1, ob.quoteScope(fileAliases))
 					call.Which, call.WhichKey = tokCollectDispatchAtom(source, tokens, n, nk+1)
 					call.forwardEdits, call.forwardOpts, call.callerWins = forwardedOpts(source, tokens, n, nk+1, vars, ob.quoteScope(fileAliases))
+				}
+				if len(branches) > 0 {
+					callClause[len(transCalls)] = [2]int{branchIDs[len(branchIDs)-1], clauses[len(clauses)-1]}
 				}
 				transCalls = append(transCalls, call)
 			}
@@ -3474,6 +3552,13 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 				if _, _, hasDo := parser.ScanForwardToMacroCallBlockDo(tokens, n, i+1); hasDo {
 					// The do is counted when the walk reaches it.
 					branches = append(branches, depth+1)
+					clauses = append(clauses, 0)
+					nextBranchID++
+					branchIDs = append(branchIDs, nextBranchID)
+				}
+			case "quote":
+				if _, _, hasDo := parser.ScanForwardToMacroCallBlockDo(tokens, n, i+1); hasDo {
+					quotes = append(quotes, depth+1)
 				}
 			}
 			isStmtStart := i == 0 || tokens[i-1].Kind == parser.TokEOL || tokens[i-1].Kind == parser.TokComment
@@ -3496,7 +3581,7 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 
 			// var = <an edit of the options, a read of one option, a module,
 			// or a value that Dexter cannot read>.
-			if isStmtStart {
+			if isStmtStart && len(quotes) == 0 {
 				if end, mods, handled := ob.assignment(i, fileAliases); handled {
 					for _, m := range mods {
 						optUses = append(optUses, resolveAlias(m))
@@ -3528,7 +3613,77 @@ func parseUsingBodyDetailed(text string) (imported []string, inlineDefs map[stri
 			i++
 		}
 	}
+	unknownWhenClausesDiffer(transCalls, callClause)
 	return
+}
+
+// isClauseBoundary reports whether token i starts another clause of a
+// block: `else`, `rescue`, `catch`, or `after` at the start of a line (not
+// the `else:` of a keyword list), or the `->` of a clause.
+func isClauseBoundary(source []byte, tokens []parser.Token, i int) bool {
+	tok := tokens[i]
+	switch tok.Kind {
+	case parser.TokRightArrow:
+		return true
+	case parser.TokIdent:
+		switch string(source[tok.Start:tok.End]) {
+		case "else", "rescue", "catch", "after":
+		default:
+			return false
+		}
+		if i > 0 && tokens[i-1].Kind != parser.TokEOL && tokens[i-1].Kind != parser.TokComment {
+			return false
+		}
+		return i+1 >= len(tokens) || tokens[i+1].Kind != parser.TokColon
+	}
+	return false
+}
+
+// unknownWhenClausesDiffer makes the options of use calls unknown when two
+// clauses of one branch statement (the do and else of an if, two case
+// clauses) use the same module with different options. Which clause runs
+// depends on values that Dexter does not evaluate, so neither clause's
+// options are sure; with unknown options, a lookup gives the use line
+// instead of the answer of one clause.
+func unknownWhenClausesDiffer(calls []UseCall, callClause map[int][2]int) {
+	if len(callClause) < 2 {
+		return
+	}
+	type group struct {
+		stmt   int
+		module string
+	}
+	byGroup := make(map[group][]int)
+	for k, c := range callClause {
+		g := group{c[0], calls[k].Module}
+		byGroup[g] = append(byGroup[g], k)
+	}
+	for _, ks := range byGroup {
+		differ := false
+		for _, a := range ks {
+			for _, b := range ks {
+				if callClause[a][1] != callClause[b][1] && !sameUseOptions(calls[a], calls[b]) {
+					differ = true
+				}
+			}
+		}
+		if !differ {
+			continue
+		}
+		for _, k := range ks {
+			calls[k].Opts = nil
+			calls[k].forwardOpts = true
+			calls[k].forwardEdits = []optEdit{{op: "unknown"}}
+			calls[k].callerWins = false
+		}
+	}
+}
+
+func sameUseOptions(a, b UseCall) bool {
+	return maps.Equal(a.Opts, b.Opts) && a.forwardOpts == b.forwardOpts && a.callerWins == b.callerWins &&
+		a.Which == b.Which && a.WhichKey == b.WhichKey && slices.EqualFunc(a.forwardEdits, b.forwardEdits, func(x, y optEdit) bool {
+		return x.op == y.op && x.key == y.key && x.mod == y.mod && slices.Equal(x.keys, y.keys)
+	})
 }
 
 // collectParamsFromTokens delegates to the shared parser implementation.

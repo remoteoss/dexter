@@ -118,6 +118,26 @@ func (b *optBinder) block(kind parser.TokenKind) {
 	}
 }
 
+// boundary follows a clause boundary in a block: `else`, `rescue`, `catch`,
+// or `after` at the start of a line, or the `->` of a clause. Each clause
+// starts from the variables that the block started with, as in Elixir: a
+// rebind in the `do` part of an if, or in one case clause, does not reach
+// the next one.
+func (b *optBinder) boundary(i int) {
+	if len(b.saved) == 0 || i >= b.n {
+		return
+	}
+	if !isClauseBoundary(b.source, b.tokens, i) {
+		return
+	}
+	last := b.saved[len(b.saved)-1]
+	clear(b.vars)
+	maps.Copy(b.vars, last.vars)
+	clear(b.varToOpt)
+	maps.Copy(b.varToOpt, last.varToOpt)
+	b.lits = maps.Clone(last.lits)
+}
+
 func newOptBinder(source []byte, tokens []parser.Token, self string, resolve func(string) string) *optBinder {
 	return &optBinder{source: source, tokens: tokens, n: len(tokens), resolve: resolve, self: self, vars: optVars{}, varToOpt: make(map[string]varBinding), lits: make(map[string]map[string]string)}
 }
@@ -293,6 +313,11 @@ func (b *optBinder) scanKeywordCallIn(i int, piped bool) (funcName, atomKey, def
 	}
 	d := args[2]
 	if d[1] == d[0]+1 {
+		// A nil default is no default: `Keyword.get(opts, :k, nil) || Mod`
+		// reads as `Keyword.get(opts, :k) || Mod`.
+		if b.text(d[0]) == "nil" {
+			return funcName, atomKey, "", after
+		}
 		if mod := atomModuleName(b.source, tokens, d[0]); mod != "" {
 			return funcName, atomKey, mod, after
 		}

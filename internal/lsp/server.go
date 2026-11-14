@@ -252,6 +252,11 @@ type usingCacheEntry struct {
 	// Nil for ordinary __using__ macros. Selection happens at lookup time from
 	// the literal atom, so targets never merge.
 	dispatch map[string]*usingBody
+	// atomBody is the body of the clause that a `use Mod, :name` selects,
+	// for a module whose __using__ has a clause for a keyword list and
+	// another one (`when is_atom(which)`) that does not dispatch. Nil
+	// otherwise.
+	atomBody *usingBody
 
 	// checkedGen is the store's write generation when filePath was last
 	// known to be the file that the index gives for the module. A hit with
@@ -3606,8 +3611,16 @@ func (s *Server) parseUsingFile(filePath, moduleName string) *usingCacheEntry {
 		}
 		text = scoped
 	}
-	imported, inlineDefs, transUses, transCalls, optBindings, aliases, derives, branchUses, optUses := parseUsingBodyDetailed(text)
+	var bothKinds bool
+	imported, inlineDefs, transUses, transCalls, optBindings, aliases, derives, branchUses, optUses := parseUsingBodyClause(text, false, &bothKinds)
+	var atomBody *usingBody
+	if bothKinds {
+		// `use Mod, :name` selects the other clause.
+		ai, ad, at, ac, ab, aa, adr, abu, aou := parseUsingBodyClause(text, true, nil)
+		atomBody = &usingBody{imports: ai, inlineDefs: ad, transUses: at, optUses: aou, transCalls: ac, optBindings: ab, aliases: aa, derives: adr, branchUses: abu}
+	}
 	return &usingCacheEntry{
+		atomBody: atomBody,
 		mtime:    info.ModTime().UnixNano(),
 		filePath: filePath,
 		usingBody: usingBody{
@@ -3692,8 +3705,12 @@ func (s *Server) lookupInUsingEntry(moduleName, functionName string, consumerOpt
 // literal atom; an atom that names no target injects nothing, because guessing
 // a target would merge unrelated blocks.
 func (e *usingCacheEntry) bodyFor(which string) *usingBody {
-	if e.dispatch != nil && which != "" {
-		return e.dispatch[which]
+	name, keyword := strings.CutPrefix(which, keywordDispatch)
+	if e.dispatch != nil && name != "" {
+		return e.dispatch[name]
+	}
+	if e.atomBody != nil && name != "" && !keyword {
+		return e.atomBody
 	}
 	return &e.usingBody
 }
@@ -3702,8 +3719,11 @@ func (e *usingCacheEntry) bodyFor(which string) *usingBody {
 // plus each atom-dispatch target. Used where the question is which modules
 // *could* inject a name, rather than which one a given `use` site selects.
 func (e *usingCacheEntry) bodies() []*usingBody {
-	out := make([]*usingBody, 0, 1+len(e.dispatch))
+	out := make([]*usingBody, 0, 2+len(e.dispatch))
 	out = append(out, &e.usingBody)
+	if e.atomBody != nil {
+		out = append(out, e.atomBody)
+	}
 	for _, b := range e.dispatch {
 		out = append(out, b)
 	}

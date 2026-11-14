@@ -290,7 +290,7 @@ func (s *Store) ReclaimFreePages(ctx context.Context) (int64, error) {
 		if err := ctx.Err(); err != nil {
 			return (start - free) * pageSize, err
 		}
-		if err := reclaimStep(ctx, db); err != nil {
+		if err := reclaimStep(ctx, db, min(free, reclaimStepPages)); err != nil {
 			if !isBusy(err) || busy >= reclaimBusyRetries {
 				return (start - free) * pageSize, err
 			}
@@ -331,8 +331,8 @@ func isBusy(err error) bool {
 	return errors.As(err, &se) && (se.Code == sqlite3.ErrBusy || se.Code == sqlite3.ErrLocked)
 }
 
-// reclaimStep moves up to reclaimStepPages pages in one write transaction.
-func reclaimStep(ctx context.Context, db *sql.DB) (err error) {
+// reclaimStep frees pages free pages, in one write transaction.
+func reclaimStep(ctx context.Context, db *sql.DB, pages int64) (err error) {
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		return err
@@ -346,7 +346,21 @@ func reclaimStep(ctx context.Context, db *sql.DB) (err error) {
 			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
 		}
 	}()
-	if _, err = conn.ExecContext(ctx, fmt.Sprintf("PRAGMA incremental_vacuum(%d)", reclaimStepPages)); err != nil {
+	// incremental_vacuum frees one page for each step of the statement, and
+	// Exec steps a statement once. Its rows have no columns, which the
+	// driver cannot read (go-sqlite3 indexes decltype[len(dest)-1]), so one
+	// prepared statement runs once for each page, all in this transaction.
+	stmt, err := conn.PrepareContext(ctx, "PRAGMA incremental_vacuum(1)")
+	if err != nil {
+		return err
+	}
+	for k := int64(0); k < pages; k++ {
+		if _, err = stmt.ExecContext(ctx); err != nil {
+			_ = stmt.Close()
+			return err
+		}
+	}
+	if err = stmt.Close(); err != nil {
 		return err
 	}
 	_, err = conn.ExecContext(ctx, "COMMIT")

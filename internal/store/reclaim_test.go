@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -203,5 +205,40 @@ func TestNewConnectionDoesNotWaitForAWriter(t *testing.T) {
 	}
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// One step frees reclaimStepPages pages in its transaction, not one:
+// incremental_vacuum frees a page for each step of the statement.
+func TestReclaimStepFreesAWholeStep(t *testing.T) {
+	oldStep := reclaimStepPages
+	reclaimStepPages = 64
+	defer func() { reclaimStepPages = oldStep }()
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	fillAndDrop(t, s, 2000)
+	db, err := sql.Open(driverName, s.path+fmt.Sprintf("?_busy_timeout=%d", reclaimBusyMs))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	var before, after int
+	if err := db.QueryRow("PRAGMA freelist_count").Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	if before < 200 {
+		t.Fatalf("only %d free pages to test with", before)
+	}
+	if err := reclaimStep(context.Background(), db, reclaimStepPages); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow("PRAGMA freelist_count").Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if before-after != 64 {
+		t.Errorf("one step freed %d pages, want 64", before-after)
 	}
 }
