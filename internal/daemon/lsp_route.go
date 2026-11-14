@@ -136,9 +136,20 @@ func (p *lspProxy) linkedProject(dir string) string {
 	if !p.container {
 		return ""
 	}
-	for target, link := range store.LinkedRepositories(p.root) {
-		if within(dir, target) {
-			if nested := store.NestedProject(dir, target); nested != "" {
+	links := store.LinkedRepositories(p.root)
+	if len(links) == 0 {
+		return ""
+	}
+	// The targets are canonical (symlinks resolved, the disk's letter case),
+	// so dir must be too: /tmp against /private/tmp, or other letter case,
+	// would not match.
+	canon := store.CanonicalDir(dir)
+	if canon == "" {
+		return ""
+	}
+	for target, link := range links {
+		if within(canon, target) {
+			if nested := store.NestedProject(canon, target); nested != "" {
 				return nested
 			}
 			return link

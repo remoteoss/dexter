@@ -994,6 +994,17 @@ func TestProxyRoutesTheResolvedPathOfALinkedRepository(t *testing.T) {
 	if got := p.projectRoot(filepath.Join(resolved, "lib")); got != link {
 		t.Errorf("projectRoot(resolved/lib) = %q, want %q", got, link)
 	}
+	// The target in another spelling: not resolved (/var for /private/var
+	// on macOS), or in other letter case on a file system without case.
+	if got := p.projectRoot(filepath.Join(elsewhere, "shop", "lib")); got != link {
+		t.Errorf("projectRoot(unresolved target/lib) = %q, want %q", got, link)
+	}
+	upper := strings.ToUpper(resolved[:2]) + resolved[2:]
+	if upper != resolved && store.SameDir(upper, resolved) {
+		if got := p.projectRoot(filepath.Join(upper, "lib")); got != link {
+			t.Errorf("projectRoot(target in other letter case/lib) = %q, want %q", got, link)
+		}
+	}
 	otherResolved, _ := filepath.EvalSymlinks(filepath.Join(elsewhere, "other"))
 	if got := p.projectRoot(filepath.Join(otherResolved, "lib")); got != "" {
 		t.Errorf("projectRoot(a folder outside the container) = %q, want \"\"", got)

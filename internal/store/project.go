@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/remoteoss/dexter/internal/parser"
+	"github.com/remoteoss/dexter/internal/pathcase"
 )
 
 // The project root rule. Every frontend (the CLI, the LSP proxy and server,
@@ -434,13 +435,17 @@ func scanRepoUncached(dir string) repoScan {
 			}
 			path := filepath.Join(it.dir, e.Name())
 			switch {
+			case e.Type()&os.ModeSymlink != 0:
+				// A clone that is a symlink is a repository of the container,
+				// unless it points back into the container. The scan does not
+				// go into other symlinks, so a link loop cannot hold it. This
+				// case is first: on Windows a directory symlink is also a
+				// directory.
+				if isNestedProject(path) && !linksInto(path, dir) {
+					scan.nested = append(scan.nested, path)
+				}
 			case e.IsDir():
 				queue = append(queue, item{path, it.depth + 1})
-			case e.Type()&os.ModeSymlink != 0 && isNestedProject(path) && !linksInto(path, dir):
-				// A clone that is a symlink: a repository of the container.
-				// The scan does not go into other symlinks, so a link loop
-				// cannot hold it.
-				scan.nested = append(scan.nested, path)
 			}
 		}
 	}
@@ -449,14 +454,28 @@ func scanRepoUncached(dir string) repoScan {
 
 // linksInto reports whether the symlink path points to dir or into it.
 func linksInto(path, dir string) bool {
-	target, err := filepath.EvalSymlinks(path)
-	if err != nil {
+	target := canonicalDir(path)
+	if target == "" {
 		return true
 	}
-	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+	if resolved := canonicalDir(dir); resolved != "" {
 		dir = resolved
 	}
 	return within(target, dir)
+}
+
+// CanonicalDir is dir with its symlinks resolved and in the letter case that
+// the disk stores, or "" when it does not exist. Two spellings of one
+// directory (a symlink, /tmp and /private/tmp, other letter case) give the
+// same result.
+func CanonicalDir(dir string) string { return canonicalDir(dir) }
+
+func canonicalDir(dir string) string {
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return ""
+	}
+	return pathcase.DiskSpelling(resolved)
 }
 
 // IsProjectContainer reports whether dir only holds other projects: it has no
@@ -487,8 +506,8 @@ func LinkedRepositories(dir string) map[string]string {
 		if err != nil || info.Mode()&os.ModeSymlink == 0 {
 			continue
 		}
-		target, err := filepath.EvalSymlinks(p)
-		if err != nil {
+		target := canonicalDir(p)
+		if target == "" {
 			continue
 		}
 		if links == nil {
