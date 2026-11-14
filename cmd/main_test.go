@@ -50,7 +50,7 @@ func TestFindProjectRootWithMissingStartsFromExistingAncestor(t *testing.T) {
 		filepath.Join(root, "lib", "deleted", "tree", "gone.ex"),
 		filepath.Join(root, "gone"),
 	} {
-		if got := findProjectRootWithMissing(missing, true); got != root {
+		if got := findProjectRoot(missing, true); got != root {
 			t.Errorf("root for %s = %s, want %s", missing, got, root)
 		}
 	}
@@ -58,7 +58,7 @@ func TestFindProjectRootWithMissingStartsFromExistingAncestor(t *testing.T) {
 	// With no project around it, the root is what the ancestor resolves to on
 	// its own, which is an existing directory rather than the deleted file.
 	elsewhere := t.TempDir()
-	if got, want := findProjectRootWithMissing(filepath.Join(elsewhere, "a", "gone.ex"), true), findProjectRoot(elsewhere); got != want {
+	if got, want := findProjectRoot(filepath.Join(elsewhere, "a", "gone.ex"), true), findProjectRoot(elsewhere, false); got != want {
 		t.Errorf("root outside a project = %s, want %s", got, want)
 	}
 }
@@ -142,7 +142,7 @@ func TestMCPRootsResolveLikeCLI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := findProjectRoot(sub)
+	want := findProjectRoot(sub, false)
 	if cfg.Root != want {
 		t.Errorf("fallback root = %q, want the CLI root %q", cfg.Root, want)
 	}

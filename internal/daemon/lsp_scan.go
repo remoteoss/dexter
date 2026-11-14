@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"strings"
 )
 
 // The LSP proxy must know a few facts about each message it forwards: the
@@ -96,7 +97,13 @@ type peeked struct {
 	id []byte
 	// response is true for a message with a result or an error.
 	response bool
-	// uri is the textDocument.uri of a document notification.
+	// rawURI is the JSON string of the document that the message is about:
+	// params.textDocument.uri of a textDocument/* message, params.item.uri
+	// of a call or type hierarchy message. The proxy routes the message by
+	// it. It is a slice of the message, so that a request costs no copy.
+	rawURI []byte
+	// uri is rawURI decoded, for the document notifications whose state the
+	// proxy keeps.
 	uri string
 }
 
@@ -134,14 +141,30 @@ var documentMethods = map[string]bool{
 	"textDocument/didSave":   true,
 }
 
+// paramsURI returns the JSON string of the URI that a message of method is
+// about, scanning from the start of its params value, or nil for a method
+// that has none.
+func paramsURI(method string, body []byte, i int) []byte {
+	switch {
+	case strings.HasPrefix(method, "textDocument/"):
+		return findURI(body, i, "textDocument")
+	case strings.HasPrefix(method, "callHierarchy/"), strings.HasPrefix(method, "typeHierarchy/"):
+		return findURI(body, i, "item")
+	}
+	return nil
+}
+
 // peekMessage scans body for what the proxy needs. An unexpected shape gives
 // an empty result, which the proxy forwards without keeping anything. The
 // members can come in any order: an editor that builds the message from a
 // hash table can put params before method.
 func peekMessage(body []byte) peeked {
 	p, paramsAt := peekMembers(body)
-	if p.uri == "" && paramsAt >= 0 && documentMethods[p.method] {
-		p.uri = findDocumentURI(body, paramsAt)
+	if p.rawURI == nil && paramsAt >= 0 && p.method != "" {
+		p.rawURI = paramsURI(p.method, body, paramsAt)
+	}
+	if p.rawURI != nil && documentMethods[p.method] {
+		p.uri = unquote(p.rawURI)
 	}
 	return p
 }
@@ -201,9 +224,7 @@ func peekMembers(body []byte) (peeked, int) {
 		case "params":
 			paramsAt = valueStart
 			if p.method != "" {
-				if documentMethods[p.method] {
-					p.uri = findDocumentURI(body, i)
-				}
+				p.rawURI = paramsURI(p.method, body, i)
 				if p.id != nil || notificationMethods[p.method] {
 					return p, paramsAt
 				}
@@ -257,22 +278,31 @@ func tailID(body []byte) ([]byte, bool) {
 	return raw, true
 }
 
-// findDocumentURI returns params.textDocument.uri, scanning from the start of
-// the params value.
-func findDocumentURI(body []byte, i int) string {
-	i = descend(body, i, "textDocument")
+// findURI returns the JSON string of params.<object>.uri, scanning from the
+// start of the params value, or nil.
+func findURI(body []byte, i int, object string) []byte {
+	// Most editors put the object first in params and the uri first in it:
+	// {"textDocument":{"uri":"..."}}. Then no member is skipped.
+	if rest := body[i:]; len(rest) > len(object)+10 && rest[0] == '{' && rest[1] == '"' &&
+		string(rest[2:2+len(object)]) == object && bytes.HasPrefix(rest[2+len(object):], []byte(`":{"uri":"`)) {
+		start := i + 2 + len(object) + len(`":{"uri":`)
+		if end := skipString(body, start); end > 0 {
+			return body[start:end]
+		}
+	}
+	i = descend(body, i, object)
 	if i < 0 {
-		return ""
+		return nil
 	}
 	i = descend(body, i, "uri")
 	if i < 0 || i >= len(body) || body[i] != '"' {
-		return ""
+		return nil
 	}
 	end := skipString(body, i)
 	if end < 0 {
-		return ""
+		return nil
 	}
-	return unquote(body[i:end])
+	return body[i:end]
 }
 
 // descend returns the offset of the value of key in the object that starts at
@@ -361,6 +391,10 @@ func skipString(b []byte, i int) int {
 	}
 }
 
+// structural marks the bytes that skipValue stops at inside an object or an
+// array.
+var structural = [256]bool{'"': true, '{': true, '}': true, '[': true, ']': true}
+
 // skipValue returns the offset after the JSON value that starts at i, or -1.
 func skipValue(b []byte, i int) int {
 	if i >= len(b) {
@@ -372,11 +406,15 @@ func skipValue(b []byte, i int) int {
 	case '{', '[':
 		depth := 0
 		for i < len(b) {
-			n := bytes.IndexAny(b[i:], "\"{}[]")
-			if n < 0 {
+			// Outside strings a value has only short runs of other bytes,
+			// so a table look-up per byte is faster than bytes.IndexAny,
+			// which builds its byte set on each call.
+			for i < len(b) && !structural[b[i]] {
+				i++
+			}
+			if i >= len(b) {
 				return -1
 			}
-			i += n
 			switch b[i] {
 			case '"':
 				i = skipString(b, i)

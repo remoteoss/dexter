@@ -13,6 +13,7 @@ type RenameParams struct {
 	Module   string `json:"module" jsonschema:"module being renamed, or the module owning the function"`
 	Function string `json:"function,omitempty" jsonschema:"if set, rename this function; otherwise rename the module itself (and its submodules)"`
 	NewName  string `json:"new_name" jsonschema:"new function name (e.g. get_user), or new fully-qualified module name (e.g. MyApp.Clients)"`
+	ProjectParam
 }
 
 func (h *Handler) rename(ctx context.Context, args RenameParams) (string, error) {

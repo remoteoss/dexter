@@ -52,10 +52,15 @@ type Config struct {
 type Frontend struct {
 	cfg Config
 
-	mu       sync.Mutex
-	closed   bool
+	mu     sync.Mutex
+	closed bool
+	// conns holds one connection for each project, keyed by connKey: two
+	// spellings of one folder (a symlink, other letter case) share one.
 	conns    map[string]*workspaceConn
 	sessions map[*mcp.ServerSession]*sessionState
+	// containers caches store.ContainerProjects for each resolved root: nil
+	// for a root that is a project.
+	containers map[string]containerEntry
 }
 
 type workspaceConn struct {
@@ -65,7 +70,15 @@ type workspaceConn struct {
 
 type sessionState struct {
 	root  string
-	dirty bool // the client's roots changed; resolve again on the next call
+	key   string // connKey(root)
+	dirty bool   // the client's roots changed; resolve again on the next call
+	// container is true when root only holds other projects: the session
+	// has no Backend of its own (see store.IsProjectContainer).
+	container bool
+	// projects are the connKeys of the other roots that the session's calls
+	// named with the project argument; each holds one user of its
+	// connection.
+	projects map[string]bool
 }
 
 // NewFrontend returns a Frontend for cfg.
@@ -74,9 +87,10 @@ func NewFrontend(cfg Config) *Frontend {
 		cfg.Connect = DaemonBackend
 	}
 	return &Frontend{
-		cfg:      cfg,
-		conns:    make(map[string]*workspaceConn),
-		sessions: make(map[*mcp.ServerSession]*sessionState),
+		cfg:        cfg,
+		conns:      make(map[string]*workspaceConn),
+		sessions:   make(map[*mcp.ServerSession]*sessionState),
+		containers: make(map[string]containerEntry),
 	}
 }
 
@@ -89,7 +103,11 @@ func (f *Frontend) backendFor(ctx context.Context, ss *mcp.ServerSession) (Backe
 		return nil, errClosed
 	}
 	if st, ok := f.sessions[ss]; ok && !st.dirty {
-		b := f.conns[st.root].backend
+		if st.container {
+			f.mu.Unlock()
+			return nil, errContainerRoot
+		}
+		b := f.conns[st.key].backend
 		f.mu.Unlock()
 		return b, nil
 	}
@@ -100,6 +118,8 @@ func (f *Frontend) backendFor(ctx context.Context, ss *mcp.ServerSession) (Backe
 	if err != nil {
 		return nil, err
 	}
+	container := f.isContainer(root)
+	key := connKey(root)
 
 	f.mu.Lock()
 	if f.closed {
@@ -107,23 +127,48 @@ func (f *Frontend) backendFor(ctx context.Context, ss *mcp.ServerSession) (Backe
 		return nil, errClosed
 	}
 	st, bound := f.sessions[ss]
-	if bound && st.root == root {
+	if bound && st.key == key {
 		st.dirty = false
-		b := f.conns[root].backend
+		if st.container {
+			f.mu.Unlock()
+			return nil, errContainerRoot
+		}
+		b := f.conns[key].backend
 		f.mu.Unlock()
 		return b, nil
 	}
 	var orphan Backend
+	var projects map[string]bool
 	if bound {
-		orphan = f.releaseLocked(st.root)
+		if !st.container {
+			orphan = f.releaseLocked(st.key)
+		}
+		projects = st.projects
 	}
-	c, exists := f.conns[root]
+	if container {
+		// No daemon for a container: its index would copy the projects in
+		// it. Calls name their project (see callBackend).
+		f.sessions[ss] = &sessionState{root: root, key: key, container: true, projects: projects}
+		f.mu.Unlock()
+		log.Printf("MCP session workspace: %s (%s) holds several projects; calls name the project", root, source)
+		if !bound {
+			go func() {
+				_ = ss.Wait()
+				f.detach(ss)
+			}()
+		}
+		if orphan != nil {
+			closeBackend(orphan)
+		}
+		return nil, errContainerRoot
+	}
+	c, exists := f.conns[key]
 	if !exists {
 		c = &workspaceConn{backend: f.cfg.Connect(root)}
-		f.conns[root] = c
+		f.conns[key] = c
 	}
 	c.users++
-	f.sessions[ss] = &sessionState{root: root}
+	f.sessions[ss] = &sessionState{root: root, key: key, projects: projects}
 	f.mu.Unlock()
 
 	log.Printf("MCP session workspace: %s (%s)", root, source)
@@ -175,10 +220,10 @@ func (f *Frontend) resolve(dir string) (string, error) {
 	return defaultResolveRoot(dir)
 }
 
-// releaseLocked drops one user of root and returns its Backend when no session
-// uses it any more. The caller closes it outside the lock.
-func (f *Frontend) releaseLocked(root string) Backend {
-	c, ok := f.conns[root]
+// releaseLocked drops one user of the connection key and returns its Backend
+// when no session uses it any more. The caller closes it outside the lock.
+func (f *Frontend) releaseLocked(key string) Backend {
+	c, ok := f.conns[key]
 	if !ok {
 		return nil
 	}
@@ -186,7 +231,7 @@ func (f *Frontend) releaseLocked(root string) Backend {
 	if c.users > 0 {
 		return nil
 	}
-	delete(f.conns, root)
+	delete(f.conns, key)
 	return c.backend
 }
 
@@ -195,13 +240,24 @@ func (f *Frontend) releaseLocked(root string) Backend {
 func (f *Frontend) detach(ss *mcp.ServerSession) {
 	f.mu.Lock()
 	var orphan Backend
+	var orphans []Backend
 	if st, ok := f.sessions[ss]; ok {
 		delete(f.sessions, ss)
-		orphan = f.releaseLocked(st.root)
+		if !st.container {
+			orphan = f.releaseLocked(st.key)
+		}
+		for key := range st.projects {
+			if b := f.releaseLocked(key); b != nil {
+				orphans = append(orphans, b)
+			}
+		}
 	}
 	f.mu.Unlock()
 	if orphan != nil {
 		closeBackend(orphan)
+	}
+	for _, b := range orphans {
+		closeBackend(b)
 	}
 }
 
@@ -251,7 +307,13 @@ func (f *Frontend) Close() {
 // the Backend of the session's workspace.
 func addTool[In any](srv *mcp.Server, f *Frontend, t mcp.Tool) {
 	mcp.AddTool(srv, &t, func(ctx context.Context, req *mcp.CallToolRequest, args In) (*mcp.CallToolResult, any, error) {
-		b, err := f.backendFor(ctx, req.Session)
+		project, inContainer := projectPathOf(args)
+		b, note, err := f.callBackend(ctx, req.Session, project, inContainer)
+		var ce *containerError
+		if errors.As(err, &ce) && t.Name == workspaceToolName {
+			// The overview of a container is its list of projects.
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: ce.overview()}}}, nil, nil
+		}
 		if err != nil {
 			return nil, nil, err
 		}
@@ -262,6 +324,9 @@ func addTool[In any](srv *mcp.Server, f *Frontend, t mcp.Tool) {
 		text, err := b.CallTool(ctx, t.Name, raw)
 		if err != nil {
 			return nil, nil, err
+		}
+		if note != "" {
+			text = note + "\n\n" + text
 		}
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}}, nil, nil
 	})

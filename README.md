@@ -645,11 +645,30 @@ Dexter reads `initializationOptions` from your editor configuration:
 
 ## Index database location (.dexter/)
 
-Dexter creates `.dexter/dexter.db` at the root of your project when you start the LSP for the first time. But if you prefer, you can run `dexter init` yourself in the root of your project. Where you place it determines what gets indexed.
+Dexter keeps its index in `.dexter/dexter.db` at the root of the project. The folder has its own `.gitignore` (containing `*`), so you do not need to change yours. The editor, the CLI, and `dexter mcp` find the project root the same way. They start at the folder of the file, the editor's root, or the shell, and go up:
 
-The `.dexter/` folder includes its own `.gitignore` (containing `*`), so its contents are automatically ignored by git — no need to update your project's `.gitignore`.
+```mermaid
+flowchart TD
+    start["Start folder"] --> home{"Is it your home folder?"}
+    home -- no --> index{"Has .dexter/ and mix.exs?"}
+    index -- yes --> app["This folder is the project<br/>(an index that you made, e.g. in apps/my_app)"]
+    index -- no --> git{"Is a clone (.git folder)<br/>or a linked worktree?"}
+    git -- no --> top{"Is it / (the top of the disk)?"}
+    top -- no --> up["Go to the parent folder"] --> home
+    home -- yes --> mix{"Did any folder on the way up<br/>have a mix.exs?"}
+    top -- yes --> mix
+    mix -- yes --> outer["The highest of those folders is the project<br/>(an umbrella that is not in git)"]
+    mix -- no --> clones{"Is the start folder (not your home folder)<br/>a folder of repositories with Mix projects?"}
+    clones -- yes --> container
+    clones -- no --> none["Not a project: the CLI and MCP refuse<br/>(-y allows one command); an editor gets a warning"]
+    git -- yes --> own{"Has a Mix project of its own?<br/>(not in a nested repository)"}
+    own -- yes --> repo["The repository is the project:<br/>one index for every app"]
+    own -- no --> holds{"Holds other repositories<br/>with Mix projects?"}
+    holds -- yes --> container["A folder of repositories: no index.<br/>Each repository in it is its own project"]
+    holds -- no --> repo
+```
 
-When the LSP server starts, it walks up from the project root looking for `.dexter/dexter.db`, preferring `.git` as the anchor point. This means if you initialised from the monorepo root, the server will find the right database even when Neovim's `rootUri` points to a sub-app (e.g. because `mix.exs` is there).
+Your home folder is never a project, also when it is a git repository (dotfiles). A folder whose `.git` is a file (a submodule, or the folder of a bare repository and its worktrees) is checked like a repository. In a session of one project, a nested clone, a submodule, and a dependency in `deps/` belong to that project; only a linked worktree in it is its own project. An index anywhere else is not used. Earlier versions could make one in a folder above your projects; `dexter prune` lists them, and `dexter prune --delete` deletes them.
 
 If you're upgrading from a pre-`.dexter/` version of dexter, any existing `.dexter.db` file at your project root will be automatically deleted and rebuilt into the new `.dexter/` folder on the next `dexter init` or LSP startup. You can also remove any `.dexter.db*` or `.dexter/` entries from your `.gitignore`, as they are no longer needed.
 
@@ -660,7 +679,7 @@ cd ~/code/my-monorepo   # where .git lives
 dexter init .
 ```
 
-**Single app** — Put the index inside a specific Mix project. Go-to-definition works within that app and its deps, but not across other apps in the monorepo.
+**Single app** — Put the index inside a specific Mix project. Go-to-definition works within that app and its deps, but not across other apps in the monorepo. Sessions that start in that app use it; a session that starts at the repository root still uses the root index.
 
 ```sh
 cd ~/code/my-monorepo/apps/my_app
@@ -716,6 +735,19 @@ works even for a daemon that is wedged or built by another version, escalating
 to an outright kill if the process will not exit. Editors attached to a forced
 stop lose the workspace until it restarts on the next `dexter lsp`, lookup, or
 reindex.
+
+Earlier versions of Dexter could make an index in a folder above your
+projects (for example a folder that holds several clones and worktrees), where
+it can grow very large. No session uses such an index now, and Dexter warns
+about it with its path and size. `dexter prune` lists these indexes, and
+`dexter prune --delete` deletes each one that no daemon uses. It deletes only
+Dexter's own files, one at a time: a `.dexter` folder that holds other files
+stays.
+
+```sh
+dexter prune            # list old indexes above this project
+dexter prune --delete   # delete them
+```
 
 `dexter init` is the one command that needs the workspace to itself. It asks an
 idle daemon to exit and refuses while a client is attached, so close your editor

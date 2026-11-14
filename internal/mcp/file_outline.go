@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -12,6 +13,7 @@ import (
 
 type FileOutlineParams struct {
 	File string `json:"file" jsonschema:"path to a .ex/.exs file, absolute or relative to the project root"`
+	ProjectParam
 }
 
 func (h *Handler) fileOutline(ctx context.Context, args FileOutlineParams) (string, error) {
@@ -115,4 +117,14 @@ func memberLine(d parser.Definition) string {
 		line += " → " + target
 	}
 	return line
+}
+
+// containerPath is the file, when it is absolute: in a session whose root
+// holds several projects, the file tells which project holds it. In any
+// other session the file must be in the session's project.
+func (p FileOutlineParams) containerPath() string {
+	if file := strings.TrimSpace(p.File); filepath.IsAbs(file) {
+		return file
+	}
+	return ""
 }

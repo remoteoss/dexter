@@ -16,6 +16,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/remoteoss/dexter/internal/store"
 )
 
 const (
@@ -908,15 +910,25 @@ func spawn(root string) (<-chan error, error) {
 // reaches a daemon again, starting one when necessary, and rebuilds the
 // session there; when it cannot, it tells the editor why and returns an
 // *LSPConnectionLostError.
+//
+// Each file goes to the daemon of its own project, so a session that starts
+// above several clones and worktrees is served from the right checkout. A
+// root that only holds other projects (store.IsProjectContainer) gets no
+// daemon of its own: ProxyLSP answers initialize itself and starts the
+// daemon of each project when a file of it comes.
 func ProxyLSP(ctx context.Context, root string, in io.Reader, out io.Writer) error {
+	dial := func(ctx context.Context, root string) (net.Conn, *bufio.Reader, error) {
+		return connectFrontend(ctx, root, kindLSP, "")
+	}
+	if store.IsProjectContainer(root) {
+		log.Printf("LSP proxy: %s only holds other projects; each file goes to the workspace daemon of its own project", root)
+		return newLSPProxy(ctx, root, true, in, out, dial).run(nil, nil)
+	}
 	conn, reader, err := connectFrontend(ctx, root, kindLSP, "")
 	if err != nil {
 		return failLSPStartup(ctx, root, err, in, out)
 	}
-	proxy := newLSPProxy(ctx, root, in, out, func(ctx context.Context) (net.Conn, *bufio.Reader, error) {
-		return connectFrontend(ctx, root, kindLSP, "")
-	})
-	return proxy.run(conn, reader)
+	return newLSPProxy(ctx, root, false, in, out, dial).run(conn, reader)
 }
 
 // ProxyFrontend connects stdio to a daemon-hosted protocol adapter without

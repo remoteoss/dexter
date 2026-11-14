@@ -9,6 +9,7 @@ import (
 type SearchParams struct {
 	Query         string `json:"query" jsonschema:"fuzzy symbol query, e.g. 'Accounts.fetch' or 'fetch_user'; a space works as a dot"`
 	IncludeStdlib bool   `json:"include_stdlib,omitempty" jsonschema:"also match Elixir stdlib symbols (default false)"`
+	ProjectParam
 }
 
 // maxSearchResults is how many index rows one search answer shows.

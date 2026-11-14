@@ -269,7 +269,7 @@ func TestRootThatIsNotAProjectIsShown(t *testing.T) {
 	r := notify.New()
 	r.SetLogf(func(string, ...any) {})
 	reportRoot(t.TempDir(), r)
-	if c := r.Conditions(); len(c) != 1 || !strings.Contains(c[0].Message, "does not look like an Elixir project") {
+	if c := r.Conditions(); len(c) != 1 || !strings.Contains(c[0].Message, "is probably not an Elixir project") {
 		t.Fatalf("conditions = %+v", c)
 	}
 
@@ -288,6 +288,34 @@ func TestRootThatIsNotAProjectIsShown(t *testing.T) {
 	r.SetLogf(func(string, ...any) {})
 	reportRoot(home, r)
 	if c := r.Conditions(); len(c) != 1 || !strings.Contains(c[0].Message, "is your home directory, not a project") {
+		t.Fatalf("conditions = %+v", c)
+	}
+}
+
+// An old index in a folder above the project (a parent of several projects,
+// where an earlier Dexter made one) is shown with its size, so the user can
+// free the space.
+func TestStrayIndexAboveTheProjectIsShown(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	ws := filepath.Join(home, "ws")
+	project := filepath.Join(ws, "shop")
+	writeTestModule(t, project, "mix.exs", "SharedLib.MixProject")
+	if err := os.MkdirAll(filepath.Join(project, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(store.DBDir(ws), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(store.DBPath(ws), make([]byte, 2<<20), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := notify.New()
+	r.SetLogf(func(string, ...any) {})
+	reportRoot(project, r)
+	c := r.Conditions()
+	if len(c) != 1 || c[0].Key != condStrayIndex || c[0].Severity != notify.Warning ||
+		!strings.Contains(c[0].Message, store.DBDir(ws)+" (2 MB)") || !strings.Contains(c[0].Message, "dexter prune --delete") {
 		t.Fatalf("conditions = %+v", c)
 	}
 }

@@ -205,10 +205,10 @@ func decodedMessage(body []byte) (method string, id []byte, uri string, ok bool)
 	if hasID && string(rawID) != "null" {
 		id = rawID
 	}
-	if documentMethods[method] {
+	if object := uriObject(method); object != "" {
 		var params map[string]json.RawMessage
 		var doc map[string]json.RawMessage
-		if json.Unmarshal(top["params"], &params) == nil && json.Unmarshal(params["textDocument"], &doc) == nil {
+		if json.Unmarshal(top["params"], &params) == nil && json.Unmarshal(params[object], &doc) == nil {
 			var u string
 			if json.Unmarshal(doc["uri"], &u) == nil {
 				uri = u
@@ -216,6 +216,17 @@ func decodedMessage(body []byte) (method string, id []byte, uri string, ok bool)
 		}
 	}
 	return method, id, uri, true
+}
+
+// uriObject names the params member whose uri the proxy routes by.
+func uriObject(method string) string {
+	switch {
+	case strings.HasPrefix(method, "textDocument/"):
+		return "textDocument"
+	case strings.HasPrefix(method, "callHierarchy/"), strings.HasPrefix(method, "typeHierarchy/"):
+		return "item"
+	}
+	return ""
 }
 
 // hasDuplicateKeys reports whether any object in body repeats a key.
@@ -273,6 +284,9 @@ func checkPeek(t *testing.T, body []byte) {
 	}
 	if got.method != method || !bytes.Equal(bytes.TrimSpace(got.id), bytes.TrimSpace(id)) {
 		t.Fatalf("%s: scan = method %q id %s, decode = method %q id %s", body, got.method, got.id, method, id)
+	}
+	if uriObject(method) != "" && unquote(got.rawURI) != uri {
+		t.Fatalf("%s: scan uri %q, decode uri %q", body, unquote(got.rawURI), uri)
 	}
 	if documentMethods[method] && got.uri != uri {
 		t.Fatalf("%s: scan uri %q, decode uri %q", body, got.uri, uri)

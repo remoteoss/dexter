@@ -41,7 +41,7 @@ func newProxyHarness(t *testing.T, root string) (*proxyHarness, *lspEditor) {
 		in:    proxyIn,
 	}
 	first, daemon := net.Pipe()
-	proxy := newLSPProxy(context.Background(), root, editorToProxy, proxyToEditor, func(ctx context.Context) (net.Conn, *bufio.Reader, error) {
+	proxy := newLSPProxy(context.Background(), root, false, editorToProxy, proxyToEditor, func(ctx context.Context, _ string) (net.Conn, *bufio.Reader, error) {
 		select {
 		case dial := <-h.dials:
 			// A real dial ends when ctx ends; so does this one.
@@ -1061,10 +1061,15 @@ func TestProxyRetainsOneDocumentCopy(t *testing.T) {
 	editorToProxy, proxyIn := io.Pipe()
 	proxySide, daemonSide := net.Pipe()
 	go func() { _, _ = io.Copy(io.Discard, daemonSide) }()
-	proxy := newLSPProxy(context.Background(), t.TempDir(), editorToProxy, io.Discard, func(context.Context) (net.Conn, *bufio.Reader, error) {
+	root := t.TempDir()
+	proxy := newLSPProxy(context.Background(), root, false, editorToProxy, io.Discard, func(context.Context, string) (net.Conn, *bufio.Reader, error) {
 		return nil, nil, errors.New("no reconnect in this test")
 	})
-	proxy.conn = proxySide
+	primary := proxy.newUpstream(root, 0)
+	primary.conn = proxySide
+	proxy.primary = primary
+	proxy.upstreams[proxy.rootKey] = primary
+	proxy.upstreamList = []*upstream{primary}
 	done := make(chan struct{})
 	go func() {
 		proxy.readEditor()
@@ -1104,12 +1109,12 @@ func TestProxyRetainsOneDocumentCopy(t *testing.T) {
 	runtime.KeepAlive(text)
 	retained := int64(after) - int64(before)
 	debug.FreeOSMemory()
-	proxy.stateMu.Lock()
+	primary.mu.Lock()
 	kept := 0
-	for _, doc := range proxy.docs {
+	for _, doc := range primary.docs {
 		kept += doc.retained()
 	}
-	proxy.stateMu.Unlock()
+	primary.mu.Unlock()
 	t.Logf("document %d bytes, kept in the document state %d bytes, heap growth after GC %d bytes", len(text), kept, retained)
 	if kept != lastFrame {
 		t.Fatalf("the document state keeps %d bytes, want one message of %d bytes", kept, lastFrame)
