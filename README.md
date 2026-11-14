@@ -655,9 +655,9 @@ flowchart TD
     index -- no --> git{"Is a clone (.git folder)<br/>or a linked worktree?"}
     git -- no --> top{"Is it / (the top of the disk)?"}
     top -- no --> up["Go to the parent folder"] --> home
-    home -- yes --> mix{"Passed a mix.exs?"}
+    home -- yes --> mix{"Did any folder on the way up<br/>have a mix.exs?"}
     top -- yes --> mix
-    mix -- yes --> outer["The outermost mix.exs folder is the project"]
+    mix -- yes --> outer["The highest of those folders is the project<br/>(an umbrella that is not in git)"]
     mix -- no --> none["Not a project: the CLI and MCP refuse<br/>(-y allows one command); an editor gets a warning"]
     git -- yes --> own{"Has a Mix project of its own?<br/>(not in a nested repository)"}
     own -- yes --> repo["The repository is the project:<br/>one index for every app"]
