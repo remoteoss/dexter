@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -92,7 +93,10 @@ func ResolveRoot(path string) Root {
 		d = parent
 	}
 	if gitFile != "" {
-		return Root{Dir: gitFile, Kind: OneProject}
+		// A .git file that is not a linked worktree: a submodule outside its
+		// clone, or the folder of a bare repository and its worktrees
+		// (`.git` holds `gitdir: ./.bare`), which can be a container.
+		return classifyRepo(gitFile)
 	}
 	var mixDir string
 	for d := dir; !home.is(d); {
@@ -107,6 +111,11 @@ func ResolveRoot(path string) Root {
 	}
 	if mixDir != "" {
 		return Root{Dir: mixDir, Kind: OneProject}
+	}
+	// A folder that is not in git but holds clones (~/code): a container,
+	// as the proxy sees it. The home directory is never one.
+	if !home.is(dir) && IsProjectContainer(dir) {
+		return Root{Dir: dir, Kind: Container}
 	}
 	return Root{Dir: dir, Kind: NotAProject}
 }
@@ -141,8 +150,8 @@ var homeCache struct {
 }
 
 func homeDir() homeDirs {
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
+	home := userHome()
+	if home == "" {
 		return nil
 	}
 	homeCache.Lock()
@@ -346,8 +355,25 @@ func formatBytes(n int64) string {
 
 // IsHomeDir reports whether dir is the user's home directory.
 func IsHomeDir(dir string) bool {
-	home, err := os.UserHomeDir()
-	return err == nil && SameDir(dir, home)
+	for _, home := range homeDir() {
+		if SameDir(dir, home) {
+			return true
+		}
+	}
+	return false
+}
+
+// userHome is the home directory: $HOME, or the user database when HOME is
+// unset or not absolute (a service, a sandbox), so that the walk still stops
+// there.
+func userHome() string {
+	if home, err := os.UserHomeDir(); err == nil && filepath.IsAbs(home) {
+		return home
+	}
+	if u, err := user.Current(); err == nil && filepath.IsAbs(u.HomeDir) {
+		return u.HomeDir
+	}
+	return ""
 }
 
 // SameDir reports whether two paths name the same directory. Stat is the
@@ -381,7 +407,10 @@ func NonProjectRootError(dir string) error {
 	if IsHomeDir(dir) {
 		return &NotProjectError{Dir: dir, Home: true}
 	}
-	if looksLikeProject(dir) {
+	if looksLikeProject(dir) || IsProjectContainer(dir) {
+		// A container is a valid start: the CLI refuses it with the list of
+		// its projects (ContainerRootError), MCP and the proxy serve each
+		// project in it.
 		return nil
 	}
 	return &NotProjectError{Dir: dir}
@@ -655,30 +684,42 @@ func skipContainerDir(name string) bool {
 }
 
 // NestedProject returns the project below base that owns the files of dir, or
-// "" when base owns them (or dir is not below base). It is step 1 of the
-// project root rule, stopped at base: the nearest clone or linked worktree
-// between dir and base is the project, a submodule stays a part of the
-// project that holds it, and a file in deps, _build, or node_modules belongs
-// to the project that holds that directory.
+// "" when base owns them (or dir is not below base). container tells whether
+// base is a container (IsProjectContainer).
+//
+// A file goes to another project only when base's own index does not hold
+// it: the walker of base skips linked worktrees, so the nearest linked
+// worktree between dir and base owns its files. Below a container, which has
+// no index, the repository just below base (a clone or a worktree) owns its
+// files, unless a nearer linked worktree is in it. A nested clone inside a
+// project, a submodule, and a dependency in deps, _build, or node_modules
+// stay with the project that holds them, as the walker indexes them there.
 //
 // The LSP proxy and the MCP frontend use it to send each file to its
 // project's daemon.
-func NestedProject(dir, base string) string {
+func NestedProject(dir, base string, container bool) string {
 	dir = filepath.Clean(dir)
 	base = filepath.Clean(base)
 	if !within(dir, base) {
 		return ""
 	}
 	dir = ownerOfDependencies(dir)
+	outermost := ""
 	for d := dir; d != base && within(d, base); d = filepath.Dir(d) {
-		if isNestedProject(d) {
-			return d
+		info, err := os.Lstat(filepath.Join(d, ".git"))
+		if err == nil {
+			if info.Mode().IsRegular() && parser.IsLinkedWorktree(d) {
+				return d // the nearest linked worktree
+			}
+			if container && info.IsDir() {
+				outermost = d
+			}
 		}
 		if filepath.Dir(d) == d {
 			break
 		}
 	}
-	return ""
+	return outermost
 }
 
 // isNestedProject reports whether dir is a clone (it holds a .git directory)

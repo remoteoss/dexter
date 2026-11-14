@@ -127,7 +127,7 @@ func (p *lspProxy) projectRoot(dir string) string {
 		}
 		base = p.rootKey // the start root through its resolved spelling
 	}
-	return store.NestedProject(dir, base)
+	return store.NestedProject(dir, base, p.container)
 }
 
 // linkedProject returns the project of dir when dir is in the target of a
@@ -149,7 +149,7 @@ func (p *lspProxy) linkedProject(dir string) string {
 	}
 	for target, link := range links {
 		if within(canon, target) {
-			if nested := store.NestedProject(canon, target); nested != "" {
+			if nested := store.NestedProject(canon, target, false); nested != "" {
 				return nested
 			}
 			return link

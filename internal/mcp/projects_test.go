@@ -174,3 +174,19 @@ func TestProjectArgument_SymlinkSharesTheConnection(t *testing.T) {
 		t.Errorf("%d daemon connections, want 1 (the symlink is the same project)", n)
 	}
 }
+
+// A project path in another spelling of the session root (/private/var for
+// /var on macOS) gives the same project as the session's spelling: the
+// repository, not an index in one of its apps.
+func TestProjectArgument_OtherSpellingOfTheSessionRoot(t *testing.T) {
+	e := setupNegotiation(t)
+	root, clone, _, _ := containerDir(t)
+	markIndexed(t, filepath.Join(clone, "apps", "shop"))
+	resolved, err := filepath.EvalSymlinks(filepath.Join(clone, "apps", "shop"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs, _ := e.connect(nil, fileURI(root))
+	wantContains(t, mustTool(t, cs, "dexter_definition", map[string]any{"module": "Shop", "project": filepath.Join(clone, "apps", "shop")}), "root="+clone)
+	wantContains(t, mustTool(t, cs, "dexter_definition", map[string]any{"module": "Shop", "project": resolved}), "root="+clone)
+}

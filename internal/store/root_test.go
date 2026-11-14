@@ -3,6 +3,7 @@ package store
 import (
 	"errors"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -102,20 +103,41 @@ func TestResolveRootStopsAtTheHomeDirectory(t *testing.T) {
 	}
 }
 
-func TestNestedProjectAgreesWithResolveRoot(t *testing.T) {
+// In a container, each file goes to the repository just below it (or a
+// nearer linked worktree), which is also what the CLI resolves there. Below a
+// project, only a linked worktree goes elsewhere: the walker of the project
+// skips it, and indexes a nested clone, a submodule, and deps itself.
+func TestNestedProjectFollowsTheIndexOfTheSession(t *testing.T) {
 	root := t.TempDir()
 	writeRootTree(t, root,
 		".git/", "README.md",
 		"shop/.git/", "shop/mix.exs", "shop/lib/a.ex", "shop/deps/dep/.git/", "shop/deps/dep/lib/b.ex",
 		"trees/feature/.git@", "trees/feature/mix.exs", "trees/feature/lib/a.ex",
 		"mono/.git/", "mono/apps/x/mix.exs", "mono/apps/x/lib/a.ex", "mono/vendor/sub/.git", "mono/vendor/sub/c.ex",
+		"mono/vendor/forked/.git/", "mono/vendor/forked/mix.exs", "mono/vendor/forked/lib/f.ex",
 	)
-	for _, dir := range []string{"shop/lib", "shop/deps/dep/lib", "trees/feature/lib", "mono/apps/x/lib", "mono/vendor/sub"} {
+	agree := []string{"shop/lib", "shop/deps/dep/lib", "trees/feature/lib", "mono/apps/x/lib", "mono/vendor/sub"}
+	for _, dir := range agree {
 		full := filepath.Join(root, dir)
-		nested := NestedProject(full, root)
-		resolved := ResolveRoot(full).Dir
-		if nested != resolved {
+		if nested, resolved := NestedProject(full, root, true), ResolveRoot(full).Dir; nested != resolved {
 			t.Errorf("%s: NestedProject = %s, ResolveRoot = %s", dir, nested, resolved)
+		}
+	}
+	mono := filepath.Join(root, "mono")
+	cases := []struct {
+		dir, base string
+		container bool
+		want      string
+	}{
+		{"mono/vendor/forked/lib", root, true, mono}, // a nested clone in a repository of the container
+		{"mono/vendor/forked/lib", mono, false, ""},  // a nested clone below a project session: the project's
+		{"mono/apps/x/lib", mono, false, ""},         // an app of the project
+		{"notes", root, true, ""},                    // a folder of the container outside its repositories
+		{"trees/feature/lib", root, true, filepath.Join(root, "trees", "feature")},
+	}
+	for _, c := range cases {
+		if got := NestedProject(filepath.Join(root, c.dir), c.base, c.container); got != c.want {
+			t.Errorf("NestedProject(%s, container=%t) = %q, want %q", c.dir, c.container, got, c.want)
 		}
 	}
 }
@@ -278,5 +300,72 @@ func TestStrayIndexesAboveANestedWorktree(t *testing.T) {
 		if stray := StrayIndexesAbove(wt); len(stray) != 0 {
 			t.Errorf("layout %v: the checkout's index above its worktree is stray: %v", layout, stray)
 		}
+	}
+}
+
+// The folder of a bare repository and its worktrees (`.git` is a file with
+// `gitdir: ./.bare`) is a container; each worktree is a project.
+func TestResolveRootOfABareRepositoryLayout(t *testing.T) {
+	root := t.TempDir()
+	bare := filepath.Join(root, ".bare")
+	for _, d := range []string{bare, filepath.Join(bare, "worktrees")} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeTree(t, root, ".git", ".dexter/dexter.db")
+	if err := os.WriteFile(filepath.Join(root, ".git"), []byte("gitdir: ./.bare\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, wt := range []string{"main", "feat"} {
+		admin := filepath.Join(bare, "worktrees", wt)
+		if err := os.MkdirAll(admin, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(admin, "commondir"), []byte("../..\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		writeTree(t, root, wt+"/mix.exs", wt+"/lib/a.ex")
+		if err := os.WriteFile(filepath.Join(root, wt, ".git"), []byte("gitdir: "+admin+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := ResolveRoot(root); got.Kind != Container || got.Dir != root {
+		t.Errorf("ResolveRoot(the folder) = %s (kind %d), want a container", got.Dir, got.Kind)
+	}
+	main := filepath.Join(root, "main")
+	if got := ResolveRoot(filepath.Join(main, "lib")); got.Dir != main || got.Kind != OneProject {
+		t.Errorf("ResolveRoot(main/lib) = %s (kind %d), want main", got.Dir, got.Kind)
+	}
+	if stray := StrayIndexesAbove(main); len(stray) != 1 || stray[0].Dir != root {
+		t.Errorf("the folder's index is not stray: %v", stray)
+	}
+}
+
+// A folder that is not in git but holds clones (~/code) is a container: the
+// CLI refuses it with its projects, and it is not "not a project".
+func TestResolveRootOfAFolderOfClonesWithoutGit(t *testing.T) {
+	root := t.TempDir()
+	writeRootTree(t, root, "a/.git/", "a/mix.exs", "b/.git/", "b/mix.exs")
+	if got := ResolveRoot(root); got.Kind != Container {
+		t.Errorf("ResolveRoot = %s (kind %d), want a container", got.Dir, got.Kind)
+	}
+	if err := NonProjectRootError(root); err != nil {
+		t.Errorf("NonProjectRootError = %v, want nil for a container", err)
+	}
+	if err := ContainerRootError(root); err == nil || !strings.Contains(err.Error(), "holds 2 projects") {
+		t.Errorf("ContainerRootError = %v", err)
+	}
+}
+
+// With HOME unset, the home directory still comes from the user database.
+func TestHomeDirectoryWithoutHOME(t *testing.T) {
+	u, err := user.Current()
+	if err != nil || u.HomeDir == "" {
+		t.Skip("no user database")
+	}
+	t.Setenv("HOME", "")
+	if !IsHomeDir(u.HomeDir) {
+		t.Errorf("IsHomeDir(%s) = false with HOME unset", u.HomeDir)
 	}
 }

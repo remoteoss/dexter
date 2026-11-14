@@ -60,7 +60,7 @@ type Frontend struct {
 	sessions map[*mcp.ServerSession]*sessionState
 	// containers caches store.ContainerProjects for each resolved root: nil
 	// for a root that is a project.
-	containers map[string]*containerScan
+	containers map[string]containerEntry
 }
 
 type workspaceConn struct {
@@ -90,7 +90,7 @@ func NewFrontend(cfg Config) *Frontend {
 		cfg:        cfg,
 		conns:      make(map[string]*workspaceConn),
 		sessions:   make(map[*mcp.ServerSession]*sessionState),
-		containers: make(map[string]*containerScan),
+		containers: make(map[string]containerEntry),
 	}
 }
 

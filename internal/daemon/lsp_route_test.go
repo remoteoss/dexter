@@ -787,11 +787,13 @@ func TestProxyServesWorktreesOfAContainerFromTheirOwnDaemons(t *testing.T) {
 	}
 }
 
-// TestProxyFindsTheProjectOfEachFile covers the project rule: below the
-// start root, only a nested clone (a .git directory) or a linked worktree is
-// a project of its own. A Dexter index alone, a submodule, a git dependency,
-// and a stale index of the container are not; a file outside the start root
-// has no project of its own.
+// TestProxyFindsTheProjectOfEachFile covers the project rule: a file goes to
+// another daemon only when the start root's index does not hold it. In a
+// container (no index), the repository just below it owns its files; below a
+// project, only a linked worktree, which its walker skips. A Dexter index
+// alone, a submodule, a git dependency, a nested clone in a project, and a
+// stale index of the container are not projects of their own; a file
+// outside the start root has no project of its own.
 func TestProxyFindsTheProjectOfEachFile(t *testing.T) {
 	work, shop, featureA, _ := containerFixture(t)
 	writeFiles(t, work, map[string]string{
@@ -810,7 +812,7 @@ func TestProxyFindsTheProjectOfEachFile(t *testing.T) {
 		filepath.Join(shop, "apps", "shop", "lib"):            shop,
 		filepath.Join(shop, "libs", "vendored", "lib"):        shop,
 		filepath.Join(shop, "deps", "git_dep", "lib"):         shop,
-		filepath.Join(shop, "tools", "nested_clone", "lib"):   filepath.Join(shop, "tools", "nested_clone"),
+		filepath.Join(shop, "tools", "nested_clone", "lib"):   shop,
 		filepath.Join(featureA, "apps", "shop", "lib", "x"):   featureA,
 		filepath.Join(work, "web", "src"):                     filepath.Join(work, "web"),
 		filepath.Join(work, "scripts"):                        "",
@@ -823,8 +825,8 @@ func TestProxyFindsTheProjectOfEachFile(t *testing.T) {
 	}
 
 	// A project as the start root: its own files, a leftover index in one
-	// of its apps, a submodule, and its git dependencies are its own; a
-	// nested clone and a nested linked worktree are not.
+	// of its apps, a submodule, its git dependencies, and a nested clone are
+	// its own (its index holds them); a nested linked worktree is not.
 	nested := filepath.Join(shop, ".agents", "worktrees", "x")
 	linkWorktree(t, shop, nested)
 	project := newLSPProxy(context.Background(), shop, false, nil, io.Discard, nil)
@@ -832,7 +834,7 @@ func TestProxyFindsTheProjectOfEachFile(t *testing.T) {
 		filepath.Join(shop, "apps", "shop", "lib"):          "",
 		filepath.Join(shop, "libs", "vendored", "lib"):      "",
 		filepath.Join(shop, "deps", "git_dep", "lib"):       "",
-		filepath.Join(shop, "tools", "nested_clone", "lib"): filepath.Join(shop, "tools", "nested_clone"),
+		filepath.Join(shop, "tools", "nested_clone", "lib"): "",
 		filepath.Join(nested, "lib"):                        nested,
 		filepath.Join(work, "web"):                          "",
 	} {

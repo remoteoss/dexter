@@ -658,7 +658,9 @@ flowchart TD
     home -- yes --> mix{"Did any folder on the way up<br/>have a mix.exs?"}
     top -- yes --> mix
     mix -- yes --> outer["The highest of those folders is the project<br/>(an umbrella that is not in git)"]
-    mix -- no --> none["Not a project: the CLI and MCP refuse<br/>(-y allows one command); an editor gets a warning"]
+    mix -- no --> clones{"Is the start folder (not your home folder)<br/>a folder of repositories with Mix projects?"}
+    clones -- yes --> container
+    clones -- no --> none["Not a project: the CLI and MCP refuse<br/>(-y allows one command); an editor gets a warning"]
     git -- yes --> own{"Has a Mix project of its own?<br/>(not in a nested repository)"}
     own -- yes --> repo["The repository is the project:<br/>one index for every app"]
     own -- no --> holds{"Holds other repositories<br/>with Mix projects?"}
@@ -666,7 +668,7 @@ flowchart TD
     holds -- no --> repo
 ```
 
-Your home folder is never a project, also when it is a git repository (dotfiles). A submodule, and a dependency in `deps/`, belong to the project that holds them. An index anywhere else is not used. Earlier versions could make one in a folder above your projects; `dexter prune` lists them, and `dexter prune --delete` deletes them.
+Your home folder is never a project, also when it is a git repository (dotfiles). A folder whose `.git` is a file (a submodule, or the folder of a bare repository and its worktrees) is checked like a repository. In a session of one project, a nested clone, a submodule, and a dependency in `deps/` belong to that project; only a linked worktree in it is its own project. An index anywhere else is not used. Earlier versions could make one in a folder above your projects; `dexter prune` lists them, and `dexter prune --delete` deletes them.
 
 If you're upgrading from a pre-`.dexter/` version of dexter, any existing `.dexter.db` file at your project root will be automatically deleted and rebuilt into the new `.dexter/` folder on the next `dexter init` or LSP startup. You can also remove any `.dexter.db*` or `.dexter/` entries from your `.gitignore`, as they are no longer needed.
 

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -51,24 +52,36 @@ var errContainerRoot = errors.New("the session's root holds several projects")
 // containerScan is the result of store.ContainerProjects for one root.
 type containerScan struct{ projects []string }
 
-// isContainer reports whether root only holds other projects. The scan reads
-// directories (about 0.1 s on a folder of 125 repositories), so it runs once
-// for each root that a session resolves.
-func (f *Frontend) isContainer(root string) bool { return f.containerOf(root) != nil }
+// containerEntry is a cached containerScan (nil for a root that is not a
+// container) and when it was made.
+type containerEntry struct {
+	scan *containerScan
+	at   time.Time
+}
+
+// containerTTL bounds how long a scan is used again: a clone that the user
+// adds to the folder during a session shows up after it.
+const containerTTL = 30 * time.Second
+
+// isContainer reports whether root only holds other projects. The store
+// caches its scan; the list of projects (containerOf), which costs more, is
+// made only for the messages that show it.
+func (f *Frontend) isContainer(root string) bool { return store.IsProjectContainer(root) }
 
 func (f *Frontend) containerOf(root string) *containerScan {
 	f.mu.Lock()
-	scan, ok := f.containers[root]
+	e, ok := f.containers[root]
 	f.mu.Unlock()
-	if ok {
-		return scan
+	if ok && time.Since(e.at) < containerTTL {
+		return e.scan
 	}
+	var scan *containerScan
 	if projects, isContainer := store.ContainerProjects(root); isContainer && len(projects) > 0 {
 		scan = &containerScan{projects: projects}
 	}
 	f.mu.Lock()
 	if f.containers != nil {
-		f.containers[root] = scan
+		f.containers[root] = containerEntry{scan: scan, at: time.Now()}
 	}
 	f.mu.Unlock()
 	return scan
@@ -118,13 +131,20 @@ func (f *Frontend) callBackend(ctx context.Context, ss *mcp.ServerSession, proje
 	if !info.IsDir() {
 		dir = filepath.Dir(path)
 	}
-	// Below the session's root, the project is the nearest nested clone or
-	// linked worktree, as for the editor (store.NestedProject), else the
-	// session's root. Elsewhere it is found as for any root.
+	// Below the session's root, the project is the one that the editor's
+	// proxy gives (store.NestedProject), else the session's root. Elsewhere
+	// it is found as for any root. Both paths are compared in their
+	// canonical spelling, so /tmp and /private/tmp, or other letter case,
+	// give the same project.
+	canonBase, canonDir := connKey(base), connKey(dir)
 	var root string
-	if nested := store.NestedProject(dir, base); nested != "" {
+	if nested := store.NestedProject(canonDir, canonBase, isContainer); nested != "" {
+		// In the session root's spelling, as the answers use it.
 		root = nested
-	} else if rel, relErr := filepath.Rel(base, dir); relErr == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		if rel, relErr := filepath.Rel(canonBase, nested); relErr == nil {
+			root = filepath.Join(base, rel)
+		}
+	} else if rel, relErr := filepath.Rel(canonBase, canonDir); relErr == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		root = base
 	} else if root, err = f.resolve(dir); err != nil {
 		return nil, "", fmt.Errorf("project %s: %w", project, err)
