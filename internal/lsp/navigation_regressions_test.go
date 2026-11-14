@@ -837,10 +837,7 @@ func TestRegression_UseChainOptionForms(t *testing.T) {
 		optModule("PL.InQuote", optUsing("", "      use PL.Wrapper, unquote(Keyword.put_new(opts, :base, PL.Second))")),
 		optModule("PL.Renamed", optUsing("    new_opts = Keyword.put_new(opts, :base, PL.Second)", "      use PL.Wrapper, unquote(new_opts)")),
 		optModule("PL.OtherVar", optUsing("    other = Keyword.put(opts, :base, PL.Second)\n    _ = other", "      use PL.Wrapper, unquote(opts)")),
-		optModule("PL.Mixed", optUsing("", "      use PL.Wrapper, [base: PL.Second] ++ unquote(opts)")),
 		optModule("PL.Mixed2", optUsing("", "      use PL.Wrapper, [{:base, PL.Second} | unquote(opts)]")),
-		optModule("PL.Mixed3", optUsing("", "      use PL.Wrapper, Keyword.merge(unquote(opts), base: PL.Second)")),
-		optModule("PL.Mixed4", optUsing("", "      use PL.Wrapper, [base: PL.Second, unquote_splicing(opts)]")),
 		optModule("PL.Top", optUsing("    opts = Keyword.put_new(opts, :base, PL.Third)", "      use PL.Outer, unquote(opts)")),
 		optModule("PL.TopPut", optUsing("    opts = Keyword.put(opts, :base, PL.Third)", "      use PL.Outer, unquote(opts)")),
 		optModule("PL.Web", "  def worker do\n    quote do\n      use PL.Outer\n    end\n  end\n\n  def plain do\n    quote do\n      use PL.Wrapper\n    end\n  end\n\n  defmacro __using__(which) when is_atom(which) do\n    apply(__MODULE__, which, [])\n  end"),
@@ -850,10 +847,6 @@ func TestRegression_UseChainOptionForms(t *testing.T) {
 		optModule("PL.OpaqueOuter", optUsing("    opts = Keyword.put_new(opts, :base, PL.Second)", "      use PL.Opaque, unquote(opts)")),
 		optModule("PL.CallDefault", optUsing("    mod = opts[:base] || default_base()", "      use unquote(mod)")+"\n\n  def default_base, do: PL.Base"),
 		optModule("PL.CallDefaultOuter", optUsing("    opts = Keyword.put_new(opts, :base, PL.Second)", "      use PL.CallDefault, unquote(opts)")),
-		optModule("PL.MixedKeep", optUsing("", "      use PL.Wrapper, [queue: :x] ++ unquote(opts)")),
-		optModule("PL.MergeKeep", optUsing("", "      use PL.Wrapper, Keyword.merge(unquote(opts), queue: :x)")),
-		optModule("PL.CallerFirst", optUsing("", "      use PL.Wrapper, unquote(opts) ++ [base: PL.Second]")),
-		optModule("PL.MergeCallerLast", optUsing("", "      use PL.Wrapper, Keyword.merge([base: PL.Second], unquote(opts))")),
 		optModule("PL.GetCall", optUsing("    mod = Keyword.get(opts, :base, pick())", "      use unquote(mod)")+"\n\n  def pick, do: PL.Base"),
 		optModule("PL.ValueUnquote", optUsing("    extra = :x", "      use PL.Wrapper, extra: unquote(extra)")),
 		optModule("PL.TupleValue", optUsing("    extra = :x", "      use PL.Wrapper, [{:extra, unquote(extra)} | unquote(opts)]")),
@@ -873,6 +866,42 @@ func TestRegression_UseChainOptionForms(t *testing.T) {
 		optModule("PL.Aliased", "  alias PL.Second, as: Sec\n"+optUsing("    opts = Keyword.put_new(opts, :base, Sec)", "      use PL.Wrapper, unquote(opts)")),
 		optModule("PL.Literal", optUsing("", "      use PL.Wrapper, base: PL.Second")),
 		optModule("PL.Unrelated", optUsing("    opts = Keyword.put_new(opts, :queue, :default)", "      use PL.Wrapper, unquote(opts)")),
+		// The forms below were found by compiling generated chains with
+		// Elixir and comparing.
+		optModule("PL.QuotedKey", optUsing(`    opts = Keyword.put(opts, :"base", PL.Second)`, "      use PL.Wrapper, unquote(opts)")),
+		optModule("PL.IfEdit", optUsing("    opts = if opts[:flag], do: opts, else: Keyword.put(opts, :base, PL.Second)", "      use PL.Wrapper, unquote(opts)")),
+		optModule("PL.Update", optUsing("    opts = Keyword.update(opts, :base, PL.Second, fn _ -> PL.Third end)", "      use PL.Wrapper, unquote(opts)")),
+		optModule("PL.Lazy", optUsing("    opts = Keyword.put_new_lazy(opts, :base, fn -> PL.Second end)", "      use PL.Wrapper, unquote(opts)")),
+		optModule("PL.Append", optUsing("    opts = opts ++ [base: PL.Second]", "      use PL.Wrapper, unquote(opts)")),
+		optModule("PL.Prepend", optUsing("    opts = [base: PL.Second] ++ opts", "      use PL.Wrapper, unquote(opts)")),
+		optModule("PL.MergeVar", optUsing("    extra = [base: PL.Second]\n    opts = Keyword.merge(opts, extra)", "      use PL.Wrapper, unquote(opts)")),
+		optModule("PL.MergeCall", optUsing("    opts = Keyword.merge(opts, extra())", "      use PL.Wrapper, unquote(opts)")+"\n\n  def extra, do: [base: PL.Second]"),
+		optModule("PL.MergePairs", optUsing("    opts = Keyword.merge(opts, base: PL.Second, queue: :x)", "      use PL.Wrapper, unquote(opts)")),
+		optModule("PL.Validate", optUsing("    opts = Keyword.validate!(opts, [:queue, base: PL.Second])", "      use PL.Wrapper, unquote(opts)")),
+		optModule("PL.SpliceFirst", optUsing("", "      use PL.Wrapper, [unquote_splicing(opts), base: PL.Second]")),
+		optModule("PL.WebOpts", "  def worker(opts) do\n    quote do\n      use PL.Wrapper, unquote(opts)\n    end\n  end\n\n  defmacro __using__({which, opts}) when is_atom(which) do\n    apply(__MODULE__, which, [opts])\n  end"),
+		optModule("PL.HelperRead", "  defmacro __using__(opts) do\n    build(opts)\n  end\n\n  defp build(opts) do\n    mod = opts[:base] || PL.Second\n\n    quote do\n      use unquote(mod)\n    end\n  end"),
+		optModule("PL.HelperPop", "  defmacro __using__(opts) do\n    build(opts)\n  end\n\n  defp build(opts) do\n    {_, opts} = Keyword.pop(opts, :base)\n\n    quote do\n      use PL.Wrapper, unquote(opts)\n    end\n  end"),
+		optModule("PL.FetchOk", optUsing("    {:ok, mod} = Keyword.fetch(opts, :base)", "      use unquote(mod)")),
+		optModule("PL.GetLazy", optUsing("    mod = Keyword.get_lazy(opts, :base, fn -> PL.Second end)", "      use unquote(mod)")),
+		optModule("PL.GetOr", optUsing("    mod = Keyword.get(opts, :base) || PL.Second", "      use unquote(mod)")),
+		optModule("PL.PipeGet", optUsing("    mod = opts |> Keyword.get(:base, PL.Second)", "      use unquote(mod)")),
+		optModule("PL.InlineGet", optUsing("", "      use unquote(Keyword.get(opts, :base, PL.Second))")),
+		optModule("PL.InlineAccess", optUsing("", "      use unquote(opts[:base] || PL.Second)")),
+		optModule("PL.InlineCall", optUsing("", "      use unquote(pick(opts))")+"\n\n  def pick(_opts), do: PL.Second"),
+		optModule("PL.VarDefault", optUsing("    dflt = PL.Second\n    mod = Keyword.get(opts, :base, dflt)", "      use unquote(mod)")),
+		optModule("PL.VarPut", optUsing("    dflt = PL.Second\n    opts = Keyword.put(opts, :base, dflt)", "      use PL.Wrapper, unquote(opts)")),
+		optModule("PL.QuoteVar", optUsing("    qv = PL.Second", "      use PL.Wrapper, base: unquote(qv)")),
+		optModule("PL.AttrDefault", "  @default_base PL.Second\n\n"+optUsing("    mod = Keyword.get(opts, :base, @default_base)", "      use unquote(mod)")),
+		optModule("PL.ParenUse", optUsing("", "      use(PL.Wrapper, unquote(opts))")),
+		optModule("PL.Owner", optUsing("    mod = Keyword.get(opts, :base, __MODULE__.Impl)", "      use unquote(mod)")),
+		optModule("PL.Owner.Impl", inject("owner_impl")),
+		optModule("PL.Nested", "  defmodule Impl do\n    defmacro __using__(_opts) do\n      quote do\n        def new(args, opts \\\\ []), do: {:impl, args, opts}\n      end\n    end\n  end\n\n"+optUsing("", "      use PL.Wrapper, unquote(opts)")),
+		optModule("PL.Clauses", "  defmacro __using__(which) when is_atom(which) do\n    quote do\n      use PL.Third\n    end\n  end\n\n"+optUsing("", "      use PL.Wrapper, unquote(opts)")),
+		optModule("PL.UnquoteMerge", optUsing("    extra = [base: PL.Second]", "      use PL.Wrapper, unquote(Keyword.merge(opts, extra))")),
+		optModule("PL.MergeDefVar", optUsing("    defaults = [base: PL.Second]\n    opts = Keyword.merge(defaults, opts)", "      use PL.Wrapper, unquote(opts)")),
+		optModule("PL.BlockShadow", "  defmacro __using__(opts) do\n    mod = opts[:base] || PL.Base\n    if true do\n      mod = pick()\n      quote do\n        use unquote(mod)\n      end\n    end\n  end\n\n  def pick, do: PL.Second"),
+		optModule("PL.BlockEdit", optUsing("    if opts[:flag] do\n      opts = Keyword.put(opts, :base, PL.Second)\n      _ = opts\n    end", "      use PL.Wrapper, unquote(opts)")),
 	}
 	workers := []struct{ name, use, want string }{
 		{"W.Outer", "use PL.Outer, queue: :default", "second"},
@@ -881,11 +910,10 @@ func TestRegression_UseChainOptionForms(t *testing.T) {
 		{"W.InQuote", "use PL.InQuote", "second"},
 		{"W.Renamed", "use PL.Renamed", "second"},
 		{"W.OtherVar", "use PL.OtherVar", "base"},
-		{"W.Mixed", "use PL.Mixed", "second"},
-		{"W.Mixed2", "use PL.Mixed2", "second"},
-		{"W.Mixed3", "use PL.Mixed3", "second"},
-		{"W.Mixed4", "use PL.Mixed4", "second"},
-		{"W.MixedOwn", "use PL.Mixed3, base: PL.Third", "second"},
+		// In a quote, `[{:k, X} | unquote(opts)]` is a list of one `|`
+		// expression: the next __using__ gets no options (Elixir 1.19 and
+		// 1.20 give PL.Base).
+		{"W.Mixed2", "use PL.Mixed2", "base"},
 		{"W.Top", "use PL.Top", "third"},
 		{"W.TopOwn", "use PL.Top, base: PL.Base", "base"},
 		{"W.TopPut", "use PL.TopPut, base: PL.Base", "third"},
@@ -896,16 +924,10 @@ func TestRegression_UseChainOptionForms(t *testing.T) {
 		{"W.HelperEdit", "use PL.HelperEdit", "second"},
 		{"W.Opaque", "use PL.OpaqueOuter", "second"},
 		{"W.OpaqueOwn", "use PL.OpaqueOuter, base: PL.Third", "third"},
-		{"W.MixedKeep", "use PL.MixedKeep, base: PL.Third", "third"},
-		{"W.MergeKeep", "use PL.MergeKeep, base: PL.Third", "third"},
-		{"W.CallerFirst", "use PL.CallerFirst", "second"},
-		{"W.CallerFirstOwn", "use PL.CallerFirst, base: PL.Third", "third"},
-		{"W.MergeCallerLast", "use PL.MergeCallerLast", "second"},
-		{"W.MergeCallerLastOwn", "use PL.MergeCallerLast, base: PL.Third", "third"},
 		{"W.GetCallNone", "use PL.GetCall", "use"},
 		{"W.GetCallOwn", "use PL.GetCall, base: PL.Third", "third"},
 		{"W.ValueUnquote", "use PL.ValueUnquote, base: PL.Third", "base"},
-		{"W.TupleValue", "use PL.TupleValue, base: PL.Third", "third"},
+		{"W.TupleValue", "use PL.TupleValue, base: PL.Third", "base"},
 		{"W.TupleNested", "use PL.TupleNested", "second"},
 		{"W.DeleteRead", "use PL.DeleteRead, base: PL.Second", "base"},
 		{"W.TakeRead", "use PL.TakeRead, base: PL.Second", "base"},
@@ -931,6 +953,62 @@ func TestRegression_UseChainOptionForms(t *testing.T) {
 		{"W.Var", "use PL.Wrapper, base: @base", "use"},
 		{"W.MultiLine", "use PL.Outer,\n    queue: :default,\n    base: PL.Third", "third"},
 		{"W.Nested", "use PL.Wrapper, base: PL.Second, extra: [base: :nope]", "second"},
+		{"W.QuotedKeyCaller", `use PL.Wrapper, "base": PL.Second`, "second"},
+		{"W.QuotedKeyEdit", "use PL.QuotedKey", "second"},
+		{"W.QuotedMod", `use PL.Wrapper, base: :"Elixir.PL.Second"`, "second"},
+		// The first value of a key wins, as in Keyword.get and Keyword.pop.
+		{"W.DupKey", "use PL.Wrapper, base: PL.Second, base: PL.Third", "second"},
+		// A value that Dexter cannot read replaces the options: not the
+		// caller's option.
+		{"W.IfEdit", "use PL.IfEdit, base: PL.Third", "use"},
+		{"W.Update", "use PL.Update", "second"},
+		{"W.UpdateOwn", "use PL.Update, base: PL.Base", "use"},
+		{"W.Lazy", "use PL.Lazy", "use"},
+		{"W.LazyOwn", "use PL.Lazy, base: PL.Third", "third"},
+		{"W.Append", "use PL.Append", "second"},
+		{"W.AppendOwn", "use PL.Append, base: PL.Third", "third"},
+		{"W.PrependOwn", "use PL.Prepend, base: PL.Third", "second"},
+		{"W.MergeVar", "use PL.MergeVar, base: PL.Third", "second"},
+		{"W.MergeCall", "use PL.MergeCall, base: PL.Third", "use"},
+		{"W.MergePairs", "use PL.MergePairs, base: PL.Third", "second"},
+		{"W.Validate", "use PL.Validate", "second"},
+		{"W.SpliceFirstOwn", "use PL.SpliceFirst, base: PL.Third", "third"},
+		{"W.WebOpts", "use PL.WebOpts, {:worker, base: PL.Second}", "second"},
+		{"W.HelperRead", "use PL.HelperRead", "second"},
+		{"W.HelperReadOwn", "use PL.HelperRead, base: PL.Third", "third"},
+		{"W.HelperPop", "use PL.HelperPop, base: PL.Third", "base"},
+		{"W.FetchOk", "use PL.FetchOk, base: PL.Second", "second"},
+		{"W.GetLazy", "use PL.GetLazy", "use"},
+		{"W.GetLazyOwn", "use PL.GetLazy, base: PL.Third", "third"},
+		{"W.GetOr", "use PL.GetOr", "second"},
+		{"W.PipeGet", "use PL.PipeGet", "second"},
+		{"W.InlineGet", "use PL.InlineGet", "second"},
+		{"W.InlineGetOwn", "use PL.InlineGet, base: PL.Third", "third"},
+		{"W.InlineAccess", "use PL.InlineAccess", "second"},
+		{"W.InlineCall", "use PL.InlineCall", "use"},
+		{"W.VarDefault", "use PL.VarDefault", "second"},
+		{"W.VarPut", "use PL.VarPut, base: PL.Third", "second"},
+		{"W.QuoteVar", "use PL.QuoteVar", "second"},
+		{"W.AttrDefault", "use PL.AttrDefault", "second"},
+		{"W.ParenUse", "use PL.ParenUse, base: PL.Second", "second"},
+		{"W.ParenCaller", "use(PL.Wrapper, base: PL.Second)", "second"},
+		{"W.Owner", "use PL.Owner", "owner_impl"},
+		// The __using__ of a module nested in PL.Nested is not its own.
+		{"W.NestedOwn", "use PL.Nested, base: PL.Second", "second"},
+		// The clause for an atom does not take the options.
+		{"W.Clauses", "use PL.Clauses, base: PL.Second", "second"},
+		// A match in a block does not change the variable after the block.
+		{"W.BlockEdit", "use PL.BlockEdit", "base"},
+		// A variable bound to a keyword list, merged under the options: a
+		// key that the options hold wins.
+		{"W.MergeDefVar", "use PL.MergeDefVar", "second"},
+		// The unquote runs in macro code, where extra is the keyword list.
+		{"W.UnquoteMerge", "use PL.UnquoteMerge", "second"},
+		{"W.UnquoteMergeOwn", "use PL.UnquoteMerge, base: PL.Third", "second"},
+		{"W.MergeDefVarOwn", "use PL.MergeDefVar, base: PL.Third", "third"},
+		// A rebind in a block that Dexter cannot read: the quote in the
+		// block sees the new value, so the answer is the use line.
+		{"W.BlockShadow", "use PL.BlockShadow", "use"},
 	}
 	files := append([]bbFile(nil), lib...)
 	var caller strings.Builder
@@ -978,5 +1056,129 @@ func TestRegression_UseChainOptionForms(t *testing.T) {
 	for marker, want := range map[string]string{"Two.A.new": "base", "Two.B.new": "second"} {
 		l, c := bbPos(t, callerFile.src, marker, "new")
 		check(marker, bbLines(definitionAt(t, server, uri, l, c), server.projectRoot), want, "")
+	}
+}
+
+// An alias that a library's __using__ injects, reached through a wrapper
+// that selects the library with an option (`use unquote(mod)`), has its
+// references in the modules whose options select that library.
+func TestRegression_UseChainOptionAlias(t *testing.T) {
+	target := bbFile{"lib/al_target.ex", "defmodule AL.Target.Thing do\n  def run, do: :ok\nend\n"}
+	base := optModule("AL.Base", "  defmacro __using__(_opts) do\n    quote do\n      alias AL.Target.Thing\n    end\n  end")
+	other := optModule("AL.Other", "  defmacro __using__(_opts) do\n    quote do\n      :ok\n    end\n  end")
+	wrapper := optModule("AL.Wrapper", optUsing("    {mod, opts} = Keyword.pop(opts, :base, AL.Other)", "      use unquote(mod), unquote(opts)"))
+	defWrapper := optModule("AL.DefWrapper", optUsing("    {mod, opts} = Keyword.pop(opts, :base, AL.Base)", "      use unquote(mod), unquote(opts)"))
+	outer := optModule("AL.Outer", optUsing("    opts = Keyword.put_new(opts, :base, AL.Base)", "      use AL.Wrapper, unquote(opts)"))
+	pass := optModule("AL.Pass", optUsing("", "      use AL.Wrapper, unquote(opts)"))
+	// The second use of the wrapper, with other options, is a new expansion:
+	// it must not hide the first one, which injects the alias.
+	twice := optModule("AL.Twice", "  defmacro __using__(_opts) do\n    quote do\n      use AL.Wrapper, base: AL.Base\n      use AL.Wrapper, base: AL.Other\n    end\n  end")
+	var files []bbFile
+	files = append(files, target, base, other, wrapper, defWrapper, outer, pass, twice)
+	users := []struct {
+		use      string
+		injected bool
+	}{
+		{"use AL.Outer", true},
+		{"use AL.Outer, base: AL.Other", false},
+		{"use AL.Wrapper", false},
+		{"use AL.Wrapper, base: AL.Base", true},
+		{"use AL.DefWrapper", true},
+		{"use AL.DefWrapper, base: AL.Other", false},
+		{"use AL.Pass, base: AL.Base", true},
+		{"use AL.Pass", false},
+		{"use AL.Twice", true},
+	}
+	want := map[string]bool{}
+	what := map[string]string{}
+	for i, u := range users {
+		f := bbFile{fmt.Sprintf("lib/al_user%d.ex", i), fmt.Sprintf("defmodule AL.User%d do\n  %s\n\n  def go, do: Thing.run()\nend\n", i, u.use)}
+		files = append(files, f)
+		want[f.rel+":4"] = u.injected
+		what[f.rel+":4"] = u.use
+	}
+	server, cleanup := bbServer(t, files...)
+	defer cleanup()
+	locs, err := server.ReferenceNames("AL.Target.Thing", "run", NameReferenceOptions{Kind: NameKindCallable})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, l := range locs {
+		rel, _ := filepath.Rel(server.projectRoot, l.FilePath)
+		got[fmt.Sprintf("%s:%d", rel, l.Line)] = true
+	}
+	for site, injected := range want {
+		if got[site] != injected {
+			t.Errorf("%s: reference = %t, want %t", what[site], got[site], injected)
+		}
+	}
+}
+
+// A wrapper that names the injector only as the default of a piped
+// Keyword.update makes the alias reach its users: the default is put when
+// the caller gives no value. The wrapper passes its options on, so the open
+// wrappers also find these users; the injector graph takes the default too,
+// as it does for the direct call.
+func TestRegression_UseChainUpdateDefaultAlias(t *testing.T) {
+	files := []bbFile{
+		{"lib/au_target.ex", "defmodule AU.Target.Thing do\n  def run, do: :ok\nend\n"},
+		optModule("AU.Base", "  defmacro __using__(_opts) do\n    quote do\n      alias AU.Target.Thing\n    end\n  end"),
+		optModule("AU.Other", "  defmacro __using__(_opts) do\n    quote do\n      :ok\n    end\n  end"),
+		optModule("AU.Wrapper", optUsing("    {mod, opts} = Keyword.pop(opts, :base, AU.Other)", "      use unquote(mod), unquote(opts)")),
+		optModule("AU.Outer", optUsing("    opts = opts |> Keyword.update(:base, AU.Base, & &1)", "      use AU.Wrapper, unquote(opts)")),
+		{"lib/au_user0.ex", "defmodule AU.User0 do\n  use AU.Outer\n\n  def go, do: Thing.run()\nend\n"},
+		{"lib/au_user1.ex", "defmodule AU.User1 do\n  use AU.Outer, base: AU.Other\n\n  def go, do: Thing.run()\nend\n"},
+	}
+	server, cleanup := bbServer(t, files...)
+	defer cleanup()
+	locs, err := server.ReferenceNames("AU.Target.Thing", "run", NameReferenceOptions{Kind: NameKindCallable})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, l := range locs {
+		rel, _ := filepath.Rel(server.projectRoot, l.FilePath)
+		got[fmt.Sprintf("%s:%d", rel, l.Line)] = true
+	}
+	if !got["lib/au_user0.ex:4"] {
+		t.Errorf("use AU.Outer: no reference through the Keyword.update default (got %v)", got)
+	}
+	if got["lib/au_user1.ex:4"] {
+		t.Errorf("use AU.Outer, base: AU.Other: a reference, but the caller's value wins")
+	}
+}
+
+// A module whose use chain has an option value that Dexter cannot read: only
+// a name that a chain can inject goes to the use line. A typo keeps the
+// answer that it has with no such option.
+func TestRegression_UnknownOptionNameNotInjected(t *testing.T) {
+	inject := "  defmacro __using__(_opts) do\n    quote do\n      def new(args, opts \\\\ []), do: {:base, args, opts}\n    end\n  end"
+	worker := optModule("W.Var", "  use PL.Wrapper, base: @base\n\n  def run(a), do: new(a)\n  def typo(a), do: bogus(a)")
+	caller := bbFile{"lib/pl_caller.ex", "defmodule PL.Caller do\n  def f(a), do: W.Var.new(a)\n  def g(a), do: W.Var.bogus(a)\nend\n"}
+	server, cleanup := bbServer(t,
+		optModule("PL.Base", inject),
+		optModule("PL.Wrapper", optUsing("    {mod, opts} = Keyword.pop(opts, :base, PL.Base)", "      use unquote(mod), unquote(opts)")),
+		worker, caller)
+	defer cleanup()
+	uri := bbOpen(t, server, caller)
+	wuri := bbOpen(t, server, worker)
+	at := func(f bbFile, u, marker, token string) []string {
+		t.Helper()
+		l, c := bbPos(t, f.src, marker, token)
+		return bbLines(definitionAt(t, server, u, l, c), server.projectRoot)
+	}
+	if got := at(caller, uri, "W.Var.new", "new"); len(got) != 1 || got[0] != "lib/w_var.ex:2" {
+		t.Errorf("W.Var.new: definition = %v, want the use line lib/w_var.ex:2", got)
+	}
+	if got := at(worker, wuri, "do: new(a)", "new"); len(got) != 1 || got[0] != "lib/w_var.ex:2" {
+		t.Errorf("bare new: definition = %v, want the use line lib/w_var.ex:2", got)
+	}
+	// Qualified: the module, as for any name that the module does not have.
+	if got := at(caller, uri, "W.Var.bogus", "bogus"); len(got) != 1 || got[0] != "lib/w_var.ex:1" {
+		t.Errorf("W.Var.bogus: definition = %v, want the module lib/w_var.ex:1", got)
+	}
+	if got := at(worker, wuri, "do: bogus(a)", "bogus"); len(got) != 0 {
+		t.Errorf("bare bogus: definition = %v, want none", got)
 	}
 }

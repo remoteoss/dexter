@@ -150,3 +150,17 @@ func TestModuleAPI_MarksGeneratedFunctionsFromAnOldBuild(t *testing.T) {
 	}
 	wantContains(t, line, "older than the source")
 }
+
+// A use chain with an option value that Dexter cannot read gives the use line
+// for a name that it can inject, and not for a typo.
+func TestDefinition_UnknownOptionNameNotInjected(t *testing.T) {
+	e := setupTestEnv(t)
+	e.indexFile("lib/my_app/base.ex", "defmodule MyApp.Base do\n  defmacro __using__(_opts) do\n    quote do\n      def new(args), do: args\n    end\n  end\nend\n")
+	e.indexFile("lib/my_app/wrapper.ex", "defmodule MyApp.Wrapper do\n  defmacro __using__(opts) do\n    {mod, _opts} = Keyword.pop(opts, :base, MyApp.Base)\n\n    quote do\n      use unquote(mod)\n    end\n  end\nend\n")
+	e.indexFile("lib/my_app/worker.ex", "defmodule MyApp.Worker do\n  use MyApp.Wrapper, base: @base\nend\n")
+
+	wantContains(t, e.callTool("dexter_definition", map[string]any{"module": "MyApp.Worker", "function": "new"}), "lib/my_app/worker.ex:2")
+	typo := e.callTool("dexter_definition", map[string]any{"module": "MyApp.Worker", "function": "bogus"})
+	wantContains(t, typo, "MyApp.Worker.bogus is not in the index")
+	wantNotContains(t, typo, "lib/my_app/worker.ex:2")
+}

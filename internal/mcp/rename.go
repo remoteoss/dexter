@@ -51,6 +51,9 @@ func (h *Handler) rename(ctx context.Context, args RenameParams) (string, error)
 			fmt.Fprintf(&b, "  %s\n", h.relPath(fp))
 		}
 	}
+	for _, w := range summary.Warnings {
+		fmt.Fprintf(&b, "\nWARNING: %s\n", w)
+	}
 	if len(summary.FilesMoved) > 0 {
 		fmt.Fprintf(&b, "\nFiles moved to follow the naming convention:\n")
 		from := make([]string, 0, len(summary.FilesMoved))

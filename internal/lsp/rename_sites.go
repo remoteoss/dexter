@@ -92,8 +92,17 @@ var renameStaleLimit = 200
 // save, gets the rename instead of a refusal. Only a state that a reindex
 // cannot fix is refused: a buffer of the requesting editor with unsaved
 // lines that do not match the index, or a change too large to index here.
+//
+// First it waits once for the watcher (flushEvents): a file written a moment
+// ago (an agent that writes a call and renames at once) is not in the index
+// yet, and nothing in the plan reads it, so without the wait the rename would
+// miss its call sites and the project would not compile. The wait is the
+// platform's event latency (20–50 ms) when nothing is queued.
 // The caller holds renameSerial.
 func (s *Server) retryWithFreshIndex(ctx context.Context, plan func() (*WorkspaceEdit, error)) (*WorkspaceEdit, error) {
+	if err := s.flushForRename(ctx); err != nil {
+		return nil, err
+	}
 	edit, err := plan()
 	var behind *indexBehindError
 	if !errors.As(err, &behind) {
@@ -105,7 +114,7 @@ func (s *Server) retryWithFreshIndex(ctx context.Context, plan func() (*Workspac
 			"Dexter: the rename was not applied, because %d files changed since Dexter indexed them; Dexter is probably still indexing a large change, such as a branch switch. No file was changed; wait for the index, then rename again.",
 			len(paths)))
 	}
-	unexplained, err := s.flushForMoves(ctx, behind.disk)
+	unexplained, err := s.goneFiles(behind.disk)
 	if err != nil {
 		return nil, err
 	}
@@ -135,42 +144,43 @@ func (s *Server) retryWithFreshIndex(ctx context.Context, plan func() (*Workspac
 		s.summarize(behind.disk)))
 }
 
-// renameFlushWait bounds the wait for the watcher in flushForMoves.
+// renameFlushWait bounds the wait for the watcher in flushForRename.
 var renameFlushWait = 2 * time.Second
 
-// flushForMoves waits for the watcher when a file the rename plans from is
-// gone and no earlier reply asked an editor to move it. That is what a move by
-// another program (git mv, git checkout, a file manager) looks like before the
-// watcher has indexed the new path: removing the old path and planning on
-// would miss the call sites at the new path, and the project would not
-// compile. After the wait the index has the new path. The common case, with
-// no gone file, does not wait.
-//
-// It returns the gone files that the watcher did not report: the index still
-// has them after the wait.
-func (s *Server) flushForMoves(ctx context.Context, paths []string) ([]string, error) {
+// flushForRename waits until the index has every file change that the
+// watcher has seen, up to renameFlushWait. Without a watcher (an embedded
+// server, a test) there is nothing to wait for.
+func (s *Server) flushForRename(ctx context.Context) error {
 	if s.index.flushEvents == nil {
-		return nil, nil
-	}
-	var gone []string
-	for _, p := range paths {
-		if _, recorded := s.index.clientMoves[p]; recorded {
-			continue
-		}
-		if _, err := os.Stat(p); errors.Is(err, fs.ErrNotExist) {
-			gone = append(gone, p)
-		}
-	}
-	if len(gone) == 0 {
-		return nil, nil
+		return nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, renameFlushWait)
 	defer cancel()
 	if err := s.index.flushEvents(ctx); err != nil {
-		return nil, s.renameRefusal("Dexter: the rename was not applied, because Dexter is still indexing a change. No file was changed; wait for the index, then rename again.")
+		return s.renameRefusal("Dexter: the rename was not applied, because Dexter is still indexing a change. No file was changed; wait for the index, then rename again.")
+	}
+	return nil
+}
+
+// goneFiles returns the files the rename plans from that are gone, and that
+// no earlier reply asked an editor to move, but that the index still has
+// after the flush of retryWithFreshIndex: a move by another program (git mv,
+// a file manager) whose events the watcher has not reported. Removing the
+// old path and planning on would miss the call sites at the new path.
+func (s *Server) goneFiles(paths []string) ([]string, error) {
+	if s.index.flushEvents == nil {
+		// No watcher: the rename removes a gone file from the index and
+		// goes on.
+		return nil, nil
 	}
 	var unexplained []string
-	for _, p := range gone {
+	for _, p := range paths {
+		if _, recorded := s.index.clientMoves[p]; recorded {
+			continue
+		}
+		if _, err := os.Stat(p); !errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
 		if has, err := s.store.HasPath(p); err != nil || has {
 			unexplained = append(unexplained, p)
 		}

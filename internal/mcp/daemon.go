@@ -107,11 +107,26 @@ type daemonBackend struct {
 	root   string
 	ensure func(ctx context.Context, root string) (controlClient, error)
 	client controlClient
-	closed bool
+	// connecting is the connect in progress, or nil. The connect runs
+	// without mu, because a daemon start can take 30 seconds or more, and
+	// Close must not wait for it.
+	connecting *connectAttempt
+	closed     bool
 	// closeReason is the error that calls get after Close.
 	closeReason error
 
 	slots chan struct{}
+}
+
+// connectAttempt is one connect to the workspace daemon. Calls that arrive
+// while it runs wait for its result instead of starting a second connect.
+type connectAttempt struct {
+	// done closes when client and err are set.
+	done chan struct{}
+	// cancel stops the connect. Close calls it.
+	cancel context.CancelFunc
+	client controlClient
+	err    error
 }
 
 // retire closes the backend with the error that its calls in flight get.
@@ -125,6 +140,10 @@ func (b *daemonBackend) retire(reason error) error {
 func (b *daemonBackend) closedErr() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	return b.closedErrLocked()
+}
+
+func (b *daemonBackend) closedErrLocked() error {
 	if !b.closed {
 		return nil
 	}
@@ -135,15 +154,14 @@ func (b *daemonBackend) closedErr() error {
 }
 
 // connection returns the live control connection, connecting when there is
-// none or the last one ended.
+// none or the last one ended. Only one connect runs at a time. Each caller
+// waits for its result or for its own context, so a caller that stops
+// waiting does not stop the connect for the others.
 func (b *daemonBackend) connection(ctx context.Context) (controlClient, error) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.closed {
-		if b.closeReason != nil {
-			return nil, b.closeReason
-		}
-		return nil, errClosed
+	if err := b.closedErrLocked(); err != nil {
+		b.mu.Unlock()
+		return nil, err
 	}
 	if b.client != nil {
 		select {
@@ -151,29 +169,78 @@ func (b *daemonBackend) connection(ctx context.Context) (controlClient, error) {
 			_ = b.client.Close()
 			b.client = nil
 		default:
-			return b.client, nil
+			client := b.client
+			b.mu.Unlock()
+			return client, nil
 		}
 	}
-	client, err := b.ensure(ctx, b.root)
+	attempt := b.connecting
+	if attempt == nil {
+		// Only Close stops the connect. daemon.Ensure has its own time
+		// limits, and a connect that no caller waits for any more gives a
+		// connection to the next call.
+		connectCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+		attempt = &connectAttempt{done: make(chan struct{}), cancel: cancel}
+		b.connecting = attempt
+		go b.connect(connectCtx, attempt, b.root)
+	}
+	b.mu.Unlock()
+	select {
+	case <-attempt.done:
+		return attempt.client, attempt.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// connect runs one connect attempt without the lock, and then installs its
+// result under the lock. When the backend closed during the connect, the new
+// connection is closed and the attempt gets the close reason.
+func (b *daemonBackend) connect(ctx context.Context, attempt *connectAttempt, root string) {
+	defer attempt.cancel()
+	client, err := b.ensure(ctx, root)
 	var mismatch *daemon.RootMismatchError
 	if errors.As(err, &mismatch) {
 		// A daemon already serves this workspace through another spelling of
 		// the root, for example the one an editor used. Share it: the agent
 		// gets paths in that spelling, which name the same files.
-		log.Printf("MCP: workspace %s is served as %s; using that root", b.root, mismatch.Daemon)
-		b.root = mismatch.Daemon
-		client, err = b.ensure(ctx, b.root)
+		log.Printf("MCP: workspace %s is served as %s; using that root", root, mismatch.Daemon)
+		root = mismatch.Daemon
+		b.mu.Lock()
+		b.root = root
+		b.mu.Unlock()
+		client, err = b.ensure(ctx, root)
 	}
-	if err != nil {
-		return nil, err
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.connecting = nil
+	if closedErr := b.closedErrLocked(); closedErr != nil {
+		if err == nil {
+			_ = client.Close()
+		}
+		client, err = nil, closedErr
 	}
-	b.client = client
-	return client, nil
+	if err == nil {
+		b.client = client
+	} else {
+		client = nil
+	}
+	attempt.client, attempt.err = client, err
+	close(attempt.done)
+}
+
+// rootName returns the root, which a connect can change to the spelling that
+// the daemon uses.
+func (b *daemonBackend) rootName() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.root
 }
 
 func (b *daemonBackend) warm(ctx context.Context) {
 	if _, err := b.connection(ctx); err != nil {
-		log.Printf("MCP: cannot start the workspace daemon for %s: %v", b.root, err)
+		log.Printf("MCP: cannot start the workspace daemon for %s: %v", b.rootName(), err)
 	}
 }
 
@@ -196,12 +263,12 @@ func (b *daemonBackend) CallTool(ctx context.Context, name string, args json.Raw
 			return res.Text, nil
 		}
 		if strings.Contains(err.Error(), fmt.Sprintf("unknown daemon method %q", MethodTool)) {
-			return "", fmt.Errorf("the dexter daemon for %s was started by a build without MCP tools; run `dexter stop --force` in the project, then retry", b.root)
+			return "", fmt.Errorf("the dexter daemon for %s was started by a build without MCP tools; run `dexter stop --force` in the project, then retry", b.rootName())
 		}
 		if name == renameToolName && ctx.Err() != nil {
 			// A client that canceled may not read the answer, so the log
 			// keeps it too.
-			log.Printf("MCP: a rename was canceled while it ran in %s; it may have been applied, so check git status", b.root)
+			log.Printf("MCP: a rename was canceled while it ran in %s; it may have been applied, so check git status", b.rootName())
 			return "", fmt.Errorf("the rename was canceled while it ran, so it may have been applied; check git status (%w)", ctx.Err())
 		}
 		if reason := b.closedErr(); reason != nil {
@@ -226,10 +293,15 @@ func (b *daemonBackend) CallTool(ctx context.Context, name string, args json.Raw
 	}
 }
 
+// Close closes the connection and stops a connect in progress. It does not
+// wait for that connect to return.
 func (b *daemonBackend) Close() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.closed = true
+	if b.connecting != nil {
+		b.connecting.cancel()
+	}
 	if b.client == nil {
 		return nil
 	}

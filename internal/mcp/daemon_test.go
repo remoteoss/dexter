@@ -213,3 +213,124 @@ func TestRecoveryHintsSayForce(t *testing.T) {
 	out := e.callTool("dexter_workspace", nil)
 	wantContains(t, out, "dexter stop --force")
 }
+
+// slowEnsure is a daemon connect that blocks until the test releases it, also
+// when its context is canceled, like a daemon start that waits for a lock.
+type slowEnsure struct {
+	entered chan struct{}
+	release chan struct{}
+	calls   atomic.Int32
+	client  *blockingClient
+}
+
+func newSlowEnsure() *slowEnsure {
+	return &slowEnsure{entered: make(chan struct{}, 8), release: make(chan struct{}), client: newBlockingClient()}
+}
+
+func (s *slowEnsure) ensure(context.Context, string) (controlClient, error) {
+	s.calls.Add(1)
+	s.entered <- struct{}{}
+	<-s.release
+	return s.client, nil
+}
+
+// Regression: Close and retire waited for the lock that a slow daemon connect
+// held, so a shutdown or a change of roots hung while a daemon started.
+func TestDaemonBackend_CloseDoesNotWaitForConnect(t *testing.T) {
+	for _, retire := range []bool{false, true} {
+		s := newSlowEnsure()
+		b := newDaemonBackend("/project", s.ensure)
+		errc := make(chan error, 1)
+		go func() {
+			_, err := b.CallTool(context.Background(), "dexter_search", nil)
+			errc <- err
+		}()
+		<-s.entered
+
+		closed := make(chan struct{})
+		go func() {
+			if retire {
+				_ = b.retire(errRootsChanged)
+			} else {
+				_ = b.Close()
+			}
+			close(closed)
+		}()
+		select {
+		case <-closed:
+		case <-time.After(2 * time.Second):
+			close(s.release)
+			t.Fatalf("retire=%v: Close waited for the connect", retire)
+		}
+
+		// The connect ends later. Its connection is closed, not kept, and the
+		// call gets the close reason.
+		close(s.release)
+		var err error
+		select {
+		case err = <-errc:
+		case <-time.After(5 * time.Second):
+			t.Fatal("call did not end")
+		}
+		want := errClosed
+		if retire {
+			want = errRootsChanged
+		}
+		if !errors.Is(err, want) {
+			t.Fatalf("retire=%v: error = %v, want %v", retire, err, want)
+		}
+		select {
+		case <-s.client.Done():
+		default:
+			t.Fatalf("retire=%v: the connection that the connect made after Close is still open", retire)
+		}
+	}
+}
+
+// Calls that arrive while a connect runs share it instead of starting a
+// second connect, and a caller that stops waiting does not end it for the
+// others.
+func TestDaemonBackend_ConcurrentCallsShareOneConnect(t *testing.T) {
+	s := newSlowEnsure()
+	b := newDaemonBackend("/project", s.ensure)
+	defer func() { _ = b.Close() }()
+
+	impatient, cancel := context.WithCancel(context.Background())
+	errc := make(chan error, 1)
+	go func() {
+		_, err := b.connection(impatient)
+		errc <- err
+	}()
+	<-s.entered
+	got := make(chan controlClient, 4)
+	for i := 0; i < 4; i++ {
+		go func() {
+			c, err := b.connection(context.Background())
+			if err != nil {
+				t.Error(err)
+			}
+			got <- c
+		}()
+	}
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-errc:
+		if !errors.Is(err, context.Canceled) {
+			close(s.release)
+			t.Fatalf("canceled caller error = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		close(s.release)
+		t.Fatal("a canceled caller waited for the connect")
+	}
+	close(s.release)
+	for i := 0; i < 4; i++ {
+		if c := <-got; c != s.client {
+			t.Fatalf("connection = %v, want the shared client", c)
+		}
+	}
+	if n := s.calls.Load(); n != 1 {
+		t.Fatalf("connects = %d, want 1", n)
+	}
+}

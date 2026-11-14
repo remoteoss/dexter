@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -225,11 +226,36 @@ func runDexter(t *testing.T, binary string, dir string, args ...string) string {
 	// points at the process's directory, and the spelled path is what the daemon
 	// indexes so stored paths match the URIs this test sends.
 	cmd.Env = append(os.Environ(), "DEXTER_DAEMON_IDLE_TIMEOUT=1s", "PWD="+mustAbs(t, dir))
+	stopDaemonAtCleanup(t, binary, dir)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("dexter %v failed: %v\n%s", args, err, out)
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// stoppedAtCleanup holds the test and directory pairs that stopDaemonAtCleanup
+// has registered.
+var stoppedAtCleanup sync.Map
+
+// stopDaemonAtCleanup stops the daemon that a CLI call in dir started, when
+// the test ends. A daemon that is still in its idle timeout can write to
+// .dexter while the test removes its temporary directory, which then fails
+// with "directory not empty". The cleanup runs before the removal of a
+// directory that t.TempDir made earlier, and a forced stop waits for the
+// daemon to exit.
+func stopDaemonAtCleanup(t *testing.T, binary, dir string) {
+	t.Helper()
+	key := t.Name() + "\x00" + dir
+	if _, loaded := stoppedAtCleanup.LoadOrStore(key, true); loaded {
+		return
+	}
+	t.Cleanup(func() {
+		stoppedAtCleanup.Delete(key)
+		stop := exec.Command(binary, "stop", "--force", "--root", dir)
+		stop.Dir = dir
+		_ = stop.Run()
+	})
 }
 
 func TestIntegration_InitAndLookup(t *testing.T) {
@@ -743,6 +769,7 @@ func TestIntegration_StopDaemon(t *testing.T) {
 
 	// Spawn the daemon with a long idle timeout so it cannot disappear between
 	// the commands on a slow machine.
+	stopDaemonAtCleanup(t, binary, root)
 	spawn := exec.Command(binary, "lookup", "--root", root, "MyApp.Repo")
 	spawn.Dir = root
 	spawn.Env = append(os.Environ(), "DEXTER_DAEMON_IDLE_TIMEOUT=30s", "PWD="+root)
@@ -800,6 +827,7 @@ func TestIntegration_StopDaemonForce(t *testing.T) {
 func TestIntegration_RefusesNonProjectRoot(t *testing.T) {
 	binary := buildDexter(t)
 	scratch := t.TempDir()
+	stopDaemonAtCleanup(t, binary, scratch)
 
 	run := func(args ...string) (string, error) {
 		cmd := exec.Command(binary, args...)
@@ -850,6 +878,7 @@ func TestIntegration_RefusesGitBackedHome(t *testing.T) {
 	if err := os.Mkdir(child, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	stopDaemonAtCleanup(t, binary, child)
 	cmd := exec.Command(binary, "lookup", "MyApp.Repo")
 	cmd.Dir = child
 	cmd.Env = append(os.Environ(), "HOME="+home, "PWD="+child)
@@ -903,6 +932,7 @@ func TestIntegration_GitBackedHomeYesIsSticky(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(home, ".git"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	stopDaemonAtCleanup(t, binary, home)
 	run := func(args ...string) (string, error) {
 		cmd := exec.Command(binary, args...)
 		cmd.Dir = home
@@ -964,6 +994,7 @@ func TestIntegration_LegacyMigration(t *testing.T) {
 // MCP client session.
 func mcpConnect(t *testing.T, binary, root string) *sdkmcp.ClientSession {
 	t.Helper()
+	stopDaemonAtCleanup(t, binary, root)
 	cmd := exec.Command(binary, "mcp", root)
 	cmd.Dir = root
 	cmd.Stderr = os.Stderr

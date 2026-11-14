@@ -68,10 +68,35 @@ const unknownOpt = "\x00unknown"
 // (`opts = Keyword.put_new(opts, :key, Mod)`). The edits of a variable are
 // in source order.
 type optEdit struct {
-	op   string   // "put", "put_new", "delete", or "take"
-	key  string   // for put, put_new, delete
-	mod  string   // the value; unknownOpt when it is not a module
+	op   string   // "put", "put_new", "update", "delete", "take", "unknown" (any key, any value), or "unknown_new" (any value for a key that is not set)
+	key  string   // for put, put_new, update, delete
+	mod  string   // the value (for update: the one put when the key is not set); unknownOpt when it is not a module
 	keys []string // for take: the keys that are kept
+}
+
+// optAnyKey, as a key of an options map, marks options whose keys Dexter
+// cannot know (`opts = if ..., do: ..., else: ...`): every key that the map
+// does not hold has a value that Dexter cannot read. optAbsent, as a value,
+// is a key that such options are known not to hold (deleted after it).
+const (
+	optAnyKey = "\x00any"
+	optAbsent = "\x00absent"
+)
+
+// optLookup is the value of key in an options map; set is false when the
+// options do not hold the key. A key that options of unknown keys can hold
+// has the value unknownOpt.
+func optLookup(opts map[string]string, key string) (v string, set bool) {
+	if v, ok := opts[key]; ok {
+		if v == optAbsent {
+			return "", false
+		}
+		return v, true
+	}
+	if _, anyKey := opts[optAnyKey]; anyKey {
+		return unknownOpt, true
+	}
+	return "", false
 }
 
 // effectiveOpts are the caller's options with edits applied: the caller
@@ -90,17 +115,51 @@ func effectiveOpts(consumer map[string]string, edits []optEdit) map[string]strin
 		case "put":
 			out[e.key] = e.mod
 		case "put_new":
-			if _, ok := out[e.key]; !ok {
+			if v, set := optLookup(out, e.key); !set {
+				out[e.key] = e.mod
+			} else if v == unknownOpt {
+				// The key can be set or not: either value.
+				out[e.key] = unknownOpt
+			}
+		case "update":
+			// Keyword.update(opts, :key, default, fun): fun changes a value
+			// that is set, and Dexter cannot read what it gives.
+			if _, set := optLookup(out, e.key); set {
+				out[e.key] = unknownOpt
+			} else {
 				out[e.key] = e.mod
 			}
 		case "delete":
-			delete(out, e.key)
+			if _, anyKey := out[optAnyKey]; anyKey {
+				out[e.key] = optAbsent
+			} else {
+				delete(out, e.key)
+			}
 		case "take":
+			_, anyKey := out[optAnyKey]
 			for k := range out {
 				if !slices.Contains(e.keys, k) {
 					delete(out, k)
 				}
 			}
+			if anyKey {
+				for _, k := range e.keys {
+					if _, ok := out[k]; !ok {
+						out[k] = unknownOpt
+					}
+				}
+			}
+		case "unknown":
+			clear(out)
+			out[optAnyKey] = unknownOpt
+		case "unknown_new":
+			// A key that the options do not hold can have any value.
+			for k, v := range out {
+				if v == optAbsent {
+					delete(out, k)
+				}
+			}
+			out[optAnyKey] = unknownOpt
 		}
 	}
 	return out
@@ -110,7 +169,7 @@ func effectiveOpts(consumer map[string]string, edits []optEdit) map[string]strin
 // options: the option's value, or the default when no step sets it. ok is
 // false, and mod empty, when there is none or the value cannot be known.
 func bindingModule(binding optBinding, consumer map[string]string) (mod string, ok bool) {
-	if v, set := effectiveOpts(consumer, binding.readEdits)[binding.optKey]; set {
+	if v, set := optLookup(effectiveOpts(consumer, binding.readEdits), binding.optKey); set {
 		if v == unknownOpt || v == "" {
 			return "", false
 		}
@@ -125,7 +184,7 @@ func bindingModule(binding optBinding, consumer map[string]string) (mod string, 
 // bindingUnknown reports whether the option an optBinding reads has a value
 // that Dexter cannot read.
 func bindingUnknown(binding optBinding, consumer map[string]string) bool {
-	v, set := effectiveOpts(consumer, binding.readEdits)[binding.optKey]
+	v, set := optLookup(effectiveOpts(consumer, binding.readEdits), binding.optKey)
 	if !set {
 		// The default applies: `opts[:key] || build()` cannot be read.
 		return binding.defaultMod == unknownOpt
@@ -140,15 +199,34 @@ func callOpts(call UseCall, consumer map[string]string) map[string]string {
 	if !call.forwardOpts {
 		return call.Opts
 	}
-	out := make(map[string]string)
 	forwarded := effectiveOpts(consumer, call.forwardEdits)
 	if call.callerWins {
-		maps.Copy(out, call.Opts)
-		maps.Copy(out, forwarded)
-		return out
+		return overlayOpts(call.Opts, forwarded)
 	}
-	maps.Copy(out, forwarded)
-	maps.Copy(out, call.Opts)
+	return overlayOpts(forwarded, call.Opts)
+}
+
+// overlayOpts are the options low with the keys of high over them.
+func overlayOpts(low, high map[string]string) map[string]string {
+	out := make(map[string]string, len(low)+len(high))
+	maps.Copy(out, low)
+	for k, v := range high {
+		if v == optAbsent {
+			if _, ok := low[k]; ok {
+				// high does not hold the key: the value of low stays.
+				continue
+			}
+		}
+		out[k] = v
+	}
+	if _, anyKey := high[optAnyKey]; anyKey {
+		// high can hold every other key too.
+		for k := range low {
+			if _, ok := high[k]; !ok {
+				out[k] = unknownOpt
+			}
+		}
+	}
 	return out
 }
 
@@ -174,6 +252,11 @@ type usingCacheEntry struct {
 	// Nil for ordinary __using__ macros. Selection happens at lookup time from
 	// the literal atom, so targets never merge.
 	dispatch map[string]*usingBody
+	// atomBody is the body of the clause that a `use Mod, :name` selects,
+	// for a module whose __using__ has a clause for a keyword list and
+	// another one (`when is_atom(which)`) that does not dispatch. Nil
+	// otherwise.
+	atomBody *usingBody
 
 	// checkedGen is the store's write generation when filePath was last
 	// known to be the file that the index gives for the module. A hit with
@@ -228,7 +311,7 @@ type IndexCoordinator struct {
 	writes      sync.RWMutex
 	unavailable bool // guarded by writes
 
-	backgroundWork sync.WaitGroup
+	backgroundWork workGroup
 
 	// reporter tells every attached editor about failures, degraded states,
 	// and long work. It is shared like the store: one workspace, one set of
@@ -237,14 +320,19 @@ type IndexCoordinator struct {
 	failures fileFailures
 	// firstBuildReported makes the first-build report once per workspace.
 	firstBuildReported atomic.Bool
-	otp                otpOutcomes  // see reportBeamOTP
-	beamFailures       beamFailures // see rememberBeamFailure
+	// reclaiming is set while startReclaimFreePages runs.
+	reclaiming   atomic.Bool
+	otp          otpOutcomes  // see reportBeamOTP
+	beamFailures beamFailures // see rememberBeamFailure
 
 	// caches are shared by every session; see sharedCaches.
 	caches sharedCaches
 	// injectedDelegates keeps the defdelegate facades of __using__ quotes;
 	// see injectedDelegatesTo.
 	injectedDelegates injectedDelegateCache
+	// optionInjectors keeps the optionInjectors of the __using__ bodies,
+	// built again after each index write.
+	optionInjectors optionInjectorCache
 	// useCalls keeps the use calls of module files for completion; see
 	// fileUseCalls.
 	useCalls useCallsCache
@@ -402,6 +490,10 @@ func (c *IndexCoordinator) takeClientMove(from string) (string, bool) {
 // editor. The caller holds renameSerial (see beginRename).
 func (s *Server) renameNotify(sev notify.Severity, msg string) {
 	s.index.renameNotices = append(s.index.renameNotices, renameNotice{sev, msg})
+	if r := s.index.renameReport; r != nil && sev != notify.Error {
+		// An error is the rename's returned error too.
+		r.Warnings = append(r.Warnings, strings.TrimPrefix(msg, "Dexter: "))
+	}
 }
 
 // CancelWork stops the reconciliation in flight and makes every later one
@@ -635,10 +727,44 @@ func isStreamClosed(err error) bool {
 		errors.Is(err, syscall.EPIPE)
 }
 
-// WaitForIndexWork waits for background index writes already accepted by this
-// workspace. Callers must prevent new sessions from adding work first.
+// WaitForIndexWork stops accepting background index work in this workspace,
+// and waits for the work already accepted. A session that is still running
+// (a rename that outlives its connection) cannot start more: its index update
+// is left to the next start, which finds the files changed.
 func (s *Server) WaitForIndexWork() {
-	s.index.backgroundWork.Wait()
+	s.index.backgroundWork.closeAndWait()
+}
+
+// workGroup is a WaitGroup that stops accepting work when it closes, so that
+// no work can start while, or after, the workspace waits for it to end.
+type workGroup struct {
+	mu     sync.Mutex
+	closed bool
+	wg     sync.WaitGroup
+}
+
+// start accepts one piece of work, unless the group is closed. The caller
+// calls done when it ends.
+func (g *workGroup) start() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closed {
+		return false
+	}
+	g.wg.Add(1)
+	return true
+}
+
+func (g *workGroup) done() { g.wg.Done() }
+
+// Wait waits for the work accepted so far.
+func (g *workGroup) Wait() { g.wg.Wait() }
+
+func (g *workGroup) closeAndWait() {
+	g.mu.Lock()
+	g.closed = true
+	g.mu.Unlock()
+	g.wg.Wait()
 }
 
 // OpenDocuments reports how many buffers this session holds. Daemon status
@@ -647,6 +773,55 @@ func (s *Server) OpenDocuments() int { return s.docs.Count() }
 
 // ProjectRoot returns the workspace root this session answers for.
 func (s *Server) ProjectRoot() string { return s.projectRoot }
+
+// startWarmUsingCache runs warmUsingCache in the background, as index work
+// that the workspace waits for when it closes. The warm-up is marked as in
+// progress before the goroutine starts, so a request that arrives first waits
+// for it instead of parsing the same files at the same time.
+func (s *Server) startWarmUsingCache() {
+	end, ok := s.usingCache.beginWarm()
+	if !ok {
+		return
+	}
+	if !s.index.backgroundWork.start() {
+		end()
+		return
+	}
+	go func() {
+		defer s.index.backgroundWork.done()
+		defer end()
+		defer s.index.reporter.Recover("cache", "the warm-up of the __using__ cache")
+		s.fillUsingCache()
+	}()
+}
+
+// startReclaimFreePages gives the free pages of the index file back in the
+// background (see store.ReclaimFreePages), one reclaim at a time for the
+// workspace. It is index work that the workspace waits for, or cancels, when
+// it closes. A reclaim that stops (a writer that held the lock too long, a
+// shutdown) goes on after the next pass.
+func (s *Server) startReclaimFreePages() {
+	if !s.index.reclaiming.CompareAndSwap(false, true) {
+		return
+	}
+	if !s.index.backgroundWork.start() {
+		s.index.reclaiming.Store(false)
+		return
+	}
+	go func() {
+		defer s.index.backgroundWork.done()
+		defer s.index.reclaiming.Store(false)
+		defer s.index.reporter.Recover("index", "the reclaim of free index pages")
+		start := time.Now()
+		freed, err := s.store.ReclaimFreePages(s.index.work)
+		switch {
+		case err != nil && s.index.work.Err() == nil:
+			log.Printf("Index file: reclaimed %d MB of free pages, then stopped: %v", freed>>20, err)
+		case freed > 0:
+			log.Printf("Index file: reclaimed %d MB of free pages (%s)", freed>>20, time.Since(start).Round(time.Millisecond))
+		}
+	}()
+}
 
 // warmUsingCache parses every module's defmacro __using__ body ahead of the
 // first request that needs one.
@@ -658,15 +833,32 @@ func (s *Server) ProjectRoot() string { return s.projectRoot }
 // a user waiting on a reference lookup. Every later request costs 1-2ms.
 //
 // The work is the same either way; this only moves it off the request path. It
-// runs at the end of the background reindex, where the index is known to exist
-// and no request is waiting, and it is bounded to NumCPU readers so that a
-// speculative warm-up cannot storm the filesystem while the editor is starting.
+// starts as soon as the index has the modules: at the start of a background
+// pass when the index already exists (an entry is checked against the file's
+// mtime when it is read, so an index that the pass then updates is safe to
+// read), and right after a cold build commits. A request that needs every
+// entry while it runs waits for it rather than parse the same files again. It
+// runs once more at the end of the pass, where it only checks mtimes. It is
+// bounded to NumCPU readers so that a speculative warm-up cannot storm the
+// filesystem while the editor is starting.
 //
 // Nothing here is required for correctness. Entries are validated against file
 // mtime when they are read, so a warmed entry that goes stale is simply
 // re-parsed, and a file that cannot be read is skipped exactly as it would be
 // on the request path.
 func (s *Server) warmUsingCache() {
+	end, ok := s.usingCache.beginWarm()
+	if !ok {
+		s.usingCache.waitWarm()
+		return
+	}
+	defer end()
+	s.fillUsingCache()
+}
+
+// fillUsingCache is the work of warmUsingCache. The caller holds the warm-up
+// mark of the cache (beginWarm).
+func (s *Server) fillUsingCache() {
 	usingModules, err := s.store.LookupUsingModules()
 	if err != nil || len(usingModules) == 0 {
 		return
@@ -759,6 +951,12 @@ func (s *Server) pruneMissingFiles(seen map[string]struct{}) error {
 
 	storedPaths, err := s.store.ListFilePaths()
 	if err != nil {
+		// A root that went away also fails the read: the pool opens a new
+		// connection by the index's path, which is gone with the root. Say
+		// that, not only that the pass is incomplete.
+		if rootErr := s.checkProjectRoot(); errors.Is(rootErr, ErrRootGone) {
+			return rootErr
+		}
 		return fmt.Errorf("%w: listing stored files: %v", ErrIncomplete, err)
 	}
 
@@ -1145,14 +1343,19 @@ func (s *Server) backgroundReindex() {
 // not be written and a later pass must write them.
 func (s *Server) startBackgroundReindex() <-chan error {
 	done := make(chan error, 1)
-	s.index.backgroundWork.Add(1)
+	if !s.index.backgroundWork.start() {
+		// The workspace is closing: the pass is canceled.
+		done <- nil
+		close(done)
+		return done
+	}
 	go func() {
 		var result error
 		defer func() {
 			done <- result
 			close(done)
 		}()
-		defer s.index.backgroundWork.Done()
+		defer s.index.backgroundWork.done()
 		s.index.reindexing.Lock()
 		defer s.index.reindexing.Unlock()
 		// Deferred last so it runs first: the locks above are released after
@@ -1179,6 +1382,9 @@ func (s *Server) startBackgroundReindex() <-chan error {
 		start := time.Now()
 		reindexed, failed := 0, 0
 		coldStart := s.store.IsEmpty()
+		if !coldStart {
+			s.startWarmUsingCache()
+		}
 		fullBuilt := false
 		var buildTask *notify.Task
 		progress := reconcileProgress{reporter: s.index.reporter}
@@ -1221,6 +1427,7 @@ func (s *Server) startBackgroundReindex() <-chan error {
 			default:
 				fullBuilt = true
 				reindexed = stats.Files
+				s.startWarmUsingCache()
 			}
 		}
 
@@ -1309,6 +1516,13 @@ func (s *Server) startBackgroundReindex() <-chan error {
 		// The index is in place now, so fill the __using__ cache before a user
 		// asks for it. See warmUsingCache.
 		s.warmUsingCache()
+
+		// A rebuild or a large prune leaves free pages in the index file. Only
+		// after a pass that worked: a pass that found the root gone or could
+		// not write must leave the index alone.
+		if result == nil {
+			s.startReclaimFreePages()
+		}
 
 		elapsed := time.Since(start).Round(time.Millisecond)
 		if failed > 0 {
@@ -3403,8 +3617,16 @@ func (s *Server) parseUsingFile(filePath, moduleName string) *usingCacheEntry {
 		}
 		text = scoped
 	}
-	imported, inlineDefs, transUses, transCalls, optBindings, aliases, derives, branchUses, optUses := parseUsingBodyDetailed(text)
+	var bothKinds bool
+	imported, inlineDefs, transUses, transCalls, optBindings, aliases, derives, branchUses, optUses := parseUsingBodyClause(text, false, &bothKinds)
+	var atomBody *usingBody
+	if bothKinds {
+		// `use Mod, :name` selects the other clause.
+		ai, ad, at, ac, ab, aa, adr, abu, aou := parseUsingBodyClause(text, true, nil)
+		atomBody = &usingBody{imports: ai, inlineDefs: ad, transUses: at, optUses: aou, transCalls: ac, optBindings: ab, aliases: aa, derives: adr, branchUses: abu}
+	}
 	return &usingCacheEntry{
+		atomBody: atomBody,
 		mtime:    info.ModTime().UnixNano(),
 		filePath: filePath,
 		usingBody: usingBody{
@@ -3489,8 +3711,12 @@ func (s *Server) lookupInUsingEntry(moduleName, functionName string, consumerOpt
 // literal atom; an atom that names no target injects nothing, because guessing
 // a target would merge unrelated blocks.
 func (e *usingCacheEntry) bodyFor(which string) *usingBody {
-	if e.dispatch != nil && which != "" {
-		return e.dispatch[which]
+	name, keyword := strings.CutPrefix(which, keywordDispatch)
+	if e.dispatch != nil && name != "" {
+		return e.dispatch[name]
+	}
+	if e.atomBody != nil && name != "" && !keyword {
+		return e.atomBody
 	}
 	return &e.usingBody
 }
@@ -3499,8 +3725,11 @@ func (e *usingCacheEntry) bodyFor(which string) *usingBody {
 // plus each atom-dispatch target. Used where the question is which modules
 // *could* inject a name, rather than which one a given `use` site selects.
 func (e *usingCacheEntry) bodies() []*usingBody {
-	out := make([]*usingBody, 0, 1+len(e.dispatch))
+	out := make([]*usingBody, 0, 2+len(e.dispatch))
 	out = append(out, &e.usingBody)
+	if e.atomBody != nil {
+		out = append(out, e.atomBody)
+	}
 	for _, b := range e.dispatch {
 		out = append(out, b)
 	}
@@ -3550,7 +3779,25 @@ func (s *Server) lookupThroughUseOfDetailed(fullModule, functionName string, fol
 			unknownUse, hasUnknown = store.LookupResult{FilePath: modResults[0].FilePath, Line: calls[i].line, Kind: "use"}, true
 		}
 	}
+	if hasUnknown && !s.unknownChainCanInject(functionName) {
+		// A name that no chain can inject, such as a typo, is not the
+		// use's.
+		return nil, store.LookupResult{}, false
+	}
 	return nil, unknownUse, hasUnknown
+}
+
+// unknownChainCanInject reports whether a use chain whose module Dexter cannot
+// read can inject name: a __using__ body of the workspace defines it, or a
+// module that one imports defines it as public. The names are cached for each
+// write generation of the store, so a request does not read the files again.
+func (s *Server) unknownChainCanInject(name string) bool {
+	names, imports := s.usingCache.injectable(s.store.WriteGeneration(), s.loadUsingEntries)
+	if names[name] {
+		return true
+	}
+	results, err := s.store.LookupFunctionInModules(imports, name, -1)
+	return err == nil && len(publicOnly(results)) > 0
 }
 
 // moduleUseCalls are the `use` calls of module in its file: a file can hold
@@ -3571,8 +3818,41 @@ func moduleUseCalls(fileText, module string) []UseCall {
 	return kept
 }
 
-func usingVisitKey(moduleName, which string) string {
-	return moduleName + "\x00" + which
+// usingVisitKey identifies one expansion of a __using__ body in a use-chain
+// walk. The options are part of it: Elixir expands a module again for each
+// use, and `use unquote(mod)` makes the body depend on them, so a second use
+// of the same module with other options can inject other code. Option values
+// come from the source, so the walk has a finite number of keys;
+// maxUseChainVisits bounds it on code that has very many.
+func usingVisitKey(moduleName, which string, opts map[string]string) string {
+	key := moduleName + "\x00" + which
+	if len(opts) == 0 {
+		return key
+	}
+	keys := slices.Sorted(maps.Keys(opts))
+	var b strings.Builder
+	b.WriteString(key)
+	for _, k := range keys {
+		b.WriteByte(0)
+		b.WriteString(k)
+		b.WriteByte('=')
+		b.WriteString(opts[k])
+	}
+	return b.String()
+}
+
+// maxUseChainVisits bounds the expansions of one use-chain walk. Real chains
+// have a few dozen; the bound only stops a pathological option fan-out.
+const maxUseChainVisits = 1024
+
+// beginUsingVisit marks the expansion of key as visited, and reports false
+// when it was visited already or the walk has reached maxUseChainVisits.
+func beginUsingVisit(visited map[string]bool, key string) bool {
+	if visited[key] || len(visited) >= maxUseChainVisits {
+		return false
+	}
+	visited[key] = true
+	return true
 }
 
 // lookupInUsingEntryFor is lookupInUsingEntry with the dispatch atom from the
@@ -3582,11 +3862,9 @@ func (s *Server) lookupInUsingEntryFor(moduleName, functionName, which string, c
 }
 
 func (s *Server) lookupInUsingEntryForWithFollow(moduleName, functionName, which string, consumerOpts map[string]string, visited map[string]bool, followDelegates bool) []store.LookupResult {
-	visitKey := usingVisitKey(moduleName, which)
-	if visited[visitKey] {
+	if !beginUsingVisit(visited, usingVisitKey(moduleName, which, consumerOpts)) {
 		return nil
 	}
-	visited[visitKey] = true
 
 	entry := s.cachedUsing(moduleName)
 	if entry == nil {
@@ -3680,11 +3958,9 @@ func (s *Server) resolveModuleViaUseChainWithOpts(moduleName, functionName strin
 // resolveModuleViaUseChainFor is resolveModuleViaUseChainWithOpts with the
 // dispatch atom from the `use` site (empty for an ordinary `use Module`).
 func (s *Server) resolveModuleViaUseChainFor(moduleName, functionName, which string, consumerOpts map[string]string, visited map[string]bool) string {
-	visitKey := usingVisitKey(moduleName, which)
-	if visited[visitKey] {
+	if !beginUsingVisit(visited, usingVisitKey(moduleName, which, consumerOpts)) {
 		return ""
 	}
-	visited[visitKey] = true
 
 	entry := s.cachedUsing(moduleName)
 	if entry == nil {
@@ -3753,6 +4029,7 @@ type usingEntryRef struct {
 // mtime validation (and a file read on a cache miss), so the wall-clock cost
 // is dominated by I/O rather than parsing.
 func (s *Server) loadUsingEntries() []usingEntryRef {
+	s.usingCache.waitWarm()
 	usingModules, err := s.store.LookupUsingModules()
 	if err != nil {
 		return nil
@@ -3966,12 +4243,13 @@ func (s *Server) findInjectedAliasesFor(targetModule string, targetRefs []store.
 		return nil
 	}
 
+	graph := s.optionInjectorGraph()
 	result := make([]injectedAlias, 0, len(direct))
 	for k, injectors := range direct {
 		result = append(result, injectedAlias{
 			shortName: k.shortName,
 			module:    k.module,
-			injectors: s.closeOverInjectors(injectors, usingByFile),
+			injectors: s.closeOverInjectors(injectors, usingByFile, graph),
 		})
 	}
 	return result
@@ -3979,13 +4257,15 @@ func (s *Server) findInjectedAliasesFor(targetModule string, targetRefs []store.
 
 // usingInjectsAlias reports whether the body selected by a concrete use call
 // injects the requested alias, directly or through another use. Dispatch is
-// significant: aliases from `:controller` must not leak into `:channel`.
-func (s *Server) usingInjectsAlias(module, which, targetModule, written, resolved string, visited map[string]bool) bool {
-	visitKey := usingVisitKey(module, which)
-	if visited[visitKey] {
+// significant: aliases from `:controller` must not leak into `:channel`. The
+// options follow the chain as for a definition (consumerOpts are the ones
+// this use gets): `use unquote(mod)` uses the module that the options name.
+// When a chain reads an option that Dexter cannot know, every module that the
+// body's option edits can put counts, as the use-chain graph has them.
+func (s *Server) usingInjectsAlias(module, which string, consumerOpts map[string]string, targetModule, written, resolved string, visited map[string]bool) bool {
+	if !beginUsingVisit(visited, usingVisitKey(module, which, consumerOpts)) {
 		return false
 	}
-	visited[visitKey] = true
 
 	entry := s.cachedUsing(module)
 	if entry == nil {
@@ -4001,20 +4281,34 @@ func (s *Server) usingInjectsAlias(module, which, targetModule, written, resolve
 			return true
 		}
 	}
-	for i := len(body.transCalls) - 1; i >= 0; i-- {
-		call := body.transCalls[i]
-		if s.usingInjectsAlias(call.Module, call.dispatchAtom(), targetModule, written, resolved, visited) {
+	unknown := false
+	for _, b := range body.optBindings {
+		if b.kind != "use" {
+			continue
+		}
+		if bindingUnknown(b, consumerOpts) {
+			unknown = true
+			continue
+		}
+		if mod, ok := bindingModule(b, consumerOpts); ok && s.usingInjectsAlias(mod, "", bindingOpts(b, consumerOpts), targetModule, written, resolved, visited) {
 			return true
 		}
 	}
-	// The modules that option edits put count too: this walk lists where an
-	// alias can come from, for references, as closeOverInjectors does.
-	uses := body.graphUses()
+	for i := len(body.transCalls) - 1; i >= 0; i-- {
+		call := body.transCalls[i]
+		if s.usingInjectsAlias(call.Module, call.dispatchAtom(), callOpts(call, consumerOpts), targetModule, written, resolved, visited) {
+			return true
+		}
+	}
+	uses := body.transUses
+	if unknown {
+		uses = body.graphUses()
+	}
 	for i := len(uses) - 1; i >= 0; i-- {
 		if body.hasTransCall(uses[i]) {
 			continue
 		}
-		if s.usingInjectsAlias(uses[i], "", targetModule, written, resolved, visited) {
+		if s.usingInjectsAlias(uses[i], "", nil, targetModule, written, resolved, visited) {
 			return true
 		}
 	}
@@ -4127,7 +4421,7 @@ func (s *Server) usingModulesByFile() map[string][]string {
 // uses an injector passes the injected alias on to its own users. Candidates
 // come from the index — the `use` sites of each injector — so this costs one
 // indexed query per injector rather than a scan of every __using__ body.
-func (s *Server) closeOverInjectors(direct []string, usingByFile map[string][]string) []string {
+func (s *Server) closeOverInjectors(direct []string, usingByFile map[string][]string, graph optionInjectors) []string {
 	seen := make(map[string]bool, len(direct))
 	all := make([]string, 0, len(direct))
 	queue := make([]string, 0, len(direct))
@@ -4139,9 +4433,20 @@ func (s *Server) closeOverInjectors(direct []string, usingByFile map[string][]st
 		}
 	}
 
+	add := func(mod string) {
+		if !seen[mod] {
+			seen[mod] = true
+			all = append(all, mod)
+			queue = append(queue, mod)
+		}
+	}
 	for len(queue) > 0 {
 		current := queue[0]
 		queue = queue[1:]
+
+		for _, mod := range graph.users[current] {
+			add(mod)
+		}
 
 		refs, err := s.store.LookupReferences(current, "")
 		if err != nil {
@@ -4149,6 +4454,9 @@ func (s *Server) closeOverInjectors(direct []string, usingByFile map[string][]st
 		}
 		for _, r := range refs {
 			if r.Kind != "use" {
+				for _, mod := range graph.openUsers[r.FilePath] {
+					add(mod)
+				}
 				continue
 			}
 			for _, mod := range usingByFile[r.FilePath] {
@@ -4185,6 +4493,98 @@ func (s *Server) closeOverInjectors(direct []string, usingByFile map[string][]st
 	}
 
 	return all
+}
+
+// optionInjectors are the use-chain edges that the index has no use reference
+// for. A wrapper can name an injector in an option edit (`Keyword.put_new(opts,
+// :base, Injector)`) or as the default of `use unquote(mod)`: users maps the
+// injector to those wrappers. And a wrapper with `use unquote(mod)` (or one
+// that passes its options on to such a wrapper) is open: it uses whatever
+// module its caller's options name. It is a candidate for an injector that a
+// file with a use of it names, and the check of each use site
+// (usingInjectsAlias, with that caller's options) keeps only the right ones.
+type optionInjectors struct {
+	// openUsers maps a file to the open wrappers that it uses: in such a
+	// file, a reference to a module (`use Wrapper, base: Injector`) can
+	// select that module.
+	openUsers map[string][]string
+	users     map[string][]string
+}
+
+type optionInjectorCache struct {
+	mu    sync.Mutex
+	gen   uint64
+	valid bool
+	graph optionInjectors
+}
+
+// optionInjectorGraph reads the optionInjectors from the parsed __using__
+// bodies, once for each index generation.
+func (s *Server) optionInjectorGraph() optionInjectors {
+	c := &s.index.optionInjectors
+	gen := s.store.WriteGeneration()
+	c.mu.Lock()
+	if c.valid && c.gen == gen {
+		g := c.graph
+		c.mu.Unlock()
+		return g
+	}
+	c.mu.Unlock()
+	g := s.buildOptionInjectorGraph()
+	c.mu.Lock()
+	c.graph, c.gen, c.valid = g, gen, true
+	c.mu.Unlock()
+	return g
+}
+
+func (s *Server) buildOptionInjectorGraph() optionInjectors {
+	g := optionInjectors{users: make(map[string][]string), openUsers: make(map[string][]string)}
+	entries := s.loadUsingEntries()
+	open := make(map[string]bool)
+	for _, e := range entries {
+		for _, body := range e.entry.bodies() {
+			for _, m := range body.optUses {
+				g.users[m] = append(g.users[m], e.module)
+			}
+			for _, b := range body.optBindings {
+				if b.kind != "use" {
+					continue
+				}
+				open[e.module] = true
+				if b.defaultMod != "" && b.defaultMod != unknownOpt {
+					g.users[b.defaultMod] = append(g.users[b.defaultMod], e.module)
+				}
+			}
+		}
+	}
+	// A wrapper that passes its options on to an open one is open too.
+	for changed := true; changed; {
+		changed = false
+		for _, e := range entries {
+			if open[e.module] {
+				continue
+			}
+			for _, body := range e.entry.bodies() {
+				for _, c := range body.transCalls {
+					if c.forwardOpts && open[c.Module] {
+						open[e.module], changed = true, true
+					}
+				}
+			}
+		}
+	}
+	for mod := range open {
+		refs, err := s.store.LookupReferences(mod, "")
+		if err != nil {
+			continue
+		}
+		for _, r := range refs {
+			if r.Kind == "use" && !slices.Contains(g.openUsers[r.FilePath], mod) {
+				g.openUsers[r.FilePath] = append(g.openUsers[r.FilePath], mod)
+			}
+		}
+	}
+	return g
 }
 
 // injectedAliasRefs returns indexed references that name targetModule, or a
@@ -4395,7 +4795,7 @@ func (s *Server) injectedAliasRefs(targetModule, functionName string, targetRefs
 							continue
 						}
 						for _, call := range useCallsAt(r.FilePath, r.Line) {
-							if resolvedUseModule(tf, call, inj) != inj || call.local || !s.usingInjectsAlias(inj, call.dispatchAtom(), targetModule, ia.shortName, ia.module, make(map[string]bool)) {
+							if resolvedUseModule(tf, call, inj) != inj || call.local || !s.usingInjectsAlias(inj, call.dispatchAtom(), call.Opts, targetModule, ia.shortName, ia.module, make(map[string]bool)) {
 								continue
 							}
 							sites = append(sites, useSite{r.FilePath, r.Line, call.token, lexicalScopeAt(tf, r.Line, call.token)})
@@ -4515,11 +4915,9 @@ func (s *Server) injectedAliasReferences(fullModule, functionName string, module
 // addCompletionsFromUsing adds completion items injected by a module's __using__
 // body — inline defs, imported functions, and transitive uses — into items.
 func (s *Server) addCompletionsFromUsingFor(moduleName, which string, consumerOpts map[string]string, funcPrefix string, seen map[string]bool, items *[]protocol.CompletionItem, visited map[string]bool, inPipe bool, useSnippets bool) {
-	visitKey := usingVisitKey(moduleName, which)
-	if visited[visitKey] {
+	if !beginUsingVisit(visited, usingVisitKey(moduleName, which, consumerOpts)) {
 		return
 	}
-	visited[visitKey] = true
 
 	entry := s.cachedUsing(moduleName)
 	if entry == nil {
@@ -4728,11 +5126,9 @@ func (s *Server) mergeAliasesFromUseCalls(useCalls []UseCall, aliases map[string
 }
 
 func (s *Server) mergeAliasesFromUsingEntryFor(moduleName, which string, consumerOpts map[string]string, aliases map[string]string, visited map[string]bool) {
-	visitKey := usingVisitKey(moduleName, which)
-	if visited[visitKey] {
+	if !beginUsingVisit(visited, usingVisitKey(moduleName, which, consumerOpts)) {
 		return
 	}
-	visited[visitKey] = true
 
 	entry := s.cachedUsing(moduleName)
 	if entry == nil {
@@ -5205,11 +5601,9 @@ func (s *Server) findCallbacksViaUseChain(text, functionName string, arity int, 
 }
 
 func (s *Server) collectCallbacksInChainFor(moduleName, which, functionName string, arity int, visited map[string]bool, results *[]store.CallbackResult) {
-	visitKey := usingVisitKey(moduleName, which)
-	if visited[visitKey] {
+	if !beginUsingVisit(visited, usingVisitKey(moduleName, which, nil)) {
 		return
 	}
-	visited[visitKey] = true
 
 	if callbacks, err := s.store.LookupCallbackDef(moduleName, functionName); err == nil {
 		for _, cb := range callbacks {
@@ -6875,6 +7269,7 @@ func (s *Server) planFunctionRename(module, functionName, newName string, reques
 		return nil, plan.err
 	}
 	family.notifyDynamicCalls(s, source)
+	family.notifyApplyCalls(s, source)
 
 	// Update defdelegate lines that forward to this function: add or update
 	// the `as:` option so the facade keeps working after the rename. The
@@ -8932,9 +9327,14 @@ func (s *Server) reindexAfterRename(removePaths, diskPaths []string, textPaths [
 	done := make(chan struct{})
 	// The caller holds renameSerial (see beginRename).
 	s.index.lastRenameIndexed = done
-	s.index.backgroundWork.Add(1)
+	if !s.index.backgroundWork.start() {
+		// The workspace is closing: the next start finds the renamed files
+		// changed and indexes them.
+		close(done)
+		return done
+	}
 	go func() {
-		defer s.index.backgroundWork.Done()
+		defer s.index.backgroundWork.done()
 		defer close(done)
 		// Deferred after close(done), so it runs first; the locks are
 		// released in writeAfterRename before it.

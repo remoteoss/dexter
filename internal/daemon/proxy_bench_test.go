@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -68,6 +69,23 @@ func (e *lspEditor) send(message map[string]any) {
 	e.wmu.Unlock()
 	if err != nil {
 		e.tb.Fatal(err)
+	}
+}
+
+// answer answers a server request with a null result. It runs on its own
+// goroutine, so it must not call Fatal, and a test can end while it is on
+// its way: a write to a connection that the test closed is not a failure.
+func (e *lspEditor) answer(rawID any) {
+	body, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": rawID, "result": nil})
+	if err != nil {
+		e.tb.Errorf("answer to a server request: %v", err)
+		return
+	}
+	e.wmu.Lock()
+	_, err = fmt.Fprintf(e.w, "Content-Length: %d\r\n\r\n%s", len(body), body)
+	e.wmu.Unlock()
+	if err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.ErrClosedPipe) {
+		e.tb.Errorf("answer to a server request: %v", err)
 	}
 }
 
@@ -139,7 +157,7 @@ func (e *lspEditor) handle(message map[string]any) bool {
 	if rawID, hasID := message["id"]; hasID {
 		// From another goroutine: the caller may be the only reader while a
 		// writer waits for the other side to read.
-		go e.send(map[string]any{"id": rawID, "result": nil})
+		go e.answer(rawID)
 		return true
 	}
 	e.mu.Lock()

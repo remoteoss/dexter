@@ -685,12 +685,20 @@ func (s *Server) commitDisk(txn *diskTxn, requester renameRequester) (*commitRes
 		return nil, err
 	}
 	res.report(s.index.renameReport, txn)
-	s.index.backgroundWork.Add(1)
-	go func() {
-		defer s.index.backgroundWork.Done()
-		defer s.index.reporter.Recover("request", "the removal of rename backups")
-		txn.removeBackups()
-	}()
+	if s.index.backgroundWork.start() {
+		go func() {
+			defer s.index.backgroundWork.done()
+			defer s.index.reporter.Recover("request", "the removal of rename backups")
+			txn.removeBackups()
+		}()
+	} else {
+		// The workspace is closing and waits for no new work: remove them
+		// here.
+		func() {
+			defer s.index.reporter.Recover("request", "the removal of rename backups")
+			txn.removeBackups()
+		}()
+	}
 	if res.rolledBack != "" && len(res.changed) == 0 {
 		return nil, s.renameRefusal(fmt.Sprintf(
 			"Dexter: the rename was not applied, because Dexter could not replace %s (%s). The files it had already replaced were restored; no file was changed.",

@@ -5,6 +5,7 @@ import (
 	"os"
 	"slices"
 	"sort"
+	"strings"
 
 	"github.com/remoteoss/dexter/internal/notify"
 	"github.com/remoteoss/dexter/internal/parser"
@@ -331,6 +332,118 @@ func (f *renameFamilyInfo) notifyDynamicCalls(s *Server, source func(string) *pa
 	s.renameNotify(notify.Warning, fmt.Sprintf(
 		"Dexter: the rename did not change %d calls through a variable that can call the callback %s.%s (Dexter cannot know the module the variable holds): %s. Check them.",
 		len(found), f.behaviour, f.name, notify.Summarize(found)))
+}
+
+// notifyApplyCalls warns about the calls that name the function with an atom,
+// `apply(Mod, :name, args)`, which the rename does not change: Dexter does not
+// rename atoms (an atom can name other things), so the user checks them.
+// Only the files that refer to a family module, or define one, can hold them.
+func (f *renameFamilyInfo) notifyApplyCalls(s *Server, source func(string) *parsedSource) {
+	files := map[string]bool{}
+	for _, m := range f.modules {
+		if refs, err := s.store.LookupReferences(m, ""); err == nil {
+			for _, r := range refs {
+				files[r.FilePath] = true
+			}
+		}
+		if defs, err := s.store.LookupModule(m); err == nil {
+			for _, d := range defs {
+				files[d.FilePath] = true
+			}
+		}
+	}
+	var found []string
+	for file := range files {
+		if s.isStdlibPath(file) || s.isDepsFile(file) {
+			continue
+		}
+		if p := source(file); p != nil {
+			for _, line := range applyCalls(p, f.name, f.modules) {
+				found = append(found, fmt.Sprintf("%s:%d", s.displayPath(file), line))
+			}
+		}
+	}
+	if len(found) == 0 {
+		return
+	}
+	sort.Strings(found)
+	s.renameNotify(notify.Warning, fmt.Sprintf(
+		"Dexter: the rename did not change %d calls that name %s with the atom :%s (such as apply/3): %s. Check them.",
+		len(found), f.name, f.name, notify.Summarize(found)))
+}
+
+// applyCalls returns the lines of `apply(Mod, :name, args)` (also
+// `Kernel.apply` and `:erlang.apply`) whose module can be one of modules: a
+// name that is one of them or ends like one (an alias), `__MODULE__` in one of
+// them, or a value Dexter cannot know (a variable or an attribute).
+func applyCalls(p *parsedSource, name string, modules []string) []int {
+	var lines []int
+	toks := p.tokens
+	isFamily := func(mod string) bool {
+		for _, m := range modules {
+			if m == mod || strings.HasSuffix(m, "."+mod) {
+				return true
+			}
+		}
+		return false
+	}
+	for i := 0; i+1 < len(toks); i++ {
+		if toks[i].Kind != parser.TokIdent || parser.TokenText(p.src, toks[i]) != "apply" || toks[i+1].Kind != parser.TokOpenParen {
+			continue
+		}
+		if i > 0 && toks[i-1].Kind == parser.TokDot {
+			if i < 2 || (parser.TokenText(p.src, toks[i-2]) != "Kernel" && parser.TokenText(p.src, toks[i-2]) != ":erlang") {
+				continue
+			}
+		}
+		// The first argument, up to its comma at the top level.
+		j, depth := i+2, 0
+		var first []parser.Token
+		for ; j < len(toks); j++ {
+			k := toks[j].Kind
+			if depth == 0 && (k == parser.TokComma || k == parser.TokCloseParen) {
+				break
+			}
+			switch k {
+			case parser.TokOpenParen, parser.TokOpenBracket, parser.TokOpenBrace:
+				depth++
+			case parser.TokCloseParen, parser.TokCloseBracket, parser.TokCloseBrace:
+				depth--
+			}
+			if k != parser.TokEOL && k != parser.TokComment {
+				first = append(first, toks[j])
+			}
+		}
+		if j >= len(toks) || toks[j].Kind != parser.TokComma {
+			continue
+		}
+		atom := parser.NextSigToken(toks, len(toks), j+1)
+		if atom >= len(toks) || toks[atom].Kind != parser.TokAtom || parser.TokenText(p.src, toks[atom]) != ":"+name {
+			continue
+		}
+		var mod strings.Builder
+		unknown := false
+		for _, t := range first {
+			switch t.Kind {
+			case parser.TokModule, parser.TokDot:
+				mod.WriteString(parser.TokenText(p.src, t))
+			default:
+				unknown = true
+			}
+		}
+		text := mod.String()
+		switch {
+		case len(first) == 1 && first[0].Kind == parser.TokModule && text == "__MODULE__":
+			if isFamily(p.moduleAt(toks[i].Line)) {
+				lines = append(lines, toks[i].Line)
+			}
+		case unknown || text == "":
+			lines = append(lines, toks[i].Line)
+		case isFamily(text):
+			lines = append(lines, toks[i].Line)
+		}
+	}
+	return lines
 }
 
 // keywordListLines returns the lines of the `name:` keys in the keyword
