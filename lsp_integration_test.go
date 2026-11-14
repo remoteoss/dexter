@@ -88,7 +88,7 @@ func TestLSP_WarnsOnNonProjectRoot(t *testing.T) {
 	}
 	defer client.Close()
 
-	shown, err := client.WaitShown("does not look like an Elixir project", 10*time.Second)
+	shown, err := client.WaitShown("is probably not an Elixir project", 10*time.Second)
 	if err != nil {
 		t.Fatalf("serving a non-project root showed no warning: %v\n%s", err, stderr.String())
 	}

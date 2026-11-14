@@ -113,7 +113,7 @@ func FindProjectRoot(path string, extraMarkers ...string) string {
 	for _, marker := range markers {
 		dir := path
 		for {
-			if validProjectMarker(filepath.Join(dir, marker), marker) {
+			if validProjectMarker(filepath.Join(dir, marker), marker) && (!isIndexMarker(marker) || LooksLikeProject(dir)) {
 				return dir
 			}
 			if parser.IsLinkedWorktree(dir) {
@@ -127,6 +127,14 @@ func FindProjectRoot(path string, extraMarkers ...string) string {
 		}
 	}
 	return path
+}
+
+// isIndexMarker reports whether marker is a Dexter database. A database is a
+// workspace only where the directory also looks like a project (see
+// LooksLikeProject); a database that a frontend made in a parent of many
+// projects is skipped.
+func isIndexMarker(marker string) bool {
+	return marker == filepath.Join(".dexter", "dexter.db") || marker == ".dexter.db"
 }
 
 func validProjectMarker(path, marker string) bool {

@@ -22,7 +22,7 @@ const (
 // the index.
 func reportRoot(root string, reporter *notify.Reporter) {
 	if store.IsHomeDir(root) {
-		if store.HasIndex(root) {
+		if store.HasIndex(root) && store.ChosenRoot(root) {
 			return
 		}
 		reporter.Set(condRoot, notify.Warning, fmt.Sprintf(
@@ -33,7 +33,7 @@ func reportRoot(root string, reporter *notify.Reporter) {
 		return
 	}
 	reporter.Set(condRoot, notify.Warning, fmt.Sprintf(
-		"Dexter: %s does not look like an Elixir project (no mix.exs, .git, or Dexter database). Dexter indexes it anyway. If it is the wrong directory, open the project directory instead, or set --root <path> in the dexter command of the editor.", root))
+		"Dexter: %s has no mix.exs or .git, so it is probably not an Elixir project. Dexter indexes every file below it, which can be slow. Open the project directory, or set --root <path> in the editor's dexter command. To use this directory anyway, run `dexter init -y` in it.", root))
 }
 
 // damagedIndexMessage explains an index that was damaged and was deleted for

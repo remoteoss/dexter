@@ -1302,15 +1302,51 @@ func TestFindProjectRoot(t *testing.T) {
 	}
 
 	t.Run("new layout at root", func(t *testing.T) {
-		root := mktree(t, []string{".dexter/dexter.db", "apps/app/lib/foo.ex"})
+		root := mktree(t, []string{".dexter/dexter.db", ".dexter/" + chosenRootFile, "apps/app/lib/foo.ex"})
 		got := FindProjectRoot(filepath.Join(root, "apps", "app"))
 		if got != root {
 			t.Errorf("got %q, want %q", got, root)
 		}
 	})
 
+	// A database alone does not make a workspace: one that a frontend made
+	// in a parent of many projects is skipped for the nearer repository.
+	t.Run("index without project signs is skipped", func(t *testing.T) {
+		parent := mktree(t, []string{".dexter/dexter.db", "proj/.git/HEAD", "proj/lib/foo.ex"})
+		got := FindProjectRoot(filepath.Join(parent, "proj", "lib"))
+		if want := filepath.Join(parent, "proj"); got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+		if LooksLikeProject(parent) || NonProjectRootError(parent) == nil {
+			t.Errorf("a directory with only an index looks like a project")
+		}
+	})
+
+	t.Run("index in a repository is used", func(t *testing.T) {
+		root := mktree(t, []string{".dexter/dexter.db", ".git/HEAD", "apps/app/mix.exs", "apps/app/lib/foo.ex"})
+		if got := FindProjectRoot(filepath.Join(root, "apps", "app")); got != root {
+			t.Errorf("got %q, want %q", got, root)
+		}
+	})
+
+	t.Run("a chosen root needs no -y again", func(t *testing.T) {
+		root := mktree(t, []string{"lib/foo.ex"})
+		if NonProjectRootError(root) == nil {
+			t.Fatal("a plain directory is a project")
+		}
+		if err := MarkChosenRoot(root); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(DBPath(root), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := NonProjectRootError(root); err != nil {
+			t.Errorf("a chosen root with an index is refused: %v", err)
+		}
+	})
+
 	t.Run("legacy file at root", func(t *testing.T) {
-		root := mktree(t, []string{".dexter.db", "apps/app/lib/foo.ex"})
+		root := mktree(t, []string{".dexter.db", ".dexter/" + chosenRootFile, "apps/app/lib/foo.ex"})
 		got := FindProjectRoot(filepath.Join(root, "apps", "app"))
 		if got != root {
 			t.Errorf("got %q, want %q", got, root)
@@ -1377,7 +1413,7 @@ func TestFindProjectRoot(t *testing.T) {
 		// Walking up from the subdir must return the repo root (matching
 		// .dexter/dexter.db first), not the subdir — a reversed priority
 		// would incorrectly match the closer .dexter.db.
-		root := mktree(t, []string{".dexter/dexter.db", "apps/app/.dexter.db"})
+		root := mktree(t, []string{".dexter/dexter.db", ".git/HEAD", "apps/app/.dexter.db"})
 		cwd := filepath.Join(root, "apps", "app")
 		got := FindProjectRoot(cwd)
 		if got != root {

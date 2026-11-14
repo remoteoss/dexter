@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"go.lsp.dev/protocol"
@@ -131,5 +132,48 @@ func TestDaemonSessionRejectsNestedSymlinkedEditorRoot(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("daemon session accepted a nested symlink workspace spelling")
+	}
+}
+
+// An editor whose workspace folder is above the project (an editor root
+// marker that found a parent directory) gets the project; a folder outside
+// the project is refused with a message that says what to do.
+func TestDaemonSessionEditorRootAboveTheProject(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "work", "proj")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	session := func() *Server {
+		return NewServerWithOptions(s, root, ServerOptions{
+			Index:  NewIndexCoordinator(),
+			Events: &recordingWorkspaceEvents{reconciled: make(chan string, 8), removed: make(chan string, 8)},
+		})
+	}
+	initialize := func(server *Server, folder string) error {
+		_, err := server.Initialize(context.Background(), &protocol.InitializeParams{
+			WorkspaceFolders: []protocol.WorkspaceFolder{{URI: string(uri.File(folder)), Name: filepath.Base(folder)}},
+		})
+		return err
+	}
+	server := session()
+	if err := initialize(server, parent); err != nil {
+		t.Fatalf("an editor folder above the project: %v", err)
+	}
+	if server.projectRoot != root {
+		t.Errorf("project root = %s, want %s", server.projectRoot, root)
+	}
+	other := filepath.Join(parent, "other")
+	if err := os.MkdirAll(other, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	err = initialize(session(), other)
+	if err == nil || !strings.Contains(err.Error(), "is not inside the project") || !strings.Contains(err.Error(), "Set the editor's root for Dexter to "+root) {
+		t.Errorf("an editor folder outside the project: %v", err)
 	}
 }

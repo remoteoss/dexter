@@ -10,13 +10,36 @@ import (
 )
 
 // LooksLikeProject reports whether dir shows the cheap signs of a Dexter
-// workspace: a mix.exs, a .git, or a Dexter database. They match what
-// FindProjectRoot trusts, and a Dexter marker means an actual database, not an
-// empty directory left by an interrupted operation.
+// workspace: a mix.exs, a .git, or a Dexter database that a user chose to make
+// there (ChosenRoot). They match what FindProjectRoot trusts. A database
+// alone is not a sign: any frontend that was started in a directory makes
+// one, and a database that a frontend made in the wrong directory (a parent
+// of many projects) would then make that directory the workspace of every
+// later session below it.
 func LooksLikeProject(dir string) bool {
 	return regularFile(filepath.Join(dir, "mix.exs")) ||
 		gitMarker(filepath.Join(dir, ".git")) ||
-		HasIndex(dir)
+		(HasIndex(dir) && ChosenRoot(dir))
+}
+
+// chosenRootFile, in the .dexter directory, records that the user chose to
+// index a directory that does not look like a project (`dexter init -y`).
+const chosenRootFile = "chosen-root"
+
+// ChosenRoot reports whether the user chose dir as a workspace although it
+// does not look like a project. See MarkChosenRoot.
+func ChosenRoot(dir string) bool {
+	return regularFile(filepath.Join(DBDir(dir), chosenRootFile))
+}
+
+// MarkChosenRoot records that the user chose dir as a workspace (-y/--yes),
+// so that later sessions there, and in directories below it, use it without
+// -y.
+func MarkChosenRoot(dir string) error {
+	if err := os.MkdirAll(DBDir(dir), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(DBDir(dir), chosenRootFile), []byte("This directory was chosen as a Dexter workspace with -y/--yes.\n"), 0o644)
 }
 
 // HasIndex reports whether dir holds a Dexter database.
@@ -58,7 +81,7 @@ func gitMarker(path string) bool {
 // read every file under it.
 func NonProjectRootError(dir string) error {
 	if IsHomeDir(dir) {
-		if HasIndex(dir) {
+		if HasIndex(dir) && ChosenRoot(dir) {
 			return nil
 		}
 		return fmt.Errorf("refusing to use %s as a workspace: it is your home directory, not a project", dir)
@@ -66,7 +89,7 @@ func NonProjectRootError(dir string) error {
 	if LooksLikeProject(dir) {
 		return nil
 	}
-	return fmt.Errorf("refusing to use %s as a workspace: no mix.exs, .git, or Dexter database found, so it does not look like an Elixir project", dir)
+	return fmt.Errorf("refusing to use %s as a workspace: no mix.exs or .git found, so it does not look like an Elixir project", dir)
 }
 
 // containerScanDepth and containerScanDirs bound IsProjectContainer. A Mix
