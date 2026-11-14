@@ -2,49 +2,227 @@ package store
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/remoteoss/dexter/internal/parser"
 )
 
-// LooksLikeProject reports whether dir shows the cheap signs of a Dexter
-// workspace: a mix.exs, a .git, or a Dexter database that a user chose to make
-// there (ChosenRoot). They match what FindProjectRoot trusts. A database
-// alone is not a sign: any frontend that was started in a directory makes
-// one, and a database that a frontend made in the wrong directory (a parent
-// of many projects) would then make that directory the workspace of every
-// later session below it.
-func LooksLikeProject(dir string) bool {
-	return regularFile(filepath.Join(dir, "mix.exs")) ||
-		gitMarker(filepath.Join(dir, ".git")) ||
-		(HasIndex(dir) && ChosenRoot(dir))
+// The project root rule. Every frontend (the CLI, the LSP proxy and server,
+// MCP) finds the workspace of a path with ResolveRoot, so one directory
+// always gets one daemon and one index:
+//
+//  1. The repository of a path is the nearest directory above it that is a
+//     clone (it holds a .git directory) or a linked worktree. A submodule (a
+//     .git file that is not a linked worktree) belongs to the repository
+//     that holds it, and a file in deps, _build, or node_modules belongs to
+//     the project that holds that directory. The home directory is never a
+//     repository: a dotfiles repository there is not a project.
+//  2. A repository with a Mix project of its own (a mix.exs at its root, or
+//     below it but not in a nested repository) is one project: a normal
+//     project, an umbrella, or a monorepo. A repository that only holds
+//     other repositories with Mix projects is a container: each repository
+//     in it is a project, and the container has no index of its own.
+//  3. With no repository, the outermost mix.exs below the home directory is
+//     the project (an umbrella that is not in git).
+//
+// A Dexter index does not make a project: one that a frontend made in the
+// wrong directory (a parent of many projects) would otherwise make that
+// directory the workspace of every later session below it. An index in a
+// directory above the root that this rule picks is never used (see
+// StrayIndexesAbove).
+
+// RootKind is what ResolveRoot found.
+type RootKind int
+
+const (
+	// NotAProject: no repository and no mix.exs. Root.Dir is the start
+	// directory; a frontend uses it only when the user insists (-y).
+	NotAProject RootKind = iota
+	// OneProject: Root.Dir is a project with one index.
+	OneProject
+	// Container: Root.Dir only holds other projects (see ContainerProjects).
+	Container
+)
+
+// Root is the workspace of a path.
+type Root struct {
+	Dir  string
+	Kind RootKind
 }
 
-// chosenRootFile, in the .dexter directory, records that the user chose to
-// index a directory that does not look like a project (`dexter init -y`).
-const chosenRootFile = "chosen-root"
-
-// ChosenRoot reports whether the user chose dir as a workspace although it
-// does not look like a project. See MarkChosenRoot.
-func ChosenRoot(dir string) bool {
-	return regularFile(filepath.Join(DBDir(dir), chosenRootFile))
-}
-
-// MarkChosenRoot records that the user chose dir as a workspace (-y/--yes),
-// so that later sessions there, and in directories below it, use it without
-// -y.
-func MarkChosenRoot(dir string) error {
-	if err := os.MkdirAll(DBDir(dir), 0o755); err != nil {
-		return err
+// ResolveRoot returns the workspace of path, a file or a directory. See the
+// project root rule above.
+func ResolveRoot(path string) Root {
+	dir := filepath.Clean(path)
+	if info, err := os.Stat(dir); err == nil && !info.IsDir() {
+		dir = filepath.Dir(dir)
 	}
-	return os.WriteFile(filepath.Join(DBDir(dir), chosenRootFile), []byte("This directory was chosen as a Dexter workspace with -y/--yes.\n"), 0o644)
+	dir = ownerOfDependencies(dir)
+	home := homeDir()
+	var gitFile, mixDir string
+	for d := dir; ; {
+		if home != "" && d == home {
+			break
+		}
+		if isNestedProject(d) {
+			if !repoHasOwnMixProject(d) && IsProjectContainer(d) {
+				return Root{Dir: d, Kind: Container}
+			}
+			return Root{Dir: d, Kind: OneProject}
+		}
+		if gitFile == "" && regularFile(filepath.Join(d, ".git")) {
+			gitFile = d // a submodule outside a clone, or a worktree whose admin directory is gone
+		}
+		if regularFile(filepath.Join(d, "mix.exs")) {
+			mixDir = d
+		}
+		parent := filepath.Dir(d)
+		if parent == d {
+			break
+		}
+		d = parent
+	}
+	switch {
+	case gitFile != "":
+		return Root{Dir: gitFile, Kind: OneProject}
+	case mixDir != "":
+		return Root{Dir: mixDir, Kind: OneProject}
+	}
+	return Root{Dir: dir, Kind: NotAProject}
+}
+
+// FindProjectRoot returns the directory of ResolveRoot: the project root of
+// path, the container that holds it, or path itself when it is in no
+// project.
+func FindProjectRoot(path string) string {
+	return ResolveRoot(path).Dir
+}
+
+func homeDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	return filepath.Clean(home)
+}
+
+// ownerOfDependencies returns the project directory that holds dir when dir is
+// in a dependency or build directory of it (deps, _build, or node_modules next
+// to a mix.exs, a package.json, or a .git), or dir. The outermost one wins: a
+// dependency's own deps belong to the same project.
+func ownerOfDependencies(dir string) string {
+	owner := dir
+	for d := dir; ; {
+		parent := filepath.Dir(d)
+		if parent == d {
+			return owner
+		}
+		if isDependencyDir(d) {
+			owner = parent
+		}
+		d = parent
+	}
+}
+
+func isDependencyDir(d string) bool {
+	switch filepath.Base(d) {
+	case "deps", "_build", "node_modules":
+		parent := filepath.Dir(d)
+		return regularFile(filepath.Join(parent, "mix.exs")) ||
+			regularFile(filepath.Join(parent, "package.json")) ||
+			gitMarker(filepath.Join(parent, ".git"))
+	}
+	return false
+}
+
+// LooksLikeProject reports whether dir shows the cheap signs of a workspace
+// root: a mix.exs or a .git. A Dexter database alone is not a sign (see the
+// project root rule).
+func LooksLikeProject(dir string) bool {
+	return regularFile(filepath.Join(dir, "mix.exs")) || gitMarker(filepath.Join(dir, ".git"))
 }
 
 // HasIndex reports whether dir holds a Dexter database.
 func HasIndex(dir string) bool {
 	return regularFile(DBPath(dir)) || regularFile(LegacyDBPath(dir))
+}
+
+// StrayIndex is a Dexter index that the project root rule does not use.
+type StrayIndex struct {
+	Dir   string // the directory that holds the index
+	Bytes int64  // the size of the database and its journal files
+}
+
+// StrayIndexesAbove lists the Dexter indexes in the directories above root,
+// up to and including the home directory. No session uses them: the rule
+// never picks a directory above a project. Earlier versions of Dexter made
+// such indexes in parents of several projects, where they can be very large.
+func StrayIndexesAbove(root string) []StrayIndex {
+	home := homeDir()
+	var stray []StrayIndex
+	for d := filepath.Clean(root); ; {
+		if home != "" && d == home {
+			return stray
+		}
+		parent := filepath.Dir(d)
+		if parent == d {
+			return stray
+		}
+		d = parent
+		if HasIndex(d) {
+			stray = append(stray, StrayIndex{Dir: d, Bytes: indexBytes(d)})
+		}
+	}
+}
+
+func indexBytes(dir string) int64 {
+	var n int64
+	for _, db := range []string{DBPath(dir), LegacyDBPath(dir)} {
+		for _, suffix := range []string{"", "-wal", "-shm"} {
+			if info, err := os.Stat(db + suffix); err == nil {
+				n += info.Size()
+			}
+		}
+	}
+	return n
+}
+
+// StrayIndexMessage explains the stray indexes above a workspace, or is ""
+// when there are none.
+func StrayIndexMessage(stray []StrayIndex) string {
+	if len(stray) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("Dexter: ")
+	for i, s := range stray {
+		if i > 0 {
+			b.WriteString("; ")
+		}
+		fmt.Fprintf(&b, "%s (%s)", DBDir(s.Dir), formatBytes(s.Bytes))
+	}
+	if len(stray) == 1 {
+		b.WriteString(" is an old Dexter index that no session uses: it is above this project, and Dexter makes an index only at a project root. Delete that directory to free the space.")
+	} else {
+		b.WriteString(" are old Dexter indexes that no session uses: they are above this project, and Dexter makes an index only at a project root. Delete those directories to free the space.")
+	}
+	return b.String()
+}
+
+func formatBytes(n int64) string {
+	switch {
+	case n >= 1<<30:
+		return fmt.Sprintf("%.1f GB", float64(n)/(1<<30))
+	case n >= 1<<20:
+		return fmt.Sprintf("%d MB", n>>20)
+	default:
+		return fmt.Sprintf("%d KB", n>>10)
+	}
 }
 
 // IsHomeDir reports whether dir is the user's home directory.
@@ -77,13 +255,10 @@ func gitMarker(path string) bool {
 
 // NonProjectRootError explains why dir is not a workspace to index, or returns
 // nil when it is one. Every frontend refuses such a directory unless the user
-// insists, because indexing it (the home directory, a mistyped path) would
-// read every file under it.
+// insists (-y, which applies to that command only), because indexing it (the
+// home directory, a mistyped path) would read every file under it.
 func NonProjectRootError(dir string) error {
 	if IsHomeDir(dir) {
-		if HasIndex(dir) && ChosenRoot(dir) {
-			return nil
-		}
 		return fmt.Errorf("refusing to use %s as a workspace: it is your home directory, not a project", dir)
 	}
 	if LooksLikeProject(dir) {
@@ -92,69 +267,167 @@ func NonProjectRootError(dir string) error {
 	return fmt.Errorf("refusing to use %s as a workspace: no mix.exs or .git found, so it does not look like an Elixir project", dir)
 }
 
-// containerScanDepth and containerScanDirs bound IsProjectContainer. A Mix
-// project of the root itself is rarely deeper than apps/<name>/mix.exs or
-// services/<group>/<name>/mix.exs; a scan that reaches the directory limit
-// gives up and takes dir for a project, as before.
+// ContainerRootError explains that dir only holds other projects, or returns
+// nil. A command that indexes one workspace refuses a container, because its
+// index would be a copy of every project in it.
+func ContainerRootError(dir string) error {
+	projects, ok := ContainerProjects(dir)
+	if !ok || len(projects) == 0 {
+		return nil
+	}
+	example := projects[0]
+	if rel, err := filepath.Rel(dir, example); err == nil {
+		example = rel
+	}
+	return fmt.Errorf("refusing to use %s as a workspace: it holds %d projects (clones and worktrees of other repositories), not one. Run Dexter in the project you work in, for example %s", dir, len(projects), example)
+}
+
+// containerScanDepth and containerScanDirs bound the scan of a repository
+// that has no mix.exs at its root. The Mix projects of a monorepo itself are
+// rarely deeper than apps/<name>/mix.exs or services/<group>/<name>/mix.exs.
+// A scan that reaches the directory limit takes the repository for one
+// project, as before the container rule.
 const (
 	containerScanDepth = 4
 	containerScanDirs  = 20000
 )
 
+// repoScan is what scanRepo found in a repository.
+type repoScan struct {
+	own       bool     // a Mix project of its own, or too large to tell
+	nested    []string // the nested repositories, in breadth-first order
+	container bool     // !own, and a nested repository holds a Mix project
+}
+
+// scanCacheTTL bounds how long a scan result is used again. A repository
+// seldom changes between a monorepo and a container, but a long-lived daemon
+// must see it when it does.
+const scanCacheTTL = 30 * time.Second
+
+var scanCache = struct {
+	sync.Mutex
+	entries map[string]scanCacheEntry
+}{entries: make(map[string]scanCacheEntry)}
+
+type scanCacheEntry struct {
+	scan repoScan
+	at   time.Time
+}
+
+// repoHasOwnMixProject reports whether the repository dir holds a Mix project
+// that is its own: a mix.exs at its root (one stat), or one below it that is
+// not in a nested repository.
+func repoHasOwnMixProject(dir string) bool {
+	if regularFile(filepath.Join(dir, "mix.exs")) {
+		return true
+	}
+	return scanRepo(dir).own
+}
+
+// scanRepo reads the directories of dir breadth first, to containerScanDepth.
+// It stops at the first mix.exs that is not in a nested repository (a
+// monorepo), and does not go into a nested repository (a clone or a linked
+// worktree), dependency or build output, or hidden directory. The cost for a
+// container is then the count of its own directories, not the size of the
+// repositories in it.
+func scanRepo(dir string) repoScan {
+	scanCache.Lock()
+	if e, ok := scanCache.entries[dir]; ok && time.Since(e.at) < scanCacheTTL {
+		scanCache.Unlock()
+		return e.scan
+	}
+	scanCache.Unlock()
+
+	scan := scanRepoUncached(dir)
+	if !scan.own {
+		for _, p := range scan.nested {
+			if holdsMixProject(p, containerScanDepth-1) {
+				scan.container = true
+				break
+			}
+		}
+	}
+
+	scanCache.Lock()
+	scanCache.entries[dir] = scanCacheEntry{scan: scan, at: time.Now()}
+	scanCache.Unlock()
+	return scan
+}
+
+func scanRepoUncached(dir string) repoScan {
+	type item struct {
+		dir   string
+		depth int
+	}
+	var scan repoScan
+	queue := []item{{dir, 0}}
+	visited := 0
+	for len(queue) > 0 {
+		it := queue[0]
+		queue = queue[1:]
+		if visited++; visited > containerScanDirs {
+			log.Printf("Project root: %s has more than %d directories to scan; Dexter takes it for one project", dir, containerScanDirs)
+			scan.own = true
+			return scan
+		}
+		if it.dir != dir && isNestedProject(it.dir) {
+			scan.nested = append(scan.nested, it.dir)
+			continue
+		}
+		entries, err := os.ReadDir(it.dir)
+		if err != nil {
+			continue
+		}
+		if it.dir != dir && hasEntry(entries, "mix.exs") {
+			scan.own = true
+			return scan
+		}
+		if it.depth >= containerScanDepth {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() && !skipContainerDir(e.Name()) {
+				queue = append(queue, item{filepath.Join(it.dir, e.Name()), it.depth + 1})
+			}
+		}
+	}
+	return scan
+}
+
 // IsProjectContainer reports whether dir only holds other projects: it has no
-// Mix project of its own (no mix.exs outside the repositories below it), and
-// at least one repository below it (a clone, or a linked worktree) holds a
-// Mix project. A directory that holds the clones and worktrees of several
-// repositories is such a container. Each file below it belongs to the
-// repository that holds it, so a frontend serves each file from that
-// project, and does not index the container itself: its index would be a
-// copy of the projects in it.
+// Mix project of its own, and at least one repository below it (a clone, or a
+// linked worktree) holds a Mix project. A directory that holds the clones and
+// worktrees of several repositories is such a container. Each file below it
+// belongs to the repository that holds it, so a frontend serves each file
+// from that project, and does not index the container itself: its index
+// would be a copy of the projects in it.
 //
 // A monorepo with Mix projects in apps/ and libs/ is not a container, also
 // when worktrees are checked out inside it.
 func IsProjectContainer(dir string) bool {
-	projects, ok := ContainerProjects(dir)
-	return ok && len(projects) > 0
+	if regularFile(filepath.Join(dir, "mix.exs")) {
+		return false
+	}
+	return scanRepo(dir).container
 }
 
 // ContainerProjects returns the repositories below dir that hold a Mix
-// project, in walk order, when dir has no Mix project of its own; ok is false
-// when it has one, or when dir is too large to scan (see containerScanDirs).
+// project, in breadth-first order, when dir has no Mix project of its own;
+// ok is false when it has one, or when dir is too large to scan (see
+// containerScanDirs). It checks each repository, so it costs more than
+// IsProjectContainer: it is for the messages that list the projects.
 func ContainerProjects(dir string) (projects []string, ok bool) {
 	if regularFile(filepath.Join(dir, "mix.exs")) {
 		return nil, false
 	}
-	visited := 0
-	var walk func(d string, depth int) (own bool)
-	walk = func(d string, depth int) bool {
-		if visited++; visited > containerScanDirs {
-			return true // too large to tell: a project, as before
-		}
-		entries, err := os.ReadDir(d)
-		if err != nil {
-			return false
-		}
-		if d != dir && hasEntry(entries, ".git") {
-			if holdsMixProject(d, containerScanDepth-1) {
-				projects = append(projects, d)
-			}
-			return false // another repository: its files are not dir's
-		}
-		if d != dir && hasEntry(entries, "mix.exs") {
-			return true
-		}
-		if depth >= containerScanDepth {
-			return false
-		}
-		for _, e := range entries {
-			if e.IsDir() && !skipContainerDir(e.Name()) && walk(filepath.Join(d, e.Name()), depth+1) {
-				return true
-			}
-		}
-		return false
-	}
-	if walk(dir, 0) {
+	scan := scanRepo(dir)
+	if scan.own {
 		return nil, false
+	}
+	for _, p := range scan.nested {
+		if holdsMixProject(p, containerScanDepth-1) {
+			projects = append(projects, p)
+		}
 	}
 	return projects, true
 }
@@ -195,15 +468,11 @@ func skipContainerDir(name string) bool {
 }
 
 // NestedProject returns the project below base that owns the files of dir, or
-// "" when base owns them (or dir is not below base). Below base, a file
-// belongs to another project only when a nested clone (a .git directory) or a
-// linked worktree is between the file and base; the nearest one is the
-// project. An index alone does not make a project (a Dexter index left in
-// apps/foo of a monorepo is not one), and a submodule (a .git file that is
-// not a linked worktree) stays a part of the project that holds it. A file of
-// a dependency or of build output (deps, _build, node_modules) belongs to the
-// project that holds that directory: a git dependency is a clone, but not a
-// project of its own.
+// "" when base owns them (or dir is not below base). It is step 1 of the
+// project root rule, stopped at base: the nearest clone or linked worktree
+// between dir and base is the project, a submodule stays a part of the
+// project that holds it, and a file in deps, _build, or node_modules belongs
+// to the project that holds that directory.
 //
 // The LSP proxy and the MCP frontend use it to send each file to its
 // project's daemon.
@@ -213,7 +482,7 @@ func NestedProject(dir, base string) string {
 	if !within(dir, base) {
 		return ""
 	}
-	dir = aboveDependencies(dir, base)
+	dir = ownerOfDependencies(dir)
 	for d := dir; d != base && within(d, base); d = filepath.Dir(d) {
 		if isNestedProject(d) {
 			return d
@@ -226,7 +495,7 @@ func NestedProject(dir, base string) string {
 }
 
 // isNestedProject reports whether dir is a clone (it holds a .git directory)
-// or a linked worktree.
+// or a linked worktree: a repository boundary of the project root rule.
 func isNestedProject(dir string) bool {
 	info, err := os.Lstat(filepath.Join(dir, ".git"))
 	if err != nil {
@@ -236,23 +505,6 @@ func isNestedProject(dir string) bool {
 		return true
 	}
 	return info.Mode().IsRegular() && parser.IsLinkedWorktree(dir)
-}
-
-// aboveDependencies returns the parent of the first deps, _build, or
-// node_modules directory of dir below base, or dir when it has none.
-func aboveDependencies(dir, base string) string {
-	rel, err := filepath.Rel(base, dir)
-	if err != nil || rel == "." {
-		return dir
-	}
-	at := base
-	for _, part := range strings.Split(rel, string(filepath.Separator)) {
-		if part == "deps" || part == "_build" || part == "node_modules" {
-			return at
-		}
-		at = filepath.Join(at, part)
-	}
-	return dir
 }
 
 // within reports whether path is base or below it.

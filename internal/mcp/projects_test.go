@@ -126,3 +126,33 @@ func TestContainerSession_LeftoverIndexDoesNotCaptureAProject(t *testing.T) {
 
 	wantContains(t, mustTool(t, cs, "dexter_definition", map[string]any{"module": "Shop", "project": filepath.Join(clone, "apps/shop/lib/shop.ex")}), "root="+clone)
 }
+
+// A project argument that names a folder that is not a project, or a folder
+// of projects, fails with no daemon: MCP has no -y, and an index there would
+// read every file below it.
+func TestProjectArgument_NotAProjectStartsNoDaemon(t *testing.T) {
+	e := setupNegotiation(t)
+	_, uri := projectDir(t)
+	cs, _ := e.connect(nil, uri)
+
+	loose := t.TempDir()
+	writeSource(t, loose, "notes/a.ex", "defmodule Loose do\nend\n")
+	out, ok := toolText(t, cs, "dexter_definition", map[string]any{"module": "Loose", "project": filepath.Join(loose, "notes")})
+	if ok {
+		t.Fatalf("a call for a folder that is not a project succeeded: %s", out)
+	}
+	wantContains(t, out, "does not look like an Elixir project")
+
+	container, _, _, _ := containerDir(t)
+	out, ok = toolText(t, cs, "dexter_search", map[string]any{"query": "Shop", "project": container})
+	if ok {
+		t.Fatalf("a call for a folder of projects succeeded: %s", out)
+	}
+	wantContains(t, out, "holds 3 projects")
+
+	for _, dir := range []string{loose, filepath.Join(loose, "notes"), container} {
+		if n := len(e.backendsFor(dir)); n != 0 {
+			t.Errorf("%d daemon connections for %s, want 0", n, dir)
+		}
+	}
+}

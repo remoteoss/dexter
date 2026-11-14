@@ -37,7 +37,7 @@ func TestIsProjectContainer(t *testing.T) {
 		{"clones and worktrees of other repositories", []string{
 			".git/", "README.md",
 			"shop/.git/", "shop/apps/shop/mix.exs",
-			"shop-worktrees/feature/.git", "shop-worktrees/feature/apps/shop/mix.exs",
+			"shop-worktrees/feature/.git@", "shop-worktrees/feature/apps/shop/mix.exs",
 		}, true},
 		{"a monorepo with Mix projects in apps and libs", []string{
 			".git/", "apps/shop/mix.exs", "libs/util/mix.exs",
@@ -52,7 +52,7 @@ func TestIsProjectContainer(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			root := t.TempDir()
-			writeTree(t, root, c.paths...)
+			writeRootTree(t, root, c.paths...)
 			if got := IsProjectContainer(root); got != c.want {
 				t.Errorf("IsProjectContainer = %t, want %t", got, c.want)
 			}

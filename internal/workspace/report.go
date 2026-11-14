@@ -14,17 +14,19 @@ const (
 	condWatch         = "watcher"
 	condWatchCoverage = "watcher.coverage"
 	condWatchFallback = "watcher.fallback"
+	condStrayIndex    = "root.stray-index"
 )
 
-// reportRoot warns when the workspace root does not look like a project. An
+// reportRoot warns when the workspace root does not look like a project, and
+// about old indexes above it that no session uses (they can be very large). An
 // editor decides what it opens, so Dexter serves the directory anyway; the
 // warning is shown in every editor that attaches, because each of them pays for
 // the index.
 func reportRoot(root string, reporter *notify.Reporter) {
+	if msg := store.StrayIndexMessage(store.StrayIndexesAbove(root)); msg != "" {
+		reporter.Set(condStrayIndex, notify.Warning, msg)
+	}
 	if store.IsHomeDir(root) {
-		if store.HasIndex(root) && store.ChosenRoot(root) {
-			return
-		}
 		reporter.Set(condRoot, notify.Warning, fmt.Sprintf(
 			"Dexter: %s is your home directory, not a project, but the editor opened it as the workspace. Dexter indexes it anyway, which can take a long time. Open the project directory instead, or set --root <path> in the dexter command of the editor.", root))
 		return
@@ -33,7 +35,7 @@ func reportRoot(root string, reporter *notify.Reporter) {
 		return
 	}
 	reporter.Set(condRoot, notify.Warning, fmt.Sprintf(
-		"Dexter: %s has no mix.exs or .git, so it is probably not an Elixir project. Dexter indexes every file below it, which can be slow. Open the project directory, or set --root <path> in the editor's dexter command. To use this directory anyway, run `dexter init -y` in it.", root))
+		"Dexter: %s has no mix.exs or .git, so it is probably not an Elixir project. Dexter indexes every file below it, which can be slow. Open the project directory, or set --root <path> in the editor's dexter command.", root))
 }
 
 // damagedIndexMessage explains an index that was damaged and was deleted for

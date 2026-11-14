@@ -288,45 +288,30 @@ func projectRootIn(path string, info os.FileInfo) string {
 	if !info.IsDir() {
 		path = filepath.Dir(path)
 	}
-	root := store.FindProjectRoot(path, "mix.exs")
-	if home, homeErr := os.UserHomeDir(); homeErr == nil && store.SameDir(root, home) {
-		if mixRoot := findMarkerBefore(path, "mix.exs", home); mixRoot != "" {
-			return mixRoot
-		}
-	}
-	return root
-}
-
-func findMarkerBefore(path, marker, stop string) string {
-	for dir := path; !store.SameDir(dir, stop); dir = filepath.Dir(dir) {
-		if info, err := os.Stat(filepath.Join(dir, marker)); err == nil && info.Mode().IsRegular() {
-			return dir
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return ""
-		}
-	}
-	return ""
+	return store.FindProjectRoot(path)
 }
 
 // requireProjectRoot refuses to treat a directory that shows no sign of being
-// an Elixir project as a workspace. A mistyped directory is far more likely
-// than the intent to index one: a `dexter lookup` in the home directory would
-// otherwise spend minutes of CPU building a database over every file the user
-// owns, and would do it silently. -y/--yes is the way through, and it is
-// needed only once: it records the choice (store.MarkChosenRoot), so later
-// sessions there use the directory without -y.
+// an Elixir project, or that only holds other projects, as a workspace. A
+// mistyped directory is far more likely than the intent to index one: a
+// `dexter lookup` in the home directory would otherwise spend minutes of CPU
+// building a database over every file the user owns, and would do it
+// silently. -y/--yes is the way through, for that command only: Dexter
+// records nothing, so a later command there needs -y again.
+//
+// It also warns about old indexes above the workspace, which no session uses.
 func requireProjectRoot(dir string, allowNonProject bool) {
+	if msg := store.StrayIndexMessage(store.StrayIndexesAbove(dir)); msg != "" {
+		fmt.Fprintln(os.Stderr, "Warning: "+strings.TrimPrefix(msg, "Dexter: "))
+	}
 	if allowNonProject {
-		if store.NonProjectRootError(dir) != nil {
-			if err := store.MarkChosenRoot(dir); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: could not record %s as a chosen workspace: %v\n", dir, err)
-			}
-		}
 		return
 	}
-	if err := store.NonProjectRootError(dir); err != nil {
+	err := store.NonProjectRootError(dir)
+	if err == nil {
+		err = store.ContainerRootError(dir)
+	}
+	if err != nil {
 		fatal(fmt.Errorf("%w\nhint: run from a project, pass --root <path>, or pass -y/--yes to index it anyway", err))
 	}
 }

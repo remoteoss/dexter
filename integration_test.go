@@ -827,7 +827,8 @@ func TestIntegration_RefusesNonProjectRoot(t *testing.T) {
 		t.Fatalf("refused commands left an index behind: %v", err)
 	}
 
-	// -y/--yes is the way through, and it is sticky.
+	// -y/--yes is the way through, for that command only: an index alone
+	// does not make the directory a project for the next command.
 	if out, err := run("lookup", "-y", "MyApp.Repo"); err != nil {
 		t.Fatalf("lookup -y failed: %v\n%s", err, out)
 	}
@@ -835,9 +836,13 @@ func TestIntegration_RefusesNonProjectRoot(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(scratch, ".dexter", "dexter.db")); err != nil {
 		t.Fatalf("-y did not create an index: %v", err)
 	}
-	if out, err := run("lookup", "MyApp.Repo"); err != nil {
-		t.Fatalf("lookup after -y was refused: %v\n%s", err, out)
+	if out, err := run("lookup", "MyApp.Repo"); err == nil {
+		t.Fatalf("lookup without -y used the index that -y made:\n%s", out)
 	}
+	if out, err := run("lookup", "-y", "MyApp.Repo"); err != nil {
+		t.Fatalf("lookup -y again failed: %v\n%s", err, out)
+	}
+	_, _ = run("stop")
 }
 
 func TestIntegration_RefusesGitBackedHome(t *testing.T) {
@@ -857,8 +862,10 @@ func TestIntegration_RefusesGitBackedHome(t *testing.T) {
 	if err == nil {
 		t.Fatalf("lookup in a git-backed home succeeded:\n%s", out)
 	}
-	if !strings.Contains(string(out), "home directory") {
-		t.Fatalf("lookup refusal did not identify the home directory:\n%s", out)
+	// The home directory's repository is not a project, so the folder in it
+	// is not one either.
+	if !strings.Contains(string(out), "does not look like an Elixir project") {
+		t.Fatalf("lookup refusal did not say that the folder is not a project:\n%s", out)
 	}
 	if _, err := os.Stat(filepath.Join(home, ".dexter")); !os.IsNotExist(err) {
 		t.Fatalf("refused lookup left an index behind: %v", err)
@@ -897,7 +904,7 @@ func TestIntegration_FindsProjectInsideGitBackedHome(t *testing.T) {
 	}
 }
 
-func TestIntegration_GitBackedHomeYesIsSticky(t *testing.T) {
+func TestIntegration_GitBackedHomeYesIsForOneCommand(t *testing.T) {
 	binary := buildDexter(t)
 	home := t.TempDir()
 	if err := os.Mkdir(filepath.Join(home, ".git"), 0o755); err != nil {
@@ -914,10 +921,9 @@ func TestIntegration_GitBackedHomeYesIsSticky(t *testing.T) {
 		t.Fatalf("lookup -y in home failed: %v\n%s", err, out)
 	}
 	_, _ = run("stop")
-	if out, err := run("lookup", "MyApp.Repo"); err != nil {
-		t.Fatalf("lookup after home opt-in was refused: %v\n%s", err, out)
+	if out, err := run("lookup", "MyApp.Repo"); err == nil || !strings.Contains(out, "home directory") {
+		t.Fatalf("lookup without -y in home was not refused (%v):\n%s", err, out)
 	}
-	_, _ = run("stop")
 }
 
 // TestIntegration_LegacyMigration simulates an upgrade path: a project with
