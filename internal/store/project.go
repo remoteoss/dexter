@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -274,7 +275,30 @@ func StrayIndexAt(dir string) (StrayIndex, bool) {
 }
 
 // indexFiles are the files that Dexter keeps in its .dexter directory.
-var indexFiles = []string{"dexter.db", "dexter.db-wal", "dexter.db-shm", ".gitignore", "chosen-root"}
+var indexFiles = []string{"dexter.db", "dexter.db-wal", "dexter.db-shm", ".gitignore", "chosen-root", upgradedFile}
+
+// upgradedFile, in the .dexter directory, holds the index version of the
+// build that last rebuilt an index of an older version there. Only the
+// database files are deleted on a rebuild, by this build and by older ones,
+// so the file stays when an older build rebuilds the index again.
+const upgradedFile = "upgraded"
+
+// MarkUpgraded records that this build (index version current) rebuilt the
+// index of dir from an older version.
+func MarkUpgraded(dir string, current int) error {
+	return os.WriteFile(filepath.Join(DBDir(dir), upgradedFile), []byte(strconv.Itoa(current)+"\n"), 0o644)
+}
+
+// UpgradedBy is the index version that MarkUpgraded last recorded for dir,
+// or 0.
+func UpgradedBy(dir string) int {
+	b, err := os.ReadFile(filepath.Join(DBDir(dir), upgradedFile))
+	if err != nil {
+		return 0
+	}
+	v, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+	return v
+}
 
 func indexBytes(dir string) int64 {
 	var n int64

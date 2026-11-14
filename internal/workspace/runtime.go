@@ -1360,13 +1360,21 @@ func openStore(root string, reporter *notify.Reporter) (*store.Store, error) {
 		}
 	}
 	if stored := s.GetIndexVersion(); stored != version.IndexVersion && !s.IsEmpty() {
-		reporter.Set(lsp.CondIndexRebuild, notify.Warning, versionMismatchMessage(stored, version.IndexVersion))
+		// This build upgraded the index before, so an older build rebuilt it
+		// in between: two Dexter versions serve this project.
+		again := stored > 0 && stored < version.IndexVersion && store.UpgradedBy(root) == version.IndexVersion
+		reporter.Set(lsp.CondIndexRebuild, notify.Warning, versionMismatchMessage(stored, version.IndexVersion, again))
 		if err := s.Close(); err != nil {
 			return nil, fmt.Errorf("closing outdated index: %w", err)
 		}
 		removeIndexFiles(root)
 		if s, err = store.Open(root); err != nil {
 			return nil, openFailed(reporter, otherOpenFailureMessage(root, err), err)
+		}
+		if stored > 0 && stored < version.IndexVersion {
+			if err := store.MarkUpgraded(root, version.IndexVersion); err != nil {
+				log.Printf("Warning: could not record the index upgrade: %v", err)
+			}
 		}
 	}
 	return s, nil

@@ -64,9 +64,14 @@ func otherOpenFailureMessage(root string, err error) string {
 }
 
 // versionMismatchMessage explains an index that was written by another index
-// version and must be rebuilt.
-func versionMismatchMessage(stored, current int) string {
+// version and must be rebuilt. again is set when this build upgraded the index
+// before, so an older build rebuilt it since.
+func versionMismatchMessage(stored, current int, again bool) string {
 	switch {
+	case again:
+		return fmt.Sprintf(
+			"Dexter: an older Dexter build rebuilt this project's index again (index version %d; this build uses %d), so Dexter rebuilds it once more now; navigation is limited until the rebuild ends. An editor or a terminal for this project still runs an older dexter, for example one that mise, Homebrew, or an editor plugin installed, or an editor that was open before the upgrade. Each start of the other build rebuilds the index again. Update that dexter (for example `mise upgrade dexter` or `brew upgrade dexter`) and restart the editor.",
+			stored, current)
 	case stored == 0:
 		return "Dexter: the index has no version, so the build that wrote it did not finish. Rebuilding it now; navigation is limited until the rebuild ends."
 	case stored > current:
@@ -75,7 +80,7 @@ func versionMismatchMessage(stored, current int) string {
 			stored, current)
 	default:
 		return fmt.Sprintf(
-			"Dexter: the index was written by an older Dexter build (index version %d; this build uses %d). Rebuilding it now; navigation is limited until the rebuild ends. This occurs one time after an upgrade.",
+			"Dexter: the index was written by an older Dexter build (index version %d; this build uses %d). Rebuilding it now; navigation is limited until the rebuild ends. This occurs one time after an upgrade. An editor that was open before the upgrade still runs the older build: restart it.",
 			stored, current)
 	}
 }
