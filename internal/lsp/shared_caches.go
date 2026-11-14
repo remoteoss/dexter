@@ -1,6 +1,7 @@
 package lsp
 
 import (
+	"sort"
 	"sync"
 )
 
@@ -40,6 +41,76 @@ func newSharedCaches() sharedCaches {
 type usingCache struct {
 	mu      sync.RWMutex
 	entries map[string]*usingCacheEntry
+
+	// What a __using__ body of the workspace can inject, for the store's
+	// write generation injectGen (see Server.unknownChainCanInject).
+	injectMu      sync.Mutex
+	injectGen     uint64
+	injectLoaded  bool
+	injectNames   map[string]bool
+	injectImports []string
+	// warming is closed when the warm-up in progress ends; nil when none
+	// runs. See warmUsingCache.
+	warming chan struct{}
+}
+
+// injectable is the names that the __using__ bodies of entries define and
+// the modules that they import, computed again only when the store's write
+// generation is not gen.
+func (c *usingCache) injectable(gen uint64, entries func() []usingEntryRef) (map[string]bool, []string) {
+	c.injectMu.Lock()
+	defer c.injectMu.Unlock()
+	if c.injectLoaded && c.injectGen == gen {
+		return c.injectNames, c.injectImports
+	}
+	names := make(map[string]bool)
+	imported := make(map[string]bool)
+	for _, e := range entries() {
+		for _, body := range e.entry.bodies() {
+			for name := range body.inlineDefs {
+				names[name] = true
+			}
+			for _, imp := range body.imports {
+				imported[imp] = true
+			}
+		}
+	}
+	imports := make([]string, 0, len(imported))
+	for imp := range imported {
+		imports = append(imports, imp)
+	}
+	sort.Strings(imports)
+	c.injectGen, c.injectLoaded, c.injectNames, c.injectImports = gen, true, names, imports
+	return names, imports
+}
+
+// beginWarm starts a warm-up, or returns false when one already runs.
+func (c *usingCache) beginWarm() (end func(), ok bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.warming != nil {
+		return nil, false
+	}
+	ch := make(chan struct{})
+	c.warming = ch
+	return func() {
+		c.mu.Lock()
+		c.warming = nil
+		c.mu.Unlock()
+		close(ch)
+	}, true
+}
+
+// waitWarm waits for the warm-up in progress, if any: a request that needs
+// every entry then reads the entries it parsed, instead of parsing the same
+// files at the same time.
+func (c *usingCache) waitWarm() {
+	c.mu.RLock()
+	ch := c.warming
+	c.mu.RUnlock()
+	if ch != nil {
+		<-ch
+	}
 }
 
 func (c *usingCache) get(module string) (*usingCacheEntry, bool) {

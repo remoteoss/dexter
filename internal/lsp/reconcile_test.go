@@ -436,6 +436,7 @@ func TestReconcile_RootGoneLeavesIndexUnchanged(t *testing.T) {
 		// before the prune.
 		gone       func(t *testing.T, root string)
 		duringPass bool
+		noIdle     bool
 	}{
 		{name: "moved", gone: moveRoot},
 		{name: "replaced by a new directory", gone: func(t *testing.T, root string) {
@@ -445,6 +446,10 @@ func TestReconcile_RootGoneLeavesIndexUnchanged(t *testing.T) {
 			}
 		}},
 		{name: "moved during the pass", gone: moveRoot, duringPass: true},
+		// With no idle connection, the prune's read opens a new one by the
+		// index's path, which went with the root, and fails: the result is
+		// still ErrRootGone.
+		{name: "moved during the pass, no idle connection", gone: moveRoot, duringPass: true, noIdle: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			logs := captureLog(t)
@@ -462,6 +467,10 @@ func TestReconcile_RootGoneLeavesIndexUnchanged(t *testing.T) {
 				t.Fatalf("setup: %d files indexed, want 5", len(before))
 			}
 
+			if tc.noIdle {
+				server.store.SetMaxIdleConns(0)
+				t.Cleanup(func() { server.store.SetMaxIdleConns(2) })
+			}
 			if tc.duringPass {
 				// A deleted file makes the prune delete something, and a
 				// changed file makes the pass parse it, after the walk.
@@ -482,7 +491,18 @@ func TestReconcile_RootGoneLeavesIndexUnchanged(t *testing.T) {
 
 			err := reindexResult(t, server)
 			testHookParse = nil
-			if after, _ := server.store.ListFilePaths(); len(after) != len(before) {
+			after, _ := server.store.ListFilePaths()
+			if tc.noIdle {
+				// The pool cannot open the index by its old path any more:
+				// read it where it went.
+				moved, openErr := store.Open(root + "-moved")
+				if openErr != nil {
+					t.Fatal(openErr)
+				}
+				after, _ = moved.ListFilePaths()
+				_ = moved.Close()
+			}
+			if len(after) != len(before) {
 				t.Fatalf("%d files in the index after the root went, want %d", len(after), len(before))
 			}
 			if !errors.Is(err, ErrRootGone) {
@@ -1021,4 +1041,32 @@ func TestReconcile_PanicInRebuildIsRecoveredAndTheNextPassFinishes(t *testing.T)
 			t.Fatalf("file %d after the next pass: %d definitions, want 1", i, len(r))
 		}
 	}
+}
+
+// After the workspace waited for its index work, no new work starts: a rename
+// that outlives its session cannot add work to a group that is being waited
+// for, or write to a closed store.
+func TestServer_NoIndexWorkAfterWaitForIndexWork(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+	path := writeTestFile(t, server.projectRoot, "lib/late.ex", moduleSource(7, 0))
+	server.WaitForIndexWork()
+
+	select {
+	case err := <-server.startBackgroundReindex():
+		if err != nil {
+			t.Errorf("a pass after the wait: %v, want a canceled pass", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a pass after the wait did not end")
+	}
+	select {
+	case <-server.reindexAfterRename(nil, []string{path}, nil):
+	case <-time.After(5 * time.Second):
+		t.Fatal("an index update after the wait did not end")
+	}
+	if has, _ := server.store.HasPath(path); has {
+		t.Error("index work ran after the wait")
+	}
+	server.index.backgroundWork.Wait()
 }

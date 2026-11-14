@@ -300,3 +300,29 @@ func (c *usingCache) len() int {
 	defer c.mu.RUnlock()
 	return len(c.entries)
 }
+
+// A background warm-up is in progress as soon as startWarmUsingCache returns,
+// not only once its goroutine runs: a request in between must wait for it and
+// read its entries, not parse the same files at the same time.
+func TestStartWarmUsingCacheIsInProgressAtOnce(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+	indexFile(t, server.store, server.projectRoot, "lib/ex_machina.ex", movedUsingSource)
+	for i := 0; i < 50; i++ {
+		server.usingCache.drop("MyApp.ExMachina", mustUsingOrNil(server))
+		server.startWarmUsingCache()
+		if end, ok := server.usingCache.beginWarm(); ok {
+			end()
+			server.WaitForIndexWork()
+			t.Fatalf("run %d: no warm-up in progress right after startWarmUsingCache", i)
+		}
+		server.usingCache.waitWarm()
+		mustUsing(t, server)
+	}
+	server.WaitForIndexWork()
+}
+
+func mustUsingOrNil(server *Server) *usingCacheEntry {
+	entry, _ := server.usingCache.get("MyApp.ExMachina")
+	return entry
+}
