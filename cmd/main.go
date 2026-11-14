@@ -146,7 +146,7 @@ func main() {
 		Use:   "log [path]",
 		Short: "Print the path of the daemon log of a project",
 		Long: "Print the path of the workspace daemon's log for the project of the path (default: the current directory), " +
-			"for example `tail -f \"$(dexter log)\"`. Every editor, CLI command, and MCP session of a project share one daemon and one log. " +
+			"for example `tail -F \"$(dexter log)\"`. Every editor, CLI command, and MCP session of a project share one daemon and one log. " +
 			"For a folder of repositories, print the log of each project in it that has one.",
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {

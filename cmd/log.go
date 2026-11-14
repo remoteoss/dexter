@@ -10,7 +10,7 @@ import (
 )
 
 // cmdLog prints the path of the daemon log of the project of start, so that
-// `tail -f "$(dexter log)"` follows it. For a folder of repositories, it
+// `tail -F "$(dexter log)"` follows it. For a folder of repositories, it
 // prints the log of each of its projects that has one, and names the project
 // of each on stderr (the file names are hashes).
 func cmdLog(start string, out, notes io.Writer) error {
