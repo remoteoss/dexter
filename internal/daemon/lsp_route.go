@@ -119,14 +119,16 @@ func (p *lspProxy) route(docURI string, create bool) (u *upstream, fallback bool
 // the container that has an index. It never starts the cold build of a
 // project for such a file.
 func (p *lspProxy) defaultUpstream() *upstream {
+	// A copy, so that isFailed (which takes the upstream's connMu) runs
+	// without p.mu: replay holds connMu and then takes p.mu.
 	p.mu.Lock()
-	for i := len(p.upstreamList) - 1; i >= 0; i-- {
-		if u := p.upstreamList[i]; !u.isFailed() {
-			p.mu.Unlock()
+	list := append([]*upstream(nil), p.upstreamList...)
+	p.mu.Unlock()
+	for i := len(list) - 1; i >= 0; i-- {
+		if u := list[i]; !u.isFailed() {
 			return u
 		}
 	}
-	p.mu.Unlock()
 	projects, ok := store.ContainerProjects(p.root)
 	if !ok {
 		return nil

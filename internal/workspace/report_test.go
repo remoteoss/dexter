@@ -215,6 +215,53 @@ func TestRepeatedUpgradeSaysAnOlderBuildRebuiltTheIndex(t *testing.T) {
 	}
 }
 
+// An index of Dexter 0.7.x has refs without an arity column, so opening it
+// drops its tables. It was still an upgrade: the user is told so, not that
+// the index is built for the first time.
+func TestUpgradeOfAnOlderSchemaIsReportedAsAnUpgrade(t *testing.T) {
+	quietReportEnv(t)
+	root := t.TempDir()
+	if err := os.MkdirAll(store.DBDir(root), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", store.DBPath(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		"CREATE TABLE files (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, mtime INTEGER NOT NULL)",
+		"CREATE TABLE refs (module TEXT NOT NULL, function TEXT NOT NULL DEFAULT '', line INTEGER NOT NULL, file_id INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'call')",
+		"CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+		"INSERT INTO files (path, mtime) VALUES ('" + filepath.Join(root, "lib", "a.ex") + "', 1)",
+		"INSERT INTO metadata (key, value) VALUES ('index_version', '14')",
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	_ = db.Close()
+
+	r := notify.New()
+	r.SetLogf(func(string, ...any) {})
+	s, err := openStore(root, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = s.Close()
+	var msg string
+	for _, c := range r.Conditions() {
+		if c.Key == lsp.CondIndexRebuild {
+			msg = c.Message
+		}
+	}
+	if !strings.Contains(msg, "older Dexter build (index version 14") {
+		t.Fatalf("an upgrade from the 0.7 schema is not reported as one: %q", msg)
+	}
+	if store.UpgradedBy(root) != version.IndexVersion {
+		t.Error("the upgrade is not recorded")
+	}
+}
+
 // seedIndex writes an index that holds one file.
 func seedIndex(t *testing.T, root string) {
 	t.Helper()
