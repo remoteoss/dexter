@@ -150,11 +150,128 @@ func TestIndexMessagesSayWhatHappened(t *testing.T) {
 	if strings.Contains(other, "deleted it") || !strings.Contains(other, "did not delete it") {
 		t.Errorf("a failure that is not damage claims a delete: %q", other)
 	}
-	if older := versionMismatchMessage(3, 4); !strings.Contains(older, "older Dexter build (index version 3; this build uses 4)") {
+	if older := versionMismatchMessage(3, 4, false); !strings.Contains(older, "older Dexter build (index version 3; this build uses 4)") {
 		t.Errorf("older-build message = %q", older)
 	}
-	if none := versionMismatchMessage(0, 4); !strings.Contains(none, "did not finish") {
+	if none := versionMismatchMessage(0, 4, false); !strings.Contains(none, "did not finish") {
 		t.Errorf("no-version message = %q", none)
+	}
+}
+
+// An older build that rebuilds the index after this build upgraded it is two
+// Dexter versions on one project: the next upgrade says so, and how to stop
+// it. The first upgrade, and one by a later build, do not.
+func TestRepeatedUpgradeSaysAnOlderBuildRebuiltTheIndex(t *testing.T) {
+	quietReportEnv(t)
+	root := t.TempDir()
+	open := func() *notify.Reporter {
+		t.Helper()
+		r := notify.New()
+		r.SetLogf(func(string, ...any) {})
+		s, err := openStore(root, r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = s.Close()
+		return r
+	}
+	message := func(r *notify.Reporter) string {
+		for _, c := range r.Conditions() {
+			if c.Key == lsp.CondIndexRebuild {
+				return c.Message
+			}
+		}
+		return ""
+	}
+
+	writeStaleIndex(t, root, version.IndexVersion-1)
+	if m := message(open()); !strings.Contains(m, "This occurs one time after an upgrade") {
+		t.Fatalf("first upgrade: %q", m)
+	}
+	if got := store.UpgradedBy(root); got != version.IndexVersion {
+		t.Fatalf("UpgradedBy = %d, want %d", got, version.IndexVersion)
+	}
+
+	// The older build rebuilds the index: it deletes the database files only.
+	for _, f := range []string{store.DBPath(root), store.DBPath(root) + "-wal", store.DBPath(root) + "-shm"} {
+		_ = os.Remove(f)
+	}
+	writeStaleIndex(t, root, version.IndexVersion-1)
+	if m := message(open()); !strings.Contains(m, "rebuilt this project's index again") || !strings.Contains(m, "mise upgrade dexter") {
+		t.Fatalf("second upgrade: %q", m)
+	}
+
+	// A marker of another build (an earlier upgrade by an older Dexter) is not
+	// this build's.
+	if err := store.MarkUpgraded(root, version.IndexVersion-1); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{store.DBPath(root), store.DBPath(root) + "-wal", store.DBPath(root) + "-shm"} {
+		_ = os.Remove(f)
+	}
+	writeStaleIndex(t, root, version.IndexVersion-1)
+	if m := message(open()); strings.Contains(m, "again") {
+		t.Fatalf("an upgrade after another build's marker says again: %q", m)
+	}
+}
+
+// An index of Dexter 0.7.x has refs without an arity column, so opening it
+// drops its tables. It was still an upgrade: the user is told so, not that
+// the index is built for the first time.
+func TestUpgradeOfAnOlderSchemaIsReportedAsAnUpgrade(t *testing.T) {
+	quietReportEnv(t)
+	root := t.TempDir()
+	if err := os.MkdirAll(store.DBDir(root), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", store.DBPath(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		"CREATE TABLE files (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, mtime INTEGER NOT NULL)",
+		"CREATE TABLE refs (module TEXT NOT NULL, function TEXT NOT NULL DEFAULT '', line INTEGER NOT NULL, file_id INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'call')",
+		"CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+		"INSERT INTO files (path, mtime) VALUES ('" + filepath.Join(root, "lib", "a.ex") + "', 1)",
+		"INSERT INTO metadata (key, value) VALUES ('index_version', '14')",
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	_ = db.Close()
+
+	r := notify.New()
+	r.SetLogf(func(string, ...any) {})
+	s, err := openStore(root, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = s.Close()
+	var msg string
+	for _, c := range r.Conditions() {
+		if c.Key == lsp.CondIndexRebuild {
+			msg = c.Message
+		}
+	}
+	if !strings.Contains(msg, "older Dexter build (index version 14") {
+		t.Fatalf("an upgrade from the 0.7 schema is not reported as one: %q", msg)
+	}
+	if store.UpgradedBy(root) != version.IndexVersion {
+		t.Error("the upgrade is not recorded")
+	}
+	// A new file, with the auto_vacuum mode of a new index.
+	check, err := sql.Open("sqlite3", store.DBPath(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = check.Close() }()
+	var mode int
+	if err := check.QueryRow("PRAGMA auto_vacuum").Scan(&mode); err != nil {
+		t.Fatal(err)
+	}
+	if mode != 2 {
+		t.Errorf("auto_vacuum of the upgraded index = %d, want 2 (incremental): the old file was kept", mode)
 	}
 }
 

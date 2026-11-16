@@ -3,6 +3,7 @@ package daemon
 import (
 	"bytes"
 	"encoding/json"
+	"log"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -104,7 +105,41 @@ func (p *lspProxy) route(docURI string, create bool) (u *upstream, fallback bool
 	if p.fallbackUp != nil && p.fallbackUp.isFailed() {
 		p.fallbackUp = nil
 	}
+	if p.fallbackUp == nil && p.container && create {
+		p.fallbackUp = p.defaultUpstream()
+	}
 	return p.fallbackUp, true
+}
+
+// defaultUpstream is, for a container session with no project file yet, the
+// upstream for a file outside every project: a standard library or
+// dependency file that an editor opened in a session of its own, which then
+// starts in the container. Each project's index holds the standard library.
+// It is an upstream that is already connected, or else the first project of
+// the container that has an index. It never starts the cold build of a
+// project for such a file.
+func (p *lspProxy) defaultUpstream() *upstream {
+	// A copy, so that isFailed (which takes the upstream's connMu) runs
+	// without p.mu: replay holds connMu and then takes p.mu.
+	p.mu.Lock()
+	list := append([]*upstream(nil), p.upstreamList...)
+	p.mu.Unlock()
+	for i := len(list) - 1; i >= 0; i-- {
+		if u := list[i]; !u.isFailed() {
+			return u
+		}
+	}
+	projects, ok := store.ContainerProjects(p.root)
+	if !ok {
+		return nil
+	}
+	for _, root := range projects {
+		if store.HasIndex(root) {
+			log.Printf("LSP proxy: files outside every project go to the workspace daemon of %s", root)
+			return p.addUpstream(root, workspaceIdentity(root))
+		}
+	}
+	return nil
 }
 
 // projectRoot returns the root of the project that owns the files of dir, or

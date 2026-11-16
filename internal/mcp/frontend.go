@@ -171,7 +171,7 @@ func (f *Frontend) backendFor(ctx context.Context, ss *mcp.ServerSession) (Backe
 	f.sessions[ss] = &sessionState{root: root, key: key, projects: projects}
 	f.mu.Unlock()
 
-	log.Printf("MCP session workspace: %s (%s)", root, source)
+	log.Printf("MCP session workspace: %s (%s; log: %s)", root, source, daemonLogOf(root))
 	if !bound {
 		go func() {
 			_ = ss.Wait()

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/remoteoss/dexter/internal/store"
@@ -66,8 +67,18 @@ func runtimeDirs() []string {
 	return platformDirs()
 }
 
-// platformDirs is platformRuntimeDirs; tests replace it.
-var platformDirs = platformRuntimeDirs
+// platformDirsOverride replaces platformRuntimeDirs in tests. It is atomic
+// because a proxy goroutine of an earlier test can still resolve an endpoint
+// while a later test swaps it.
+var platformDirsOverride atomic.Pointer[func() []string]
+
+// platformDirs is platformRuntimeDirs, or the tests' override.
+func platformDirs() []string {
+	if f := platformDirsOverride.Load(); f != nil {
+		return (*f)()
+	}
+	return platformRuntimeDirs()
+}
 
 // endpointKeys are the file names a workspace can use in one candidate
 // directory: the full key first, and a shorter key for a directory whose path

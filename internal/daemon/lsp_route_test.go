@@ -1012,3 +1012,44 @@ func TestProxyRoutesTheResolvedPathOfALinkedRepository(t *testing.T) {
 		t.Errorf("projectRoot(a folder outside the container) = %q, want \"\"", got)
 	}
 }
+
+// An editor can start a session of its own for a standard library file (it
+// finds no project markers there), and that session starts in the folder of
+// repositories. With no project file yet, such a file goes to a project that
+// has an index, which holds the standard library; with no index anywhere, no
+// daemon starts for it.
+func TestProxySendsAFileOutsideEveryProjectToAnIndexedProject(t *testing.T) {
+	work, shop, _, _ := containerFixture(t)
+	stdlib := filepath.Join(t.TempDir(), "lib", "elixir", "lib", "calendar", "datetime.ex")
+	writeFiles(t, filepath.Dir(stdlib), map[string]string{"datetime.ex": "defmodule DateTime do\nend\n"})
+
+	t.Run("an indexed project answers", func(t *testing.T) {
+		writeFiles(t, shop, map[string]string{".dexter/dexter.db": "x"})
+		t.Cleanup(func() { _ = os.RemoveAll(filepath.Join(shop, ".dexter")) })
+		h, _ := newRouteHarness(t, work, true)
+		e := h.editor
+		e.request(1, "initialize", map[string]any{"capabilities": map[string]any{}})
+		e.response(1)
+		openDoc(e, stdlib, "defmodule DateTime do\nend\n")
+		e.request(2, "textDocument/definition", at(stdlib))
+		d := h.daemon(shop)
+		connectUpstream(t, d, shop, fileURI(stdlib))
+		answerNext(t, d, "textDocument/definition", []any{map[string]any{"uri": fileURI(stdlib), "range": map[string]any{}}})
+		if res := e.response(2); res["result"] == nil {
+			t.Fatalf("definition in a standard library file = %v, want the indexed project's answer", res)
+		}
+	})
+
+	t.Run("no index starts no daemon", func(t *testing.T) {
+		h, _ := newRouteHarness(t, work, true)
+		e := h.editor
+		e.request(1, "initialize", map[string]any{"capabilities": map[string]any{}})
+		e.response(1)
+		openDoc(e, stdlib, "defmodule DateTime do\nend\n")
+		e.request(2, "textDocument/definition", at(stdlib))
+		e.response(2)
+		if dials := h.dials(); len(dials) != 0 {
+			t.Fatalf("daemons started for a file outside every project with no index: %v", dials)
+		}
+	})
+}
