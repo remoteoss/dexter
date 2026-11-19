@@ -14,7 +14,7 @@ Steps or a minimal code snippet that triggers the issue.
 What you expected to happen.
 
 **Debug logs**
-Please enable debug mode and include the relevant logs after reindexing using `dexter init --force` in your project root. See the [Debugging section](https://github.com/remoteoss/dexter#debugging) in the README.
+Run `dexter init --force` in your project root to rebuild the index. If the bug is still there, enable debug mode (see the [Debugging section](https://github.com/remoteoss/dexter#debugging) in the README), make the bug happen again, and include the relevant lines of the daemon log. `dexter log` in your project prints the path of that log. You can also include your editor's LSP log.
 
 <details>
 <summary>Logs</summary>
@@ -26,7 +26,7 @@ Paste debug logs here
 </details>
 
 **Environment**
-- Dexter version (`dexter --version`):
+- Dexter version (`dexter version`):
 - Elixir version (`elixir --version`):
 - Editor and version:
 - OS:

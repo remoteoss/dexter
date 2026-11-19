@@ -8,6 +8,7 @@ A fast, full-featured Elixir LSP optimized for large Elixir codebases.
 
 - [Features](#features)
 - [Quick start](#quick-start)
+  - [Run the latest main](#run-the-latest-main)
 - [Editor setup](#editor-setup)
   - [VS Code / Cursor](#vs-code--cursor)
     - [Configuration](#configuration)
@@ -56,17 +57,21 @@ A fast, full-featured Elixir LSP optimized for large Elixir codebases.
 - **Autocompletion** — modules, functions, types, and variables with full snippet support. Resolves through aliases, imports, `use` injections, and the Elixir stdlib. Works for qualified calls (`MyApp.Accounts.|`), bare function calls, and module prefixes.
 - **Rename** — rename modules, functions, and variables with automatic file renaming when the convention is followed.
 - **No compilation required** — the index is built by parsing source files directly, not by compiling your project. Dexter works immediately on any codebase, even ones that don't compile.
+- **Macro-generated functions** — when your project is compiled, completion, hover, and go-to-definition also find functions that macros generate (for example Phoenix route helpers). Dexter reads them from the compiled `.beam` files in `_build`. Compilation stays optional.
 - **Monorepo and umbrella support** — a single index at the repository root covers all apps and shared libraries. Go-to-definition, find references, and rename work cross-project out of the box.
 - **Format on save** — formats `.ex`, `.exs`, and `.heex` files on save via a persistent Elixir process. Near-instant after the first save. Formatter plugins (Styler, Phoenix.LiveView.HTMLFormatter) are loaded from your project's `_build` — no install needed. Syntax errors are surfaced as diagnostics.
 - **Elixir stdlib indexing** — jump to `Enum`, `String`, `Mix`, and other bundled modules by indexing your local Elixir installation sources.
 - **Signature help** — parameter hints as you type function calls.
 - **Workspace symbols** — search for any module or function across the entire codebase.
 - **Call hierarchy** — navigate incoming and outgoing calls.
+- **Go-to-implementation** — find the modules that implement a behaviour or a protocol.
 - **Code actions** — add missing aliases with a single action.
 - **Document symbols** — outline view of all functions and modules in the current file.
 - **Document highlight** — highlight all occurrences of the symbol under the cursor.
 - **Variable support** — go-to-definition, rename, and completion for local variables via tree-sitter, with correct scoping across `case`, `with`, `for`, and other block constructs.
 - **Git branch switch detection** — automatically reindexes when you switch branches.
+- **One index for every tool** — your editors, the CLI, and AI agents share one [workspace daemon](#workspace-daemon) per project, so they all answer from the same index.
+- **MCP server for AI agents** — `dexter mcp` gives agents the same navigation and rename as your editor. See [MCP server](#mcp-server).
 
 <details>
 <summary>More features</summary>
@@ -101,7 +106,25 @@ A fast, full-featured Elixir LSP optimized for large Elixir codebases.
 
 2. **Configure your editor** — see [Editor setup](#editor-setup) below.
 
-3. **Open an Elixir project.** Dexter indexes automatically the first time the LSP starts.
+3. **Open an Elixir project.** Dexter indexes the project automatically the first time your editor starts it.
+
+### Run the latest main
+
+To try changes before they are released, install the newest `main` branch with mise:
+
+```sh
+mise use -g asdf:remoteoss/dexter@main
+```
+
+The asdf plugin clones `main` and builds it on your machine. The build needs Go 1.26.1 (for example `mise use -g go@1.26.1`) and a C compiler, because Dexter uses SQLite through cgo. On macOS, `xcode-select --install` gives you a C compiler.
+
+mise does not update this install by itself. To rebuild from the newest `main`:
+
+```sh
+mise install -f asdf:remoteoss/dexter@main
+```
+
+A build from `main` reports the number of the last release in `dexter version`. The `aqua:` backend installs only releases, so it cannot install `main`.
 
 ## Editor setup
 
@@ -115,9 +138,9 @@ Or, if you prefer to install from source: [dexter-vscode](https://github.com/rem
 
 #### Configuration
 
-If you installed via Mise or ASDF, you're all done!
+If `dexter` is on your `PATH` (for example after an install with mise, asdf, or Homebrew), you do not need to configure anything.
 
-But if Dexter is not on your `PATH`, set the binary path in your editor settings:
+If Dexter is not on your `PATH`, set the binary path in your editor settings:
 
 ```json
 {
@@ -150,18 +173,24 @@ Add to your LSP configuration (e.g., `after/plugin/lsp.lua`):
 
 ```lua
 vim.lsp.config('dexter', {
-  cmd = { 'dexter', 'lsp' },
-  root_markers = { '.dexter/dexter.db', '.dexter.db', '.git', 'mix.exs' },
+  -- Start Dexter in the project of the file. Neovim starts a server in its own
+  -- current folder, and Dexter finds the project from the folder it starts in.
+  cmd = function(dispatchers, config)
+    return vim.lsp.rpc.start({ 'dexter', 'lsp', config.root_dir }, dispatchers)
+  end,
+  root_markers = { 'mix.exs', '.git' },
   filetypes = { 'elixir', 'eelixir', 'heex' },
   init_options = {
     followDelegates = true,  -- jump through defdelegate to the target function
     -- stdlibPath = "",      -- override Elixir stdlib path (auto-detected)
-    -- debug = false,        -- verbose logging to stderr (view with :LspLog)
+    -- debug = false,        -- verbose logging to the LSP log (view with :LspLog)
   },
 })
 
 vim.lsp.enable 'dexter'
 ```
+
+The root markers only need to find a folder inside the project. Dexter finds the project root from there, for example the root of a monorepo.
 
 That's it. Go-to-definition (`gd`, `<C-]>`, or whatever you have mapped to `vim.lsp.buf.definition()`) will now use dexter alongside any other attached LSP servers.
 
@@ -211,7 +240,7 @@ configs.dexter = {
   default_config = {
     cmd = { "dexter", "lsp" }, -- update this if you don't have Dexter in your PATH
     filetypes = { "elixir", "eelixir", "heex" },
-    root_dir = lspconfig.util.root_pattern(".dexter/dexter.db", ".dexter.db", "mix.exs", ".git"),
+    root_dir = lspconfig.util.root_pattern("mix.exs", ".git"),
   },
 }
 
@@ -239,7 +268,7 @@ See the [Zed docs](https://zed.dev/docs/languages/elixir#using-dexter) for full 
 }
 ```
 
-If you already have Dexter installed via [mise](https://mise.en.dev/), the extension will use your local binary from PATH instead of downloading.
+If `dexter` is already on your `PATH` (for example from [mise](https://mise.en.dev/)), the extension uses that binary and does not download one.
 
 To override the binary path manually, add this to your `settings.json`:
 
@@ -256,7 +285,7 @@ To override the binary path manually, add this to your `settings.json`:
 }
 ```
 
-If Zed shows a *"could not detect Elixir stdlib"* warning on startup — common when Elixir was installed via Homebrew, which ships no stdlib sources — point Dexter at an Elixir source tree matching your version (e.g. a checkout of [elixir-lang/elixir](https://github.com/elixir-lang/elixir)):
+If Zed shows the warning *"could not find the Elixir standard library"*, point Dexter at the `lib` directory of an Elixir source tree that matches your Elixir version (for example a checkout of [elixir-lang/elixir](https://github.com/elixir-lang/elixir)). This is common when Elixir was installed with Homebrew, which ships no standard library sources:
 
 ```json
 {
@@ -270,7 +299,7 @@ If Zed shows a *"could not detect Elixir stdlib"* warning on startup — common 
 }
 ```
 
-Equivalently, set the `DEXTER_ELIXIR_LIB_ROOT` environment variable via `lsp.dexter.binary.env`.
+You can also set the `DEXTER_ELIXIR_LIB_ROOT` environment variable in `lsp.dexter.binary.env`. Then run `dexter stop` in the project and restart Zed, because a running daemon keeps the standard library that it found.
 
 ### Emacs
 
@@ -382,11 +411,11 @@ Measured on a 57k-file Elixir monorepo (330k definitions, 2.7M references) on a 
 
 ## CLI usage
 
-The CLI commands are available for scripting and manual use.
+Use the CLI for scripts and for manual queries. `dexter --help` lists the commands, and `dexter <command> --help` lists the flags of a command.
 
-Every command accepts `--root <path>` (or `-C <path>`) and then runs as if it had
-been started there, which lets a shell, an agent, or an editor wrapper query a
-project from somewhere else entirely:
+Every command accepts `--root <path>` (or `-C <path>`). The command then runs as if
+you started it in that directory. A shell, an agent, or an editor wrapper can
+query a project from any directory:
 
 ```sh
 # the flag goes anywhere on the command line
@@ -398,13 +427,18 @@ dexter lsp --root ~/code/my-elixir-project
 dexter stop --root ~/code/my-elixir-project
 ```
 
-Dexter refuses to treat a directory with no `mix.exs`, `.git`, or Dexter database as a
-workspace, so a mistyped `dexter lookup` in your home directory stops instead of
-building a database over everything you own. Pass `--root <path>` to name the
-project, or `-y`/`--yes` if that directory really is what you meant; the
-`.dexter/dexter.db` database the first run creates is itself a marker, so the flag is only
-needed once. `dexter lsp` is the exception: an editor is authoritative about what
-the user opened, so it logs a warning and serves the directory anyway.
+`init`, `reindex`, `lookup`, and `references` refuse to run in a directory that is
+not a project: your home directory, or a directory with no `mix.exs` or `.git` in it or
+above it (see [how Dexter finds the project](#index-database-location-dexter)).
+`init` checks only the directory that you give it, so give it the project root.
+Thus a mistyped `dexter lookup` in your home directory stops, and does not build an
+index of all your files. Pass `--root <path>` to name the project. If you really
+mean that directory, pass `-y`/`--yes`. The flag applies to that one command only, so
+add it each time. In a folder that holds several repositories, these commands also
+refuse, and name the projects in it: run them in one of those projects.
+
+`dexter lsp` does not refuse: the editor decides what the user opened, so Dexter
+serves the directory and shows a warning in the editor.
 
 ### Index a project
 
@@ -424,6 +458,8 @@ Dexter auto-detects your Elixir installation. If it can't find it (e.g. a non-st
 ```sh
 export DEXTER_ELIXIR_LIB_ROOT="/path/to/elixir/lib"
 ```
+
+The workspace daemon reads this variable when it starts. If a daemon is already running for the project, run `dexter stop` first.
 
 ### Look up definitions
 
@@ -445,6 +481,11 @@ dexter lookup --strict MyApp.Accounts nonexistent
 # => (exit code 1)
 ```
 
+The first query in a project starts the [workspace daemon](#workspace-daemon), which builds the index if there is none. By default, a query answers at once from what is indexed, and prints a note to stderr while the index is still building. `lookup` and `references` accept two flags for this:
+
+- `--wait <duration>` (for example `--wait 30s`): wait up to this long for the index to finish before answering.
+- `-q`/`--quiet`: do not print the note. Setting the `DEXTER_QUIET=1` environment variable does the same.
+
 ### Find references
 
 ```sh
@@ -462,7 +503,7 @@ Exits 1 with a message to stderr if no references are found.
 
 ### Reindexing files manually
 
-The LSP does this for you automatically, but if for some reason you need to, you can reindex files manually via the CLI.
+Dexter keeps the index up to date for you. If you need to, you can reindex files manually with the CLI.
 
 ```sh
 # Re-index a single file (~10ms)
@@ -472,25 +513,44 @@ dexter reindex /path/to/lib/my_app/accounts.ex
 dexter reindex ~/code/my-elixir-project
 ```
 
-When running as an LSP server, dexter automatically:
+While the workspace daemon runs, it automatically:
 
-- Reindexes files on save (`textDocument/didSave`)
-- Runs an incremental reindex on startup
-- Watches `.git/HEAD` for branch switches and reindexes when detected
+- Runs an incremental reindex when it starts
+- Watches the project files, so it also indexes changes that other programs make (for example `git checkout` or an AI agent)
+- Reindexes a file when your editor saves it
+- Checks `.git/HEAD` for branch switches and reindexes when it finds one
 
 ## MCP server
 
-Dexter includes a built-in [Model Context Protocol](https://modelcontextprotocol.io) server, modeled on `gopls mcp`, so AI agents can navigate Elixir codebases through the index instead of grep. Tools cover symbol search, definitions with docs and specs, references, module API summaries, file outlines, behaviour/protocol implementations, callers and callees, incremental reindexing, and workspace-wide rename.
+Dexter includes a built-in [Model Context Protocol](https://modelcontextprotocol.io) server, modeled on `gopls mcp`. With it, AI agents navigate Elixir code through the index instead of grep. It has nine tools:
 
-Register it with your MCP client. For Claude Code:
+| Tool | What it does |
+| --- | --- |
+| `dexter_workspace` | Project layout, index state, and warnings |
+| `dexter_search` | Find modules and functions by part of their name |
+| `dexter_definition` | Where a module or function is defined, with its `@doc`, `@spec`, and source |
+| `dexter_references` | Every call site, with the function or test that holds it; optionally the callees of a function |
+| `dexter_module_api` | The public API of a module, including what a `use` injects |
+| `dexter_file_outline` | What a file defines, with line numbers |
+| `dexter_implementations` | Implementations of a behaviour or a protocol (including `@derive`) |
+| `dexter_reindex` | Reindex now (only needed when file watching is not active) |
+| `dexter_rename_symbol` | Rename a module or function in the whole project |
+
+Register the server with your MCP client. For Claude Code:
 
 ```sh
 claude mcp add dexter -- dexter mcp
 ```
 
-Any client that speaks MCP over stdio works the same way: point it at `dexter mcp`. The server obtains its workspace from the client through MCP roots and resolves it the way the CLI does, so it binds the project the client is working in rather than the directory it was launched from. Clients that provide no roots get the launch directory (when it is a project), and an explicit path argument (`dexter mcp <path>`) overrides negotiation entirely. One session serves one workspace: when a client gives several roots, the session uses the first one that is a usable project (an existing directory inside an Elixir project, not the home directory) and ignores the others. In `--listen` mode each resolved root gets its own workspace, so sessions from different projects can share one server.
+Any client that speaks MCP over stdio works the same way: point it at `dexter mcp`.
 
-`dexter mcp` is a frontend of the workspace daemon, like `dexter lsp` and the CLI: it starts the daemon when necessary and keeps no index of its own. The tools answer from the same index, watchers, and caches as the editor, so edits made directly by an agent are indexed by the daemon's file watcher, and a `dexter_reindex` tool forces an immediate update if a lookup ever seems stale. A tool that answers from an index that is still building or degraded says so in its answer. The tools read file text the way the user sees it: when an editor attached to the same daemon holds a file open with changes it has not saved (and the file on disk has not changed since), outlines, definition snippets, and reference lines come from that buffer (with its line numbers), and the answer says so. The rename tool follows the rules in [Renaming with several editors](#renaming-with-several-editors): it writes files that an editor has open without unsaved changes (the editor reloads them), and it changes nothing, naming the file, when a file it must change has unsaved changes in an editor.
+**Which project the server uses.** The server asks the client for its workspace roots (MCP roots) and finds the project from them the same way the CLI does. So it uses the project that the client works in, not the directory that it was started from. When the client gives several roots, the server uses the first one that is a project. It refuses a root that is not a project, and your home directory. A client that gives no roots gets the directory that the server started in, if that is a project. To fix the project, give it as an argument (`dexter mcp <path>`) or with `--root`. With `--listen`, each client session finds its own project, so clients in different projects can share one server.
+
+**A folder of repositories.** When the project is a folder that holds several repositories (clones and git worktrees), each tool takes a `project` argument: the directory of the checkout to ask, or a file in it. In any session, `project` can also name another checkout.
+
+**Shared index.** `dexter mcp` connects to the [workspace daemon](#workspace-daemon), like `dexter lsp` and the CLI. It starts the daemon if necessary and keeps no index of its own. So the tools answer from the same index and caches as your editor. The daemon's file watcher indexes the changes that an agent writes. If the index is still building or cannot be fully used, the answer says so.
+
+**Unsaved editor changes.** When an editor that uses the same daemon has a file open with unsaved changes (and the file on disk did not change after that), outlines, definition snippets, and reference lines come from the editor's text and its line numbers. The answer says so. The rename tool follows the rules in [Renaming with several editors](#renaming-with-several-editors): it writes a file that an editor has open without unsaved changes (the editor reloads it). If a file that it must change has unsaved changes in an editor, it changes nothing and names that file.
 
 Useful variants:
 
@@ -505,7 +565,7 @@ dexter mcp --instructions
 
 ## Hover documentation
 
-Dexter serves hover docs (`textDocument/hover`) for functions, modules, and types. When you hover over a symbol, it looks up the definition in the index and reads the `@doc`, `@moduledoc`, `@typedoc`, or `@spec` annotations from the source file.
+Dexter serves hover docs (`textDocument/hover`) for functions, modules, and types. When you hover over a symbol, it looks up the definition in the index and reads the `@doc`, `@moduledoc`, `@typedoc`, or `@spec` annotations from the source file. For a function that a macro generates, which has no source, Dexter reads the documentation from the compiled module, if your project is compiled.
 
 The hover response shows the function signature (with `@spec` if present), followed by the doc string:
 
@@ -614,7 +674,7 @@ A rename is all or nothing. If one file cannot be replaced, Dexter puts back eve
 
 ## Lightning-fast formatting
 
-Dexter formats files on save via `textDocument/willSaveWaitUntil` using a persistent Elixir process per `.formatter.exs`. This persistent formatter server starts once when you open the first file in a project under a given `.formatter.exs`, so formatting is near-instant.
+Dexter formats files through `textDocument/formatting`. To format on save, turn on format on save in your editor (see [Editor setup](#editor-setup)). A persistent Elixir process does the formatting, so it is near-instant after the first format. Each `.formatter.exs` gets its own formatter in that process, which loads the first time it formats a file.
 
 Plugins ([`Styler`](https://github.com/remoteoss/elixir-styler), `Phoenix.LiveView.HTMLFormatter`, etc.) are loaded from
 your project's `_build/dev/lib`. So as long as your formatter plugins are installed and compiled, everything is ready to
@@ -622,8 +682,9 @@ go.
 
 **Non-standard formatter options:** Dexter passes your `.formatter.exs` options through to plugins as-is, matching `mix
 format`. So plugin-specific options like `Phoenix.LiveView.HTMLFormatter`'s `:heex_line_length`, `:attribute_formatters`,
-and `:inline_matcher` are honored. One caveat: the persistent process runs outside `Mix`, so a plugin that resolves
-config at format time via `Mix.*` or `Application.get_env/2` (e.g. `CanonicalTailwind` looking up its Tailwind binary)
+and `:inline_matcher` are honored. Like `mix format`, the formatter loads your `mix.exs` first, so `Mix.Project.config/0`
+works. One caveat: the persistent process does not load your application config (`config/*.exs`), so a plugin that
+reads it at format time with `Application.get_env/2` (e.g. `CanonicalTailwind` looking up its Tailwind binary)
 won't see it — inline that config directly in `.formatter.exs` instead (e.g. `canonical_tailwind: [binary: "PATH"]`).
 
 If the persistent process can't start, dexter falls back to running `mix format` directly.
@@ -640,7 +701,7 @@ Dexter reads `initializationOptions` from your editor configuration:
 
 - **`followDelegates`** (boolean, default: `true`): follow `defdelegate` targets on lookup.
 - **`stdlibPath`** (string): override the Elixir stdlib directory to index. Defaults to auto-detection; use this if your install is non-standard. All editors of a project share one index, so the first editor that sets `stdlibPath` decides it until the daemon stops; an editor that sets another value is warned.
-- **`debug`** (boolean, default: `false`): enable verbose logging for this editor session. Logs timing and resolution details for every definition, hover, references, and rename request to your editor's LSP log and to the workspace daemon's log (see [Debugging](#debugging)). Can also be enabled via the `DEXTER_DEBUG=true` environment variable.
+- **`debug`** (boolean, default: `false`): enable verbose logging for this editor session. Logs timing and resolution details for every definition, hover, references, and rename request to your editor's LSP log and to the workspace daemon's log (see [Debugging](#debugging)). You can also set the `DEXTER_DEBUG=true` environment variable; the workspace daemon reads it when it starts.
 - **`maxTransientDocuments`** (integer, default: `50`): cap on how many lazily-loaded buffers the server retains in memory. When an LSP client (e.g. Claude Code) queries a file it never opened via `didOpen`, dexter reads it from disk and caches it. Editor-owned buffers are unaffected; only disk-loaded entries are subject to LRU eviction. Set to `0` to disable transient caching.
 
 ## Index database location (.dexter/)
@@ -668,7 +729,13 @@ flowchart TD
     holds -- no --> repo
 ```
 
-Your home folder is never a project, also when it is a git repository (dotfiles). A folder whose `.git` is a file (a submodule, or the folder of a bare repository and its worktrees) is checked like a repository. In a session of one project, a nested clone, a submodule, and a dependency in `deps/` belong to that project; only a linked worktree in it is its own project. An index anywhere else is not used. Earlier versions could make one in a folder above your projects; `dexter prune` lists them, and `dexter prune --delete` deletes them.
+Some details of this rule:
+
+- Your home folder is never a project, also when it is a git repository (dotfiles).
+- A file in `deps/` belongs to the project that holds `deps/`.
+- A folder whose `.git` is a file (a submodule, or the folder of a bare repository and its worktrees) is checked like a repository, but only when no clone or linked worktree is above it.
+- In a session of one project, a nested clone and a submodule belong to that project. Only a linked worktree in it is its own project.
+- Dexter does not use an index in any other folder. Earlier versions could make one in a folder above your projects; `dexter prune` lists them, and `dexter prune --delete` deletes them (see [Workspace daemon](#workspace-daemon)).
 
 If you're upgrading from a pre-`.dexter/` version of dexter, any existing `.dexter.db` file at your project root will be automatically deleted and rebuilt into the new `.dexter/` folder on the next `dexter init` or LSP startup. You can also remove any `.dexter.db*` or `.dexter/` entries from your `.gitignore`, as they are no longer needed.
 
@@ -688,36 +755,40 @@ dexter init .
 
 ## Workspace daemon
 
-One background process per project owns the index, so your editor and the CLI
-see the same fresh index instead of each maintaining their own.
+One background process per project, the workspace daemon, owns the index. Your
+editors, the CLI, and `dexter mcp` all connect to it, so they share one fresh
+index and do not each keep their own.
 
-The first `dexter lsp`, `dexter mcp`, `dexter lookup`, `dexter references`, or `dexter reindex`
-starts it, and it exits on its own after 15 minutes with no clients. Nothing
-about editor configuration changes: `dexter lsp` still speaks LSP over stdio, it
-just proxies to the daemon, and the protocol bytes are copied rather than
-re-parsed.
+The first `dexter lsp`, `dexter mcp`, `dexter lookup`, `dexter references`, or
+`dexter reindex` in a project starts the daemon. It stops by itself after 15
+minutes with no clients. You do not configure it: `dexter lsp` still speaks LSP
+over stdio, and passes the messages to the daemon without changing them.
 
-The daemon belongs to the workspace, not to whichever frontend started it. No
-editor owns the index for another: a second editor and a lookup in a shell both
-attach to the same daemon and share its index and resolution caches, so neither
-can see a different, staler answer. `dexter mcp` attaches to it too, so every
-frontend answers from one index.
+The daemon belongs to the project, not to the editor or command that started
+it. A second editor, a lookup in a shell, and an AI agent all connect to the
+same daemon and share its index and caches, so none of them can get an older
+answer than another.
 
-The daemon owns the SQLite index in `.dexter/` (one writer), the file watchers and
-`.git/HEAD` poll that drive incremental reindexes, stdlib and dependency
-discovery, and the use-chain, generated-function, and BEAM caches. A CLI call
-therefore reuses an editor's warm caches instead of starting cold.
+The daemon owns:
 
-Its runtime files live outside your project in the environment-independent
-`/tmp/dexter-<uid>` directory: one socket, lock, and log per workspace. Dexter
-refuses a runtime directory that is not owned by you or would make the socket
-path too long. Ownership is an
-advisory kernel lock, so a crash or `kill -9` releases it immediately — there is
-no stale lock to clean up and no PID file to go wrong. The log is the first place
-to look when something behaves oddly.
+- The SQLite index in `.dexter/` (it is the only writer)
+- The file watchers and the `.git/HEAD` check that drive incremental reindexes
+- Detection of the Elixir standard library and of dependencies
+- The use-chain, generated-function, and BEAM caches
+
+So a CLI command uses the warm caches of your editor and does not start cold.
+
+The daemon keeps its runtime files (one socket, lock, and log per project)
+outside your project, in `/tmp/dexter-<uid>`. If that directory is not owned by
+you, or if the socket path would be too long, Dexter uses
+`~/Library/Caches/dexter/run` (macOS) or `~/.cache/dexter/run` (Linux). The
+lock is an advisory kernel lock, so a crash or `kill -9` releases it at once:
+there is no stale lock or PID file to clean up. The log is the first place to
+look when something behaves oddly (see [Debugging](#debugging)).
 
 ```sh
-# how long an idle daemon waits before exiting (0 = never)
+# how long an idle daemon waits before it stops (0 = never)
+# set it where the daemon starts, for example in your shell profile
 export DEXTER_DAEMON_IDLE_TIMEOUT=30m
 
 # stop the workspace daemon now
@@ -726,32 +797,31 @@ dexter stop
 dexter stop --force
 ```
 
-`dexter stop` is the manual version, useful when a daemon is stuck,
-misbehaving, or just in the way — it finds the process by workspace rather than
-by pid, reports whether one was running, and is a no-op when there was nothing to
-stop. A plain stop asks the daemon politely and refuses while clients are
-attached; `--force` skips the handshake and signals the process directly, so it
-works even for a daemon that is wedged or built by another version, escalating
-to an outright kill if the process will not exit. Editors attached to a forced
-stop lose the workspace until it restarts on the next `dexter lsp`, lookup, or
-reindex.
+Use `dexter stop` when a daemon is stuck, misbehaves, or is in the way. It
+finds the daemon of the project (not by PID), tells you whether one was
+running, and does nothing when none was. A plain stop asks the daemon to exit,
+and refuses while clients are attached. `--force` skips that request and
+signals the process directly, so it also stops a daemon that hangs or that
+another Dexter version built. If the process does not exit, Dexter kills it.
+Editors that were attached lose the project until the next `dexter lsp`,
+lookup, or reindex starts a daemon again.
 
-Earlier versions of Dexter could make an index in a folder above your
-projects (for example a folder that holds several clones and worktrees), where
-it can grow very large. No session uses such an index now, and Dexter warns
-about it with its path and size. `dexter prune` lists these indexes, and
-`dexter prune --delete` deletes each one that no daemon uses. It deletes only
-Dexter's own files, one at a time: a `.dexter` folder that holds other files
-stays.
+Earlier versions of Dexter could make an index in a folder above your projects
+(for example a folder that holds several clones and worktrees), where it can
+grow very large. No session uses such an index now, and Dexter warns about it
+with its path and size. `dexter prune` lists these indexes, also the index of a
+folder of repositories. `dexter prune --delete` deletes each one that no daemon
+uses. It deletes only Dexter's own files: a `.dexter` folder that holds other
+files stays.
 
 ```sh
 dexter prune            # list old indexes above this project
 dexter prune --delete   # delete them
 ```
 
-`dexter init` is the one command that needs the workspace to itself. It asks an
-idle daemon to exit and refuses while a client is attached, so close your editor
-(or wait for the idle timeout) before rebuilding an index from scratch.
+`dexter init` is the one command that needs the project to itself. It asks an
+idle daemon to exit, and refuses while a client is attached. Close your editor
+(or wait for the idle timeout) before you rebuild an index from scratch.
 
 ## Debugging
 
@@ -767,7 +837,12 @@ If the issue persists, enable debug mode to get verbose logs. You can do this in
 1. Set the `debug` option in your editor's LSP `initializationOptions` (see [LSP options](#lsp-options)). It applies to that editor session as soon as it connects.
 2. Or set the `DEXTER_DEBUG=true` environment variable for the editor or CLI command that starts the workspace daemon. The daemon reads it when it starts, so if one is already running, run `dexter stop --force` first (a plain stop is refused while an editor or an MCP session is attached). This is also how to debug CLI commands such as `dexter lookup`.
 
-Debug mode logs timing and resolution details for every definition, hover, references, and rename request. Each editor receives the lines for its own requests in its LSP log (in Neovim usually `~/.local/state/nvim/lsp.log`, in VS Code Output > Dexter). Every editor and CLI command for a workspace shares one daemon, and all of its lines, including those for CLI commands, also go to the daemon's log file: `<key>.log` in its runtime directory (`/tmp/dexter-<uid>` on macOS and Linux; see [docs/daemon.md](docs/daemon.md)). The first line `dexter lsp` writes to your editor's log names that file, and `dexter log` prints it from a terminal: `tail -F "$(dexter log)"` follows it, also across a daemon restart. In a folder of repositories, each project has its own daemon and log: the editor's log names each one when Dexter connects to it, and `dexter log` in the folder prints them all.
+Debug mode logs timing and resolution details for every definition, hover, references, and rename request. The lines go to two places:
+
+- **Your editor's LSP log.** Each editor gets the lines for its own requests (in Neovim usually `~/.local/state/nvim/lsp.log`, in VS Code Output > Dexter).
+- **The daemon's log file.** All editors, CLI commands, and MCP sessions of a project share one daemon, and its log has all of their lines. The file is in the daemon's runtime directory, usually `/tmp/dexter-<uid>` (see [Workspace daemon](#workspace-daemon) and [docs/daemon.md](docs/daemon.md)).
+
+`dexter log` prints the path of the daemon's log file, and `tail -F "$(dexter log)"` follows it, also across a daemon restart. The first line that `dexter lsp` writes to your editor's log also names the file. In a folder of repositories, each project has its own daemon and log: the editor's log names each one when Dexter connects to it, and `dexter log` in the folder prints them all.
 
 When [filing an issue](https://github.com/remoteoss/dexter/issues/new), please include:
 
@@ -778,12 +853,12 @@ When [filing an issue](https://github.com/remoteoss/dexter/issues/new), please i
 
 ## Development (building from source)
 
-Requires Go 1.21+, SQLite, and Elixir.
+Requires Go 1.26.1, a C compiler (Dexter uses SQLite through cgo), and Elixir. The versions are in `.tool-versions`.
 
 ```sh
 git clone https://github.com/remoteoss/dexter.git
 cd dexter
-mise install    # install dependencies
+mise install    # install Go, Elixir, and Erlang from .tool-versions
 make build      # to build from source
 make test       # to test
 ```
