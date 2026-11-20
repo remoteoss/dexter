@@ -21,17 +21,18 @@ Which tool for which question:
 
 The index updates automatically: the dexter daemon, which the editor shares,
 watches file changes and git branch switches, and a lookup that finds nothing
-first waits for the changes the watcher has seen. `dexter_reindex` is needed
-only when `dexter_workspace` says that file watching is not active. An answer that ends
-with a note about the index (still building, being rebuilt, files that could
-not be indexed) can be incomplete; retry after the note goes away.
+first waits for the changes the watcher has seen. Use `dexter_reindex` only
+when `dexter_workspace` says that file watching is not active. An answer that
+ends with a note about the index (still building, being rebuilt, files that
+could not be indexed) can be incomplete; retry after the note goes away.
 
 Several projects: when the session starts in a folder that holds several
 repositories (clones and git worktrees), that folder has no index of its own.
 Pass `project` to every tool: the directory of the checkout you work in, or
 any file in it (absolute, or relative to the session's root). A call without
-it lists the projects. `project` also selects another checkout in any
-session, for example a worktree that is nested in the project.
+it answers from the only project with an index, or else lists the projects.
+`project` also selects another checkout in any session, for example a worktree
+that is nested in the project.
 
 Elixir specifics: modules are not tied to files (use `dexter_file_outline` for
 a file, `dexter_definition` for a module); pass fully-qualified module names,

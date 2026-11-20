@@ -97,9 +97,8 @@ func usableRoot(uri string, resolve func(string) (string, error)) (string, error
 	return resolve(path)
 }
 
-// defaultResolveRoot finds the project root above dir with the store's marker
-// search (an existing index, then a repository), and refuses a directory that
-// is not a project.
+// defaultResolveRoot finds the project root above dir with the project root
+// rule (store.ResolveRoot), and refuses a directory that is not a project.
 func defaultResolveRoot(dir string) (string, error) {
 	root := store.FindProjectRoot(dir)
 	if err := store.NonProjectRootError(root); err != nil {

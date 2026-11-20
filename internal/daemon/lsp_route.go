@@ -14,13 +14,13 @@ import (
 	"github.com/remoteoss/dexter/internal/store"
 )
 
-// Routing: each file goes to the daemon of its own project. The project of a
-// file is the nearest nested clone or linked worktree between it and the
-// start root, else the start root (see projectRoot). A file outside the
-// start root (a dependency or a
+// Routing: each file goes to the daemon of its own project (see projectRoot
+// and store.NestedProject). A file outside every project (a dependency or a
 // standard library file that a definition opened) has no project to start a
 // daemon for, so it goes to the primary, or for a container to the upstream
-// that served the last file. Directories are looked up once per session.
+// that served the last project file, else to an upstream that is already
+// connected, else to the first project of the container that has an index
+// (defaultUpstream). Directories are looked up once per session.
 
 // maxRoutedDirs bounds the directory cache; past it, the cache starts again.
 const maxRoutedDirs = 4096
@@ -145,12 +145,12 @@ func (p *lspProxy) defaultUpstream() *upstream {
 // projectRoot returns the root of the project that owns the files of dir, or
 // "" when that is the start root, or dir is not below the start root.
 //
-// Below the start root, a file belongs to another project only when a nested
-// clone (a .git directory) or a linked worktree is between the file and the
-// start root; the nearest one is the project. An index alone does not make a
-// project: a Dexter index left in apps/foo of a monorepo is not one. A
-// submodule (a .git file that is not a linked worktree) stays a part of the
-// project that holds it. The rule is the same for a container.
+// Below a project, a file belongs to another project only when a linked
+// worktree is between the file and the start root; the nearest one is the
+// project. Below a container, the repository just below the container owns
+// the file, unless a nearer linked worktree is in it. A nested clone inside a
+// project, a submodule, a dependency, and a Dexter index left in apps/foo of a
+// monorepo stay a part of the project that holds them.
 //
 // In a container, a file of a repository that is a symlink can come with the
 // resolved path, outside the start root; it goes to that repository too.

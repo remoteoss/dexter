@@ -44,19 +44,22 @@ Runtime files live in the user-private `/tmp/dexter-<uid>` directory, keyed by
 the workspace. The location is environment-independent so a GUI editor and a
 shell cannot derive different ownership locks for the same index. Dexter refuses
 the directory if it is not a real directory owned by this user, is a symlink, or
-would leave the socket path past `sockaddr_un`'s limit. On a multi-user host
-another user can create `/tmp/dexter-<uid>` first; Dexter then uses a second
-candidate under the home directory that the user database records for the uid
-(not `$HOME`): `~/Library/Caches/dexter/run` on macOS, `~/.cache/dexter/run`
-elsewhere. The first candidate that can be used wins, and that state is the same
-for every process of the user, so the GUI editor and the shell still agree. A
-daemon checks on each endpoint check (below) that new frontends still resolve
-its directory, and exits when they do not; while a daemon holds the workspace in
-one candidate, no process takes ownership in another. `DEXTER_RUNTIME_DIR`
-replaces every candidate; it exists for tests and sandboxes, and every frontend
-of a project must see the same value. Dexter does not change the directory that
-it names: it uses its own subdirectory `dexter-<uid>` there, and only that one is
-made private and cleaned.
+would leave the socket path past `sockaddr_un`'s limit.
+
+On a multi-user host another user can create `/tmp/dexter-<uid>` first. Dexter
+then uses a second candidate under the home directory that the user database
+records for the uid (not `$HOME`): `~/Library/Caches/dexter/run` on macOS,
+`~/.cache/dexter/run` elsewhere. The first candidate that can be used wins.
+That choice is the same for every process of the user, so the GUI editor and
+the shell still agree. On each endpoint check (below), a daemon makes sure that
+new frontends still resolve its directory, and exits when they do not. While a
+daemon holds the workspace in one candidate, no process takes ownership in
+another.
+
+`DEXTER_RUNTIME_DIR` replaces every candidate. It exists for tests and
+sandboxes, and every frontend of a project must see the same value. Dexter does
+not change the directory that it names: it uses its own subdirectory
+`dexter-<uid>` there, and only that one is made private and cleaned.
 
 The key is the first 16 bytes of the SHA-256 of the workspace identity, rendered
 as hex, and each workspace gets `<key>.sock`, `<key>.lock`, and `<key>.log`. When
@@ -65,6 +68,13 @@ key is the first 8 bytes instead. Nothing is placed under the repository:
 `sockaddr_un` paths are capped near 104 bytes, repository paths can be
 read-only, and this is machine-local state. The socket is removed on exit, but
 only when it is still the one that this daemon bound.
+
+The log is shared: every editor session, CLI command, and MCP session of the
+workspace writes to the daemon's `<key>.log`. `dexter log` prints its path
+(`tail -F "$(dexter log)"`). For a folder of repositories it prints the log of
+each project that has one. The first line that `dexter lsp` writes to the
+editor's log also names the file. A frontend that starts a daemon first empties
+a log that is larger than 4 MiB.
 
 A lock file is unlinked only by a process that holds its lock, and every lock
 acquisition checks after `flock` that the path still names the file it locked;
@@ -82,18 +92,22 @@ Every connection starts with a small versioned handshake carrying the workspace
 is the symlink-resolved root, and it decides which daemon owns the physical
 workspace. On macOS it also takes the case that the file system stores
 (`F_GETPATH`), because the default file system ignores case and
-`filepath.EvalSymlinks` keeps the case the caller typed: without it,
+`filepath.EvalSymlinks` keeps the case the caller typed. Without it,
 `~/Code/app` and `~/code/app` would get two locks and two daemons that build
-one index at the same time. The root the daemon *indexes* keeps the spelling its starter used,
-because stored paths are matched against the URIs an editor sends: canonicalizing
-them would break every path-keyed lookup for a project reached through a symlink
-(on macOS a temp dir is `/var/...` to the editor and `/private/var/...` after
-resolution). The handshake also carries that indexed spelling. A frontend using
-another alias is refused with the daemon's root instead of receiving incorrect
-path-keyed answers. A frontend that is not sitting
-in the project names it with `dexter --root <path>` (or `-C`), which changes
-directory before the workspace is resolved, so relative paths follow the named
-root and the spelling an editor or agent chose is the one that gets indexed.
+one index at the same time.
+
+The root that the daemon *indexes* keeps the spelling that its starter used,
+because stored paths are matched against the URIs that an editor sends.
+Canonical paths would break every path-keyed lookup for a project reached
+through a symlink (on macOS a temp dir is `/var/...` to the editor and
+`/private/var/...` after resolution). The handshake also carries that indexed
+spelling. The daemon refuses a frontend that uses another spelling, and sends
+its own root, instead of giving incorrect path-keyed answers.
+
+A frontend that is not in the project names it with `dexter --root <path>` (or
+`-C`). That flag changes directory before the workspace is resolved, so
+relative paths follow the named root, and the spelling that the editor or
+agent chose is the one that gets indexed.
 
 An LSP connection becomes a bidirectional LSP byte stream after the
 handshake; the stdio frontend never decodes or re-encodes JSON, so the hop costs
@@ -229,6 +243,13 @@ calls:
   never starts for a root that is not there, because opening the index would
   create the directory again.
 
+When the daemon opens an index of another `IndexVersion`, it rebuilds the index
+in a new file and warns every editor. When the old index was older, the daemon
+also writes its own version to `.dexter/upgraded`. If a later start finds an
+older index again while that file names the current version, an older build
+(for example 0.7.x in an editor that stayed open) rebuilt the index in between.
+The warning then says to update that `dexter` and restart the editor.
+
 `dexter stop --force` stops every daemon process whose command line names the
 root, not only the first one that `ps` lists.
 
@@ -318,23 +339,27 @@ schedule dependency reconciliation instead, and an attached editor session still
 registers `didChangeWatchedFiles`, whose glob covers `deps/` and path
 dependencies. Events from both sources coalesce by path in the one queue, so the
 overlap costs a map insert rather than a second reindex. A watcher event overflow
-or an FSEvents dropped-event flag causes a full reconcile. A directory that is
-created, renamed, or removed costs only its subtree: a directory that is there
-is walked with the skip rules of the index walks, so it reports what a full
-walk would index (`deps/` included; a nested worktree in it becomes a top), and
-a directory that is gone is sent as one path, which removes what
-was indexed below it with one range read. A directory that was renamed or
+or an FSEvents dropped-event flag causes a full reconcile.
+
+A directory that is created, renamed, or removed costs only its subtree. A
+directory that is there is walked with the skip rules of the index walks, so it
+reports what a full walk would index (`deps/` included; a nested worktree in it
+becomes a top). A directory that is gone is sent as one path, which removes
+what was indexed below it with one range read. A directory that was renamed or
 removed and is there again is sent as well, and the indexed files below it that
-are gone are removed. FSEvents reports paths in the case that the file system
-stores, so the stream compares them with that spelling of the root
-(`F_GETPATH`) and maps them back to the spelling the runtime indexes; a root
-typed in another case is watched. After a rename that changes only the case
-(`mv lib/Area lib/area`), a stat of the old spelling still succeeds; the old
-spelling is found with `F_GETPATH`, only for paths that are already suspect (a
-path in an event, or a stored path that a full walk did not see), and it is
-removed from the index. If FSEvents cannot
-start, Dexter falls back to fsnotify. A directory the kernel refuses to watch is
-logged and tracked instead of aborting the fsnotify tree. The runtime reconciles
+are gone are removed.
+
+FSEvents reports paths in the case that the file system stores. The stream
+compares them with that spelling of the root (`F_GETPATH`) and maps them back
+to the spelling that the runtime indexes, so a root typed in another case is
+watched. After a rename that changes only the case (`mv lib/Area lib/area`), a
+stat of the old spelling still succeeds. Dexter finds the old spelling with
+`F_GETPATH`, only for paths that are already suspect (a path in an event, or a
+stored path that a full walk did not see), and removes it from the index.
+
+If FSEvents cannot start, Dexter falls back to fsnotify. A directory the kernel
+refuses to watch is logged and tracked instead of aborting the fsnotify tree.
+The runtime reconciles
 once when coverage is lost, retries only failed registrations, and reconciles
 after each restored subtree to catch changes made during its gap. Failure to
 create the native watcher is retried the same way. There is no periodic full-tree
@@ -359,12 +384,13 @@ An open connection is a lease: an LSP or long-lived MCP connection keeps the
 daemon alive. After the last connection closes, the daemon exits once the idle
 timeout has passed with no connections. Work that is still running then, such as
 a cold build that no client waits for, stops, and the next daemon finishes it.
-The default is 15
-minutes; `DEXTER_DAEMON_IDLE_TIMEOUT` sets it for every daemon a machine spawns
-(including one an editor starts), `dexter daemon --idle-timeout` sets it for one
-run, and `0` means never exit. Idle cost is a 2 s `.git/HEAD` stat, so the reason
-to bound it at all is the resident memory and watch descriptors a large workspace
-holds after the project is abandoned.
+
+The default idle timeout is 15 minutes. `DEXTER_DAEMON_IDLE_TIMEOUT` (a Go
+duration such as `1h`) changes it; a daemon takes it from the environment of
+the frontend that starts it, also when that is an editor. `dexter daemon
+--idle-timeout` sets it for one run. `0` means never exit. An idle daemon only
+stats `.git/HEAD` every 2 s. The timeout exists because a large workspace holds
+resident memory and watch descriptors after the user stops work on it.
 
 Shutdown stops event sources, drains accepted mutation work, waits for background
 index writes, checkpoints and closes the store, closes the socket, and finally
@@ -429,11 +455,11 @@ daemon stream it:
    documents, each as one `didOpen` with its current text and version, and,
    for a buffer with unsaved changes (a `didChange` after its open or its last
    `didSave`), one full `didChange` with the same text, so that the new daemon
-   gives MCP tools and the CLI the editor's text. An
-   `initialize` that the old daemon never
-   answered is sent with the editor's id, and its answer goes to the editor. A
-   second `client/registerCapability` from the replayed session is answered by
-   the proxy, because the editor holds that registration already.
+   gives MCP tools and the CLI the editor's text. An `initialize` that the old
+   daemon never answered is sent with the editor's id, and its answer goes to
+   the editor. A second `client/registerCapability` from the replayed session
+   is answered by the proxy, because the editor holds that registration
+   already.
 
 Messages the editor sends meanwhile wait and follow the replay, so none is lost
 and none overtakes it; a request that could not be sent to a daemon that went
@@ -458,9 +484,11 @@ is the session released. A released session starts nothing new: no BEAM, no
 Erlang warm-up, no document warm-up. References (and the
 `workspace/references` control method), workspace symbols, the planning of a
 rename, and formatting stop when their context ends; a module rename stops
-only before it starts to move and write files. When the daemon cannot be reached — a newer build took
-over and this proxy is older, the root is spelled another way, the project
-directory is gone, or every attempt failed — the proxy sends
+only before it starts to move and write files.
+
+When the daemon cannot be reached — a newer build took over and this proxy is
+older, the root is spelled another way, the project directory is gone, or
+every attempt failed — the proxy sends
 `window/showMessage` (Error) with the reason and the fix, answers the requests
 it still holds, and exits with a non-zero status. A session that the editor ends
 (`shutdown` and `exit`, or the end of its input) is not carried over.
@@ -481,21 +509,45 @@ cannot handle is a file that could not be indexed.
 
 ### Sessions with several projects
 
+Every frontend finds the workspace of a path with one rule,
+`store.ResolveRoot`: the nearest clone or linked worktree, then its Mix
+project. The home directory is never a repository. With no repository, the
+outermost `mix.exs` below the home directory is the project. An index next to
+a `mix.exs` (from `dexter init` in an app of a monorepo) is a project too, and
+the nearest one wins. A Dexter index alone does not make a project. A
+directory with no Mix project of its own that holds repositories (clones or
+linked worktrees) with Mix projects is a *container*
+(`store.IsProjectContainer`): each repository in it is a project, and the
+container has no index of its own. `dexter prune` lists the indexes
+that the rule does not use (in the directories above the project, or in a
+container), and `dexter prune --delete` deletes each one whose workspace lock
+it can take, so no daemon uses it.
+
 An editor or an agent can start `dexter lsp` in a directory that holds several
-projects: clones and linked worktrees of repositories. Each file then goes to
-the daemon of its own project. Below the start root, a file belongs to another
-project only when a nested clone (a `.git` directory) or a linked worktree is
-between the file and the start root; the nearest one is the project. Else the
-file belongs to the start root. A Dexter index alone does not make a project,
-so an index that was left in `apps/foo` of a monorepo does not split the
-session. A submodule (a `.git` file that is not a linked worktree) is a part of
-the project that holds it. A file in `deps/`, `_build/`, or `node_modules/`
-belongs to the project that holds that directory, so a git dependency gets no
-daemon. Two spellings of one project (a symlink, or another letter case on a
-file system that ignores case) share one upstream, as they share one daemon.
-Only the files below the start root go to a project of their own. A file outside the
-start root (a standard library file that a definition opened) goes to the
-daemon of the start root.
+projects: a container, or a project with linked worktrees in it. Each file then goes to the daemon of its own project
+(`store.NestedProject`):
+
+- In a project, a file belongs to another project only when a linked worktree
+  is between the file and the start root (the nearest one), because the index
+  walk of the project skips linked worktrees. A nested clone stays a part of
+  the project, as the walk indexes it there.
+- In a container, a file belongs to the repository just below the container
+  (a clone or a worktree), unless a nearer linked worktree is in it.
+- A submodule (a `.git` file that is not a linked worktree) is a part of the
+  project that holds it. A file in `deps/`, `_build/`, or `node_modules/`
+  belongs to the project that holds that directory, so a git dependency gets
+  no daemon. An index in `apps/foo` of a monorepo does not split the session,
+  also when it is next to a `mix.exs`.
+
+Two spellings of one project (a symlink, or another letter case on a file
+system that ignores case) share one upstream, as they share one daemon. In a
+container, a repository that is a symlink also gets the files that come with
+its resolved path, outside the start root.
+
+Any other file outside the start root, such as a standard library or
+dependency file that a definition opened, has no project to start a daemon
+for. In a project session it goes to the daemon of the start root. For a
+container, see below.
 
 The proxy keeps one connection to a daemon, an upstream, for each project. It
 makes an upstream when the first message for a file of that project comes. A
@@ -529,7 +581,7 @@ end.
 | `completionItem/resolve` | the upstream that answered the last completion |
 | `workspace/symbol` | every connected upstream; the proxy joins the results |
 | `shutdown` | every upstream; the editor gets one answer when all answered |
-| `initialized`, `workspace/didChangeConfiguration`, `workspace/didChangeWorkspaceFolders`, `$/setTrace`, `exit` | every upstream |
+| `initialized`, `workspace/didChangeConfiguration`, `workspace/didChangeWorkspaceFolders`, `$/setTrace`, `$/logTrace`, `exit` | every upstream |
 | `workspace/didChangeWatchedFiles` | each change to the upstream of its file; no new upstream |
 | `$/cancelRequest` | the upstream that holds the request; a canceled `workspace/symbol` is answered by the proxy at once |
 | `window/workDoneProgress/cancel` | the upstream that made the token |
@@ -544,16 +596,22 @@ a prefix of that upstream. A second `client/registerCapability` for a
 registration that the editor has already (each daemon registers the same file
 watcher) is answered by the proxy.
 
-A start root that only holds other projects (`store.IsProjectContainer`: no Mix
-project of its own, and a clone or worktree below it that has one) gets no
-daemon, because its index would be a copy of the projects in it. The proxy
-answers `initialize` itself with `lsp.NewInitializeResult`, the answer that
-every daemon gives: it does not depend on the request. The proxy cannot hold
-the editor's `initialize` until a daemon exists, because the editor opens files
-only after the answer. Until a file of a project is open, requests get an empty
-answer, and notifications are dropped. A file of the container itself, or a
-file outside it, goes to the upstream of the last file that has a project, and
-its document stays on that upstream until the editor closes it.
+A container start root gets no daemon, because its index would be a copy of
+the projects in it. The proxy answers `initialize` itself with
+`lsp.NewInitializeResult`, the answer that every daemon gives: it does not
+depend on the request. The proxy cannot hold the editor's `initialize` until a
+daemon exists, because the editor opens files only after the answer.
+
+A file of the container itself, or a file outside it (a standard library or
+dependency file), has no project. It goes to the upstream of the last file
+that has a project. With no such upstream (or when it failed), it goes to an
+upstream that is connected, or else to the first project of the container
+that has an index: each project's index holds the standard library. So an
+editor that starts a separate session for a standard library file in the
+container (Neovim does this) gets answers there too. The proxy never starts the
+cold build of a project for such a file. Its document stays on the upstream
+that got its `didOpen` until the editor closes it. When no upstream can take a
+message, a request gets an empty answer, and a notification is dropped.
 
 ## Extension seams
 
@@ -593,12 +651,18 @@ registered control method, `mcp/tool`. It opens no store, starts no watcher, and
 runs no LSP lifecycle of its own.
 
 - **Roots.** Multi-root negotiation stays in the frontend. Each MCP session's
-  root comes from MCP roots, resolved with the same project-root search as the
-  CLI, or from the command line. Sessions that resolve to the same root share
-  one control connection (`daemon.Ensure`), which is the lease that keeps the
+  root comes from MCP roots, resolved with `store.ResolveRoot` as in the CLI,
+  or from the command line. Sessions that resolve to the same root share one
+  control connection (`daemon.Ensure`), which is the lease that keeps the
   daemon alive; the connection closes when the last such session ends. The
   frontend keeps the spelling the client gave. When the daemon already serves
   the workspace through another spelling, the frontend uses the daemon's root.
+- **Projects.** Every tool takes an optional `project`: a directory or any
+  file of a project, absolute or relative to the session's root. Below the
+  session's root it selects the project that `store.NestedProject` gives, as
+  the LSP proxy does. A session whose root is a container has no index of its
+  own: a call without `project` answers from the only project with an index
+  and says so, or else fails with the list of projects.
 - **Tools.** `internal/mcp` registers `mcp/tool` at package initialization. A
   call carries the tool name, its arguments, and `waitReadyMs`. The daemon runs
   the tool body against `mc.LSP()` (the headless language service, since MCP
@@ -662,12 +726,13 @@ runs no LSP lifecycle of its own.
   attached), the next tool call connects again, which starts a new daemon.
   A read-only call that was in flight is sent once more; a rename is never
   repeated.
-- **Rename.** The rename runs on the headless language service and writes the
-  changed files on disk. It does not yet look at buffers that an editor attached
-  to the same daemon has open. The shared rule for frontends without an editor
-  (never write over unsaved editor work; refuse with an actionable error when an
-  affected file has unsaved changes) will replace the call in
-  `internal/mcp/rename.go` when it lands in `internal/lsp`.
+- **Rename.** The rename runs on the headless language service
+  (`RenameFunctionContext`, `RenameModuleContext`) and writes the changed files
+  on disk, with every rule of the editor rename. It never writes over unsaved
+  editor work: a file that an attached editor has open without unsaved changes
+  is written (the editor reloads it), but a file with unsaved changes, or a
+  file to move that an editor has open, stops the whole rename before any
+  change, with an error that names the file.
 
 A daemon-hosted frontend (`RegisterFrontend("mcp", ...)`, with the MCP server
 inside the daemon) would save the local round trip per tool call. It needs an

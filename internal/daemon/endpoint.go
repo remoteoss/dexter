@@ -25,7 +25,7 @@ import (
 // running daemon, whose startup then rebuilds a populated index whose
 // IndexVersion differs. Routine changes that leave frontends and daemons
 // compatible do not bump it, so a running daemon is left alone.
-const ContractVersion = 5 // 5: IndexVersion 17. A later contract change in the same release keeps 5.
+const ContractVersion = 5 // 5: v0.8.0, the first release with a daemon (IndexVersion 17). A later contract change in the same release keeps 5.
 
 // maxSocketPath keeps a workspace socket inside sockaddr_un on every supported
 // platform (about 104 bytes on macOS, 108 on Linux), including the NUL.
